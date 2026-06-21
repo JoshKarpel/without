@@ -1,0 +1,26 @@
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[project]
+name = "without-integration"
+version = "0.0.0"
+description = "Cross-package integration tests: depends on without and every plugin to exercise them together."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Josh Karpel", email = "josh.karpel@gmail.com" },
+]
+requires-python = ">=3.13"
+dependencies = [
+    "without",
+    "without-env",
+    "without-configmap",
+    "pydantic>=2",
+    "pydantic-settings>=2.7",
+]
+
+[tool.uv.sources]
+without = { workspace = true }
+without-env = { workspace = true }
+without-configmap = { workspace = true }

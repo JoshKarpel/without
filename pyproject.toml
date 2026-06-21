@@ -1,0 +1,102 @@
+[project]
+name = "without-workspace"
+version = "0.0.0"
+description = "Workspace root for without: a sans-IO substrate connecting event streams to stateful processors backed by contexts."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Josh Karpel", email = "josh.karpel@gmail.com" },
+]
+requires-python = ">=3.13"
+dependencies = [
+    "without",
+    "without-env",
+    "without-configmap",
+]
+
+[tool.uv]
+package = false
+exclude-newer = "7 days"
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+without = { workspace = true }
+without-env = { workspace = true }
+without-configmap = { workspace = true }
+without-integration = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "without-integration",
+    "pre-commit>=4.4",
+    "pytest<10",
+    "pytest-cov>=3",
+    "pytest-xdist>=3",
+    "pytest-asyncio>=1",
+    "pytest-mock>=3",
+    "hypothesis>=6.80",
+    "mypy>=1",
+    "ruff>=0.15.4",
+    "types-pyyaml>=6",
+]
+
+[tool.pytest.ini_options]
+addopts = ["--strict-markers", "-Werror"]
+testpaths = ["packages"]
+
+markers = ["slow"]
+
+asyncio_mode = "auto"
+
+[tool.mypy]
+pretty = true
+show_error_codes = true
+
+files = ["."]
+exclude = ["site/"]
+
+check_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+disallow_any_generics = true
+
+warn_unused_configs = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+warn_redundant_casts = true
+
+ignore_missing_imports = true
+
+plugins = ["pydantic.mypy"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "I",   # https://beta.ruff.rs/docs/rules/#isort-i
+    "F",   # https://beta.ruff.rs/docs/rules/#pyflakes-f
+    "E",   # https://beta.ruff.rs/docs/rules/#error-e
+    "W",   # https://beta.ruff.rs/docs/rules/#warning-w
+    "T20", # https://beta.ruff.rs/docs/rules/#flake8-print-t20
+    "PIE", # https://beta.ruff.rs/docs/rules/#flake8-pie-pie
+    "PLC", # https://beta.ruff.rs/docs/rules/#convention-plc
+    "PLE", # https://beta.ruff.rs/docs/rules/#error-ple
+    "PLW", # https://beta.ruff.rs/docs/rules/#warning-plw
+    "PTH", # https://beta.ruff.rs/docs/rules/#flake8-use-pathlib-pth
+    "PGH", # https://beta.ruff.rs/docs/rules/#pygrep-hooks-pgh
+    "RUF", # https://beta.ruff.rs/docs/rules/#ruff-specific-rules-ruf
+]
+
+ignore = [
+    "E501",  # line length exceeds limit
+    "E741",  # ambiguous variable name
+    "T201",  # print
+    "T203",  # pprint
+    "F403",  # star imports, used for utilities
+    "F405",  # star imports, used for utilities
+]
