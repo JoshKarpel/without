@@ -19,8 +19,8 @@ This is a `uv` workspace of flat, version-locked packages (no namespace
 packages). Each package is its own top-level import.
 
 - `packages/without` — the core: the contracts every plugin speaks
-  (`without.contracts`) plus a first-step DAG recovery and mermaid visualizer
-  (`without.graph`). Imported as `without`.
+  (`without.contracts`), the stream edge connectors (`without.wiring`), and a
+  `with`-scoped background task helper (`without.tasks`). Imported as `without`.
 - `packages/without-env` — first plugin: a static `Context` parsed from
   environment variables (`pydantic-settings`). Imported as `without_env`.
 - `packages/without-integration` — not a real package: depends on `without` and

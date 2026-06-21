@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from without import Context, Registry, sample
+from without import Context, sample
 from without.testing import tick
 from without_configmap import read_yaml_file, watch_config
 from without_env import EnvContext
@@ -24,7 +24,7 @@ def _write_routing(mount: Path, upstream: str) -> None:
     (mount / "routing.yaml").write_text(f"upstream: {upstream}\n")
 
 
-async def test_env_and_configmap_contexts_feed_one_declared_graph(
+async def test_static_and_reloading_contexts_coexist(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -39,19 +39,12 @@ async def test_env_and_configmap_contexts_feed_one_declared_graph(
 
     routing_source = watch_config(tmp_path, read_yaml_file(Routing, "routing.yaml"), changes=reloads)
 
-    registry = Registry()
-
-    @registry.node
-    def handle(limits: object, routing: object, request: object) -> object: ...
-
-    edges = registry.graph().edges()
-
-    assert ("limits", "handle") in edges
-    assert ("routing", "handle") in edges
-
-    assert limits.current().max_connections == 32
-
     async with sample(routing_source) as routing:
+        assert isinstance(limits, Context)
+        assert isinstance(routing, Context)
+
+        assert limits.current().max_connections == 32
         assert routing.current().upstream == "db.before"
+
         await tick()
         assert routing.current().upstream == "db.after"
