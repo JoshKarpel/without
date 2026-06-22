@@ -6,7 +6,8 @@ dependencies so its interaction with the rest gets a home for tests.
 
 It also hosts validation artifacts that are not meant to be distributed. `kv` is
 a toy line-protocol key-value server (Redis-ish) built on `without`, proving the
-contract supports long-lived processor state and request/response: a pure core
-(parse a line, fold it into an immutable keyspace threaded by `from_scan`,
-render a reply) under an asyncio TCP shell that multiplexes many connections
-onto one shared-state processor.
+contract supports long-lived processor state and request/response. It splits into
+`kv.core` (the pure keyspace: parse a line, fold it into an immutable `Store`,
+render a reply) and `kv.shell` (a generic line-server transport plus the wiring
+that runs the core over it), a small demonstration that `without` is a principled
+way to write an imperative shell.
