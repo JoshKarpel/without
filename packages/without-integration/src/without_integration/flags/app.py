@@ -1,0 +1,173 @@
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
+
+from without import Context, Processor, Stream, sample
+from without_asgi import (
+    ASGIApp,
+    HttpScope,
+    Inbound,
+    Outbound,
+    Receive,
+    Response,
+    ResponseStart,
+    Scope,
+    Send,
+    Shutdown,
+    ShutdownComplete,
+    Startup,
+    StartupComplete,
+    encode_lifespan_reply,
+    encode_response,
+    http_inbound,
+    http_outbound,
+    lifespan_inbound,
+    parse_http_scope,
+    scope_type,
+)
+
+from without_integration.flags.core import Flags, bad_request, flag_name, render_all, render_one, route_not_found
+
+# A handler is built per request from the connection facts and the live config
+# Context, then run over the request's inbound event stream. This is the ASGI
+# analogue of kv's per-connection `make_session`: routing picks one of these.
+type Handler = Callable[[HttpScope, Context[Flags]], Processor[Inbound, Outbound]]
+
+
+async def _respond(events: Stream[Inbound], make: Callable[[], Response]) -> AsyncIterator[Outbound]:
+    async for _event in events:  # consume the whole request before replying
+        pass
+    for event in encode_response(make()):
+        yield event
+
+
+def _handler(make: Callable[[HttpScope, Context[Flags]], Response]) -> Handler:
+    def build(head: HttpScope, flags: Context[Flags]) -> Processor[Inbound, Outbound]:
+        def processor(inputs: Stream[Inbound]) -> Stream[Outbound]:
+            # `make` reads `flags.current()` here, at request time, so each
+            # request sees the latest reloaded config rather than a value
+            # captured once at startup.
+            return _respond(inputs, lambda: make(head, flags))
+
+        return processor
+
+    return build
+
+
+def all_flags(head: HttpScope, flags: Context[Flags]) -> Response:
+    return render_all(flags.current())
+
+
+def one_flag(head: HttpScope, flags: Context[Flags]) -> Response:
+    name = flag_name(head.query_string)
+    if name is None:
+        return bad_request("missing 'name' query parameter")
+    return render_one(flags.current(), name)
+
+
+def not_found(head: HttpScope, flags: Context[Flags]) -> Response:
+    return route_not_found(head.method, head.path)
+
+
+def with_header(name: bytes, value: bytes) -> Callable[[Handler], Handler]:
+    """Middleware: append a header to every response, as plain processor composition."""
+
+    def wrap(inner: Handler) -> Handler:
+        def build(head: HttpScope, flags: Context[Flags]) -> Processor[Inbound, Outbound]:
+            return _inject(inner(head, flags), name, value)
+
+        return build
+
+    return wrap
+
+
+def _inject(inner: Processor[Inbound, Outbound], name: bytes, value: bytes) -> Processor[Inbound, Outbound]:
+    def processor(inputs: Stream[Inbound]) -> Stream[Outbound]:
+        return _inject_header(inner(inputs), name, value)
+
+    return processor
+
+
+async def _inject_header(outputs: Stream[Outbound], name: bytes, value: bytes) -> AsyncIterator[Outbound]:
+    async for event in outputs:
+        if isinstance(event, ResponseStart):
+            yield ResponseStart(status=event.status, headers=(*event.headers, (name, value)))
+        else:
+            yield event
+
+
+@dataclass(frozen=True, slots=True)
+class Route:
+    method: str
+    path: str
+    handler: Handler
+
+
+@dataclass(frozen=True, slots=True)
+class Router:
+    routes: tuple[Route, ...]
+    not_found: Handler
+
+    def select(self, method: str, path: str) -> Handler:
+        for route in self.routes:
+            if route.method == method and route.path == path:
+                return route.handler
+        return self.not_found
+
+
+@dataclass(slots=True)
+class _Holder:
+    # The one reference shared across ASGI calls. Lifespan startup and each HTTP
+    # request are separate `app` invocations, so the config Context they share
+    # must live in the closure. ASGI guarantees lifespan startup completes before
+    # any request, so `current` is set before any reader reaches `get`.
+    current: Context[Flags] | None = None
+
+    def get(self) -> Context[Flags]:
+        if self.current is None:
+            raise RuntimeError("lifespan startup has not run")
+        return self.current
+
+
+async def _run_lifespan(receive: Receive, send: Send, source: Stream[Flags], holder: _Holder) -> None:
+    # The `sample` block spans the gap between startup and shutdown, so the
+    # config watch lives for exactly the server's lifetime: lifespan owns the
+    # resource's lifecycle, the way a FastAPI lifespan would.
+    async with sample(source) as flags:
+        holder.current = flags
+        async for event in lifespan_inbound(receive):
+            match event:
+                case Startup():
+                    await send(encode_lifespan_reply(StartupComplete()))
+                case Shutdown():
+                    await send(encode_lifespan_reply(ShutdownComplete()))
+
+
+def make_app(source: Stream[Flags], router: Router) -> ASGIApp:
+    holder = _Holder()
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        match scope_type(scope):
+            case "lifespan":
+                await _run_lifespan(receive, send, source, holder)
+            case "http":
+                head = parse_http_scope(scope)
+                handler = router.select(head.method, head.path)
+                await http_outbound(send)(handler(head, holder.get())(http_inbound(receive)))
+            case other:
+                raise NotImplementedError(f"unsupported scope type: {other!r}")
+
+    return app
+
+
+def feature_flags_app(source: Stream[Flags]) -> ASGIApp:
+    """A read-only feature-flag service whose handlers read a live config `Context`."""
+    router = Router(
+        routes=(
+            Route("GET", "/flags", with_header(b"x-flags-source", b"configmap")(_handler(all_flags))),
+            Route("GET", "/flag", _handler(one_flag)),
+        ),
+        not_found=_handler(not_found),
+    )
+    return make_app(source, router)

@@ -16,6 +16,7 @@ dependencies = [
     "without",
     "without-env",
     "without-configmap",
+    "without-asgi",
     "pydantic>=2",
     "pydantic-settings>=2.7",
 ]
@@ -24,3 +25,4 @@ dependencies = [
 without = { workspace = true }
 without-env = { workspace = true }
 without-configmap = { workspace = true }
+without-asgi = { workspace = true }

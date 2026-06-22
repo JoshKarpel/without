@@ -25,6 +25,12 @@ packages). Each package is its own top-level import.
   `with`-scoped background task helper (`without.tasks`). Imported as `without`.
 - `packages/without-env` — first plugin: a static `Context` parsed from
   environment variables (`pydantic-settings`). Imported as `without_env`.
+- `packages/without-configmap` — config from a Kubernetes mount (`watchfiles` +
+  `pydantic`); the context-updated-by-a-stream half of the model. Imported as
+  `without_configmap`.
+- `packages/without-asgi` — adapters that turn an ASGI app's `receive`/`send`
+  into typed event streams and back (the boundary only, no routing or
+  framework). Imported as `without_asgi`.
 - `packages/without-integration` — not a real package: depends on `without` and
   every plugin so they can be exercised together in cross-package tests.
 
@@ -32,9 +38,12 @@ Planned plugins, in the order they should be attempted:
 
 1. `without-env` — config from env vars; a static context. **(done)**
 2. `without-configmap` — config from a k8s mount (`watchfiles` + `pydantic`);
-   proves the context-updated-by-a-stream loop.
+   proves the context-updated-by-a-stream loop. **(done)**
 3. a toy line-protocol server (Redis-ish); proves long-lived processor state.
-4. HTTP (sans-IO deps); the real test of the contract.
+   **(done: `without_integration.kv`)**
+4. HTTP (sans-IO deps); the real test of the contract. **(in progress:
+   `without-asgi` adapters plus a feature-flag example in
+   `without_integration.flags`)**
 
 ## Development
 

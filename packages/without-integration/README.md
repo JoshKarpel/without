@@ -11,3 +11,11 @@ contract supports long-lived processor state and request/response. It splits int
 render a reply) and `kv.shell` (a generic line-server transport plus the wiring
 that runs the core over it), a small demonstration that `without` is a principled
 way to write an imperative shell.
+
+`flags` is a stateless feature-flag service built on the `without-asgi` adapters.
+It shows the FastAPI-shaped concerns (routing, a middleware, lifespan) as plain
+`without` wiring, with handlers that read flags from a live `without-configmap`
+`Context` at request time, so a ConfigMap reload reaches in-flight requests. It
+splits into `flags.core` (pure: the `Flags` model and response rendering) and
+`flags.app` (the ASGI app: a `Router` value, a header middleware, and a lifespan
+that owns the config-watch lifecycle).
