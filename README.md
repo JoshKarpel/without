@@ -1,8 +1,10 @@
 # without
 
-A sans-IO substrate for connecting streams of events to stateful processors
+A decoupled-IO substrate for connecting streams of events to stateful processors
 backed by contexts, aiming for maximum concurrency from testable,
-dependency-injected code.
+dependency-injected code. I/O is not banned, it is separated into the right
+abstractions (sources at the edge, behaviors via `sample`, effects contained in
+a processor's step) so the parts stay reusable.
 
 The bet: Python has many frameworks with similar-but-subtly-different shapes
 (ASGI apps, Kafka consumers, asyncio protocols, config reloaders) that do not

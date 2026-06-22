@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
@@ -28,9 +28,8 @@ class Stream[T](Protocol):
     """An asynchronous sequence of values.
 
     A stream is the single shape every connection has. Sources that touch the
-    outside world (a socket, a file watcher, a clock) are streams too, and are
-    the only place I/O is allowed; keeping it there is what lets every processor
-    stay pure.
+    outside world (a socket, a file watcher, a clock) are streams too: a stream
+    is just the one shape every connection takes, whoever does the I/O.
     """
 
     def __aiter__(self) -> AsyncIterator[T]: ...
@@ -41,9 +40,16 @@ class Processor[In, Out](Protocol):
 
     This is the only thing a user writes, and the only node type: a processor's
     output stream becomes another processor's input stream, all the way down.
-    Implementations SHOULD be built from a pure reducer via ``from_reducer`` so
-    the logic stays I/O-free and testable; a processor MUST NOT perform I/O
-    itself, only the source streams at the boundary may.
+
+    I/O is *decoupled, not forbidden*. A processor MAY ``await`` I/O while
+    handling an event (a database query, a closed-lifespan sub-request), reading
+    its dependencies from injected ``Context`` values; this is why a reducer's
+    ``step`` is async. The point is not to ban I/O but to separate it into the
+    right abstractions so the parts stay reusable: sources at the edge, behaviors
+    via ``sample``, effects contained in the step. The one rule: an effect MUST
+    NOT escape the entrypoint. A processor awaits its I/O to completion and MUST
+    NOT hand a half-open resource (an open socket, an unfinished task it does not
+    own) back to the runtime. Testing injects fake ``Context`` dependencies.
     """
 
     def __call__(self, inputs: Stream[In]) -> Stream[Out]: ...
@@ -65,14 +71,16 @@ class Context[T](Protocol):
 
 def from_reducer[In, S, Out](
     initial: S,
-    step: Callable[[In, S], Transition[S, Out]],
+    step: Callable[[In, S], Awaitable[Transition[S, Out]]],
 ) -> Processor[In, Out]:
-    """Build a processor from a pure reducer.
+    """Build a processor from a reducer.
 
-    ``step`` is the testable kernel: given an event and the current state it
-    returns the next state and any outputs, with no I/O. ``from_reducer`` supplies
-    the scan (the loop that threads state across the input stream), so the I/O
-    boundary stays at the source and the logic stays a plain function.
+    ``step`` is the kernel: given an event and the current state it returns the
+    next state and any outputs. It is ``async`` so it MAY ``await`` contained I/O
+    (reading dependencies from ``Context`` values captured by closure), but a
+    ``step`` that does no I/O is just an ``async def`` that never awaits.
+    ``from_reducer`` supplies the scan: the loop that threads state across the
+    input stream. The effect MUST complete within each call (see ``Processor``).
     """
 
     def processor(inputs: Stream[In]) -> Stream[Out]:
@@ -84,11 +92,11 @@ def from_reducer[In, S, Out](
 async def _scan[In, S, Out](
     inputs: Stream[In],
     initial: S,
-    step: Callable[[In, S], Transition[S, Out]],
+    step: Callable[[In, S], Awaitable[Transition[S, Out]]],
 ) -> AsyncIterator[Out]:
     state = initial
     async for event in inputs:
-        transition = step(event, state)
+        transition = await step(event, state)
         state = transition.state
         for output in transition.outputs:
             yield output
