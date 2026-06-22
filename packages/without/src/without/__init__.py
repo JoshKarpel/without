@@ -1,4 +1,4 @@
-from without.contracts import Context, Processor, Stream, Transition, from_reducer
+from without.contracts import Context, Processor, Stream, Transition, from_mapper, from_reducer
 from without.tasks import background_task
 from without.wiring import Sample, broadcast, distribute, merge, pipe, route, sample, tee
 
@@ -11,6 +11,7 @@ __all__ = [
     "background_task",
     "broadcast",
     "distribute",
+    "from_mapper",
     "from_reducer",
     "merge",
     "pipe",

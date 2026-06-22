@@ -5,7 +5,9 @@ stream connectors and a `with`-scoped background task helper.
 
 See `without.contracts` for the typed sketch of `Processor`, `Context`,
 `Stream`, and `Transition` (and `from_reducer`, which builds a processor from an
-async reducer whose step may `await` contained I/O), `without.wiring` for the
+async reducer whose step may `await` contained I/O, plus `from_mapper`, its
+stateless counterpart for a step that maps each event straight to a single
+output), `without.wiring` for the
 edge connectors (`pipe`, `distribute`, `tee`, `broadcast`, `route`, and `merge`
 on the event edge; `sample` on the behavior edge), and `without.tasks` for
 `background_task`.

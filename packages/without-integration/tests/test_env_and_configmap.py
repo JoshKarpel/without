@@ -73,7 +73,7 @@ def make_router(limits: Context[Limits], routing: Context[Routing]) -> Processor
             sequence=sequence,
             within_limit=sequence <= limits.current().max_connections,
         )
-        return Transition(state=sequence, outputs=(routed,))
+        return Transition(state=sequence, output=routed)
 
     return from_reducer(0, step)
 

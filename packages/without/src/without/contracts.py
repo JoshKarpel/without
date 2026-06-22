@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 
@@ -15,12 +15,14 @@ from typing import Protocol, runtime_checkable
 class Transition[S, Out]:
     """The result of folding one event into a reducer's state.
 
-    A value, never a place: a step returns the next ``state`` and the ``outputs``
-    it emits (zero or more), and mutates nothing the caller can observe.
+    A value, never a place: a step returns the next ``state`` and the single
+    ``output`` it emits, and mutates nothing the caller can observe. Splitting
+    one event into several outputs is a wiring-style concern, not a per-step
+    one, so a transition carries one output rather than a collection.
     """
 
     state: S
-    outputs: tuple[Out, ...] = field(default=())
+    output: Out
 
 
 @runtime_checkable
@@ -76,7 +78,7 @@ def from_reducer[In, S, Out](
     """Build a processor from a reducer.
 
     ``step`` is the kernel: given an event and the current state it returns the
-    next state and any outputs. It is ``async`` so it MAY ``await`` contained I/O
+    next state and the output it emits. It is ``async`` so it MAY ``await`` contained I/O
     (reading dependencies from ``Context`` values captured by closure), but a
     ``step`` that does no I/O is just an ``async def`` that never awaits.
     ``from_reducer`` supplies the scan: the loop that threads state across the
@@ -98,5 +100,33 @@ async def _scan[In, S, Out](
     async for event in inputs:
         transition = await step(event, state)
         state = transition.state
-        for output in transition.outputs:
-            yield output
+        yield transition.output
+
+
+def from_mapper[In, Out](
+    step: Callable[[In], Awaitable[Out]],
+) -> Processor[In, Out]:
+    """Build a processor from a stateless step: each event maps to one output.
+
+    The counterpart to ``from_reducer`` for a processor that holds no state.
+    Each event is handled independently of every other, so there is no
+    ``initial`` to seed and no ``Transition`` to thread: ``step`` maps an event
+    straight to its single output. Like ``from_reducer`` the step is ``async``
+    so it MAY ``await`` contained I/O, and the effect MUST complete within each
+    call (see ``Processor``). Splitting one event into several outputs is a
+    separate, wiring-style concern, not a per-step one, so the step returns a
+    single value rather than a collection.
+    """
+
+    def processor(inputs: Stream[In]) -> Stream[Out]:
+        return _map(inputs, step)
+
+    return processor
+
+
+async def _map[In, Out](
+    inputs: Stream[In],
+    step: Callable[[In], Awaitable[Out]],
+) -> AsyncIterator[Out]:
+    async for event in inputs:
+        yield await step(event)

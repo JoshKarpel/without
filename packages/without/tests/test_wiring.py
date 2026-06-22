@@ -18,7 +18,7 @@ from without.testing import collect, stream, tick
 
 async def test_pipe_feeds_every_output_into_the_processor() -> None:
     async def double(event: int, _: None) -> Transition[None, int]:
-        return Transition(state=None, outputs=(event * 2,))
+        return Transition(state=None, output=event * 2)
 
     doubled = pipe(stream([6, 7, 8]), from_reducer(None, double))
 
@@ -38,7 +38,7 @@ async def test_sample_tracks_the_latest_value() -> None:
 
 async def test_distribute_handles_every_event_exactly_once() -> None:
     async def square(event: int, _: None) -> Transition[None, int]:
-        return Transition(state=None, outputs=(event * event,))
+        return Transition(state=None, output=event * event)
 
     events = [2, 3, 4, 5, 6, 7]
     outputs = await collect(distribute(stream(events), from_reducer(None, square), workers=3))
@@ -57,7 +57,7 @@ async def test_distribute_caps_concurrency_at_the_worker_count() -> None:
         peak = max(peak, in_flight)
         await release.wait()
         in_flight -= 1
-        return Transition(state=None, outputs=(event,))
+        return Transition(state=None, output=event)
 
     async def release_once_saturated() -> None:
         while peak < 4:
@@ -99,10 +99,10 @@ async def test_tee_buffer_lets_a_fast_branch_run_ahead_of_a_slow_one() -> None:
 
 async def test_broadcast_feeds_every_event_to_every_processor() -> None:
     async def double(event: int, _: None) -> Transition[None, str]:
-        return Transition(state=None, outputs=(f"double={event * 2}",))
+        return Transition(state=None, output=f"double={event * 2}")
 
     async def negate(event: int, _: None) -> Transition[None, str]:
-        return Transition(state=None, outputs=(f"negate={-event}",))
+        return Transition(state=None, output=f"negate={-event}")
 
     outputs = await collect(broadcast(stream([5, 6]), from_reducer(None, double), from_reducer(None, negate)))
 
