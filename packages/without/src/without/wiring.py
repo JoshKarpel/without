@@ -22,7 +22,7 @@ from without.tasks import background_task
 def pipe[In, Out](source: Stream[In], processor: Processor[In, Out]) -> Stream[Out]:
     """Connect a source to a processor on the event edge: every value flows on.
 
-    This is just function composition (``processor(source)``); it exists to name
+    This is just function composition (`processor(source)`); it exists to name
     the event edge and to read left-to-right. Chaining is nesting: a downstream
     processor takes this result as its own source.
     """
@@ -34,12 +34,18 @@ async def stream_from_queue[T](queue: asyncio.Queue[T]) -> AsyncIterator[T]:
 
     A source that *pushes* (a server's accept loop, a callback-based client, a
     pub/sub subscriber) drops values into a queue; this turns that queue into the
-    pull-based ``Stream`` the rest of ``without`` consumes. It does not end on its
-    own, so it is meant to be driven inside a ``background_task`` or otherwise
-    cancelled by its consumer.
+    pull-based `Stream` the rest of `without` consumes. It ends gracefully when
+    the queue is shut down (`queue.shutdown()`): remaining items still drain, then
+    `get` raises `QueueShutDown` and the stream ends, letting a downstream fold
+    return its final value. Shutting the queue down is thus the closable-stream
+    signal; without it the stream never ends on its own and must be driven inside
+    a `background_task` or otherwise cancelled by its consumer.
     """
     while True:
-        yield await queue.get()
+        try:
+            yield await queue.get()
+        except asyncio.QueueShutDown:
+            return
 
 
 class _Stop:
@@ -49,13 +55,13 @@ class _Stop:
 async def merge[T](*sources: Stream[T]) -> AsyncIterator[T]:
     """Interleave several sources into one stream, in completion order (fan-in).
 
-    The N-to-1 dual of the fan-out connectors: where ``distribute`` and
-    ``broadcast`` split or copy one stream across many consumers and merge the
-    results back, ``merge`` folds many independent sources into a single stream.
+    The N-to-1 dual of the fan-out connectors: where `distribute` and
+    `broadcast` split or copy one stream across many consumers and merge the
+    results back, `merge` folds many independent sources into a single stream.
     One forwarding task drains each source into a shared bounded outbox; the
     merged stream ends once every source has. The bound gives backpressure (a
     slow consumer stalls the forwarders rather than buffering an unbounded
-    backlog), and the ``finally`` guarantees the stop sentinel is emitted even if
+    backlog), and the `finally` guarantees the stop sentinel is emitted even if
     a source raises, so the error surfaces here instead of hanging the consumer.
     """
     outbox: asyncio.Queue[T | _Stop] = asyncio.Queue(maxsize=len(sources) or 1)
@@ -82,17 +88,17 @@ async def distribute[In, Out](
     processor: Processor[In, Out],
     workers: int,
 ) -> AsyncIterator[Out]:
-    """Spread one stream across ``workers`` competing consumers, merging outputs.
+    """Spread one stream across `workers` competing consumers, merging outputs.
 
     The distribute edge: each event is handled *once*, by whichever worker is
     free, not broadcast to all of them. This is the bounded-concurrency
-    primitive: ``workers`` independent instances of ``processor`` (each with its
+    primitive: `workers` independent instances of `processor` (each with its
     own state) pull from a shared inbox, and their outputs merge into the single
     stream returned here, in completion order.
 
-    Concurrency is capped at ``workers`` and backpressure is end-to-end: the
+    Concurrency is capped at `workers` and backpressure is end-to-end: the
     queues are bounded, so a slow consumer stalls the workers, which stalls the
-    feeder pulling from ``source``. The source is never drained faster than the
+    feeder pulling from `source`. The source is never drained faster than the
     workers retire it.
     """
     if workers < 1:
@@ -119,18 +125,18 @@ async def distribute[In, Out](
 
 @asynccontextmanager
 async def tee[T](source: Stream[T], branches: int, buffer: int = 1) -> AsyncIterator[tuple[Stream[T], ...]]:
-    """Fan a stream out into ``branches`` independent copies (the broadcast edge).
+    """Fan a stream out into `branches` independent copies (the broadcast edge).
 
     Every branch sees every value, in order: the structural counterpart to
-    ``distribute`` (which splits events *between* consumers). One pump reads the
+    `distribute` (which splits events *between* consumers). One pump reads the
     source once and pushes each value to every branch. Every branch MUST be
     consumed, and *concurrently*: a full branch queue blocks the pump, so
     draining one branch to exhaustion before starting another deadlocks.
 
-    ``buffer`` is how many values each branch may run ahead, trading memory for
-    slack between a fast and a slow branch: the default ``1`` keeps memory
+    `buffer` is how many values each branch may run ahead, trading memory for
+    slack between a fast and a slow branch: the default `1` keeps memory
     O(branches) and the slowest branch gating the rest, a larger value lets a
-    fast branch pull ahead, and ``0`` is unbounded (no backpressure: a slow
+    fast branch pull ahead, and `0` is unbounded (no backpressure: a slow
     branch buffers without limit).
     """
     if branches < 1:
@@ -160,10 +166,10 @@ async def tee[T](source: Stream[T], branches: int, buffer: int = 1) -> AsyncIter
 async def broadcast[In, Out](source: Stream[In], *processors: Processor[In, Out]) -> AsyncIterator[Out]:
     """Feed every event to every processor (fan-out), merging their outputs.
 
-    The processor-level convenience over ``tee``: ``broadcast`` is ``tee`` then
-    ``merge``. Each processor sees the whole input stream and runs on its own
+    The processor-level convenience over `tee`: `broadcast` is `tee` then
+    `merge`. Each processor sees the whole input stream and runs on its own
     branch; their outputs interleave into the single stream returned here. The
-    fan-out twin of ``distribute``.
+    fan-out twin of `distribute`.
     """
     if not processors:
         raise ValueError("broadcast requires at least one processor")
@@ -187,8 +193,8 @@ def _route_for[T](
 async def route[T](source: Stream[T], *types: type[T]) -> AsyncIterator[tuple[Stream[T], ...]]:
     """Partition a stream by the runtime type of each value, one branch per type.
 
-    Unlike ``tee`` (every branch sees every value), ``route`` sends each value to
-    exactly one branch: the first ``types`` entry it is an instance of. This is
+    Unlike `tee` (every branch sees every value), `route` sends each value to
+    exactly one branch: the first `types` entry it is an instance of. This is
     how a processor that emits a heterogeneous union (say a response and a
     background-kickoff) splits its output to distinct sinks. A value matching no
     listed type raises rather than being silently dropped, so an unhandled
@@ -228,9 +234,9 @@ async def sample[T](source: Stream[T]) -> AsyncIterator[Context[T]]:
     """Connect to a stream on the behavior edge: read its latest value, not each.
 
     The first value is sampled eagerly, so the context is never "not ready". A
-    background task keeps the held value current while the ``with`` block is open,
+    background task keeps the held value current while the `with` block is open,
     dropping intermediate values (latest-wins, no backpressure). The held value is
-    mutated only by the drain; readers see it only through ``current``.
+    mutated only by the drain; readers see it only through `current`.
     """
     iterator = source.__aiter__()
     sampled = Sample(await anext(iterator))

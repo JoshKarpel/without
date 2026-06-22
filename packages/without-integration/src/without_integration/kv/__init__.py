@@ -18,7 +18,7 @@ from without_integration.kv.core import (
     make_store,
     parse_request,
 )
-from without_integration.kv.shell import Connected, Send, make_responder, serve
+from without_integration.kv.shell import Connected, Send, ServeConfig, make_responder, serve
 
 __all__ = [
     "EMPTY_STORE",
@@ -33,6 +33,7 @@ __all__ = [
     "Reply",
     "Request",
     "Send",
+    "ServeConfig",
     "Set",
     "Store",
     "Stored",

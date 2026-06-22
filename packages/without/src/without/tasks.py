@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager, suppress
 
 @asynccontextmanager
 async def background_task(coro: Coroutine[object, object, object]) -> AsyncIterator[asyncio.Task[object]]:
-    """Run ``coro`` as a task for the duration of the ``with`` block.
+    """Run `coro` as a task for the duration of the `with` block.
 
     The task is started on entry and cancelled (then awaited) on exit, so it is
     bounded by the block and never leaks. If it finishes on its own with an

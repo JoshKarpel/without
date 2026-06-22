@@ -28,10 +28,10 @@ def watch_config[T](
 ) -> Stream[T]:
     """The parsed config now, and a freshly parsed value on every mount change.
 
-    ``parse`` is the boundary: it turns the mount directory into a validated
-    value. ``changes`` is the source of reload signals, injectable so tests can
+    `parse` is the boundary: it turns the mount directory into a validated
+    value. `changes` is the source of reload signals, injectable so tests can
     drive reloads deterministically without real filesystem events; it defaults
-    to watching the mount directory with ``watchfiles``.
+    to watching the mount directory with `watchfiles`.
     """
 
     async def source() -> AsyncIterator[T]:

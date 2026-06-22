@@ -15,8 +15,8 @@ from typing import Protocol, runtime_checkable
 class Transition[S, Out]:
     """The result of folding one event into a scan's state.
 
-    A value, never a place: a step returns the next ``state`` and the single
-    ``output`` it emits, and mutates nothing the caller can observe. Splitting
+    A value, never a place: a step returns the next `state` and the single
+    `output` it emits, and mutates nothing the caller can observe. Splitting
     one event into several outputs is a wiring-style concern, not a per-step
     one, so a transition carries one output rather than a collection.
     """
@@ -43,15 +43,15 @@ class Processor[In, Out](Protocol):
     This is the only thing a user writes, and the only node type: a processor's
     output stream becomes another processor's input stream, all the way down.
 
-    I/O is *decoupled, not forbidden*. A processor MAY ``await`` I/O while
+    I/O is *decoupled, not forbidden*. A processor MAY `await` I/O while
     handling an event (a database query, a closed-lifespan sub-request), reading
-    its dependencies from injected ``Context`` values; this is why a scan's
-    ``step`` is async. The point is not to ban I/O but to separate it into the
+    its dependencies from injected `Context` values; this is why a scan's
+    `step` is async. The point is not to ban I/O but to separate it into the
     right abstractions so the parts stay reusable: sources at the edge, behaviors
-    via ``sample``, effects contained in the step. The one rule: an effect MUST
+    via `sample`, effects contained in the step. The one rule: an effect MUST
     NOT escape the entrypoint. A processor awaits its I/O to completion and MUST
     NOT hand a half-open resource (an open socket, an unfinished task it does not
-    own) back to the runtime. Testing injects fake ``Context`` dependencies.
+    own) back to the runtime. Testing injects fake `Context` dependencies.
     """
 
     def __call__(self, inputs: Stream[In]) -> Stream[Out]: ...
@@ -61,10 +61,10 @@ class Processor[In, Out](Protocol):
 class Context[T](Protocol):
     """A stream viewed as its latest value: the "behavior" half of the model.
 
-    Where consuming a stream sees *every* event, ``current`` samples the *latest*
+    Where consuming a stream sees *every* event, `current` samples the *latest*
     and never blocks. This is how long-lived state (config, a connection pool) is
     read: a context is just another processor's output that a reader samples
-    rather than consumes. ``current`` MUST return a value; a context is never
+    rather than consumes. `current` MUST return a value; a context is never
     "not ready". The reader only ever gets a value, never a writable place.
     """
 
@@ -77,14 +77,14 @@ def from_scan[In, S, Out](
 ) -> Processor[In, Out]:
     """Build a processor from a stateful step that emits an output every event.
 
-    ``step`` is the kernel: given an event and the current state it returns the
-    next state and the output it emits. It is ``async`` so it MAY ``await`` contained I/O
-    (reading dependencies from ``Context`` values captured by closure), but a
-    ``step`` that does no I/O is just an ``async def`` that never awaits.
-    ``from_scan`` supplies the loop that threads state across the input stream,
+    `step` is the kernel: given an event and the current state it returns the
+    next state and the output it emits. It is `async` so it MAY `await` contained I/O
+    (reading dependencies from `Context` values captured by closure), but a
+    `step` that does no I/O is just an `async def` that never awaits.
+    `from_scan` supplies the loop that threads state across the input stream,
     emitting one output per event: a scan, not a reduce (the collapse-to-one-
-    value form is ``from_fold``). The effect MUST complete within each call (see
-    ``Processor``).
+    value form is `from_fold`). The effect MUST complete within each call (see
+    `Processor`).
     """
 
     def processor(inputs: Stream[In]) -> Stream[Out]:
@@ -110,12 +110,12 @@ def from_map[In, Out](
 ) -> Processor[In, Out]:
     """Build a processor from a stateless step: each event maps to one output.
 
-    The counterpart to ``from_scan`` for a processor that holds no state.
+    The counterpart to `from_scan` for a processor that holds no state.
     Each event is handled independently of every other, so there is no
-    ``initial`` to seed and no ``Transition`` to thread: ``step`` maps an event
-    straight to its single output. Like ``from_scan`` the step is ``async``
-    so it MAY ``await`` contained I/O, and the effect MUST complete within each
-    call (see ``Processor``). Splitting one event into several outputs is a
+    `initial` to seed and no `Transition` to thread: `step` maps an event
+    straight to its single output. Like `from_scan` the step is `async`
+    so it MAY `await` contained I/O, and the effect MUST complete within each
+    call (see `Processor`). Splitting one event into several outputs is a
     separate, wiring-style concern, not a per-step one, so the step returns a
     single value rather than a collection.
     """
@@ -141,11 +141,11 @@ type Fold[In, S] = Callable[[Stream[In]], Awaitable[S]]
 def from_sink[In](step: Callable[[In], Awaitable[None]]) -> Sink[In]:
     """Build a leaf that consumes a stream for its effects and emits nothing.
 
-    The stateless terminus, dual to ``from_map``: where a map turns each event
+    The stateless terminus, dual to `from_map`: where a map turns each event
     into an output, a sink turns each event into an effect and yields no output
     stream at all. Awaiting it drains the stream to completion (or runs forever,
-    for an unbounded source driven inside a ``background_task``). The ``step``
-    MAY ``await`` contained I/O.
+    for an unbounded source driven inside a `background_task`). The `step`
+    MAY `await` contained I/O.
     """
 
     async def sink(inputs: Stream[In]) -> None:
@@ -158,10 +158,10 @@ def from_sink[In](step: Callable[[In], Awaitable[None]]) -> Sink[In]:
 def from_fold[In, S](initial: S, step: Callable[[In, S], Awaitable[S]]) -> Fold[In, S]:
     """Build a leaf that folds a stream of events into a single final state.
 
-    The stateful terminus, dual to ``from_scan``: where ``from_scan`` threads
-    state and emits an output every step (a scan), ``from_fold`` threads state
+    The stateful terminus, dual to `from_scan`: where `from_scan` threads
+    state and emits an output every step (a scan), `from_fold` threads state
     and yields only the final accumulated value when the stream ends (a true
-    reduce). The ``step`` MAY ``await`` contained I/O, so a fold whose result you
+    reduce). The `step` MAY `await` contained I/O, so a fold whose result you
     ignore is also how you run a stateful consumer for its effects.
     """
 
