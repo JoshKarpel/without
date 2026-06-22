@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from without import Context, Processor, Transition, from_reducer, pipe, sample
+from without import Context, Processor, Transition, from_scan, pipe, sample
 from without.testing import collect, tick
 from without_configmap import read_yaml_file, watch_config
 from without_env import EnvContext
@@ -75,7 +75,7 @@ def make_router(limits: Context[Limits], routing: Context[Routing]) -> Processor
         )
         return Transition(state=sequence, output=routed)
 
-    return from_reducer(0, step)
+    return from_scan(0, step)
 
 
 async def test_processor_reads_both_contexts_and_tracks_a_reload_mid_stream(

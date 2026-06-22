@@ -6,11 +6,12 @@ from without import (
     Transition,
     broadcast,
     distribute,
-    from_reducer,
+    from_scan,
     merge,
     pipe,
     route,
     sample,
+    stream_from_queue,
     tee,
 )
 from without.testing import collect, stream, tick
@@ -20,9 +21,21 @@ async def test_pipe_feeds_every_output_into_the_processor() -> None:
     async def double(event: int, _: None) -> Transition[None, int]:
         return Transition(state=None, output=event * 2)
 
-    doubled = pipe(stream([6, 7, 8]), from_reducer(None, double))
+    doubled = pipe(stream([6, 7, 8]), from_scan(None, double))
 
     assert await collect(doubled) == [12, 14, 16]
+
+
+async def test_stream_from_queue_yields_pushed_values_in_order() -> None:
+    queue: asyncio.Queue[int] = asyncio.Queue()
+    for value in (5, 6, 7):
+        queue.put_nowait(value)
+
+    pushed = stream_from_queue(queue)
+
+    received = [await anext(pushed) for _ in range(3)]
+
+    assert received == [5, 6, 7]
 
 
 async def test_sample_starts_at_the_first_value() -> None:
@@ -41,7 +54,7 @@ async def test_distribute_handles_every_event_exactly_once() -> None:
         return Transition(state=None, output=event * event)
 
     events = [2, 3, 4, 5, 6, 7]
-    outputs = await collect(distribute(stream(events), from_reducer(None, square), workers=3))
+    outputs = await collect(distribute(stream(events), from_scan(None, square), workers=3))
 
     assert sorted(outputs) == sorted(value * value for value in events)
 
@@ -64,7 +77,7 @@ async def test_distribute_caps_concurrency_at_the_worker_count() -> None:
             await asyncio.sleep(0)
         release.set()
 
-    worker = from_reducer(None, hold_until_released)
+    worker = from_scan(None, hold_until_released)
 
     outputs = await asyncio.gather(
         collect(distribute(stream(range(20)), worker, workers=4)),
@@ -104,7 +117,7 @@ async def test_broadcast_feeds_every_event_to_every_processor() -> None:
     async def negate(event: int, _: None) -> Transition[None, str]:
         return Transition(state=None, output=f"negate={-event}")
 
-    outputs = await collect(broadcast(stream([5, 6]), from_reducer(None, double), from_reducer(None, negate)))
+    outputs = await collect(broadcast(stream([5, 6]), from_scan(None, double), from_scan(None, negate)))
 
     assert sorted(outputs) == ["double=10", "double=12", "negate=-5", "negate=-6"]
 

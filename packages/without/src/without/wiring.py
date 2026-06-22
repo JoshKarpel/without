@@ -4,7 +4,9 @@
 # and `merge` (N to 1 fan-in). Behavior edge: `sample` exposes a stream's latest
 # value as a Context. `pipe` is pure composition; every other connector needs
 # something running (a `background_task`), so those are the thin boundaries where
-# the imperative shell shows up.
+# the imperative shell shows up. `stream_from_queue` sits at the same boundary
+# from the other side: not a connector between processors but a source adapter
+# that turns a push-based queue into a pull-based stream to feed the rest.
 
 from __future__ import annotations
 
@@ -25,6 +27,19 @@ def pipe[In, Out](source: Stream[In], processor: Processor[In, Out]) -> Stream[O
     processor takes this result as its own source.
     """
     return processor(source)
+
+
+async def stream_from_queue[T](queue: asyncio.Queue[T]) -> AsyncIterator[T]:
+    """Expose a queue as a Stream: the bridge from a push source to a pull stream.
+
+    A source that *pushes* (a server's accept loop, a callback-based client, a
+    pub/sub subscriber) drops values into a queue; this turns that queue into the
+    pull-based ``Stream`` the rest of ``without`` consumes. It does not end on its
+    own, so it is meant to be driven inside a ``background_task`` or otherwise
+    cancelled by its consumer.
+    """
+    while True:
+        yield await queue.get()
 
 
 class _Stop:

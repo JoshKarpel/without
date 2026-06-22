@@ -97,6 +97,4 @@ ignore = [
     "E741",  # ambiguous variable name
     "T201",  # print
     "T203",  # pprint
-    "F403",  # star imports, used for utilities
-    "F405",  # star imports, used for utilities
 ]
