@@ -18,16 +18,27 @@ from without_integration.kv.core import (
     make_store,
     parse_request,
 )
-from without_integration.kv.shell import Connected, Send, ServeConfig, make_responder, serve
+from without_integration.kv.shell import (
+    Ask,
+    Connected,
+    MakeSession,
+    Send,
+    ServeConfig,
+    make_keyspace,
+    make_session,
+    serve,
+)
 
 __all__ = [
     "EMPTY_STORE",
+    "Ask",
     "Command",
     "Connected",
     "Delete",
     "Deleted",
     "Error",
     "Get",
+    "MakeSession",
     "Malformed",
     "Nil",
     "Reply",
@@ -40,7 +51,8 @@ __all__ = [
     "Value",
     "apply",
     "encode_reply",
-    "make_responder",
+    "make_keyspace",
+    "make_session",
     "make_store",
     "parse_request",
     "serve",

@@ -1,14 +1,27 @@
 # The imperative shell: a generic line-protocol TCP server, plus the wiring that
 # runs the pure `core` over it. This is the demonstration that without is a
-# principled way to write a shell. The transport (`Send`, `Connected`, `serve`)
-# knows nothing of any protocol: it reads lines, hands each to a caller-supplied
-# codec, funnels every connection into one inbox, and runs one consumer over the
-# merged stream. Each event carries a `send` callable bound to its connection, so
-# the consumer replies by calling `send` (contained I/O) rather than the server
-# routing output: no connection ids, no reply registry. This is the shape ASGI
-# uses (scope/receive/send). `make_responder` is the wiring: it lifts the core's
-# pure `apply` into a fold over `Connected[Request, Reply]`, instantiating the
-# generic `In`/`Out` at the KV protocol's `Request`/`Reply`.
+# principled way to write a shell, and it turns on one move: each connection is
+# its own `Processor` over its own line stream, so a connection's lifecycle *is* a
+# stream's lifecycle. The line stream ends when the client hangs up (EOF), the
+# per-connection processor's `async for` runs dry and returns, and the writer
+# closes. No in-flight counter, no "is this connection done" bookkeeping: the
+# stream's end is the signal.
+#
+# Two kinds of state live here, and where each lives is the whole lesson:
+#   - Shared state (the keyspace) lives in ONE serial `from_fold` (`make_keyspace`)
+#     that every connection funnels into through a bounded `inbox`. A `from_fold`
+#     pulls its next event only after the current step's coroutine completes, so
+#     the store's read-modify-write never interleaves even across `await`s: the
+#     sequential `async for` *is* the mutual exclusion, and the store stays a
+#     threaded value, never a shared place behind a lock.
+#   - Connection-scoped state (a per-connection request counter) is threaded in
+#     that connection's own `from_scan` (`make_session`). It is safe to keep local
+#     precisely because it is unshared, so connections run fully concurrently.
+# The rule: thread state *down* only when it is scoped to that level; funnel *up*
+# to a singular fold for anything shared. A connection reaches the shared core
+# through `ask` (put a request on the `inbox`, await the reply on this
+# connection's own channel), which is contained I/O, the per-event analogue of
+# ASGI's receive/send.
 #
 # Finding worth recording: `without.merge` is a *static* N-to-1 fan-in (a fixed
 # set of sources known up front). A server's set of connections is *dynamic*, so
@@ -20,15 +33,17 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from without import Context, Fold, from_fold, stream_from_queue
+from without import Context, Fold, Processor, Transition, from_fold, from_scan, stream_from_queue
 
-from without_integration.kv.core import EMPTY_STORE, Reply, Request, Store, apply
+from without_integration.kv.core import EMPTY_STORE, Reply, Request, Store, apply, encode_reply, parse_request
 
 type Send[Out] = Callable[[Out], Awaitable[None]]
+type Ask[In, Out] = Callable[[In], Awaitable[Out]]
+type MakeSession[In, Out] = Callable[[Ask[In, Out]], Processor[str, str]]
 
 
 class ServeConfig(BaseSettings):
@@ -47,6 +62,7 @@ class ServeConfig(BaseSettings):
     port: int = 0
     max_pending: int = 100
     drain_timeout: float = 5.0
+    idle_timeout: float | None = None  # reap a connection silent this long; None disables it
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,81 +82,73 @@ class Connected[In, Out]:
 @asynccontextmanager
 async def serve[In, Out](
     consumer: Fold[Connected[In, Out], object],
+    make_session: MakeSession[In, Out],
     *,
-    decode: Callable[[str], In],
-    encode: Callable[[Out], str],
     config: Context[ServeConfig],
 ) -> AsyncIterator[asyncio.Server]:
-    """Run a TCP line server, feeding every connection's requests to `consumer`.
+    """Run a TCP line server: a shared serial `consumer` plus a `make_session` per connection.
 
-    The transport, with no knowledge of any protocol. `decode` parses a received
-    line into an input and `encode` renders an output into a line: both are the
-    boundary, so `consumer` works in domain values and never touches bytes or
-    sockets. Each connection gets a `send` closure (encode, then write) carried
-    on its events, so `consumer` replies by calling `send` rather than the server
-    routing output. `consumer` is a leaf (a fold or a sink); its result is
-    ignored. Binding and shutdown knobs come from `config` (a `Context`); `port`
-    0 lets the OS choose and the chosen address is on the yielded server's
-    `sockets`.
+    The two arguments are a value and a maker, and that asymmetry is the point:
+    `consumer` is the single serial owner of any shared state (the keyspace fold),
+    built once, into which every connection funnels its requests on one bounded
+    `inbox`; `make_session` is called *per connection* and, given that
+    connection's `ask` (the round trip to the consumer), builds the
+    `Processor[str, str]` mapping its inbound lines to outbound lines, owning the
+    protocol codec plus any connection-scoped state. The transport itself touches
+    only bytes and sockets. Binding and shutdown knobs come from `config` (a
+    `Context`); `port` 0 lets the OS choose and the chosen address is on the
+    yielded server's `sockets`.
 
-    The shared `inbox` is bounded, so a slow consumer backpressures every
-    connection's reader rather than buffering an unbounded backlog. `send` does
-    not `drain`, so one slow client cannot stall the shared consumer (the
-    transport buffers instead, the same trade the design accepts on the inbound
-    side).
+    Each connection runs its session over its own line stream, so the connection
+    ends naturally when the client hangs up: EOF ends the stream, the session's
+    processor returns, the writer closes. A connection silent longer than
+    `idle_timeout` is reaped the same way (its read times out, ending the stream),
+    so an idle or slow-loris client cannot hold a session open forever; `None`
+    disables it. Requests on one connection are sequential (await the reply before
+    the next line), which is correct for an ordered line protocol and means a slow
+    client stalls only its own session, never the shared consumer, so
+    `await writer.drain()` is free of head-of-line risk. The `inbox` is bounded,
+    so a backed-up consumer backpressures the connections rather than buffering
+    without limit.
 
-    A connection's writer is not closed when its reader hits EOF: replies are
-    produced asynchronously by the shared consumer, so closing on EOF would race
-    the reply for an already-enqueued request and silently drop it (the classic
-    send-then-half-close client). Each connection instead tracks its in-flight
-    requests and closes only once every reply it enqueued has been written.
-
-    On exit the server drains gracefully, in order: it stops accepting new
-    connections, then waits (bounded by `drain_timeout`) for the connections it
-    already accepted to finish reading their buffered requests into the `inbox`
-    and receive their replies. Stragglers still parked past the budget (an idle
-    client that never disconnects) are then cut off, the `inbox` is shut down so
-    the consumer finishes the queue and its stream ends, and a consumer that
-    overruns the budget is cancelled. Every wait is bounded, so shutdown always
-    terminates.
+    On exit the server drains within a single `drain_timeout` budget. It stops
+    accepting new connections, then, inside one `asyncio.timeout`, waits for
+    accepted sessions to finish on their own (clients hanging up, the consumer
+    answering their asks) and for the consumer to drain the `inbox`. If that whole
+    graceful phase overruns the one budget, the server hard-stops: force-close
+    every remaining client, cancel the consumer, and cancel any session still
+    parked (e.g. awaiting a reply a stopped consumer will never send). Either way
+    it then waits for the transports to close. The budget is global (one timeout
+    around the graceful phase, not one per step), so shutdown always terminates in
+    roughly `drain_timeout` without leaking a task.
     """
     settings = config.current()
     inbox: asyncio.Queue[Connected[In, Out]] = asyncio.Queue(maxsize=settings.max_pending)
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        inflight = 0  # requests enqueued from this connection whose reply has not yet been written
-        quiesced = asyncio.Event()
-        quiesced.set()
+        replies: asyncio.Queue[Out] = asyncio.Queue(maxsize=1)  # one reply in flight: this connection is sequential
 
-        async def send(value: Out) -> None:
-            nonlocal inflight
-            try:
-                if not writer.is_closing():  # a reply to a departed client must not kill the shared consumer
-                    writer.write(f"{encode(value)}\n".encode())
-                    # deliberately no `await writer.drain()`: draining here would let one slow client stall the
-                    # single shared consumer (head-of-line blocking across all clients); the transport buffers
-                    # instead. `writer.close()` below still flushes the buffered bytes before closing.
-            finally:
-                inflight -= 1
-                if inflight == 0:
-                    quiesced.set()
+        async def ask(request: In) -> Out:
+            await inbox.put(Connected(send=replies.put, payload=request))
+            return await replies.get()
+
+        async def input_lines() -> AsyncIterator[str]:
+            while True:
+                try:
+                    raw = await asyncio.wait_for(reader.readline(), settings.idle_timeout)
+                except TimeoutError:
+                    return  # idle past idle_timeout: end the stream, which returns the session and closes the writer
+                if not raw:
+                    return  # EOF: the client hung up
+                yield raw.decode().rstrip("\n")
 
         try:
-            async for raw in reader:
-                inflight += 1
-                quiesced.clear()
-                try:
-                    await inbox.put(Connected(send=send, payload=decode(raw.decode().rstrip("\n"))))
-                except asyncio.QueueShutDown:  # shutting down: stop reading, do not strand this request as in-flight
-                    inflight -= 1
-                    if inflight == 0:
-                        quiesced.set()
-                    break
+            async for output_line in make_session(ask)(input_lines()):
+                writer.write(f"{output_line}\n".encode())
+                await writer.drain()
+        except ConnectionError:  # client reset the connection (read or write); this session is simply over
+            pass
         finally:
-            # hold the writer open until the consumer has replied to everything this connection enqueued, but
-            # never longer than the drain budget (a cancelled consumer leaves replies unsent, so do not hang).
-            with suppress(TimeoutError):
-                await asyncio.wait_for(quiesced.wait(), settings.drain_timeout)
             writer.close()
 
     connections: set[asyncio.Task[None]] = set()
@@ -149,10 +157,6 @@ async def serve[In, Out](
         connection = asyncio.create_task(handle(reader, writer))
         connections.add(connection)
         connection.add_done_callback(connections.discard)
-
-    async def drain_connections() -> None:
-        if connections:
-            await asyncio.wait(connections, timeout=settings.drain_timeout)
 
     async def consume_inbox() -> None:
         await consumer(stream_from_queue(inbox))
@@ -163,28 +167,32 @@ async def serve[In, Out](
         yield server
     finally:
         server.close()  # stop accepting new connections; in-flight ones keep going
-        await drain_connections()  # let accepted readers finish enqueuing requests and receiving replies
-        server.close_clients()  # cut off stragglers (an idle reader parked with nothing left to send)
-        inbox.shutdown()  # readers are done producing; let the consumer finish the queue, then its stream ends
         try:
-            await asyncio.wait_for(consumer_task, settings.drain_timeout)
+            async with asyncio.timeout(settings.drain_timeout):  # ONE global budget for the whole graceful drain
+                if connections:
+                    await asyncio.wait(connections)  # each session finishes: its client hangs up, the consumer answers
+                inbox.shutdown()  # sessions all done, so no more asks; the consumer drains the rest and returns
+                await asyncio.wait([consumer_task])
         except TimeoutError:
-            pass  # wait_for cancelled the overrunning consumer; collect it below
-        with suppress(asyncio.CancelledError):
-            await consumer_task
-        await drain_connections()  # let the just-cut-off handlers finish closing their writers
-        await server.wait_closed()
+            pass  # budget spent; hard-stop whatever is still running below
+        server.close_clients()  # force-close any client still connected
+        consumer_task.cancel()  # no-op if the consumer already returned
+        stragglers = list(connections)  # any session still parked (e.g. awaiting a reply the consumer will not send)
+        for connection in stragglers:
+            connection.cancel()
+        await asyncio.gather(consumer_task, *stragglers, return_exceptions=True)  # let the cancellations settle
+        await server.wait_closed()  # blocks until the listening sockets and every client connection (writer) close
 
 
-def make_responder(initial: Store = EMPTY_STORE) -> Fold[Connected[Request, Reply], Store]:
-    """Wire the pure core into the shell: fold each request into the keyspace, reply on its channel.
+def make_keyspace(initial: Store = EMPTY_STORE) -> Fold[Connected[Request, Reply], Store]:
+    """The shared serial state owner: fold each request into the keyspace, reply on its channel.
 
-    The KV instantiation of the generic transport: it lifts `core.apply` into a
-    fold over `Connected[Request, Reply]` (so `In`/`Out` become `Request`/`Reply`),
-    threading the keyspace as `make_store` does but with a per-event effect of
-    sending the reply on the event's own channel. The final `Store` is returned at
-    end-of-stream and ignored by the server (whose source never ends); the point
-    is the send, and the keyspace stays a threaded value.
+    Every connection funnels here. A `from_fold` consumes the merged request
+    stream one event at a time, threading the keyspace as a value and answering
+    each request on the channel it arrived with. Because the fold pulls its next
+    event only after the current step completes, the store's read-modify-write is
+    serialized without a lock even though `apply` may `await`. The final `Store`
+    at end-of-stream is ignored; the point is the threaded value and the reply.
     """
 
     async def respond(event: Connected[Request, Reply], store: Store) -> Store:
@@ -193,3 +201,24 @@ def make_responder(initial: Store = EMPTY_STORE) -> Fold[Connected[Request, Repl
         return transition.state
 
     return from_fold(initial, respond)
+
+
+def make_session(ask: Ask[Request, Reply]) -> Processor[str, str]:
+    """Build one connection's processor: thread a request counter, funnel to the shared keyspace.
+
+    The connection-scoped half, dual to `make_keyspace`'s shared half. Called per
+    connection with that connection's `ask`, it owns the protocol codec (parse
+    at the inbound boundary, encode at the outbound one) and threads a per-connection
+    request counter with `from_scan`. The counter is safe to keep local precisely
+    because it is unshared: each connection numbers its own replies from 1 while the
+    keyspace stays common to all. Each reply line is thus a function of both kinds of
+    state, the connection-local number and the shared-store answer, reached via
+    `ask` (contained I/O to the serial keyspace fold).
+    """
+
+    async def step(line: str, count: int) -> Transition[int, str]:
+        number = count + 1
+        reply = await ask(parse_request(line))
+        return Transition(state=number, output=f"{number} {encode_reply(reply)}")
+
+    return from_scan(0, step)
