@@ -166,5 +166,6 @@ async def test_websocket_scope_is_unsupported(tmp_path: Path) -> None:
     async def send(message: Message) -> None:
         raise AssertionError("websocket scope should send nothing")
 
-    with pytest.raises(NotImplementedError, match="websocket"):
-        await app({"type": "websocket", "path": "/ws"}, receive, send)
+    async with _running(app):
+        with pytest.raises(NotImplementedError, match="websocket"):
+            await app({"type": "websocket", "path": "/ws"}, receive, send)

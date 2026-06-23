@@ -4,8 +4,10 @@
 event streams and back. This package is *only* the boundary: it parses raw ASGI
 event dicts into typed values, encodes typed values back into the dicts a server
 expects, and exposes `receive` as a `Stream` and `send` as a `Sink`. Routing,
-middleware, lifespan policy, and handlers are left to the application, which
-hooks processors together in its own code.
+middleware, and handlers are left to the application, which hooks processors
+together in its own code. The one piece of protocol the adapter does drive is
+lifespan (see `with_lifespan` below), because that is boundary work, not app
+policy.
 
 An ASGI app is `async def app(scope, receive, send)`. The adapters let the body
 of that callable read as plain `without` wiring:
@@ -25,6 +27,15 @@ generator (no queue): the request's lifecycle *is* the stream's lifecycle, so it
 ends on the final body chunk or a disconnect. `scope` (method, path) is known
 once up front, so routing is an ordinary `scope -> Processor` choice rather than
 a per-event stream split.
+
+`with_lifespan(lifespan, app)` drives the ASGI lifespan protocol around a
+portable `Lifespan[T] = () -> AbstractAsyncContextManager[T]`: it sets the value
+up on `startup`, tears it down on `shutdown` (reporting setup/teardown errors as
+`lifespan.startup.failed` / `lifespan.shutdown.failed`), and hands every other
+scope to `app` with the value threaded in. The `Lifespan` names no ASGI types on
+purpose, so the same value drives a non-ASGI shell (a queue processor, a CLI, a
+test) unchanged; only the wrapper differs. Interdependent resources compose
+inside the lifespan with nested `async with`, which also orders teardown.
 
 The pure half (`parse_http_scope`, `parse_inbound`, `encode_outbound`,
 `encode_response`, and the lifespan equivalents) is sans-IO and tested without a

@@ -14,17 +14,12 @@ from without_asgi import (
     ResponseStart,
     Scope,
     Send,
-    Shutdown,
-    ShutdownComplete,
-    Startup,
-    StartupComplete,
-    encode_lifespan_reply,
     encode_response,
     http_inbound,
     http_outbound,
-    lifespan_inbound,
     parse_http_scope,
     scope_type,
+    with_lifespan,
 )
 
 from without_integration.flags.core import Flags, bad_request, flag_name, render_all, render_one, route_not_found
@@ -116,49 +111,21 @@ class Router:
         return self.not_found
 
 
-@dataclass(slots=True)
-class _Holder:
-    # The one reference shared across ASGI calls. Lifespan startup and each HTTP
-    # request are separate `app` invocations, so the config Context they share
-    # must live in the closure. ASGI guarantees lifespan startup completes before
-    # any request, so `current` is set before any reader reaches `get`.
-    current: Context[Flags] | None = None
-
-    def get(self) -> Context[Flags]:
-        if self.current is None:
-            raise RuntimeError("lifespan startup has not run")
-        return self.current
-
-
-async def _run_lifespan(receive: Receive, send: Send, source: Stream[Flags], holder: _Holder) -> None:
-    # The `sample` block spans the gap between startup and shutdown, so the
-    # config watch lives for exactly the server's lifetime: lifespan owns the
-    # resource's lifecycle, the way a FastAPI lifespan would.
-    async with sample(source) as flags:
-        holder.current = flags
-        async for event in lifespan_inbound(receive):
-            match event:
-                case Startup():
-                    await send(encode_lifespan_reply(StartupComplete()))
-                case Shutdown():
-                    await send(encode_lifespan_reply(ShutdownComplete()))
-
-
 def make_app(source: Stream[Flags], router: Router) -> ASGIApp:
-    holder = _Holder()
-
-    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+    # The lifespan is just the config watch: `sample(source)` is already an async
+    # context manager, so the same value would drive a non-ASGI shell unchanged.
+    # `with_lifespan` owns the protocol and the one shared reference; handlers are
+    # handed the live `Context` per request and read `.current()` at request time.
+    async def serve(flags: Context[Flags], scope: Scope, receive: Receive, send: Send) -> None:
         match scope_type(scope):
-            case "lifespan":
-                await _run_lifespan(receive, send, source, holder)
             case "http":
                 head = parse_http_scope(scope)
                 handler = router.select(head.method, head.path)
-                await http_outbound(send)(handler(head, holder.get())(http_inbound(receive)))
+                await http_outbound(send)(handler(head, flags)(http_inbound(receive)))
             case other:
                 raise NotImplementedError(f"unsupported scope type: {other!r}")
 
-    return app
+    return with_lifespan(lambda: sample(source), serve)
 
 
 def feature_flags_app(source: Stream[Flags]) -> ASGIApp:

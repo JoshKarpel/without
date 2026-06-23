@@ -17,5 +17,5 @@ It shows the FastAPI-shaped concerns (routing, a middleware, lifespan) as plain
 `without` wiring, with handlers that read flags from a live `without-configmap`
 `Context` at request time, so a ConfigMap reload reaches in-flight requests. It
 splits into `flags.core` (pure: the `Flags` model and response rendering) and
-`flags.app` (the ASGI app: a `Router` value, a header middleware, and a lifespan
-that owns the config-watch lifecycle).
+`flags.app` (the ASGI app: a `Router` value, a header middleware, and the
+config-watch held for the server's lifetime via `without-asgi`'s `with_lifespan`).

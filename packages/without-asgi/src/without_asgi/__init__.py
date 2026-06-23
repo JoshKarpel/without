@@ -28,6 +28,11 @@ from without_asgi.core import (
     parse_lifespan_event,
     scope_type,
 )
+from without_asgi.lifespan import (
+    Lifespan,
+    ScopedApp,
+    with_lifespan,
+)
 from without_asgi.shell import (
     http_inbound,
     http_outbound,
@@ -40,6 +45,7 @@ __all__ = [
     "Disconnect",
     "HttpScope",
     "Inbound",
+    "Lifespan",
     "LifespanEvent",
     "LifespanReply",
     "Message",
@@ -50,6 +56,7 @@ __all__ = [
     "ResponseBody",
     "ResponseStart",
     "Scope",
+    "ScopedApp",
     "Send",
     "Shutdown",
     "ShutdownComplete",
@@ -68,4 +75,5 @@ __all__ = [
     "parse_inbound",
     "parse_lifespan_event",
     "scope_type",
+    "with_lifespan",
 ]
