@@ -68,6 +68,13 @@ as a decorator).
 The `integration` package's `transform.router` shows a small protocol-generic
 `Router` built from these, dispatching both an HTTP and a WebSocket route.
 
+For a full, opinionated router you don't have to hand-roll, the sibling
+[`without-web`](../without-web) package provides trie matching with typed path
+parameters, 405-vs-404, mounting, exception handlers, and OpenAPI. It snaps onto
+this boundary through nothing but the `HttpRouter` type (`Router.dispatch` *is*
+one), so adopting it is opt-in and bring-your-own stays first-class. The
+`integration` package's `todos` example is built on it.
+
 A `Middleware` wraps the whole handler, a `Processor[Inbound, Outbound]`, so it can
 transform the inbound stream, the outbound stream, or both. The body is not a
 special thing to reach for; it is the `RequestBody` events on the inbound stream

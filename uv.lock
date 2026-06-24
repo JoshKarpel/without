@@ -17,6 +17,7 @@ members = [
     "without-asgi",
     "without-configmap",
     "without-env",
+    "without-web",
     "without-workspace",
 ]
 
@@ -245,6 +246,7 @@ dependencies = [
     { name = "without-asgi" },
     { name = "without-configmap" },
     { name = "without-env" },
+    { name = "without-web" },
 ]
 
 [package.metadata]
@@ -255,6 +257,7 @@ requires-dist = [
     { name = "without-asgi", editable = "packages/without-asgi" },
     { name = "without-configmap", editable = "packages/without-configmap" },
     { name = "without-env", editable = "packages/without-env" },
+    { name = "without-web", editable = "packages/without-web" },
 ]
 
 [[package]]
@@ -832,6 +835,21 @@ requires-dist = [
 ]
 
 [[package]]
+name = "without-web"
+version = "0.0.0"
+source = { editable = "packages/without-web" }
+dependencies = [
+    { name = "without" },
+    { name = "without-asgi" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "without", editable = "packages/without" },
+    { name = "without-asgi", editable = "packages/without-asgi" },
+]
+
+[[package]]
 name = "without-workspace"
 version = "0.0.0"
 source = { virtual = "." }
@@ -840,6 +858,7 @@ dependencies = [
     { name = "without-asgi" },
     { name = "without-configmap" },
     { name = "without-env" },
+    { name = "without-web" },
 ]
 
 [package.dev-dependencies]
@@ -863,6 +882,7 @@ requires-dist = [
     { name = "without-asgi", editable = "packages/without-asgi" },
     { name = "without-configmap", editable = "packages/without-configmap" },
     { name = "without-env", editable = "packages/without-env" },
+    { name = "without-web", editable = "packages/without-web" },
 ]
 
 [package.metadata.requires-dev]

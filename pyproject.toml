@@ -13,6 +13,7 @@ dependencies = [
     "without-env",
     "without-configmap",
     "without-asgi",
+    "without-web",
 ]
 
 [tool.uv]
@@ -27,6 +28,7 @@ without = { workspace = true }
 without-env = { workspace = true }
 without-configmap = { workspace = true }
 without-asgi = { workspace = true }
+without-web = { workspace = true }
 integration = { workspace = true }
 
 [dependency-groups]
