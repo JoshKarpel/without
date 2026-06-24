@@ -11,7 +11,6 @@ from without import Processor
 from without import Transition
 from without import collect
 from without import from_scan
-from without import pipe
 from without import sample
 from without.testing import tick
 from without_configmap import read_yaml_file
@@ -108,7 +107,7 @@ async def test_processor_reads_both_contexts_and_tracks_a_reload_mid_stream(
         yield Request(id=12)
 
     async with sample(routing_source) as routing:
-        routed = await collect(pipe(requests(), make_router(limits, routing)))
+        routed = await collect(make_router(limits, routing)(requests()))
 
     assert routed == [
         Routed(request_id=10, upstream="db.before", sequence=1, within_limit=True),

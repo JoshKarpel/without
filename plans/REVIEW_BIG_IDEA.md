@@ -91,7 +91,7 @@ explicit:
   pure stream-transformers (built from a reducer via `from_reducer`, which
   supplies the scan) and only the source streams at the edge touch the world.
 - **Two edge types (Conal Elliott's events vs. behaviors).** An *event* edge
-  feeds every output onward (`pipe`, which is just composition). A *behavior*
+  feeds every output onward (`compose`, which is just composition). A *behavior*
   edge exposes a stream's *latest* value as a `Context` (`sample`,
   latest-wins, no backpressure). This is what the "is held state a processor or
   a context?" question was circling: it is a processor; "context" names how a

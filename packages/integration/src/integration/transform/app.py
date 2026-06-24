@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import time
 from collections.abc import AsyncIterator
 from typing import assert_never
 from urllib.parse import parse_qs
 
 from without import Stream
+from without import compose
 from without import sample
 from without import stream
 from without_asgi import ASGIApp
@@ -14,6 +17,7 @@ from without_asgi import HttpScope
 from without_asgi import Inbound
 from without_asgi import Outbound
 from without_asgi import RawHeaders
+from without_asgi import RequestBody
 from without_asgi import Response
 from without_asgi import ResponseStart
 from without_asgi import WebsocketAccept
@@ -30,8 +34,10 @@ from without_asgi import WebsocketSend
 from without_asgi import WebsocketText
 from without_asgi import make_asgi_app
 from without_asgi.routing import HttpMiddleware
+from without_asgi.routing import WebsocketMiddleware
 from without_asgi.routing import buffered
 from without_asgi.routing import stack
+from without_asgi.routing import wrap
 
 from integration.transform.core import Mode
 from integration.transform.core import Settings
@@ -125,16 +131,14 @@ def refuse_socket(settings: Settings, head: WebsocketScope) -> WebsocketHandler:
     return handler
 
 
-def with_header(name: bytes, value: bytes) -> HttpMiddleware:
-    """Build middleware that appends a header to every response."""
-
-    def add_header(inner: HttpHandler, _head: HttpScope) -> HttpHandler:
-        def processor(inputs: Stream[Inbound]) -> Stream[Outbound]:
-            return inject_header(inner(inputs), name, value)
-
-        return processor
-
-    return add_header
+# How you write a `Middleware` depends on what it needs. `wrap` lifts scope-aware
+# edge transformer(s) into a middleware, saving the `(handler, scope) -> handler`
+# wrapper and the inner `compose`: reach for it whenever each edge is transformed
+# on its own (logging, headers). When a middleware instead needs a value that spans
+# the whole handling, that value is just a local in a plain processor (see
+# `access_timing`); `wrap`'s separate transformers have no shared scope to hold it.
+# A real service would emit structured records; printing just shows where the seam
+# is, and that the same shape serves both protocols.
 
 
 async def inject_header(outputs: Stream[Outbound], name: bytes, value: bytes) -> AsyncIterator[Outbound]:
@@ -145,17 +149,13 @@ async def inject_header(outputs: Stream[Outbound], name: bytes, value: bytes) ->
             yield event
 
 
-# `access_log` and `socket_log` need no configuration, so they are `Middleware`
-# directly, where `with_header` is a factory that builds one. A real service would
-# emit structured records; printing just shows where the seam is, and that the same
-# `Middleware` vocabulary composes for both protocols.
-def access_log(inner: HttpHandler, head: HttpScope) -> HttpHandler:
-    def processor(inputs: Stream[Inbound]) -> Stream[Outbound]:
-        # Wraps both ends: the inbound stream to log the request as it arrives,
-        # the outbound stream to log the status the handler finally produced.
-        return log_response(inner(log_request(inputs, head)), head)
+def with_header(name: bytes, value: bytes) -> HttpMiddleware:
+    """Build middleware that appends a header to every response."""
 
-    return processor
+    def add_header(outputs: Stream[Outbound], _head: HttpScope) -> Stream[Outbound]:
+        return inject_header(outputs, name, value)
+
+    return wrap(outbound=add_header)
 
 
 async def log_request(inputs: Stream[Inbound], head: HttpScope) -> AsyncIterator[Inbound]:
@@ -171,12 +171,63 @@ async def log_response(outputs: Stream[Outbound], head: HttpScope) -> AsyncItera
         yield event
 
 
-def socket_log(inner: WebsocketHandler, head: WebsocketScope) -> WebsocketHandler:
-    def processor(inputs: Stream[WebsocketInbound]) -> Stream[WebsocketOutbound]:
-        print(f"=== WS {head.path}")
-        return inner(inputs)
+# Two independent ends that never share state, so one `wrap` bundles them: the
+# inbound end logs the request as it arrives, the outbound end logs the status.
+access_log: HttpMiddleware = wrap(inbound=log_request, outbound=log_response)
+
+
+# The contrast: `access_timing` needs one value, the start time, to span the whole
+# handling, from before the handler produces anything to after its last output.
+# That is just a local in a single output-wrapping processor: the first pull drives
+# the handler, so the local is set right as handling begins and read once the
+# stream ends. No inbound transform and no second closure, so no shared mutable
+# state and no `nonlocal`. `wrap` can't express this; its two transformers have no
+# shared scope to hold the value.
+def access_timing(handler: HttpHandler, head: HttpScope) -> HttpHandler:
+    async def processor(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
+        started = time.monotonic()
+        async for event in handler(inputs):
+            yield event
+        print(f"<-> {head.method} {head.path} {(time.monotonic() - started) * 1000:.1f} ms")
 
     return processor
+
+
+# The genuine both-sides case: data observed on the inbound stream is carried into
+# the outbound stream. The inbound end feeds each body chunk into a hasher; the
+# outbound end reads the finished digest into a response header (the way S3 returns
+# an `ETag` of an uploaded object). The shared state is the hasher, mutated in
+# place, so there is still no `nonlocal`, and `compose` wraps both ends around the
+# handler. This relies on the handler reading the whole request before it responds
+# (true for the buffered routes here): a handler that streamed its response first
+# would digest only the chunks seen by then.
+def request_digest(handler: HttpHandler, head: HttpScope) -> HttpHandler:
+    digest = hashlib.sha256()
+
+    async def absorb(inputs: Stream[Inbound]) -> AsyncIterator[Inbound]:
+        async for event in inputs:
+            if isinstance(event, RequestBody):
+                digest.update(event.body)
+            yield event
+
+    async def stamp(inputs: Stream[Outbound]) -> AsyncIterator[Outbound]:
+        async for event in inputs:
+            if isinstance(event, ResponseStart):
+                tag = (b"x-request-digest", b"sha-256=" + digest.hexdigest().encode())
+                yield ResponseStart(status=event.status, headers=(*event.headers, tag))
+            else:
+                yield event
+
+    return compose(absorb, compose(handler, stamp))
+
+
+async def log_connect(inputs: Stream[WebsocketInbound], head: WebsocketScope) -> AsyncIterator[WebsocketInbound]:
+    print(f"=== WS {head.path}")
+    async for event in inputs:
+        yield event
+
+
+socket_log: WebsocketMiddleware = wrap(inbound=log_connect)
 
 
 def text_transform_app(source: Stream[Settings]) -> ASGIApp:
@@ -193,8 +244,11 @@ def text_transform_app(source: Stream[Settings]) -> ASGIApp:
         ),
         fallback=not_found,
         middleware=stack(
-            # First is outermost, so it sees the status every other middleware produced.
+            # First is outermost, so it times everything inside and sees the status
+            # every other middleware produced.
+            access_timing,
             access_log,
+            request_digest,
             # https://www.gnuterrypratchett.com: keep his name moving on the overhead.
             with_header(b"x-clacks-overhead", b"GNU Terry Pratchett"),
         ),

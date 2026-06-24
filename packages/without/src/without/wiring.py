@@ -1,8 +1,8 @@
 # How processors connect. Two edge types, matching the two halves of the model.
-# Event edge (every value flows on): `pipe` (1 to 1), `distribute` (1 to N
-# competing), `tee`/`broadcast` (1 to N fan-out), `route` (1 to N by variant),
+# Event edge (every value flows on): `compose` (chain 1 to 1), `distribute` (1 to
+# N competing), `tee`/`broadcast` (1 to N fan-out), `route` (1 to N by variant),
 # and `merge` (N to 1 fan-in). Behavior edge: `sample` exposes a stream's latest
-# value as a Context. `pipe` is pure composition; every other connector needs
+# value as a Context. `compose` is pure composition; every other connector needs
 # something running (a `background_task`), so those are the thin boundaries where
 # the imperative shell shows up. `stream_from_queue` sits at the same boundary
 # from the other side: not a connector between processors but a source adapter
@@ -24,14 +24,18 @@ from without.contracts import Stream
 from without.tasks import background_task
 
 
-def pipe[In, Out](source: Stream[In], processor: Processor[In, Out]) -> Stream[Out]:
-    """Connect a source to a processor on the event edge: every value flows on.
+def compose[A, B, C](first: Processor[A, B], second: Processor[B, C]) -> Processor[A, C]:
+    """Compose two processors on the event edge: `first` then `second`.
 
-    This is just function composition (`processor(source)`); it exists to name
-    the event edge and to read left-to-right. Chaining is nesting: a downstream
-    processor takes this result as its own source.
+    The join type `B` may differ from `A` and `C`, so this adapts as well as
+    chains. Pure composition (the only event-edge connector that needs nothing
+    running); nest for three or more stages.
     """
-    return processor(source)
+
+    def composed(inputs: Stream[A]) -> Stream[C]:
+        return second(first(inputs))
+
+    return composed
 
 
 async def stream_from_queue[T](queue: asyncio.Queue[T]) -> AsyncIterator[T]:

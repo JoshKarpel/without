@@ -48,7 +48,7 @@ on whether the serial owner is a place you address or a value you compose.
 This framing subsumes the checkpoint's (b) and (c):
 
 - **(b) composition by stream transform vs addressing** follows from value vs
-  place: structural composition (`pipe`/`distribute`/`tee`/`merge`) is possible
+  place: structural composition (`compose`/`distribute`/`tee`/`merge`) is possible
   precisely because there is no identity to address.
 - **(c) end-to-end backpressure vs unbounded mailboxes** follows too: bounded
   backpressure is possible precisely because the substrate is a bounded stream

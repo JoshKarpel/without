@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from collections.abc import Callable
 
+from without import Processor
 from without import Stream
+from without import compose
 
 from without_asgi.app import HttpHandler
 from without_asgi.app import HttpRouter
@@ -22,6 +24,7 @@ __all__ = [
     "WebsocketMiddleware",
     "buffered",
     "stack",
+    "wrap",
 ]
 
 # Tools for building a router, not a router. *Which* connection a route matches
@@ -45,11 +48,47 @@ def stack[H, S](*middleware: Middleware[H, S]) -> Middleware[H, S]:
     middleware is itself a `Middleware`, so it nests, and `stack()` is identity."""
 
     def composed(handler: H, scope: S) -> H:
-        for wrap in reversed(middleware):
-            handler = wrap(handler, scope)
+        for one in reversed(middleware):
+            handler = one(handler, scope)
         return handler
 
     return composed
+
+
+def wrap[In, Out, S](
+    *,
+    inbound: Callable[[Stream[In], S], Stream[In]] | None = None,
+    outbound: Callable[[Stream[Out], S], Stream[Out]] | None = None,
+) -> Middleware[Processor[In, Out], S]:
+    """Build a (type-preserving) `Middleware` from scope-aware stream
+    transformers. Each is given the parsed scope, so a no-config middleware is
+    just `wrap(inbound=..., outbound=...)`; either omitted leaves that side
+    untouched.
+
+    A stream transformer is itself a `Processor`, so wrapping is composition:
+    `inbound` runs before the handler, `outbound` after it. Keeping both sides
+    same-type makes the result an endomorphism, which is what `stack` composes.
+    """
+
+    def middleware(handler: Processor[In, Out], scope: S) -> Processor[In, Out]:
+        wrapped = handler
+        if inbound is not None:
+            before = inbound
+
+            def on_inbound(inputs: Stream[In]) -> Stream[In]:
+                return before(inputs, scope)
+
+            wrapped = compose(on_inbound, wrapped)
+        if outbound is not None:
+            after = outbound
+
+            def on_outbound(inputs: Stream[Out]) -> Stream[Out]:
+                return after(inputs, scope)
+
+            wrapped = compose(wrapped, on_outbound)
+        return wrapped
+
+    return middleware
 
 
 def buffered[T](make: Callable[[T, HttpScope, bytes], Response]) -> HttpRouter[T]:

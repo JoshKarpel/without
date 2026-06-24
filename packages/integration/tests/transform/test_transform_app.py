@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -137,6 +139,33 @@ async def test_access_log_middleware_prints_the_request_and_the_response(
     out = capsys.readouterr().out
     assert "--> GET /missing" in out
     assert "<-- GET /missing 404" in out
+
+
+async def test_access_timing_middleware_reports_the_request_duration(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_settings(tmp_path, default_mode="upper", max_bytes=1024)
+    source = watch_config(tmp_path, read_yaml_file(Settings, "settings.yaml"), changes=_blocked)
+    app = text_transform_app(source)
+
+    async with _running(app):
+        await _request(app, "GET", "/missing")
+
+    out = capsys.readouterr().out
+    assert re.search(r"<-> GET /missing \d+\.\d+ ms", out)
+
+
+async def test_request_digest_middleware_tags_the_response_with_the_request_body_digest(tmp_path: Path) -> None:
+    _write_settings(tmp_path, default_mode="upper", max_bytes=1024)
+    source = watch_config(tmp_path, read_yaml_file(Settings, "settings.yaml"), changes=_blocked)
+    app = text_transform_app(source)
+    body = b"the quick brown fox"
+
+    async with _running(app):
+        start, _body = await _request(app, "POST", "/transform", body=body)
+
+    expected = b"sha-256=" + hashlib.sha256(body).hexdigest().encode()
+    assert _has_header(start, b"x-request-digest", expected)
 
 
 async def test_query_mode_overrides_the_config_default(tmp_path: Path) -> None:

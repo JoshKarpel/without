@@ -5,10 +5,10 @@ import pytest
 from without import Transition
 from without import broadcast
 from without import collect
+from without import compose
 from without import distribute
 from without import from_scan
 from without import merge
-from without import pipe
 from without import route
 from without import sample
 from without import stream
@@ -17,13 +17,28 @@ from without import tee
 from without.testing import tick
 
 
-async def test_pipe_feeds_every_output_into_the_processor() -> None:
+async def test_compose_runs_first_then_second() -> None:
     async def double(event: int, _: None) -> Transition[None, int]:
         return Transition(state=None, output=event * 2)
 
-    doubled = pipe(stream([6, 7, 8]), from_scan(None, double))
+    async def increment(event: int, _: None) -> Transition[None, int]:
+        return Transition(state=None, output=event + 1)
 
-    assert await collect(doubled) == [12, 14, 16]
+    chained = compose(from_scan(None, double), from_scan(None, increment))
+
+    assert await collect(chained(stream([6, 7, 8]))) == [13, 15, 17]
+
+
+async def test_compose_adapts_the_join_type() -> None:
+    async def measure(event: str, _: None) -> Transition[None, int]:
+        return Transition(state=None, output=len(event))
+
+    async def label(event: int, _: None) -> Transition[None, str]:
+        return Transition(state=None, output=f"len={event}")
+
+    chained = compose(from_scan(None, measure), from_scan(None, label))
+
+    assert await collect(chained(stream(["ab", "cdef"]))) == ["len=2", "len=4"]
 
 
 async def test_stream_from_queue_yields_pushed_values_in_order() -> None:

@@ -12,9 +12,9 @@ from without.tasks import background_task
 from without.wiring import Sample
 from without.wiring import broadcast
 from without.wiring import collect
+from without.wiring import compose
 from without.wiring import distribute
 from without.wiring import merge
-from without.wiring import pipe
 from without.wiring import route
 from without.wiring import sample
 from without.wiring import stream
@@ -32,13 +32,13 @@ __all__ = [
     "background_task",
     "broadcast",
     "collect",
+    "compose",
     "distribute",
     "from_fold",
     "from_map",
     "from_scan",
     "from_sink",
     "merge",
-    "pipe",
     "route",
     "sample",
     "stream",
