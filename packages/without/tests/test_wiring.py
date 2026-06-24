@@ -4,16 +4,16 @@ from dataclasses import dataclass
 import pytest
 from without import Transition
 from without import broadcast
+from without import collect
 from without import distribute
 from without import from_scan
 from without import merge
 from without import pipe
 from without import route
 from without import sample
+from without import stream
 from without import stream_from_queue
 from without import tee
-from without.testing import collect
-from without.testing import stream
 from without.testing import tick
 
 

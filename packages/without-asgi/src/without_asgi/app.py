@@ -6,18 +6,23 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass
 
 from without import Processor
+from without import Stream
+from without import stream
 
 from without_asgi.inbound import Inbound
 from without_asgi.inbound import Shutdown
 from without_asgi.inbound import Startup
 from without_asgi.inbound import WebsocketInbound
 from without_asgi.outbound import Outbound
+from without_asgi.outbound import Response
 from without_asgi.outbound import ShutdownComplete
 from without_asgi.outbound import ShutdownFailed
 from without_asgi.outbound import StartupComplete
 from without_asgi.outbound import StartupFailed
+from without_asgi.outbound import WebsocketClose
 from without_asgi.outbound import WebsocketOutbound
 from without_asgi.outbound import encode_lifespan_reply
+from without_asgi.outbound import encode_response
 from without_asgi.scope import HttpScope
 from without_asgi.scope import LifespanScope
 from without_asgi.scope import WebsocketScope
@@ -107,10 +112,44 @@ async def _drive[T](lifespan: Lifespan[T], cell: _Cell[T], receive: Receive, sen
                     await send(encode_lifespan_reply(ShutdownComplete()))
 
 
+# What the default routers refuse a connection with. An `http` scope gets `501
+# Not Implemented` (the HTTP status for "the server has no handler for this", as
+# opposed to `500` for an unexpected failure); a `websocket` scope is closed
+# before `accept`, which the ASGI server is required to turn into a `403`.
+_HTTP_UNSUPPORTED = Response(
+    status=501,
+    headers=((b"content-type", b"text/plain; charset=utf-8"),),
+    body=b"this application does not serve http\n",
+)
+_WEBSOCKET_UNSUPPORTED = WebsocketClose()
+
+
+# The default routers each `make_asgi_app` protocol falls back to, so an app
+# serves a protocol only by passing its own router to override the default. They
+# ignore the threaded state, hence `object`, which keeps them assignable as the
+# default for any `make_asgi_app[T]`.
+def refuse_http(state: object, head: HttpScope) -> HttpHandler:
+    """An `HttpRouter` that refuses every request with `501 Not Implemented`."""
+
+    def handler(inputs: Stream[Inbound]) -> Stream[Outbound]:
+        return stream(encode_response(_HTTP_UNSUPPORTED))
+
+    return handler
+
+
+def refuse_websocket(state: object, head: WebsocketScope) -> WebsocketHandler:
+    """A `WebsocketRouter` that refuses every connection by closing before `accept` (a `403`)."""
+
+    def handler(inputs: Stream[WebsocketInbound]) -> Stream[WebsocketOutbound]:
+        return stream((_WEBSOCKET_UNSUPPORTED,))
+
+    return handler
+
+
 def make_asgi_app[T](
     lifespan: Lifespan[T],
-    http: HttpRouter[T] | None = None,
-    websocket: WebsocketRouter[T] | None = None,
+    http: HttpRouter[T] = refuse_http,
+    websocket: WebsocketRouter[T] = refuse_websocket,
 ) -> ASGIApp:
     """Build the ASGI app that drives `lifespan` and runs a per-connection
     `Processor` over each connection's event stream.
@@ -123,10 +162,12 @@ def make_asgi_app[T](
     `receive` into the inbound event stream, runs the returned `Processor`, and
     drains its outbound stream into `send`: the handler only ever sees streams.
 
-    Each protocol's handler is optional, so an app serves only what it provides:
-    a connection whose handler is absent is rejected with `NotImplementedError`
-    (an HTTP-only app omits `websocket`, a WebSocket-only app omits `http`).
-    Drilling under this driver, e.g. to build a handler that needs the raw
+    Each protocol's router defaults to one that refuses the connection, so an app
+    serves a protocol only by passing its own router (an HTTP-only app passes
+    `http`, a WebSocket-only app passes `websocket`). The default refusal never
+    reaches app code: an HTTP scope gets a `501 Not Implemented` response, a
+    WebSocket scope is closed before `accept` (which the server turns into a
+    `403`). Drilling under this driver, e.g. to build a handler that needs the raw
     `receive`/`send`, is `parse_scope` plus the `http_inbound` / `http_outbound`
     (and websocket) shell functions this wires together.
     """
@@ -137,12 +178,8 @@ def make_asgi_app[T](
             case LifespanScope():
                 await _drive(lifespan, cell, receive, send)
             case HttpScope() as head:
-                if http is None:
-                    raise NotImplementedError("http scopes are not supported")
                 await http_outbound(send)(http(cell.require(), head)(http_inbound(receive)))
             case WebsocketScope() as head:
-                if websocket is None:
-                    raise NotImplementedError("websocket scopes are not supported")
                 await websocket_outbound(send)(websocket(cell.require(), head)(websocket_inbound(receive)))
 
     return app

@@ -7,11 +7,14 @@
 # the imperative shell shows up. `stream_from_queue` sits at the same boundary
 # from the other side: not a connector between processors but a source adapter
 # that turns a push-based queue into a pull-based stream to feed the rest.
+# `stream` (from a fixed iterable) and `collect` (drain to a list) are the
+# in-memory source and terminal at that same edge.
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
@@ -48,6 +51,27 @@ async def stream_from_queue[T](queue: asyncio.Queue[T]) -> AsyncIterator[T]:
             yield await queue.get()
         except asyncio.QueueShutDown:
             return
+
+
+async def stream[T](values: Iterable[T]) -> AsyncIterator[T]:
+    """Expose a fixed iterable as a `Stream`: the simplest source.
+
+    Turns already-in-hand values into the pull-based `Stream` the rest of
+    `without` consumes, e.g. to emit a fixed reply or to feed a processor under
+    test. `stream_from_queue` is the push-source counterpart.
+    """
+    for value in values:
+        yield value
+
+
+async def collect[T](source: Stream[T]) -> list[T]:
+    """Drain a `Stream` into a list: the terminal that materializes every value.
+
+    The dual of `stream`. It runs until the source ends, so it suits bounded
+    streams (a finished request, a shut-down queue); an endless source never
+    returns.
+    """
+    return [value async for value in source]
 
 
 class _Stop:

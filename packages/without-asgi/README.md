@@ -41,10 +41,12 @@ Outbound]` (and the websocket equivalent) selects the `Processor` that serves th
 connection. `make_asgi_app` then owns the receive/send wiring around it: it wraps
 `receive` into the inbound stream, runs the returned `Processor`, and drains its
 outbound stream into `send`, so a router and its handler only ever see streams,
-never the raw callables or the lifespan scope. Both routers are optional, so an
-app serves only what it provides; a connection whose router is absent is rejected
-with `NotImplementedError`. The manual wiring shown above is the drill-under path
-for a handler that needs the raw `receive`/`send`.
+never the raw callables or the lifespan scope. Each protocol's router defaults to
+one that refuses the connection, so an app serves a protocol only by passing its
+own router to override the default; an unserved HTTP scope gets a `501 Not
+Implemented` and an unserved WebSocket scope is closed before `accept` (a `403`).
+The manual wiring shown above is the drill-under path for a handler that needs the
+raw `receive`/`send`.
 
 The `Lifespan` names no ASGI types on purpose, so the same value drives a non-ASGI
 shell (a queue processor, a CLI, a test) unchanged; only the wrapper differs.

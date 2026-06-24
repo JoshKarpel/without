@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import pytest
-from without.testing import collect
-from without.testing import stream
+from without import collect
+from without import stream
 from without_asgi import ClientDisconnect
 from without_asgi import Disconnect
 from without_asgi import Inbound

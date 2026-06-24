@@ -221,17 +221,20 @@ async def test_handlers_pick_up_a_config_reload_mid_lifetime(tmp_path: Path) -> 
         assert _body(after) == b"echo"
 
 
-async def test_websocket_scope_is_unsupported(tmp_path: Path) -> None:
+async def test_websocket_scope_is_refused_with_a_close(tmp_path: Path) -> None:
     _write_settings(tmp_path, default_mode="upper", max_bytes=1024)
     source = watch_config(tmp_path, read_yaml_file(Settings, "settings.yaml"), changes=_blocked)
     app = text_transform_app(source)
 
+    sent: list[RawMessage] = []
+
     async def receive() -> RawMessage:
-        raise AssertionError("websocket scope should be rejected before reading events")
+        raise AssertionError("the refusal closes without reading events")
 
     async def send(message: RawMessage) -> None:
-        raise AssertionError("websocket scope should send nothing")
+        sent.append(message)
 
     async with _running(app):
-        with pytest.raises(NotImplementedError, match="websocket"):
-            await app({"type": "websocket", "asgi": {"version": "3.0"}, "path": "/ws", "headers": []}, receive, send)
+        await app({"type": "websocket", "asgi": {"version": "3.0"}, "path": "/ws", "headers": []}, receive, send)
+
+    assert sent == [{"type": "websocket.close", "code": 1000, "reason": ""}]

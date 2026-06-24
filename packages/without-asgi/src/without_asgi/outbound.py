@@ -108,6 +108,15 @@ class WebsocketSend:
 
 @dataclass(frozen=True, slots=True)
 class WebsocketClose:
+    """Close a websocket connection, or reject it when sent before `WebsocketAccept`.
+
+    `code` is a
+    [WebSocket close code](https://developer.mozilla.org/en-US/docs/Web/API/CloseEvent/code);
+    `1000` is a normal closure. If sent before the handshake is accepted, the
+    server discards `code`/`reason` and returns an HTTP `403` instead, so these
+    only reach the client on a close *after* accept.
+    """
+
     code: int = 1000
     reason: str = ""
 

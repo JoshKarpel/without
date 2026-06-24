@@ -4,6 +4,8 @@ from without_asgi.app import Lifespan
 from without_asgi.app import WebsocketHandler
 from without_asgi.app import WebsocketRouter
 from without_asgi.app import make_asgi_app
+from without_asgi.app import refuse_http
+from without_asgi.app import refuse_websocket
 from without_asgi.inbound import Disconnect
 from without_asgi.inbound import Inbound
 from without_asgi.inbound import LifespanEvent
@@ -142,6 +144,8 @@ __all__ = [
     "parse_websocket_inbound",
     "parse_websocket_scope",
     "read_body",
+    "refuse_http",
+    "refuse_websocket",
     "websocket_inbound",
     "websocket_outbound",
 ]

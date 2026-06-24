@@ -9,10 +9,10 @@ from pydantic_settings import SettingsConfigDict
 from without import Context
 from without import Processor
 from without import Transition
+from without import collect
 from without import from_scan
 from without import pipe
 from without import sample
-from without.testing import collect
 from without.testing import tick
 from without_configmap import read_yaml_file
 from without_configmap import watch_config

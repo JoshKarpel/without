@@ -1,19 +1,10 @@
-# Helpers for testing processors without real I/O: turn a plain iterable into a
-# Stream, and drain a Stream back into a list to assert on.
+# A helper for testing time-dependent processors by nudging the event loop.
+# Building a `Stream` from an iterable and draining one back to a list are not
+# test-only, so they live in `without` itself as `stream` and `collect`.
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
-from collections.abc import Iterable
-
-from without.contracts import Stream
-
-
-async def stream[T](values: Iterable[T]) -> AsyncIterator[T]:
-    """An in-memory `Stream` of fixed values, to feed a processor under test."""
-    for value in values:
-        yield value
 
 
 async def tick() -> None:
@@ -25,8 +16,3 @@ async def tick() -> None:
     post-update state deterministically instead of by yielding once.
     """
     await asyncio.sleep(0)
-
-
-async def collect[T](source: Stream[T]) -> list[T]:
-    """Drain a `Stream` into a list, to assert on what a processor emitted."""
-    return [value async for value in source]

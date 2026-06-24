@@ -22,7 +22,7 @@ from integration.kv import serve
 from without import Fold
 from without import Stream
 from without import from_fold
-from without.testing import stream
+from without import stream
 from without_env import EnvContext
 
 

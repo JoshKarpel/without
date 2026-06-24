@@ -11,11 +11,13 @@ from without.contracts import from_sink
 from without.tasks import background_task
 from without.wiring import Sample
 from without.wiring import broadcast
+from without.wiring import collect
 from without.wiring import distribute
 from without.wiring import merge
 from without.wiring import pipe
 from without.wiring import route
 from without.wiring import sample
+from without.wiring import stream
 from without.wiring import stream_from_queue
 from without.wiring import tee
 
@@ -29,6 +31,7 @@ __all__ = [
     "Transition",
     "background_task",
     "broadcast",
+    "collect",
     "distribute",
     "from_fold",
     "from_map",
@@ -38,6 +41,7 @@ __all__ = [
     "pipe",
     "route",
     "sample",
+    "stream",
     "stream_from_queue",
     "tee",
 ]
