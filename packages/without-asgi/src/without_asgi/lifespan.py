@@ -4,21 +4,17 @@ from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass
 
-from without_asgi.core import (
-    ASGIApp,
-    Receive,
-    Scope,
-    Send,
-    Shutdown,
+from without_asgi.inbound import Shutdown, Startup
+from without_asgi.outbound import (
     ShutdownComplete,
     ShutdownFailed,
-    Startup,
     StartupComplete,
     StartupFailed,
     encode_lifespan_reply,
-    scope_type,
 )
+from without_asgi.scope import ConnectionScope, HttpScope, LifespanScope, WebsocketScope, parse_scope
 from without_asgi.shell import lifespan_inbound
+from without_asgi.types import ASGIApp, RawScope, Receive, Send
 
 # A `Lifespan` is a plain async context manager that sets up some state `T`,
 # yields it for the server's lifetime, and tears it down. It names no ASGI types
@@ -28,9 +24,11 @@ from without_asgi.shell import lifespan_inbound
 type Lifespan[T] = Callable[[], AbstractAsyncContextManager[T]]
 
 # A request handler that receives the lifespan state explicitly, alongside the
-# ASGI triple. The state is threaded in per call rather than captured, so it
-# stays a value the handler is handed, not a place it reaches into.
-type ScopedApp[T] = Callable[[T, Scope, Receive, Send], Awaitable[None]]
+# parsed connection scope and the ASGI receive/send. It is handed a
+# `ConnectionScope`, never the lifespan scope, which `make_asgi_app` consumes
+# itself. The state is threaded in per call rather than captured, so it stays a
+# value the handler is handed, not a place it reaches into.
+type ScopedApp[T] = Callable[[T, ConnectionScope, Receive, Send], Awaitable[None]]
 
 
 class _Unset:
@@ -82,20 +80,26 @@ async def _drive[T](lifespan: Lifespan[T], cell: _Cell[T], receive: Receive, sen
                     await send(encode_lifespan_reply(ShutdownComplete()))
 
 
-def with_lifespan[T](lifespan: Lifespan[T], app: ScopedApp[T]) -> ASGIApp:
-    """Drive a portable `lifespan` over the ASGI lifespan protocol, passing every
-    other scope to `app` with the yielded state.
+def make_asgi_app[T](lifespan: Lifespan[T], handler: ScopedApp[T]) -> ASGIApp:
+    """Build the ASGI app that drives `lifespan` and dispatches each connection
+    scope to `handler` with the yielded state.
 
-    The `lifespan` is set up once on `startup` and torn down on `shutdown`, with
-    boot failures reported as `lifespan.startup.failed` / `lifespan.shutdown.failed`.
-    Each non-lifespan scope is dispatched to `app` with the state threaded in.
+    This is the ASGI entrypoint: it parses each raw scope into its typed value.
+    The `lifespan` scope is set up once on `startup` and torn down on `shutdown`,
+    with boot failures reported as `lifespan.startup.failed` /
+    `lifespan.shutdown.failed`. Each connection scope (`HttpScope`,
+    `WebsocketScope`) is dispatched to `handler` with the state threaded in, so
+    `handler` never has to handle the lifespan scope itself. Drilling under this
+    driver, e.g. to build a different one, is `parse_scope` and the per-scope
+    parsers.
     """
     cell: _Cell[T] = _Cell()
 
-    async def wrapped(scope: Scope, receive: Receive, send: Send) -> None:
-        if scope_type(scope) == "lifespan":
-            await _drive(lifespan, cell, receive, send)
-            return
-        await app(cell.require(), scope, receive, send)
+    async def app(scope: RawScope, receive: Receive, send: Send) -> None:
+        match parse_scope(scope):
+            case LifespanScope():
+                await _drive(lifespan, cell, receive, send)
+            case HttpScope() | WebsocketScope() as connection:
+                await handler(cell.require(), connection, receive, send)
 
-    return wrapped
+    return app

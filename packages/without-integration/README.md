@@ -18,4 +18,4 @@ It shows the FastAPI-shaped concerns (routing, a middleware, lifespan) as plain
 `Context` at request time, so a ConfigMap reload reaches in-flight requests. It
 splits into `flags.core` (pure: the `Flags` model and response rendering) and
 `flags.app` (the ASGI app: a `Router` value, a header middleware, and the
-config-watch held for the server's lifetime via `without-asgi`'s `with_lifespan`).
+config-watch held for the server's lifetime via `without-asgi`'s `make_asgi_app`).

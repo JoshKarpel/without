@@ -6,20 +6,19 @@ from dataclasses import dataclass
 from without import Context, Processor, Stream, sample
 from without_asgi import (
     ASGIApp,
+    ConnectionScope,
     HttpScope,
     Inbound,
     Outbound,
     Receive,
     Response,
     ResponseStart,
-    Scope,
     Send,
+    WebsocketScope,
     encode_response,
     http_inbound,
     http_outbound,
-    parse_http_scope,
-    scope_type,
-    with_lifespan,
+    make_asgi_app,
 )
 
 from without_integration.flags.core import Flags, bad_request, flag_name, render_all, render_one, route_not_found
@@ -114,18 +113,20 @@ class Router:
 def make_app(source: Stream[Flags], router: Router) -> ASGIApp:
     # The lifespan is just the config watch: `sample(source)` is already an async
     # context manager, so the same value would drive a non-ASGI shell unchanged.
-    # `with_lifespan` owns the protocol and the one shared reference; handlers are
+    # `make_asgi_app` owns the protocol and the one shared reference; handlers are
     # handed the live `Context` per request and read `.current()` at request time.
-    async def serve(flags: Context[Flags], scope: Scope, receive: Receive, send: Send) -> None:
-        match scope_type(scope):
-            case "http":
-                head = parse_http_scope(scope)
+    async def serve(flags: Context[Flags], scope: ConnectionScope, receive: Receive, send: Send) -> None:
+        match scope:
+            case HttpScope() as head:
                 handler = router.select(head.method, head.path)
-                await http_outbound(send)(handler(head, flags)(http_inbound(receive)))
-            case other:
-                raise NotImplementedError(f"unsupported scope type: {other!r}")
+                processor = handler(head, flags)
+                inbound = http_inbound(receive)
+                outbound = processor(inbound)
+                await http_outbound(send)(outbound)
+            case WebsocketScope():
+                raise NotImplementedError("websocket scopes are not supported")
 
-    return with_lifespan(lambda: sample(source), serve)
+    return make_asgi_app(lambda: sample(source), serve)
 
 
 def feature_flags_app(source: Stream[Flags]) -> ASGIApp:

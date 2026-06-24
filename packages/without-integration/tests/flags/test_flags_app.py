@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 from without.testing import tick
-from without_asgi import ASGIApp, Message
+from without_asgi import ASGIApp, RawMessage
 from without_configmap import read_yaml_file, watch_config
 from without_integration.flags.app import feature_flags_app
 from without_integration.flags.core import Flags
@@ -19,19 +19,19 @@ def _write_flags(mount: Path, flags: dict[str, bool]) -> None:
     (mount / "flags.yaml").write_text(f"flags:\n{body}\n")
 
 
-def _status(message: Message) -> int:
+def _status(message: RawMessage) -> int:
     status = message["status"]
     assert isinstance(status, int)
     return status
 
 
-def _json_body(message: Message) -> object:
+def _json_body(message: RawMessage) -> object:
     body = message["body"]
     assert isinstance(body, bytes)
     return json.loads(body)
 
 
-def _has_header(message: Message, name: bytes, value: bytes) -> bool:
+def _has_header(message: RawMessage, name: bytes, value: bytes) -> bool:
     headers = message["headers"]
     assert isinstance(headers, list)
     return [name, value] in headers
@@ -44,17 +44,17 @@ async def _blocked(mount: Path) -> AsyncIterator[object]:
 
 @asynccontextmanager
 async def _running(app: ASGIApp) -> AsyncIterator[None]:
-    inbox: asyncio.Queue[Message] = asyncio.Queue()
-    outbox: asyncio.Queue[Message] = asyncio.Queue()
+    inbox: asyncio.Queue[RawMessage] = asyncio.Queue()
+    outbox: asyncio.Queue[RawMessage] = asyncio.Queue()
 
-    async def receive() -> Message:
+    async def receive() -> RawMessage:
         return await inbox.get()
 
-    async def send(message: Message) -> None:
+    async def send(message: RawMessage) -> None:
         await outbox.put(message)
 
     async def drive() -> None:
-        await app({"type": "lifespan"}, receive, send)
+        await app({"type": "lifespan", "asgi": {"version": "3.0"}}, receive, send)
 
     lifespan = asyncio.create_task(drive())
     await inbox.put({"type": "lifespan.startup"})
@@ -67,16 +67,24 @@ async def _running(app: ASGIApp) -> AsyncIterator[None]:
         await lifespan
 
 
-async def _get(app: ASGIApp, path: str, query: bytes = b"") -> list[Message]:
-    scope: Message = {"type": "http", "method": "GET", "path": path, "headers": [], "query_string": query}
+async def _get(app: ASGIApp, path: str, query: bytes = b"") -> list[RawMessage]:
+    scope: RawMessage = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "path": path,
+        "headers": [],
+        "query_string": query,
+    }
     request = iter([{"type": "http.request", "body": b"", "more_body": False}])
 
-    async def receive() -> Message:
+    async def receive() -> RawMessage:
         return next(request)
 
-    sent: list[Message] = []
+    sent: list[RawMessage] = []
 
-    async def send(message: Message) -> None:
+    async def send(message: RawMessage) -> None:
         sent.append(message)
 
     await app(scope, receive, send)
@@ -160,12 +168,12 @@ async def test_websocket_scope_is_unsupported(tmp_path: Path) -> None:
     source = watch_config(tmp_path, read_yaml_file(Flags, "flags.yaml"), changes=_blocked)
     app = feature_flags_app(source)
 
-    async def receive() -> Message:
+    async def receive() -> RawMessage:
         raise AssertionError("websocket scope should be rejected before reading events")
 
-    async def send(message: Message) -> None:
+    async def send(message: RawMessage) -> None:
         raise AssertionError("websocket scope should send nothing")
 
     async with _running(app):
         with pytest.raises(NotImplementedError, match="websocket"):
-            await app({"type": "websocket", "path": "/ws"}, receive, send)
+            await app({"type": "websocket", "asgi": {"version": "3.0"}, "path": "/ws", "headers": []}, receive, send)

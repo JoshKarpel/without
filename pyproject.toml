@@ -45,12 +45,21 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-addopts = ["--strict-markers", "-Werror"]
+addopts = [
+    "-n", "auto",
+    "--dist", "worksteal",
+    "--strict-markers",
+    "-Werror",
+    "--cov",
+]
 testpaths = ["packages"]
 
 markers = ["slow"]
 
 asyncio_mode = "auto"
+
+[tool.coverage.run]
+branch = true
 
 [tool.mypy]
 pretty = true

@@ -4,21 +4,27 @@ from collections.abc import AsyncIterator
 
 from without import Sink, from_sink
 
-from without_asgi.core import (
+from without_asgi.inbound import (
     Disconnect,
     Inbound,
     LifespanEvent,
-    LifespanReply,
-    Outbound,
-    Receive,
     RequestBody,
-    Send,
     Shutdown,
-    encode_lifespan_reply,
-    encode_outbound,
+    WebsocketDisconnect,
+    WebsocketInbound,
     parse_inbound,
     parse_lifespan_event,
+    parse_websocket_inbound,
 )
+from without_asgi.outbound import (
+    LifespanReply,
+    Outbound,
+    WebsocketOutbound,
+    encode_lifespan_reply,
+    encode_outbound,
+    encode_websocket_outbound,
+)
+from without_asgi.types import Receive, Send
 
 
 async def http_inbound(receive: Receive) -> AsyncIterator[Inbound]:
@@ -45,6 +51,28 @@ def http_outbound(send: Send) -> Sink[Outbound]:
 
     async def write(event: Outbound) -> None:
         await send(encode_outbound(event))
+
+    return from_sink(write)
+
+
+async def websocket_inbound(receive: Receive) -> AsyncIterator[WebsocketInbound]:
+    """A websocket connection's inbound events as a stream.
+
+    The stream ends on `WebsocketDisconnect`, so the connection's lifecycle *is*
+    this stream's lifecycle, the same shape as `http_inbound`.
+    """
+    while True:
+        event = parse_websocket_inbound(await receive())
+        yield event
+        if isinstance(event, WebsocketDisconnect):
+            return
+
+
+def websocket_outbound(send: Send) -> Sink[WebsocketOutbound]:
+    """A sink that writes each outbound websocket event to ASGI `send`, encoding at the boundary."""
+
+    async def write(event: WebsocketOutbound) -> None:
+        await send(encode_websocket_outbound(event))
 
     return from_sink(write)
 

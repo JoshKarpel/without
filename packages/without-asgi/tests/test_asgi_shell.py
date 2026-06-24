@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from without.testing import collect, stream
-from without_asgi.core import (
+from without_asgi import (
     Disconnect,
     LifespanReply,
-    Message,
     Outbound,
+    RawMessage,
     Receive,
     RequestBody,
     ResponseBody,
@@ -15,23 +15,35 @@ from without_asgi.core import (
     ShutdownComplete,
     Startup,
     StartupComplete,
+    WebsocketBinary,
+    WebsocketConnect,
+    WebsocketDisconnect,
+    WebsocketOutbound,
+    WebsocketReceive,
+    WebsocketSend,
+    WebsocketText,
+    http_inbound,
+    http_outbound,
+    lifespan_inbound,
+    lifespan_outbound,
+    websocket_inbound,
+    websocket_outbound,
 )
-from without_asgi.shell import http_inbound, http_outbound, lifespan_inbound, lifespan_outbound
 
 
-def _scripted(messages: list[Message]) -> Receive:
+def _scripted(messages: list[RawMessage]) -> Receive:
     pending = iter(messages)
 
-    async def receive() -> Message:
+    async def receive() -> RawMessage:
         return next(pending)
 
     return receive
 
 
-def _capturing() -> tuple[Send, list[Message]]:
-    sent: list[Message] = []
+def _capturing() -> tuple[Send, list[RawMessage]]:
+    sent: list[RawMessage] = []
 
-    async def send(message: Message) -> None:
+    async def send(message: RawMessage) -> None:
         sent.append(message)
 
     return send, sent
@@ -74,6 +86,35 @@ async def test_http_outbound_encodes_each_event_to_send() -> None:
         {"type": "http.response.start", "status": 200, "headers": [[b"content-type", b"text/plain"]]},
         {"type": "http.response.body", "body": b"ok", "more_body": False},
     ]
+
+
+async def test_websocket_inbound_ends_on_a_disconnect() -> None:
+    receive = _scripted(
+        [
+            {"type": "websocket.connect"},
+            {"type": "websocket.receive", "text": "ping"},
+            {"type": "websocket.disconnect", "code": 1001},
+        ]
+    )
+
+    events = await collect(websocket_inbound(receive))
+
+    assert events == [
+        WebsocketConnect(),
+        WebsocketReceive(data=WebsocketText(text="ping")),
+        WebsocketDisconnect(code=1001, reason=""),
+    ]
+
+
+async def test_websocket_outbound_encodes_each_event_to_send() -> None:
+    send, sent = _capturing()
+    events: list[WebsocketOutbound] = [
+        WebsocketSend(data=WebsocketBinary(data=b"\x01")),
+    ]
+
+    await websocket_outbound(send)(stream(events))
+
+    assert sent == [{"type": "websocket.send", "bytes": b"\x01"}]
 
 
 async def test_lifespan_inbound_ends_after_shutdown() -> None:
