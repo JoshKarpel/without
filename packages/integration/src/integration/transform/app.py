@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from typing import assert_never
 from urllib.parse import parse_qs
 
+from pydantic import BaseModel
 from without import Stream
 from without import compose
 from without import sample
@@ -20,6 +21,7 @@ from without_asgi import RawHeaders
 from without_asgi import RequestBody
 from without_asgi import Response
 from without_asgi import ResponseStart
+from without_asgi import ResponseTrailers
 from without_asgi import WebsocketAccept
 from without_asgi import WebsocketBinary
 from without_asgi import WebsocketClose
@@ -32,6 +34,7 @@ from without_asgi import WebsocketReceive
 from without_asgi import WebsocketScope
 from without_asgi import WebsocketSend
 from without_asgi import WebsocketText
+from without_asgi import extension
 from without_asgi import make_asgi_app
 from without_asgi.routing import HttpMiddleware
 from without_asgi.routing import WebsocketMiddleware
@@ -40,13 +43,36 @@ from without_asgi.routing import stack
 from without_asgi.routing import wrap
 
 from integration.transform.core import Mode
-from integration.transform.core import Settings
+from integration.transform.core import TransformConfig
 from integration.transform.core import TransformError
 from integration.transform.core import apply_mode
 from integration.transform.core import transform
 from integration.transform.router import Router
 from integration.transform.router import http_route
 from integration.transform.router import ws_route
+
+
+class HttpConfig(BaseModel):
+    """The HTTP shell's own config: the request-body size limit it enforces.
+
+    A transport concern, not a domain one, so it lives with the shell and never
+    reaches the core (`transform.core` works in decoded text and names no byte
+    count). The other shell, the CLI, has no equivalent."""
+
+    max_bytes: int = 1024
+
+
+class Settings(BaseModel):
+    """The whole ASGI app's config, validated from the ConfigMap YAML at the boundary.
+
+    Two sub-configs rather than one flat bag: `transform` is the domain config the
+    core consumes, `http` is this shell's transport config. Splitting them keeps
+    the core's `TransformConfig` free of shell concerns, so a handler hands the
+    core `settings.transform` and reads its own limit from `settings.http`."""
+
+    transform: TransformConfig = TransformConfig()
+    http: HttpConfig = HttpConfig()
+
 
 JSON_HEADERS: RawHeaders = ((b"content-type", b"application/json"),)
 TEXT_HEADERS: RawHeaders = ((b"content-type", b"text/plain; charset=utf-8"),)
@@ -75,14 +101,14 @@ def mode_param(query_string: bytes) -> str | None:
 
 @buffered
 def transform_text(settings: Settings, head: HttpScope, body: bytes) -> Response:
-    if len(body) > settings.max_bytes:
-        return json_response(413, {"error": f"body exceeds {settings.max_bytes} bytes"})
+    if len(body) > settings.http.max_bytes:
+        return json_response(413, {"error": f"body exceeds {settings.http.max_bytes} bytes"})
     try:
         text = body.decode("utf-8")
     except UnicodeDecodeError:
         return json_response(400, {"error": "body is not valid UTF-8"})
     try:
-        transformed = transform(settings, mode_param(head.query_string), text)
+        transformed = transform(settings.transform, mode_param(head.query_string), text)
     except TransformError as error:
         return json_response(400, {"error": str(error)})
     return text_response(transformed)
@@ -90,7 +116,9 @@ def transform_text(settings: Settings, head: HttpScope, body: bytes) -> Response
 
 @buffered
 def modes(settings: Settings, head: HttpScope, body: bytes) -> Response:
-    return json_response(200, {"modes": [mode.value for mode in Mode], "default": settings.default_mode.value})
+    return json_response(
+        200, {"modes": [mode.value for mode in Mode], "default": settings.transform.default_mode.value}
+    )
 
 
 @buffered
@@ -109,7 +137,7 @@ def transform_socket(settings: Settings, head: WebsocketScope) -> WebsocketHandl
                 case WebsocketReceive(data):
                     match data:
                         case WebsocketText(text):
-                            yield WebsocketSend(WebsocketText(text=apply_mode(settings.default_mode, text)))
+                            yield WebsocketSend(WebsocketText(text=apply_mode(settings.transform.default_mode, text)))
                         case WebsocketBinary():
                             yield WebsocketClose(code=1003, reason="text frames only")
                         case _ as unreachable:
@@ -193,30 +221,66 @@ def access_timing(handler: HttpHandler, head: HttpScope) -> HttpHandler:
     return processor
 
 
-# The genuine both-sides case: data observed on the inbound stream is carried into
-# the outbound stream. The inbound end feeds each body chunk into a hasher; the
-# outbound end reads the finished digest into a response header (the way S3 returns
-# an `ETag` of an uploaded object). The shared state is the hasher, mutated in
-# place, so there is still no `nonlocal`, and `compose` wraps both ends around the
-# handler. This relies on the handler reading the whole request before it responds
-# (true for the buffered routes here): a handler that streamed its response first
-# would digest only the chunks seen by then.
 def request_digest(handler: HttpHandler, head: HttpScope) -> HttpHandler:
+    """Middleware reporting a SHA-256 of the request body back on the response.
+
+    The genuine both-sides case: data observed on the inbound stream (each body
+    chunk, fed into a hasher) is carried into the outbound stream (the finished
+    digest), the way S3 returns an `ETag` of an uploaded object. The shared state
+    is the hasher, mutated in place, so there is no `nonlocal`, and `compose`
+    wraps both ends around the handler.
+
+    A digest is only correct once the whole request body has been hashed, so where
+    it rides, and when the body is read, depend on what the server offers. A
+    *trailer* is emitted after the final body chunk, the latest possible moment,
+    so it captures the full digest even when a handler streams its response
+    interleaved with reading the request: the general answer, and worth keeping the
+    request streaming for. It needs the `http.response.trailers` extension, which
+    the server advertises per connection, so this negotiates: `extension(...) is
+    not None` picks the trailer.
+
+    Without it we fall back to a response *header*, which must carry the complete
+    digest at `ResponseStart`. Rather than trust the handler to read the whole
+    request before responding, the fallback `absorb` drains the inbound stream to
+    completion (hashing every chunk) *before yielding anything*, so the hasher is
+    final before the handler runs and any `ResponseStart` it emits sees a complete
+    digest. The cost is buffering the request, which the buffered routes pay anyway
+    and which the HTTP inbound stream (finite) always terminates; the trade is that
+    the header path cannot stream the request, which is exactly why the trailer
+    path exists. Either way an empty-body route like `/modes` still gets a
+    well-formed (empty-input) digest.
+    """
     digest = hashlib.sha256()
+    supports_trailers = extension(head.extensions, "http.response.trailers") is not None
+
+    def tag() -> tuple[bytes, bytes]:
+        return b"x-request-digest", b"sha-256=" + digest.hexdigest().encode()
 
     async def absorb(inputs: Stream[Inbound]) -> AsyncIterator[Inbound]:
+        if supports_trailers:
+            async for event in inputs:
+                if isinstance(event, RequestBody):
+                    digest.update(event.body)
+                yield event
+            return
+        drained: list[Inbound] = []
         async for event in inputs:
             if isinstance(event, RequestBody):
                 digest.update(event.body)
+            drained.append(event)
+        for event in drained:
             yield event
 
     async def stamp(inputs: Stream[Outbound]) -> AsyncIterator[Outbound]:
         async for event in inputs:
-            if isinstance(event, ResponseStart):
-                tag = (b"x-request-digest", b"sha-256=" + digest.hexdigest().encode())
-                yield ResponseStart(status=event.status, headers=(*event.headers, tag))
+            if isinstance(event, ResponseStart) and supports_trailers:
+                yield ResponseStart(status=event.status, headers=event.headers, trailers=True)
+            elif isinstance(event, ResponseStart):
+                yield ResponseStart(status=event.status, headers=(*event.headers, tag()))
             else:
                 yield event
+        if supports_trailers:
+            yield ResponseTrailers(headers=(tag(),))
 
     return compose(absorb, compose(handler, stamp))
 

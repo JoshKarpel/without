@@ -9,9 +9,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
+from integration.transform.app import Settings
 from integration.transform.app import mode_param
 from integration.transform.app import text_transform_app
-from integration.transform.core import Settings
 from without.testing import tick
 from without_asgi import ASGIApp
 from without_asgi import RawMessage
@@ -20,7 +20,9 @@ from without_configmap import watch_config
 
 
 def _write_settings(mount: Path, default_mode: str, max_bytes: int) -> None:
-    (mount / "settings.yaml").write_text(f"default_mode: {default_mode}\nmax_bytes: {max_bytes}\n")
+    (mount / "settings.yaml").write_text(
+        f"transform:\n  default_mode: {default_mode}\nhttp:\n  max_bytes: {max_bytes}\n"
+    )
 
 
 def _status(message: RawMessage) -> int:
@@ -75,7 +77,15 @@ async def _running(app: ASGIApp) -> AsyncIterator[None]:
         await lifespan
 
 
-async def _request(app: ASGIApp, method: str, path: str, *, query: bytes = b"", body: bytes = b"") -> list[RawMessage]:
+async def _request(
+    app: ASGIApp,
+    method: str,
+    path: str,
+    *,
+    query: bytes = b"",
+    body: bytes = b"",
+    extensions: dict[str, dict[str, object]] | None = None,
+) -> list[RawMessage]:
     scope: RawMessage = {
         "type": "http",
         "asgi": {"version": "3.0"},
@@ -84,6 +94,7 @@ async def _request(app: ASGIApp, method: str, path: str, *, query: bytes = b"", 
         "path": path,
         "headers": [],
         "query_string": query,
+        **({"extensions": extensions} if extensions is not None else {}),
     }
     request = iter([{"type": "http.request", "body": body, "more_body": False}])
 
@@ -155,7 +166,7 @@ async def test_access_timing_middleware_reports_the_request_duration(
     assert re.search(r"<-> GET /missing \d+\.\d+ ms", out)
 
 
-async def test_request_digest_middleware_tags_the_response_with_the_request_body_digest(tmp_path: Path) -> None:
+async def test_request_digest_falls_back_to_a_header_without_the_trailers_extension(tmp_path: Path) -> None:
     _write_settings(tmp_path, default_mode="upper", max_bytes=1024)
     source = watch_config(tmp_path, read_yaml_file(Settings, "settings.yaml"), changes=_blocked)
     app = text_transform_app(source)
@@ -165,7 +176,27 @@ async def test_request_digest_middleware_tags_the_response_with_the_request_body
         start, _body = await _request(app, "POST", "/transform", body=body)
 
     expected = b"sha-256=" + hashlib.sha256(body).hexdigest().encode()
+    assert start.get("trailers") is not True
     assert _has_header(start, b"x-request-digest", expected)
+
+
+async def test_request_digest_uses_a_trailer_when_the_server_advertises_the_extension(tmp_path: Path) -> None:
+    _write_settings(tmp_path, default_mode="upper", max_bytes=1024)
+    source = watch_config(tmp_path, read_yaml_file(Settings, "settings.yaml"), changes=_blocked)
+    app = text_transform_app(source)
+    body = b"the quick brown fox"
+
+    async with _running(app):
+        messages = await _request(app, "POST", "/transform", body=body, extensions={"http.response.trailers": {}})
+
+    start = messages[0]
+    assert start["trailers"] is True
+    assert not _has_header(start, b"x-request-digest", b"sha-256=" + hashlib.sha256(body).hexdigest().encode())
+
+    trailers = messages[-1]
+    assert trailers["type"] == "http.response.trailers"
+    expected = b"sha-256=" + hashlib.sha256(body).hexdigest().encode()
+    assert _has_header(trailers, b"x-request-digest", expected)
 
 
 async def test_query_mode_overrides_the_config_default(tmp_path: Path) -> None:

@@ -52,6 +52,7 @@ from without_asgi.scope import LifespanScope
 from without_asgi.scope import Scope
 from without_asgi.scope import Tls
 from without_asgi.scope import WebsocketScope
+from without_asgi.scope import extension
 from without_asgi.scope import parse_http_scope
 from without_asgi.scope import parse_scope
 from without_asgi.scope import parse_tls
@@ -133,6 +134,7 @@ __all__ = [
     "encode_outbound",
     "encode_response",
     "encode_websocket_outbound",
+    "extension",
     "http_inbound",
     "http_outbound",
     "lifespan_inbound",
@@ -148,6 +150,7 @@ __all__ = [
     "read_body",
     "refuse_http",
     "refuse_websocket",
+    "supports",
     "websocket_inbound",
     "websocket_outbound",
 ]

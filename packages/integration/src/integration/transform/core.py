@@ -12,11 +12,15 @@ class Mode(Enum):
     TITLE = "title"
 
 
-class Settings(BaseModel):
-    """The transform settings, validated from the ConfigMap YAML at the boundary."""
+class TransformConfig(BaseModel):
+    """The domain config: the one knob the core needs, the default `Mode`.
+
+    Deliberately free of any shell concern (no byte limit, no wire format): the
+    core works in decoded text under this config and nothing else, so the same
+    value serves whichever shell drives it (the ASGI app, the CLI). A shell wraps
+    this in its own larger config (see `transform.app`'s `Settings`)."""
 
     default_mode: Mode = Mode.UPPER
-    max_bytes: int = 1024
 
 
 class TransformError(Exception):
@@ -42,23 +46,23 @@ def apply_mode(mode: Mode, text: str) -> str:
             assert_never(unreachable)
 
 
-def resolve_mode(settings: Settings, requested: str | None) -> Mode:
+def resolve_mode(config: TransformConfig, requested: str | None) -> Mode:
     """The requested mode, or the configured default when none was requested.
 
     Raises `UnknownMode` when `requested` names no known mode.
     """
     if requested is None:
-        return settings.default_mode
+        return config.default_mode
     try:
         return Mode(requested)
     except ValueError:
         raise UnknownMode(requested) from None
 
 
-def transform(settings: Settings, requested_mode: str | None, text: str) -> str:
-    """Transform `text`, applying `settings`.
+def transform(config: TransformConfig, requested_mode: str | None, text: str) -> str:
+    """Transform `text`, applying `config`.
 
-    The `mode` argument overrides `settings.default_mode`; raises `UnknownMode`
-    when it names no known mode.
+    The `requested_mode` argument overrides `config.default_mode`; raises
+    `UnknownMode` when it names no known mode.
     """
-    return apply_mode(resolve_mode(settings, requested_mode), text)
+    return apply_mode(resolve_mode(config, requested_mode), text)

@@ -308,15 +308,29 @@ def parse_scope(scope: RawScope) -> Scope:
             raise ValueError(f"unexpected scope type: {other!r}")
 
 
+def extension(extensions: Mapping[str, Mapping[str, object]] | None, name: str) -> Mapping[str, object] | None:
+    """The named extension's advertised options, or `None` when it is absent.
+
+    Parse, don't validate: this returns the options mapping itself (often empty,
+    as for `http.response.trailers`) rather than a bool, so a caller needing the
+    options has them and one needing only presence checks `is not None`.
+    Server-advertised extensions are optional per-connection capabilities; an app
+    negotiates by looking one up before using it and falling back when it is
+    `None` (and `parse_tls` reads the `tls` extension through this).
+    """
+    if extensions is None:
+        return None
+    return extensions.get(name)
+
+
 def parse_tls(extensions: Mapping[str, Mapping[str, object]] | None) -> Tls | None:
     """Read the `tls` extension's connection info from a scope's `extensions`.
 
     Returns `None` when the connection is not over TLS (the extension is absent),
     which is how an application distinguishes TLS from plaintext connections.
     """
-    if extensions is None or "tls" not in extensions:
+    if (tls := extension(extensions, "tls")) is None:
         return None
-    tls = extensions["tls"]
     return Tls(
         server_cert=_as_optional_str(tls["server_cert"]),
         client_cert_chain=_as_cert_chain(tls.get("client_cert_chain", ())),

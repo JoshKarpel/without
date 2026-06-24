@@ -7,6 +7,7 @@ from without_asgi import LifespanScope
 from without_asgi import RawMessage
 from without_asgi import Tls
 from without_asgi import WebsocketScope
+from without_asgi import extension
 from without_asgi import parse_http_scope
 from without_asgi import parse_scope
 from without_asgi import parse_tls
@@ -191,3 +192,19 @@ def test_parse_tls_defaults_optional_and_nullable_fields() -> None:
 @pytest.mark.parametrize("extensions", [None, {"http.response.push": {}}])
 def test_parse_tls_is_none_without_the_extension(extensions: object) -> None:
     assert parse_tls(extensions) is None  # type: ignore[arg-type]
+
+
+def test_extension_returns_the_advertised_options() -> None:
+    extensions: dict[str, dict[str, object]] = {"http.response.trailers": {"max_trailers": 16}}
+
+    assert extension(extensions, "http.response.trailers") == {"max_trailers": 16}
+
+
+def test_extension_is_none_for_an_unadvertised_extension() -> None:
+    extensions: dict[str, dict[str, object]] = {"http.response.push": {}}
+
+    assert extension(extensions, "http.response.trailers") is None
+
+
+def test_extension_is_none_when_the_server_advertised_no_extensions() -> None:
+    assert extension(None, "http.response.trailers") is None
