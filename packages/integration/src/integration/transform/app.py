@@ -66,19 +66,32 @@ def not_found(head: HttpScope, settings: Context[Settings], body: bytes) -> Resp
     return route_not_found(head.method, head.path)
 
 
-def with_header(name: bytes, value: bytes) -> Middleware:
-    """Middleware that appends a header to every response, as plain processor composition."""
+# A layer is the real middleware: it wraps the handler's `Processor` with the
+# connection's `HttpScope` in hand. Because it sees the whole processor, one layer
+# can transform the inbound stream (wrap `inputs` before handing it to `inner`),
+# the outbound stream (wrap `inner`'s result), or both. `around` lifts a layer
+# into router `Middleware`, supplying the `Handler -> Handler` plumbing that
+# threads `head` and the config `Context` through, which every middleware would
+# otherwise repeat.
+type Layer = Callable[[Processor[Inbound, Outbound], HttpScope], Processor[Inbound, Outbound]]
 
+
+def around(layer: Layer) -> Middleware:
     def wrap(inner: Handler) -> Handler:
         def build(head: HttpScope, settings: Context[Settings]) -> Processor[Inbound, Outbound]:
-            return _inject(inner(head, settings), name, value)
+            return layer(inner(head, settings), head)
 
         return build
 
     return wrap
 
 
-def _inject(inner: Processor[Inbound, Outbound], name: bytes, value: bytes) -> Processor[Inbound, Outbound]:
+def with_header(name: bytes, value: bytes) -> Middleware:
+    """Middleware that appends a header to every response."""
+    return around(lambda inner, _head: _add_header(inner, name, value))
+
+
+def _add_header(inner: Processor[Inbound, Outbound], name: bytes, value: bytes) -> Processor[Inbound, Outbound]:
     def processor(inputs: Stream[Inbound]) -> Stream[Outbound]:
         return _inject_header(inner(inputs), name, value)
 
@@ -93,32 +106,33 @@ async def _inject_header(outputs: Stream[Outbound], name: bytes, value: bytes) -
             yield event
 
 
-def access_log(inner: Handler) -> Handler:
-    """Middleware that prints one access line per response, observing (not changing) the stream.
-
-    Takes no configuration, so it *is* a `Middleware` rather than a factory like
-    `with_header`. A real service would emit a structured log record here; this
-    just prints to show where the seam goes.
-    """
-
-    def build(head: HttpScope, settings: Context[Settings]) -> Processor[Inbound, Outbound]:
-        return _log(inner(head, settings), head)
-
-    return build
-
-
 def _log(inner: Processor[Inbound, Outbound], head: HttpScope) -> Processor[Inbound, Outbound]:
     def processor(inputs: Stream[Inbound]) -> Stream[Outbound]:
-        return _log_status(inner(inputs), head)
+        # Wraps both ends: the inbound stream to log the request as it arrives,
+        # the outbound stream to log the status the handler finally produced.
+        return _log_response(inner(_log_request(inputs, head)), head)
 
     return processor
 
 
-async def _log_status(outputs: Stream[Outbound], head: HttpScope) -> AsyncIterator[Outbound]:
+async def _log_request(inputs: Stream[Inbound], head: HttpScope) -> AsyncIterator[Inbound]:
+    print(f"--> {head.method} {head.path}")
+    async for event in inputs:
+        yield event
+
+
+async def _log_response(outputs: Stream[Outbound], head: HttpScope) -> AsyncIterator[Outbound]:
     async for event in outputs:
         if isinstance(event, ResponseStart):
-            print(f"{head.method} {head.path} -> {event.status}")
+            print(f"<-- {head.method} {head.path} {event.status}")
         yield event
+
+
+# `access_log` needs no configuration, so it is a `Middleware` value directly,
+# where `with_header` is a factory that builds one. A real service would emit
+# structured log records in `_log_request`/`_log_response`; printing just shows
+# where the seam is.
+access_log: Middleware = around(_log)
 
 
 @dataclass(frozen=True, slots=True)

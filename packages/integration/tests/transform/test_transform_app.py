@@ -123,7 +123,7 @@ async def test_every_route_carries_the_clacks_overhead_header(method: str, path:
     assert _has_header(start, b"x-clacks-overhead", b"GNU Terry Pratchett")
 
 
-async def test_access_log_middleware_prints_the_method_path_and_status(
+async def test_access_log_middleware_prints_the_request_and_the_response(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _write_settings(tmp_path, default_mode="upper", max_bytes=1024)
@@ -133,7 +133,9 @@ async def test_access_log_middleware_prints_the_method_path_and_status(
     async with _running(app):
         await _request(app, "GET", "/missing")
 
-    assert "GET /missing -> 404" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "--> GET /missing" in out
+    assert "<-- GET /missing 404" in out
 
 
 async def test_query_mode_overrides_the_config_default(tmp_path: Path) -> None:

@@ -1,6 +1,7 @@
 from integration.transform.app import Route
 from integration.transform.app import Router
 from integration.transform.app import access_log
+from integration.transform.app import around
 from integration.transform.app import text_transform_app
 from integration.transform.app import with_header
 from integration.transform.core import Mode
@@ -18,6 +19,7 @@ __all__ = [
     "Settings",
     "access_log",
     "apply_mode",
+    "around",
     "mode_param",
     "render_modes",
     "route_not_found",
