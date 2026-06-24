@@ -9,7 +9,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from without import Processor, Transition, from_scan
+from without import Processor
+from without import Transition
+from without import from_scan
 
 
 @dataclass(frozen=True, slots=True)

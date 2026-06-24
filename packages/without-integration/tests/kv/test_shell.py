@@ -4,26 +4,26 @@ import socket
 import struct
 from contextlib import AbstractAsyncContextManager
 
-from without import Fold, Stream, from_fold
+from without import Fold
+from without import Stream
+from without import from_fold
 from without.testing import stream
 from without_env import EnvContext
-from without_integration.kv import (
-    EMPTY_STORE,
-    Connected,
-    Get,
-    Nil,
-    Reply,
-    Request,
-    ServeConfig,
-    Set,
-    Store,
-    Stored,
-    Value,
-    apply,
-    make_keyspace,
-    make_session,
-    serve,
-)
+from without_integration.kv import EMPTY_STORE
+from without_integration.kv import Connected
+from without_integration.kv import Get
+from without_integration.kv import Nil
+from without_integration.kv import Reply
+from without_integration.kv import Request
+from without_integration.kv import ServeConfig
+from without_integration.kv import Set
+from without_integration.kv import Store
+from without_integration.kv import Stored
+from without_integration.kv import Value
+from without_integration.kv import apply
+from without_integration.kv import make_keyspace
+from without_integration.kv import make_session
+from without_integration.kv import serve
 
 
 def _serve(

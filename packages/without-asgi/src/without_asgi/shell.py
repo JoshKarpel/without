@@ -2,29 +2,27 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
-from without import Sink, from_sink
+from without import Sink
+from without import from_sink
 
-from without_asgi.inbound import (
-    Disconnect,
-    Inbound,
-    LifespanEvent,
-    RequestBody,
-    Shutdown,
-    WebsocketDisconnect,
-    WebsocketInbound,
-    parse_inbound,
-    parse_lifespan_event,
-    parse_websocket_inbound,
-)
-from without_asgi.outbound import (
-    LifespanReply,
-    Outbound,
-    WebsocketOutbound,
-    encode_lifespan_reply,
-    encode_outbound,
-    encode_websocket_outbound,
-)
-from without_asgi.types import Receive, Send
+from without_asgi.inbound import Disconnect
+from without_asgi.inbound import Inbound
+from without_asgi.inbound import LifespanEvent
+from without_asgi.inbound import RequestBody
+from without_asgi.inbound import Shutdown
+from without_asgi.inbound import WebsocketDisconnect
+from without_asgi.inbound import WebsocketInbound
+from without_asgi.inbound import parse_inbound
+from without_asgi.inbound import parse_lifespan_event
+from without_asgi.inbound import parse_websocket_inbound
+from without_asgi.outbound import LifespanReply
+from without_asgi.outbound import Outbound
+from without_asgi.outbound import WebsocketOutbound
+from without_asgi.outbound import encode_lifespan_reply
+from without_asgi.outbound import encode_outbound
+from without_asgi.outbound import encode_websocket_outbound
+from without_asgi.types import Receive
+from without_asgi.types import Send
 
 
 async def http_inbound(receive: Receive) -> AsyncIterator[Inbound]:

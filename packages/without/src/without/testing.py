@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator
+from collections.abc import Iterable
 
 from without.contracts import Stream
 

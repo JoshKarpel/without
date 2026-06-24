@@ -6,7 +6,8 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
+from collections.abc import Callable
 from pathlib import Path
 
 from watchfiles import awatch

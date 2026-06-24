@@ -2,8 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from without_asgi.narrow import narrow_to_bytes, narrow_to_int, narrow_to_str
-from without_asgi.types import RawMessage, WebsocketBinary, WebsocketData, WebsocketText
+from without_asgi.narrow import narrow_to_bytes
+from without_asgi.narrow import narrow_to_int
+from without_asgi.narrow import narrow_to_str
+from without_asgi.types import RawMessage
+from without_asgi.types import WebsocketBinary
+from without_asgi.types import WebsocketData
+from without_asgi.types import WebsocketText
 
 
 @dataclass(frozen=True, slots=True)

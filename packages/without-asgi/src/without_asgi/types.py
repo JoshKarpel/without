@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable
+from collections.abc import Callable
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 # The raw ASGI surface, hand-rolled to keep this package's only runtime

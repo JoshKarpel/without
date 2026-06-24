@@ -3,8 +3,10 @@ from pathlib import Path
 
 from pydantic import BaseModel
 from without import sample
-from without.testing import collect, tick
-from without_configmap import read_yaml_file, watch_config
+from without.testing import collect
+from without.testing import tick
+from without_configmap import read_yaml_file
+from without_configmap import watch_config
 
 
 class DbConfig(BaseModel):

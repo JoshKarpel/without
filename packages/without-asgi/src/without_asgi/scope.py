@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
+from collections.abc import Mapping
 from dataclasses import dataclass
 
-from without_asgi.narrow import narrow_to_bytes, narrow_to_int, narrow_to_str
+from without_asgi.narrow import narrow_to_bytes
+from without_asgi.narrow import narrow_to_int
+from without_asgi.narrow import narrow_to_str
 from without_asgi.types import RawScope
 
 

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import pytest
-from without_asgi.narrow import narrow, narrow_to_bytes, narrow_to_int, narrow_to_str
+from without_asgi.narrow import narrow
+from without_asgi.narrow import narrow_to_bytes
+from without_asgi.narrow import narrow_to_int
+from without_asgi.narrow import narrow_to_str
 
 
 def test_narrow_returns_the_value_when_the_type_matches() -> None:

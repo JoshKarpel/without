@@ -1,20 +1,28 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
-from contextlib import AbstractAsyncContextManager, AsyncExitStack
+from collections.abc import Awaitable
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 
-from without_asgi.inbound import Shutdown, Startup
-from without_asgi.outbound import (
-    ShutdownComplete,
-    ShutdownFailed,
-    StartupComplete,
-    StartupFailed,
-    encode_lifespan_reply,
-)
-from without_asgi.scope import ConnectionScope, HttpScope, LifespanScope, WebsocketScope, parse_scope
+from without_asgi.inbound import Shutdown
+from without_asgi.inbound import Startup
+from without_asgi.outbound import ShutdownComplete
+from without_asgi.outbound import ShutdownFailed
+from without_asgi.outbound import StartupComplete
+from without_asgi.outbound import StartupFailed
+from without_asgi.outbound import encode_lifespan_reply
+from without_asgi.scope import ConnectionScope
+from without_asgi.scope import HttpScope
+from without_asgi.scope import LifespanScope
+from without_asgi.scope import WebsocketScope
+from without_asgi.scope import parse_scope
 from without_asgi.shell import lifespan_inbound
-from without_asgi.types import ASGIApp, RawScope, Receive, Send
+from without_asgi.types import ASGIApp
+from without_asgi.types import RawScope
+from without_asgi.types import Receive
+from without_asgi.types import Send
 
 # A `Lifespan` is a plain async context manager that sets up some state `T`,
 # yields it for the server's lifetime, and tears it down. It names no ASGI types

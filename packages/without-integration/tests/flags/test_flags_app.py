@@ -8,8 +8,10 @@ from pathlib import Path
 
 import pytest
 from without.testing import tick
-from without_asgi import ASGIApp, RawMessage
-from without_configmap import read_yaml_file, watch_config
+from without_asgi import ASGIApp
+from without_asgi import RawMessage
+from without_configmap import read_yaml_file
+from without_configmap import watch_config
 from without_integration.flags.app import feature_flags_app
 from without_integration.flags.core import Flags
 

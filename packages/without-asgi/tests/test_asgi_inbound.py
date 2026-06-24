@@ -1,21 +1,19 @@
 from __future__ import annotations
 
 import pytest
-from without_asgi import (
-    Disconnect,
-    RawMessage,
-    RequestBody,
-    Shutdown,
-    Startup,
-    WebsocketBinary,
-    WebsocketConnect,
-    WebsocketDisconnect,
-    WebsocketReceive,
-    WebsocketText,
-    parse_inbound,
-    parse_lifespan_event,
-    parse_websocket_inbound,
-)
+from without_asgi import Disconnect
+from without_asgi import RawMessage
+from without_asgi import RequestBody
+from without_asgi import Shutdown
+from without_asgi import Startup
+from without_asgi import WebsocketBinary
+from without_asgi import WebsocketConnect
+from without_asgi import WebsocketDisconnect
+from without_asgi import WebsocketReceive
+from without_asgi import WebsocketText
+from without_asgi import parse_inbound
+from without_asgi import parse_lifespan_event
+from without_asgi import parse_websocket_inbound
 
 
 @pytest.mark.parametrize(

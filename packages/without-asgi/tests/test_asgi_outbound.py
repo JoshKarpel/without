@@ -1,33 +1,31 @@
 from __future__ import annotations
 
 import pytest
-from without_asgi import (
-    EarlyHint,
-    LifespanReply,
-    PathSend,
-    RawMessage,
-    Response,
-    ResponseBody,
-    ResponseDebug,
-    ResponseStart,
-    ResponseTrailers,
-    ServerPush,
-    ShutdownComplete,
-    StartupComplete,
-    StartupFailed,
-    WebsocketAccept,
-    WebsocketBinary,
-    WebsocketClose,
-    WebsocketResponseBody,
-    WebsocketResponseStart,
-    WebsocketSend,
-    WebsocketText,
-    ZeroCopySend,
-    encode_lifespan_reply,
-    encode_outbound,
-    encode_response,
-    encode_websocket_outbound,
-)
+from without_asgi import EarlyHint
+from without_asgi import LifespanReply
+from without_asgi import PathSend
+from without_asgi import RawMessage
+from without_asgi import Response
+from without_asgi import ResponseBody
+from without_asgi import ResponseDebug
+from without_asgi import ResponseStart
+from without_asgi import ResponseTrailers
+from without_asgi import ServerPush
+from without_asgi import ShutdownComplete
+from without_asgi import StartupComplete
+from without_asgi import StartupFailed
+from without_asgi import WebsocketAccept
+from without_asgi import WebsocketBinary
+from without_asgi import WebsocketClose
+from without_asgi import WebsocketResponseBody
+from without_asgi import WebsocketResponseStart
+from without_asgi import WebsocketSend
+from without_asgi import WebsocketText
+from without_asgi import ZeroCopySend
+from without_asgi import encode_lifespan_reply
+from without_asgi import encode_outbound
+from without_asgi import encode_response
+from without_asgi import encode_websocket_outbound
 
 
 class _FileDescriptor:

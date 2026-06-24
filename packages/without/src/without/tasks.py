@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Coroutine
-from contextlib import asynccontextmanager, suppress
+from collections.abc import AsyncIterator
+from collections.abc import Coroutine
+from contextlib import asynccontextmanager
+from contextlib import suppress
 
 
 @asynccontextmanager

@@ -3,10 +3,18 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from dataclasses import field
 
 import pytest
-from without_asgi import ASGIApp, ConnectionScope, Lifespan, RawMessage, Receive, ScopedApp, Send, make_asgi_app
+from without_asgi import ASGIApp
+from without_asgi import ConnectionScope
+from without_asgi import Lifespan
+from without_asgi import RawMessage
+from without_asgi import Receive
+from without_asgi import ScopedApp
+from without_asgi import Send
+from without_asgi import make_asgi_app
 
 
 @dataclass(slots=True)

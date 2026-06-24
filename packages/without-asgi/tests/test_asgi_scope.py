@@ -1,18 +1,16 @@
 from __future__ import annotations
 
 import pytest
-from without_asgi import (
-    Asgi,
-    HttpScope,
-    LifespanScope,
-    RawMessage,
-    Tls,
-    WebsocketScope,
-    parse_http_scope,
-    parse_scope,
-    parse_tls,
-    parse_websocket_scope,
-)
+from without_asgi import Asgi
+from without_asgi import HttpScope
+from without_asgi import LifespanScope
+from without_asgi import RawMessage
+from without_asgi import Tls
+from without_asgi import WebsocketScope
+from without_asgi import parse_http_scope
+from without_asgi import parse_scope
+from without_asgi import parse_tls
+from without_asgi import parse_websocket_scope
 
 
 def test_parse_http_scope_reads_the_connection_facts() -> None:

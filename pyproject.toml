@@ -109,3 +109,6 @@ ignore = [
     "T201",  # print
     "T203",  # pprint
 ]
+
+[tool.ruff.lint.isort]
+force-single-line = true

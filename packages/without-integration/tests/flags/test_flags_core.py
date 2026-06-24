@@ -3,7 +3,12 @@ from __future__ import annotations
 import json
 
 import pytest
-from without_integration.flags.core import Flags, bad_request, flag_name, render_all, render_one, route_not_found
+from without_integration.flags.core import Flags
+from without_integration.flags.core import bad_request
+from without_integration.flags.core import flag_name
+from without_integration.flags.core import render_all
+from without_integration.flags.core import render_one
+from without_integration.flags.core import route_not_found
 
 
 def test_render_all_lists_every_flag() -> None:

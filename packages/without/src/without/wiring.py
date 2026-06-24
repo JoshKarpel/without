@@ -15,7 +15,9 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
-from without.contracts import Context, Processor, Stream
+from without.contracts import Context
+from without.contracts import Processor
+from without.contracts import Stream
 from without.tasks import background_task
 
 

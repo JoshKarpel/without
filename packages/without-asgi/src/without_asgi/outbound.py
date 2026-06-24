@@ -4,7 +4,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
-from without_asgi.types import RawMessage, WebsocketBinary, WebsocketData, WebsocketText
+from without_asgi.types import RawMessage
+from without_asgi.types import WebsocketBinary
+from without_asgi.types import WebsocketData
+from without_asgi.types import WebsocketText
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,7 +1,12 @@
 import asyncio
 
-from without import Transition, from_fold, from_map, from_scan, from_sink
-from without.testing import collect, stream
+from without import Transition
+from without import from_fold
+from without import from_map
+from without import from_scan
+from without import from_sink
+from without.testing import collect
+from without.testing import stream
 
 
 async def test_from_scan_threads_state_and_emits_each_output() -> None:
