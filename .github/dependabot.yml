@@ -6,9 +6,9 @@ updates:
       interval: weekly
       day: saturday
     open-pull-requests-limit: 1
+    # github-actions doesn't support per-semver-tier cooldown windows.
     cooldown:
       default-days: 7
-      semver-major-days: 30
     groups:
       actions:
         patterns: ["*"]
