@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import assert_never
 
 from without import Sink
+from without import Stream
 from without import from_sink
 
 from without_asgi.inbound import Disconnect
@@ -42,6 +44,28 @@ async def http_inbound(receive: Receive) -> AsyncIterator[Inbound]:
                 return
             case RequestBody(more_body=True):
                 continue
+
+
+class ClientDisconnect(Exception):
+    """The client disconnected before its request body was fully received."""
+
+
+async def read_body(events: Stream[Inbound]) -> bytes:
+    """Accumulate an `http` request's body across its `RequestBody` chunks.
+
+    Raises `ClientDisconnect` if the client goes away before the final chunk,
+    so a truncated body fails loudly rather than passing for a complete one.
+    """
+    chunks = bytearray()
+    async for event in events:
+        match event:
+            case RequestBody(body=body):
+                chunks.extend(body)
+            case Disconnect():
+                raise ClientDisconnect
+            case _ as unreachable:
+                assert_never(unreachable)
+    return bytes(chunks)
 
 
 def http_outbound(send: Send) -> Sink[Outbound]:

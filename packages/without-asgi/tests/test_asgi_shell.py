@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import pytest
 from without.testing import collect
 from without.testing import stream
+from without_asgi import ClientDisconnect
 from without_asgi import Disconnect
+from without_asgi import Inbound
 from without_asgi import LifespanReply
 from without_asgi import Outbound
 from without_asgi import RawMessage
@@ -26,6 +29,7 @@ from without_asgi import http_inbound
 from without_asgi import http_outbound
 from without_asgi import lifespan_inbound
 from without_asgi import lifespan_outbound
+from without_asgi import read_body
 from without_asgi import websocket_inbound
 from without_asgi import websocket_outbound
 
@@ -70,6 +74,24 @@ async def test_http_inbound_ends_on_a_disconnect() -> None:
     events = await collect(http_inbound(receive))
 
     assert events == [Disconnect()]
+
+
+async def test_read_body_joins_every_chunk() -> None:
+    events = stream(
+        [
+            RequestBody(body=b"ab", more_body=True),
+            RequestBody(body=b"c", more_body=False),
+        ]
+    )
+
+    assert await read_body(events) == b"abc"
+
+
+async def test_read_body_raises_on_a_mid_body_disconnect() -> None:
+    inputs: list[Inbound] = [RequestBody(body=b"ab", more_body=True), Disconnect()]
+
+    with pytest.raises(ClientDisconnect):
+        await read_body(stream(inputs))
 
 
 async def test_http_outbound_encodes_each_event_to_send() -> None:

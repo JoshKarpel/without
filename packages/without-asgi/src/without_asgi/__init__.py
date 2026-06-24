@@ -54,10 +54,12 @@ from without_asgi.scope import parse_http_scope
 from without_asgi.scope import parse_scope
 from without_asgi.scope import parse_tls
 from without_asgi.scope import parse_websocket_scope
+from without_asgi.shell import ClientDisconnect
 from without_asgi.shell import http_inbound
 from without_asgi.shell import http_outbound
 from without_asgi.shell import lifespan_inbound
 from without_asgi.shell import lifespan_outbound
+from without_asgi.shell import read_body
 from without_asgi.shell import websocket_inbound
 from without_asgi.shell import websocket_outbound
 from without_asgi.types import ASGIApp
@@ -72,6 +74,7 @@ from without_asgi.types import WebsocketText
 __all__ = [
     "ASGIApp",
     "Asgi",
+    "ClientDisconnect",
     "ConnectionScope",
     "Disconnect",
     "EarlyHint",
@@ -138,6 +141,7 @@ __all__ = [
     "parse_tls",
     "parse_websocket_inbound",
     "parse_websocket_scope",
+    "read_body",
     "websocket_inbound",
     "websocket_outbound",
 ]

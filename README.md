@@ -44,8 +44,8 @@ Planned plugins, in the order they should be attempted:
 3. a toy line-protocol server (Redis-ish); proves long-lived processor state.
    **(done: `integration.kv`)**
 4. HTTP (sans-IO deps); the real test of the contract. **(in progress:
-   `without-asgi` adapters plus a feature-flag example in
-   `integration.flags`)**
+   `without-asgi` adapters plus a text-transform example in
+   `integration.transform`)**
 
 ## Development
 

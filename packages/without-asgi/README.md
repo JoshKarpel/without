@@ -24,9 +24,11 @@ async def app(scope, receive, send):
 
 Because `receive` is already pull-based, `http_inbound` is a plain async
 generator (no queue): the request's lifecycle *is* the stream's lifecycle, so it
-ends on the final body chunk or a disconnect. `scope` (method, path) is known
-once up front, so routing is an ordinary `scope -> Processor` choice rather than
-a per-event stream split.
+ends on the final body chunk or a disconnect. A handler that wants the whole body
+folds that stream with `read_body`, which joins the `RequestBody` chunks and
+raises `ClientDisconnect` if the client drops before the final one. `scope`
+(method, path) is known once up front, so routing is an ordinary `scope ->
+Processor` choice rather than a per-event stream split.
 
 `make_asgi_app(lifespan, http=..., websocket=...)` builds the ASGI app: it drives
 the lifespan protocol around a portable `Lifespan[T] = () ->
@@ -52,5 +54,6 @@ which also orders teardown.
 The pure half (`parse_http_scope`, `parse_inbound`, `encode_outbound`,
 `encode_response`, and the lifespan equivalents) is sans-IO and tested without a
 socket: build a `scope`, a scripted `receive`, and a capturing `send`, then call
-`app` directly. See the `integration` package for a worked feature-flag service
-that reads dynamic config from a `without-configmap` `Context`.
+`app` directly. See the `integration` package for a worked text-transform service
+that reads the request body and dynamic config from a `without-configmap`
+`Context`.

@@ -15,10 +15,14 @@ render a reply) and `kv.shell` (a generic line-server transport plus the wiring
 that runs the core over it), a small demonstration that `without` is a principled
 way to write an imperative shell.
 
-`flags` is a stateless feature-flag service built on the `without-asgi` adapters.
-It shows the FastAPI-shaped concerns (routing, a middleware, lifespan) as plain
-`without` wiring, with handlers that read flags from a live `without-configmap`
-`Context` at request time, so a ConfigMap reload reaches in-flight requests. It
-splits into `flags.core` (pure: the `Flags` model and response rendering) and
-`flags.app` (the ASGI app: a `Router` value, a header middleware, and the
-config-watch held for the server's lifetime via `without-asgi`'s `make_asgi_app`).
+`transform` is a text-transform service built on the `without-asgi` adapters.
+`POST /transform` reads the request body, uppercases/lowercases/title-cases it
+per a `?mode=` query override, and caps the size, with the default mode and the
+limit both read from a live `without-configmap` `Context` at request time, so a
+ConfigMap reload reaches in-flight requests (`GET /modes` reports them). It shows
+the FastAPI-shaped concerns (routing, a middleware, lifespan) as plain `without`
+wiring, and splits into `transform.core` (pure: the `Settings` model, the `Mode`
+transforms, and response rendering) and `transform.app` (the ASGI app: a `Router`
+value with a middleware stack applied across every route, response-header and
+access-logging layers among them, and the config-watch held for the server's
+lifetime via `without-asgi`'s `make_asgi_app`).
