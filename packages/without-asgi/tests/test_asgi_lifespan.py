@@ -7,13 +7,15 @@ from dataclasses import dataclass
 from dataclasses import field
 
 import pytest
+from without import Processor
+from without import Stream
 from without_asgi import ASGIApp
-from without_asgi import ConnectionScope
+from without_asgi import HttpRouter
+from without_asgi import HttpScope
+from without_asgi import Inbound
 from without_asgi import Lifespan
+from without_asgi import Outbound
 from without_asgi import RawMessage
-from without_asgi import Receive
-from without_asgi import ScopedApp
-from without_asgi import Send
 from without_asgi import make_asgi_app
 
 
@@ -44,11 +46,18 @@ def _lifespan(
     return lifespan
 
 
-def _recording_app(seen: list[str]) -> ScopedApp[str]:
-    async def app(state: str, scope: ConnectionScope, receive: Receive, send: Send) -> None:
+def _recording_router(seen: list[str]) -> HttpRouter[str]:
+    def router(state: str, scope: HttpScope) -> Processor[Inbound, Outbound]:
         seen.append(state)
 
-    return app
+        async def silent(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
+            nothing: tuple[Outbound, ...] = ()  # reads no events, emits none: the test only checks threaded state
+            for event in nothing:
+                yield event
+
+        return silent
+
+    return router
 
 
 def _start_lifespan(
@@ -73,10 +82,10 @@ def _start_lifespan(
 async def test_drives_the_handshake_and_enters_then_exits_the_lifespan() -> None:
     trace = Trace()
 
-    async def app(state: str, scope: ConnectionScope, receive: Receive, send: Send) -> None:
+    def router(state: str, scope: HttpScope) -> Processor[Inbound, Outbound]:
         raise AssertionError("no request in this test")
 
-    wrapped = make_asgi_app(_lifespan(trace, "ready"), app)
+    wrapped = make_asgi_app(_lifespan(trace, "ready"), router)
     inbox, outbox, task = _start_lifespan(wrapped)
 
     await inbox.put({"type": "lifespan.startup"})
@@ -92,8 +101,8 @@ async def test_drives_the_handshake_and_enters_then_exits_the_lifespan() -> None
 
 async def test_requests_are_handed_the_lifespan_state() -> None:
     seen: list[str] = []
-    app = _recording_app(seen)
-    wrapped = make_asgi_app(_lifespan(Trace(), "the-state"), app)
+    router = _recording_router(seen)
+    wrapped = make_asgi_app(_lifespan(Trace(), "the-state"), router)
     inbox, outbox, task = _start_lifespan(wrapped)
 
     await inbox.put({"type": "lifespan.startup"})
@@ -127,8 +136,8 @@ async def test_requests_are_handed_the_lifespan_state() -> None:
 
 async def test_a_request_before_startup_fails_loud() -> None:
     seen: list[str] = []
-    app = _recording_app(seen)
-    wrapped = make_asgi_app(_lifespan(Trace(), "unused"), app)
+    router = _recording_router(seen)
+    wrapped = make_asgi_app(_lifespan(Trace(), "unused"), router)
 
     async def receive() -> RawMessage:
         raise AssertionError("unreached")
@@ -156,10 +165,10 @@ async def test_a_request_before_startup_fails_loud() -> None:
 async def test_setup_failure_is_reported_as_startup_failed() -> None:
     trace = Trace()
 
-    async def app(state: str, scope: ConnectionScope, receive: Receive, send: Send) -> None:
+    def router(state: str, scope: HttpScope) -> Processor[Inbound, Outbound]:
         raise AssertionError("startup failed, so no request should run")
 
-    wrapped = make_asgi_app(_lifespan(trace, "never", fail_enter=True), app)
+    wrapped = make_asgi_app(_lifespan(trace, "never", fail_enter=True), router)
     inbox, outbox, task = _start_lifespan(wrapped)
 
     await inbox.put({"type": "lifespan.startup"})
@@ -172,10 +181,10 @@ async def test_setup_failure_is_reported_as_startup_failed() -> None:
 async def test_teardown_failure_is_reported_as_shutdown_failed() -> None:
     trace = Trace()
 
-    async def app(state: str, scope: ConnectionScope, receive: Receive, send: Send) -> None:
+    def router(state: str, scope: HttpScope) -> Processor[Inbound, Outbound]:
         raise AssertionError("no request in this test")
 
-    wrapped = make_asgi_app(_lifespan(trace, "ready", fail_exit=True), app)
+    wrapped = make_asgi_app(_lifespan(trace, "ready", fail_exit=True), router)
     inbox, outbox, task = _start_lifespan(wrapped)
 
     await inbox.put({"type": "lifespan.startup"})

@@ -9,18 +9,12 @@ from without import Processor
 from without import Stream
 from without import sample
 from without_asgi import ASGIApp
-from without_asgi import ConnectionScope
 from without_asgi import HttpScope
 from without_asgi import Inbound
 from without_asgi import Outbound
-from without_asgi import Receive
 from without_asgi import Response
 from without_asgi import ResponseStart
-from without_asgi import Send
-from without_asgi import WebsocketScope
 from without_asgi import encode_response
-from without_asgi import http_inbound
-from without_asgi import http_outbound
 from without_asgi import make_asgi_app
 
 from integration.flags.core import Flags
@@ -120,20 +114,15 @@ class Router:
 def make_app(source: Stream[Flags], router: Router) -> ASGIApp:
     # The lifespan is just the config watch: `sample(source)` is already an async
     # context manager, so the same value would drive a non-ASGI shell unchanged.
-    # `make_asgi_app` owns the protocol and the one shared reference; handlers are
-    # handed the live `Context` per request and read `.current()` at request time.
-    async def serve(flags: Context[Flags], scope: ConnectionScope, receive: Receive, send: Send) -> None:
-        match scope:
-            case HttpScope() as head:
-                handler = router.select(head.method, head.path)
-                processor = handler(head, flags)
-                inbound = http_inbound(receive)
-                outbound = processor(inbound)
-                await http_outbound(send)(outbound)
-            case WebsocketScope():
-                raise NotImplementedError("websocket scopes are not supported")
+    # `make_asgi_app` owns the protocol, the receive/send wiring, and the one
+    # shared reference; the `HttpRouter` below is handed the live `Context` and the
+    # parsed scope per connection and selects the `Processor` (handler) that serves
+    # it, reading `.current()` at request time. The app is HTTP-only by passing no
+    # websocket router.
+    def route(flags: Context[Flags], head: HttpScope) -> Processor[Inbound, Outbound]:
+        return router.select(head.method, head.path)(head, flags)
 
-    return make_asgi_app(lambda: sample(source), serve)
+    return make_asgi_app(lambda: sample(source), route)
 
 
 def feature_flags_app(source: Stream[Flags]) -> ASGIApp:

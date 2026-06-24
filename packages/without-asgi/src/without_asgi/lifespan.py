@@ -1,24 +1,32 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 
+from without import Processor
+
+from without_asgi.inbound import Inbound
 from without_asgi.inbound import Shutdown
 from without_asgi.inbound import Startup
+from without_asgi.inbound import WebsocketInbound
+from without_asgi.outbound import Outbound
 from without_asgi.outbound import ShutdownComplete
 from without_asgi.outbound import ShutdownFailed
 from without_asgi.outbound import StartupComplete
 from without_asgi.outbound import StartupFailed
+from without_asgi.outbound import WebsocketOutbound
 from without_asgi.outbound import encode_lifespan_reply
-from without_asgi.scope import ConnectionScope
 from without_asgi.scope import HttpScope
 from without_asgi.scope import LifespanScope
 from without_asgi.scope import WebsocketScope
 from without_asgi.scope import parse_scope
+from without_asgi.shell import http_inbound
+from without_asgi.shell import http_outbound
 from without_asgi.shell import lifespan_inbound
+from without_asgi.shell import websocket_inbound
+from without_asgi.shell import websocket_outbound
 from without_asgi.types import ASGIApp
 from without_asgi.types import RawScope
 from without_asgi.types import Receive
@@ -31,12 +39,23 @@ from without_asgi.types import Send
 # with nested `async with`, which also gives reverse-order teardown for free.
 type Lifespan[T] = Callable[[], AbstractAsyncContextManager[T]]
 
-# A request handler that receives the lifespan state explicitly, alongside the
-# parsed connection scope and the ASGI receive/send. It is handed a
-# `ConnectionScope`, never the lifespan scope, which `make_asgi_app` consumes
-# itself. The state is threaded in per call rather than captured, so it stays a
-# value the handler is handed, not a place it reaches into.
-type ScopedApp[T] = Callable[[T, ConnectionScope, Receive, Send], Awaitable[None]]
+# A `*Handler` is the `Processor` that serves one connection: it maps that
+# connection's inbound event stream to its outbound one, the same `Processor`
+# shape as every other `without` node, and is the only thing an app writes per
+# connection. A `*Router` selects the handler for a connection from the lifespan
+# state and the parsed scope: `make_asgi_app` calls it once per connection, then
+# owns the receive/send wiring around the returned handler (parsing inbound,
+# encoding outbound), so neither the router nor the handler touches the raw ASGI
+# callables. "Router" is the role even when it always returns the same handler (a
+# constant router that never dispatches on path is still one). The state is
+# threaded in per call rather than captured, so it stays a value the router is
+# handed, not a place it reaches into. HTTP and WebSocket have separate
+# router/handler pairs because their event types differ, which keeps an HTTP
+# handler from emitting a WebSocket event (and vice versa) by construction.
+type HttpHandler = Processor[Inbound, Outbound]
+type HttpRouter[T] = Callable[[T, HttpScope], HttpHandler]
+type WebsocketHandler = Processor[WebsocketInbound, WebsocketOutbound]
+type WebsocketRouter[T] = Callable[[T, WebsocketScope], WebsocketHandler]
 
 
 class _Unset:
@@ -88,18 +107,28 @@ async def _drive[T](lifespan: Lifespan[T], cell: _Cell[T], receive: Receive, sen
                     await send(encode_lifespan_reply(ShutdownComplete()))
 
 
-def make_asgi_app[T](lifespan: Lifespan[T], handler: ScopedApp[T]) -> ASGIApp:
-    """Build the ASGI app that drives `lifespan` and dispatches each connection
-    scope to `handler` with the yielded state.
+def make_asgi_app[T](
+    lifespan: Lifespan[T],
+    http: HttpRouter[T] | None = None,
+    websocket: WebsocketRouter[T] | None = None,
+) -> ASGIApp:
+    """Build the ASGI app that drives `lifespan` and runs a per-connection
+    `Processor` over each connection's event stream.
 
-    This is the ASGI entrypoint: it parses each raw scope into its typed value.
-    The `lifespan` scope is set up once on `startup` and torn down on `shutdown`,
-    with boot failures reported as `lifespan.startup.failed` /
-    `lifespan.shutdown.failed`. Each connection scope (`HttpScope`,
-    `WebsocketScope`) is dispatched to `handler` with the state threaded in, so
-    `handler` never has to handle the lifespan scope itself. Drilling under this
-    driver, e.g. to build a different one, is `parse_scope` and the per-scope
-    parsers.
+    This is the ASGI entrypoint: it parses each raw scope into its typed value
+    and owns all the receive/send wiring. The `lifespan` scope is set up once on
+    `startup` and torn down on `shutdown`, with boot failures reported as
+    `lifespan.startup.failed` / `lifespan.shutdown.failed`. For a connection
+    scope it calls the matching handler with the state threaded in, wraps
+    `receive` into the inbound event stream, runs the returned `Processor`, and
+    drains its outbound stream into `send`: the handler only ever sees streams.
+
+    Each protocol's handler is optional, so an app serves only what it provides:
+    a connection whose handler is absent is rejected with `NotImplementedError`
+    (an HTTP-only app omits `websocket`, a WebSocket-only app omits `http`).
+    Drilling under this driver, e.g. to build a handler that needs the raw
+    `receive`/`send`, is `parse_scope` plus the `http_inbound` / `http_outbound`
+    (and websocket) shell functions this wires together.
     """
     cell: _Cell[T] = _Cell()
 
@@ -107,7 +136,13 @@ def make_asgi_app[T](lifespan: Lifespan[T], handler: ScopedApp[T]) -> ASGIApp:
         match parse_scope(scope):
             case LifespanScope():
                 await _drive(lifespan, cell, receive, send)
-            case HttpScope() | WebsocketScope() as connection:
-                await handler(cell.require(), connection, receive, send)
+            case HttpScope() as head:
+                if http is None:
+                    raise NotImplementedError("http scopes are not supported")
+                await http_outbound(send)(http(cell.require(), head)(http_inbound(receive)))
+            case WebsocketScope() as head:
+                if websocket is None:
+                    raise NotImplementedError("websocket scopes are not supported")
+                await websocket_outbound(send)(websocket(cell.require(), head)(websocket_inbound(receive)))
 
     return app

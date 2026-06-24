@@ -11,8 +11,11 @@ from without_asgi.inbound import WebsocketReceive
 from without_asgi.inbound import parse_inbound
 from without_asgi.inbound import parse_lifespan_event
 from without_asgi.inbound import parse_websocket_inbound
+from without_asgi.lifespan import HttpHandler
+from without_asgi.lifespan import HttpRouter
 from without_asgi.lifespan import Lifespan
-from without_asgi.lifespan import ScopedApp
+from without_asgi.lifespan import WebsocketHandler
+from without_asgi.lifespan import WebsocketRouter
 from without_asgi.lifespan import make_asgi_app
 from without_asgi.outbound import EarlyHint
 from without_asgi.outbound import LifespanReply
@@ -72,6 +75,8 @@ __all__ = [
     "ConnectionScope",
     "Disconnect",
     "EarlyHint",
+    "HttpHandler",
+    "HttpRouter",
     "HttpScope",
     "Inbound",
     "Lifespan",
@@ -90,7 +95,6 @@ __all__ = [
     "ResponseStart",
     "ResponseTrailers",
     "Scope",
-    "ScopedApp",
     "Send",
     "ServerPush",
     "Shutdown",
@@ -107,11 +111,13 @@ __all__ = [
     "WebsocketConnect",
     "WebsocketData",
     "WebsocketDisconnect",
+    "WebsocketHandler",
     "WebsocketInbound",
     "WebsocketOutbound",
     "WebsocketReceive",
     "WebsocketResponseBody",
     "WebsocketResponseStart",
+    "WebsocketRouter",
     "WebsocketScope",
     "WebsocketSend",
     "WebsocketText",
