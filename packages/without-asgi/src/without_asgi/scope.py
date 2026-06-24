@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from without_asgi.narrow import narrow_to_bytes
 from without_asgi.narrow import narrow_to_int
 from without_asgi.narrow import narrow_to_str
+from without_asgi.types import RawHeaders
 from without_asgi.types import RawScope
 
 
@@ -60,7 +61,7 @@ class HttpScope:
     """The root path this application is mounted at (WSGI `SCRIPT_NAME`);
     defaults to `""`."""
 
-    headers: tuple[tuple[bytes, bytes], ...]
+    headers: RawHeaders
     """`[name, value]` byte-string header pairs, in the order received;
     duplicates are preserved."""
 
@@ -112,7 +113,7 @@ class WebsocketScope:
     """The root path this application is mounted at (WSGI `SCRIPT_NAME`);
     defaults to `""`."""
 
-    headers: tuple[tuple[bytes, bytes], ...]
+    headers: RawHeaders
     """`[name, value]` byte-string header pairs, in the order received;
     duplicates are preserved."""
 
@@ -189,7 +190,7 @@ def _as_pair(item: object) -> tuple[bytes, bytes]:
     raise TypeError(f"expected a (bytes, bytes) pair, got {item!r}")
 
 
-def _as_headers(value: object) -> tuple[tuple[bytes, bytes], ...]:
+def _as_headers(value: object) -> RawHeaders:
     if not isinstance(value, Iterable):
         raise TypeError(f"expected an iterable of bytes pairs, got {type(value).__name__}")
     return tuple(_as_pair(item) for item in value)

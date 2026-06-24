@@ -11,6 +11,8 @@ from dataclasses import dataclass
 # built on top of these.
 type RawScope = Mapping[str, object]
 type RawMessage = Mapping[str, object]
+# `(name, value)` byte-string header pairs, in the order received; duplicates are preserved.
+type RawHeaders = tuple[tuple[bytes, bytes], ...]
 type Receive = Callable[[], Awaitable[RawMessage]]
 type Send = Callable[[RawMessage], Awaitable[None]]
 type ASGIApp = Callable[[RawScope, Receive, Send], Awaitable[None]]

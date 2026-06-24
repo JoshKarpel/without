@@ -65,6 +65,23 @@ with the scope in hand; `stack`, which composes a sequence of middleware into on
 The `integration` package's `transform.router` shows a small protocol-generic
 `Router` built from these, dispatching both an HTTP and a WebSocket route.
 
+A `Middleware` wraps the whole handler, a `Processor[Inbound, Outbound]`, so it can
+transform the inbound stream, the outbound stream, or both. The body is not a
+special thing to reach for; it is the `RequestBody` events on the inbound stream
+(and `ResponseBody` events on the way out), so a middleware that touches the body
+just transforms those events before or after the inner handler. Two shapes:
+
+- **Per-chunk**, which stays streaming: wrap `inputs` and re-`yield` each
+  `RequestBody` with its `body` transformed and its `more_body` preserved, passing
+  `Disconnect` through. The inner handler still receives the body incrementally.
+- **Whole-body**, which buffers: `await read_body(inputs)` to join the chunks (it
+  raises `ClientDisconnect` on a truncated body), do the work, then `yield` one
+  `RequestBody(body=..., more_body=False)`. The inner handler sees a complete body
+  in a single event and cannot tell it was re-synthesized; the tradeoff is that
+  buffering forecloses streaming in the handler. The response body is symmetric:
+  wrap the outbound stream and transform its `ResponseBody` events, the way the
+  `transform` example's header middleware rewrites `ResponseStart`.
+
 The pure half (`parse_http_scope`, `parse_inbound`, `encode_outbound`,
 `encode_response`, and the lifespan equivalents) is sans-IO and tested without a
 socket: build a `scope`, a scripted `receive`, and a capturing `send`, then call

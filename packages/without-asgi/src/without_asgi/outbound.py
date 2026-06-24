@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
+from without_asgi.types import RawHeaders
 from without_asgi.types import RawMessage
 from without_asgi.types import WebsocketBinary
 from without_asgi.types import WebsocketData
@@ -13,7 +14,7 @@ from without_asgi.types import WebsocketText
 @dataclass(frozen=True, slots=True)
 class ResponseStart:
     status: int
-    headers: tuple[tuple[bytes, bytes], ...] = ()
+    headers: RawHeaders = ()
     trailers: bool = False
     """Whether the app will send a `ResponseTrailers` after the body; requires the
     `http.response.trailers` extension."""
@@ -36,7 +37,7 @@ class ServerPush:
     """An HTTP/2 server push (`http.response.push` extension)."""
 
     path: str
-    headers: tuple[tuple[bytes, bytes], ...]
+    headers: RawHeaders
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +71,7 @@ class EarlyHint:
 class ResponseTrailers:
     """Trailing headers sent after the final body (`http.response.trailers` extension)."""
 
-    headers: tuple[tuple[bytes, bytes], ...]
+    headers: RawHeaders
     more_trailers: bool = False
 
 
@@ -91,14 +92,14 @@ class Response:
     """A whole response as one value, the common case behind the event pair."""
 
     status: int
-    headers: tuple[tuple[bytes, bytes], ...] = ()
+    headers: RawHeaders = ()
     body: bytes = b""
 
 
 @dataclass(frozen=True, slots=True)
 class WebsocketAccept:
     subprotocol: str | None = None
-    headers: tuple[tuple[bytes, bytes], ...] = ()
+    headers: RawHeaders = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,7 +127,7 @@ class WebsocketResponseStart:
     """The start of an HTTP denial response (`websocket.http.response` extension)."""
 
     status: int
-    headers: tuple[tuple[bytes, bytes], ...] = ()
+    headers: RawHeaders = ()
 
 
 @dataclass(frozen=True, slots=True)

@@ -65,6 +65,7 @@ from without_asgi.shell import read_body
 from without_asgi.shell import websocket_inbound
 from without_asgi.shell import websocket_outbound
 from without_asgi.types import ASGIApp
+from without_asgi.types import RawHeaders
 from without_asgi.types import RawMessage
 from without_asgi.types import RawScope
 from without_asgi.types import Receive
@@ -90,6 +91,7 @@ __all__ = [
     "LifespanScope",
     "Outbound",
     "PathSend",
+    "RawHeaders",
     "RawMessage",
     "RawScope",
     "Receive",

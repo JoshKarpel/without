@@ -13,6 +13,7 @@ from without_asgi import HttpHandler
 from without_asgi import HttpScope
 from without_asgi import Inbound
 from without_asgi import Outbound
+from without_asgi import RawHeaders
 from without_asgi import Response
 from without_asgi import ResponseStart
 from without_asgi import WebsocketAccept
@@ -41,8 +42,8 @@ from integration.transform.router import Router
 from integration.transform.router import http_route
 from integration.transform.router import ws_route
 
-JSON_HEADERS: tuple[tuple[bytes, bytes], ...] = ((b"content-type", b"application/json"),)
-TEXT_HEADERS: tuple[tuple[bytes, bytes], ...] = ((b"content-type", b"text/plain; charset=utf-8"),)
+JSON_HEADERS: RawHeaders = ((b"content-type", b"application/json"),)
+TEXT_HEADERS: RawHeaders = ((b"content-type", b"text/plain; charset=utf-8"),)
 
 
 def json_response(status: int, payload: object) -> Response:
