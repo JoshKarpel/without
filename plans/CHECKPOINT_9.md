@@ -137,6 +137,18 @@ Still open, carried from earlier checkpoints:
 5. **A non-ASGI shell would make the portability promise concrete (Checkpoint
    8).** `make_asgi_app` consumes a portable `Lifespan[T]`; nothing yet drives
    the same lifespan from a queue processor or CLI to prove the seam.
+6. **Intra-workspace deps are unpinned, a packaging gap for publishing.**
+   `without-env`, `without-configmap`, and `without-asgi` each declare a bare
+   `"without"` dependency with no version constraint. The packages are published
+   in lockstep (one shared version derived from the release tag, stamped onto
+   each via `uv version` in `.github/workflows/publish.yml`), but that step only
+   sets each package's *own* version and never constrains the cross-dependency.
+   So a published `without-asgi X.Y.Z` ships `Requires-Dist: without` with no
+   lower bound, letting pip pair it with a mismatched `without`. Before the
+   first real release, either have the publish step also pin each intra-workspace
+   dep to the shared version (`without==X.Y.Z`), or commit a lower bound in each
+   `pyproject.toml` and bump it on release. The first keeps source at `0.0.0` and
+   derives everything from the tag.
 
 Carried forward from earlier checkpoints (still open):
 

@@ -42,5 +42,5 @@ inside the lifespan with nested `async with`, which also orders teardown.
 The pure half (`parse_http_scope`, `parse_inbound`, `encode_outbound`,
 `encode_response`, and the lifespan equivalents) is sans-IO and tested without a
 socket: build a `scope`, a scripted `receive`, and a capturing `send`, then call
-`app` directly. See `without-integration` for a worked feature-flag service that
-reads dynamic config from a `without-configmap` `Context`.
+`app` directly. See the `integration` package for a worked feature-flag service
+that reads dynamic config from a `without-configmap` `Context`.

@@ -7,13 +7,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
+from integration.flags.app import feature_flags_app
+from integration.flags.core import Flags
 from without.testing import tick
 from without_asgi import ASGIApp
 from without_asgi import RawMessage
 from without_configmap import read_yaml_file
 from without_configmap import watch_config
-from without_integration.flags.app import feature_flags_app
-from without_integration.flags.core import Flags
 
 
 def _write_flags(mount: Path, flags: dict[str, bool]) -> None:

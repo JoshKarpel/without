@@ -1,0 +1,45 @@
+name: Publish
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/without
+    permissions:
+      id-token: write # trusted publishing exchanges this OIDC token for a PyPI upload credential
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.0
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+
+      - name: Derive shared version from release tag
+        id: version
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      # The publishable packages are exactly the `without*` workspace members
+      # (the core `without` plus its `without-` plugins); the `integration`
+      # aggregator is deliberately named outside that family so this glob skips
+      # it. Each member's directory basename is its package name.
+      - name: Stamp the shared version and build every publishable package
+        run: |
+          for dir in packages/without*; do
+            pkg="$(basename "$dir")"
+            uv version --no-sync --package "$pkg" "${{ steps.version.outputs.version }}"
+            uv build --package "$pkg"
+          done
+
+      - name: Publish to PyPI
+        run: uv publish --trusted-publishing always

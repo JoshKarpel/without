@@ -1,8 +1,11 @@
-# without-integration
+# integration
 
-Not a real package: the aggregator where `without` and every plugin are imported
-together and exercised as a whole. Each new plugin is added to this package's
-dependencies so its interaction with the rest gets a home for tests.
+Not a real package, and never published: the name deliberately sits outside the
+`without*` family that the publish workflow globs, and a `Private :: Do Not
+Upload` classifier makes PyPI reject it as a backstop. It is the aggregator where
+`without` and every plugin are imported together and exercised as a whole. Each
+new plugin is added to this package's dependencies so its interaction with the
+rest gets a home for tests.
 
 It also hosts validation artifacts that are not meant to be distributed. `kv` is
 a toy line-protocol key-value server (Redis-ish) built on `without`, proving the

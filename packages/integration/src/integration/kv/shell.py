@@ -48,13 +48,13 @@ from without import from_fold
 from without import from_scan
 from without import stream_from_queue
 
-from without_integration.kv.core import EMPTY_STORE
-from without_integration.kv.core import Reply
-from without_integration.kv.core import Request
-from without_integration.kv.core import Store
-from without_integration.kv.core import apply
-from without_integration.kv.core import encode_reply
-from without_integration.kv.core import parse_request
+from integration.kv.core import EMPTY_STORE
+from integration.kv.core import Reply
+from integration.kv.core import Request
+from integration.kv.core import Store
+from integration.kv.core import apply
+from integration.kv.core import encode_reply
+from integration.kv.core import parse_request
 
 type Send[Out] = Callable[[Out], Awaitable[None]]
 type Ask[In, Out] = Callable[[In], Awaitable[Out]]

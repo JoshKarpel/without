@@ -31,8 +31,10 @@ packages). Each package is its own top-level import.
 - `packages/without-asgi` — adapters that turn an ASGI app's `receive`/`send`
   into typed event streams and back (the boundary only, no routing or
   framework). Imported as `without_asgi`.
-- `packages/without-integration` — not a real package: depends on `without` and
-  every plugin so they can be exercised together in cross-package tests.
+- `packages/integration` — not a real package (and never published: its name
+  sits outside the `without*` family, so the publish workflow skips it): depends
+  on `without` and every plugin so they can be exercised together in
+  cross-package tests. Imported as `integration`.
 
 Planned plugins, in the order they should be attempted:
 
@@ -40,10 +42,10 @@ Planned plugins, in the order they should be attempted:
 2. `without-configmap` — config from a k8s mount (`watchfiles` + `pydantic`);
    proves the context-updated-by-a-stream loop. **(done)**
 3. a toy line-protocol server (Redis-ish); proves long-lived processor state.
-   **(done: `without_integration.kv`)**
+   **(done: `integration.kv`)**
 4. HTTP (sans-IO deps); the real test of the contract. **(in progress:
    `without-asgi` adapters plus a feature-flag example in
-   `without_integration.flags`)**
+   `integration.flags`)**
 
 ## Development
 

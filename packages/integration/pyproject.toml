@@ -3,7 +3,7 @@ requires = ["uv_build>=0.11,<0.12"]
 build-backend = "uv_build"
 
 [project]
-name = "without-integration"
+name = "integration"
 version = "0.0.0"
 description = "Cross-package integration tests: depends on without and every plugin to exercise them together."
 readme = "README.md"
@@ -11,6 +11,10 @@ license = "MIT"
 authors = [
     { name = "Josh Karpel", email = "josh.karpel@gmail.com" },
 ]
+# Never published: the name sits outside the `without*` family the publish
+# workflow globs, and this classifier makes PyPI reject an upload if it ever
+# slips through.
+classifiers = ["Private :: Do Not Upload"]
 requires-python = ">=3.13"
 dependencies = [
     "without",

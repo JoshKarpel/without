@@ -1,20 +1,20 @@
 import pytest
+from integration.kv import Delete
+from integration.kv import Deleted
+from integration.kv import Error
+from integration.kv import Get
+from integration.kv import Malformed
+from integration.kv import Nil
+from integration.kv import Reply
+from integration.kv import Request
+from integration.kv import Set
+from integration.kv import Stored
+from integration.kv import Value
+from integration.kv import encode_reply
+from integration.kv import make_store
+from integration.kv import parse_request
 from without.testing import collect
 from without.testing import stream
-from without_integration.kv import Delete
-from without_integration.kv import Deleted
-from without_integration.kv import Error
-from without_integration.kv import Get
-from without_integration.kv import Malformed
-from without_integration.kv import Nil
-from without_integration.kv import Reply
-from without_integration.kv import Request
-from without_integration.kv import Set
-from without_integration.kv import Stored
-from without_integration.kv import Value
-from without_integration.kv import encode_reply
-from without_integration.kv import make_store
-from without_integration.kv import parse_request
 
 
 @pytest.mark.parametrize(

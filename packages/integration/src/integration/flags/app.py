@@ -23,12 +23,12 @@ from without_asgi import http_inbound
 from without_asgi import http_outbound
 from without_asgi import make_asgi_app
 
-from without_integration.flags.core import Flags
-from without_integration.flags.core import bad_request
-from without_integration.flags.core import flag_name
-from without_integration.flags.core import render_all
-from without_integration.flags.core import render_one
-from without_integration.flags.core import route_not_found
+from integration.flags.core import Flags
+from integration.flags.core import bad_request
+from integration.flags.core import flag_name
+from integration.flags.core import render_all
+from integration.flags.core import render_one
+from integration.flags.core import route_not_found
 
 # A handler is built per request from the connection facts and the live config
 # Context, then run over the request's inbound event stream. This is the ASGI
