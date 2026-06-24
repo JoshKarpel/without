@@ -18,11 +18,19 @@ way to write an imperative shell.
 `transform` is a text-transform service built on the `without-asgi` adapters.
 `POST /transform` reads the request body, uppercases/lowercases/title-cases it
 per a `?mode=` query override, and caps the size, with the default mode and the
-limit both read from a live `without-configmap` `Context` at request time, so a
-ConfigMap reload reaches in-flight requests (`GET /modes` reports them). It shows
-the FastAPI-shaped concerns (routing, a middleware, lifespan) as plain `without`
-wiring, and splits into `transform.core` (pure: the `Settings` model, the `Mode`
-transforms, and response rendering) and `transform.app` (the ASGI app: a `Router`
-value with a middleware stack applied across every route, response-header and
-access-logging layers among them, and the config-watch held for the server's
-lifetime via `without-asgi`'s `make_asgi_app`).
+limit both from a `without-configmap` `Context`. Each HTTP request and WebSocket
+connection snapshots the config the moment it arrives, so a ConfigMap reload takes
+effect on the next one rather than changing an open connection mid-flight (`GET
+/modes` reports the current values, and a WebSocket `/stream` transforms each text
+frame with its connect-time snapshot). It shows the
+framework-shaped concerns (routing, middleware, lifespan) as plain `without`
+wiring, and splits along the functional-core/imperative-shell line.
+`transform.core` is pure and HTTP-unaware: the `Settings` model, the `Mode`
+transforms over decoded text, and the `UnknownMode` error it raises rather than
+encoding a status. `transform.router` is a small protocol-generic `Router`
+assembled from `without-asgi`'s routing tools, since the adapters ship those but
+no router of their own. `transform.app` is the shell: the HTTP and WebSocket
+handlers own the bytes (the size limit, the decode, the query parse), call the
+core, and render its result or raised error as JSON; it also holds the middleware
+stack applied across every route and the config-watch kept for the server's
+lifetime via `without-asgi`'s `make_asgi_app`.

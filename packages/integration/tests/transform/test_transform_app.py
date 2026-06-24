@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
+from integration.transform.app import mode_param
 from integration.transform.app import text_transform_app
 from integration.transform.core import Settings
 from without.testing import tick
@@ -173,6 +174,18 @@ async def test_body_over_the_configured_limit_is_a_413(tmp_path: Path) -> None:
     assert _json_body(body) == {"error": "body exceeds 4 bytes"}
 
 
+async def test_non_utf8_body_is_a_400(tmp_path: Path) -> None:
+    _write_settings(tmp_path, default_mode="upper", max_bytes=1024)
+    source = watch_config(tmp_path, read_yaml_file(Settings, "settings.yaml"), changes=_blocked)
+    app = text_transform_app(source)
+
+    async with _running(app):
+        start, body = await _request(app, "POST", "/transform", body=b"\xff\xfe")
+
+    assert _status(start) == 400
+    assert _json_body(body) == {"error": "body is not valid UTF-8"}
+
+
 async def test_modes_lists_modes_and_the_current_default(tmp_path: Path) -> None:
     _write_settings(tmp_path, default_mode="title", max_bytes=1024)
     source = watch_config(tmp_path, read_yaml_file(Settings, "settings.yaml"), changes=_blocked)
@@ -221,7 +234,23 @@ async def test_handlers_pick_up_a_config_reload_mid_lifetime(tmp_path: Path) -> 
         assert _body(after) == b"echo"
 
 
-async def test_websocket_scope_is_refused_with_a_close(tmp_path: Path) -> None:
+async def _websocket(app: ASGIApp, path: str, incoming: list[RawMessage]) -> list[RawMessage]:
+    scope: RawMessage = {"type": "websocket", "asgi": {"version": "3.0"}, "path": path, "headers": []}
+    events = iter(incoming)
+
+    async def receive() -> RawMessage:
+        return next(events)
+
+    sent: list[RawMessage] = []
+
+    async def send(message: RawMessage) -> None:
+        sent.append(message)
+
+    await app(scope, receive, send)
+    return sent
+
+
+async def test_unrouted_websocket_path_is_closed_without_reading(tmp_path: Path) -> None:
     _write_settings(tmp_path, default_mode="upper", max_bytes=1024)
     source = watch_config(tmp_path, read_yaml_file(Settings, "settings.yaml"), changes=_blocked)
     app = text_transform_app(source)
@@ -229,7 +258,7 @@ async def test_websocket_scope_is_refused_with_a_close(tmp_path: Path) -> None:
     sent: list[RawMessage] = []
 
     async def receive() -> RawMessage:
-        raise AssertionError("the refusal closes without reading events")
+        raise AssertionError("the fallback closes without reading events")
 
     async def send(message: RawMessage) -> None:
         sent.append(message)
@@ -238,3 +267,38 @@ async def test_websocket_scope_is_refused_with_a_close(tmp_path: Path) -> None:
         await app({"type": "websocket", "asgi": {"version": "3.0"}, "path": "/ws", "headers": []}, receive, send)
 
     assert sent == [{"type": "websocket.close", "code": 1000, "reason": ""}]
+
+
+async def test_websocket_stream_transforms_each_text_frame_with_the_default_mode(tmp_path: Path) -> None:
+    _write_settings(tmp_path, default_mode="title", max_bytes=1024)
+    source = watch_config(tmp_path, read_yaml_file(Settings, "settings.yaml"), changes=_blocked)
+    app = text_transform_app(source)
+
+    async with _running(app):
+        sent = await _websocket(
+            app,
+            "/stream",
+            [
+                {"type": "websocket.connect"},
+                {"type": "websocket.receive", "text": "the quiet part"},
+                {"type": "websocket.receive", "text": "out loud"},
+                {"type": "websocket.disconnect", "code": 1000},
+            ],
+        )
+
+    assert sent[0]["type"] == "websocket.accept"
+    assert sent[1] == {"type": "websocket.send", "text": "The Quiet Part"}
+    assert sent[2] == {"type": "websocket.send", "text": "Out Loud"}
+
+
+@pytest.mark.parametrize(
+    ("query_string", "expected"),
+    [
+        (b"mode=title", "title"),
+        (b"mode=title&other=1", "title"),
+        (b"other=1", None),
+        (b"", None),
+    ],
+)
+def test_mode_param_reads_the_mode_parameter(query_string: bytes, expected: str | None) -> None:
+    assert mode_param(query_string) == expected

@@ -53,6 +53,18 @@ shell (a queue processor, a CLI, a test) unchanged; only the wrapper differs.
 Interdependent resources compose inside the lifespan with nested `async with`,
 which also orders teardown.
 
+Writing a router is opinionated work (what a route matches on, how dispatch falls
+back), so this package ships no router. The optional `without_asgi.routing`
+submodule provides only the unopinionated tools you assemble one from: a
+`Middleware` vocabulary, generic over the protocol's handler and scope (with
+`HttpMiddleware` / `WebsocketMiddleware` aliases), so a middleware wraps a handler
+with the scope in hand; `stack`, which composes a sequence of middleware into one
+(first outermost), so a stack of middleware is itself a `Middleware`; and
+`buffered`, which adapts a `(state, scope, body) -> Response` function into the
+`HttpRouter` shape for the common request/response case (it reads as a decorator).
+The `integration` package's `transform.router` shows a small protocol-generic
+`Router` built from these, dispatching both an HTTP and a WebSocket route.
+
 The pure half (`parse_http_scope`, `parse_inbound`, `encode_outbound`,
 `encode_response`, and the lifespan equivalents) is sans-IO and tested without a
 socket: build a `scope`, a scripted `receive`, and a capturing `send`, then call
