@@ -46,11 +46,11 @@ dev = [
 
 [tool.pytest.ini_options]
 addopts = [
+    "-q",
     "-n", "auto",
     "--dist", "worksteal",
     "--strict-markers",
     "-Werror",
-    "--cov",
 ]
 testpaths = ["packages"]
 
@@ -60,6 +60,17 @@ asyncio_mode = "auto"
 
 [tool.coverage.run]
 branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = [
+    "assert_never\\(",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@(abc\\.)?abstractmethod",
+    "\\.\\.\\.",
+]
 
 [tool.mypy]
 pretty = true

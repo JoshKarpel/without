@@ -16,9 +16,9 @@ watch *CMD:
 alias w := watch
 
 [doc('Run type checking and tests')]
-test:
+test *args:
     uv run mypy
-    uv run pytest --failed-first
+    uv run pytest --failed-first {{ args }}
 
 alias t := test
 
