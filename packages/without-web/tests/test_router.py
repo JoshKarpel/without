@@ -16,11 +16,13 @@ from without_asgi import Response
 from without_asgi import ResponseBody
 from without_asgi import ResponseStart
 from without_asgi import encode_response
+from without_web import INT
 from without_web import Match
 from without_web import Mount
 from without_web import Router
 from without_web import buffered
 from without_web import json_response
+from without_web import path_param
 from without_web import route
 
 
@@ -85,9 +87,19 @@ async def test_dispatch_selects_the_endpoint_for_the_method() -> None:
 
 
 async def test_dispatch_binds_typed_path_parameters() -> None:
-    router: Router[object] = Router(routes=(route("/todos/{id:int}", get=_show),), fallback=_fallback)
+    router: Router[object] = Router(routes=(route(t"/todos/{path_param('id', INT)}", get=_show),), fallback=_fallback)
     _start, body = await _run(router.dispatch(object(), _scope("GET", "/todos/42")))
     assert json.loads(body) == {"id": 42}
+
+
+def test_a_partial_segment_template_is_a_build_error() -> None:
+    with pytest.raises(ValueError, match="whole segment"):
+        Router(routes=(route(t"/file.{path_param('ext', INT)}", get=_show),), fallback=_fallback)
+
+
+def test_a_non_path_param_interpolation_is_a_build_error() -> None:
+    with pytest.raises(ValueError, match="path_param"):
+        Router(routes=(route(t"/x/{42}", get=_show),), fallback=_fallback)
 
 
 async def test_a_known_path_with_an_unbound_method_is_405_with_an_allow_header() -> None:
@@ -102,6 +114,17 @@ async def test_an_unknown_path_falls_back() -> None:
     start, body = await _run(router.dispatch(object(), _scope("GET", "/nope")))
     assert start.status == 404
     assert json.loads(body) == {"error": "no route for GET /nope"}
+
+
+async def test_a_string_pattern_is_a_literal_only_convenience() -> None:
+    router: Router[object] = Router(routes=(route("/todos", get=_ok),), fallback=_fallback)
+    start, body = await _run(router.dispatch(object(), _scope("GET", "/todos")))
+    assert start.status == 200 and json.loads(body) == {"who": "ok"}
+
+
+def test_a_string_pattern_with_a_brace_is_a_build_error() -> None:
+    with pytest.raises(ValueError, match="literal-only"):
+        Router(routes=(route("/todos/{id:int}", get=_show),), fallback=_fallback)
 
 
 async def test_a_mounted_router_is_grafted_at_the_prefix() -> None:

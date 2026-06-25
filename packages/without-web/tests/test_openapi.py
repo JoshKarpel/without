@@ -4,6 +4,7 @@ from collections.abc import Mapping
 
 from without_asgi import HttpScope
 from without_asgi import Response
+from without_web import INT
 from without_web import Match
 from without_web import QueryParam
 from without_web import RequestBodySpec
@@ -14,6 +15,7 @@ from without_web import buffered
 from without_web import describe
 from without_web import json_response
 from without_web import openapi
+from without_web import path_param
 from without_web import route
 
 
@@ -47,7 +49,7 @@ def _create(state: object, match: Match[HttpScope], body: bytes) -> Response:
 
 def _spec() -> dict[str, object]:
     router: Router[object] = Router(
-        routes=(route("/things/{id:int}", get=_show), route("/things", post=_create)),
+        routes=(route(t"/things/{path_param('id', INT)}", get=_show), route("/things", post=_create)),
         fallback=_fallback,
     )
     return openapi(router, title="things", version="2.0.0")

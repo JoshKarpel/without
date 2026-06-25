@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field
 from dataclasses import replace
+from string.templatelib import Template
 
 from without import Stream
 from without import stream
@@ -21,16 +22,16 @@ from without_asgi.routing import HttpMiddleware
 from without_asgi.routing import WebsocketMiddleware
 from without_asgi.routing import stack
 
-from without_web.converters import DEFAULT_CONVERTERS
-from without_web.converters import Converter
+from without_web.converters import PATH
 from without_web.exceptions import ExceptionHandler
 from without_web.exceptions import WebsocketExceptionHandler
 from without_web.exceptions import catching
 from without_web.exceptions import catching_websocket
 from without_web.patterns import CatchAll
 from without_web.patterns import Literal
+from without_web.patterns import Param
+from without_web.patterns import PathSpec
 from without_web.patterns import Segment
-from without_web.patterns import parse_pattern
 from without_web.patterns import split_path
 from without_web.trie import Node
 from without_web.trie import build
@@ -58,16 +59,73 @@ type Endpoint[T, S, H] = Callable[[T, Match[S]], H]
 type HttpEndpoint[T] = Endpoint[T, HttpScope, HttpHandler]
 type WebsocketEndpoint[T] = Endpoint[T, WebsocketScope, WebsocketHandler]
 
-# Standard HTTP methods, the only keys `route` accepts, so a typo is a build
-# error rather than a route that silently never matches.
-_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
+
+# A pattern is either a plain string (a literal-only path, `@get("/todos")`) or a
+# t-string interpolating path-param tokens (`t"/todos/{todo_id}"`, where
+# `todo_id` is a `path_param(...)`/`catch_all(...)` value). The t-string carries
+# the path *structure* for matching; the token's type is recovered separately
+# from the handler's positional extractor list, since a `Template` erases its
+# interpolation types. A brace in a plain string is a build error steering to the
+# t-string form rather than a route that silently never matches.
+type Pattern = str | Template
+
+
+def _segments(pattern: Pattern) -> tuple[Segment, ...]:
+    if isinstance(pattern, str):
+        if "{" in pattern or "}" in pattern:
+            raise ValueError(f"a plain string pattern is literal-only; use a t-string for parameters, got {pattern!r}")
+        return tuple(Literal(segment) for segment in split_path(pattern))
+    return _template_segments(pattern)
+
+
+def _template_segments(template: Template) -> tuple[Segment, ...]:
+    # `Template.strings` interleaves with `.interpolations`
+    # (strings[0], interp[0], strings[1], ...). A parameter must occupy a whole
+    # segment, so the text around each interpolation must break on `/`.
+    segments: list[Segment] = []
+    interpolations = list(template.interpolations)
+    pending = ""
+    after_param = False
+    for index, static in enumerate(template.strings):
+        chunks = static.split("/")
+        if after_param and chunks[0] != "":
+            raise ValueError("a path parameter must occupy a whole segment")
+        pending += chunks[0]
+        for chunk in chunks[1:]:
+            if pending:
+                segments.append(Literal(pending))
+            pending = chunk
+        after_param = False
+        if index < len(interpolations):
+            if pending != "":
+                raise ValueError("a path parameter must occupy a whole segment")
+            segments.append(_token_segment(interpolations[index].value))
+            after_param = True
+    if pending:
+        segments.append(Literal(pending))
+    for segment in segments[:-1]:
+        if isinstance(segment, CatchAll):
+            raise ValueError("a catch-all parameter must be the last segment")
+    return tuple(segments)
+
+
+def _token_segment(value: object) -> Segment:
+    spec = getattr(value, "path", None)
+    if not isinstance(spec, PathSpec):
+        raise ValueError("an interpolation in a route pattern must be a path_param(...) or catch_all(...)")
+    return CatchAll(spec.name, spec.converter) if spec.catch_all else Param(spec.name, spec.converter)
 
 
 @dataclass(frozen=True, slots=True)
 class Route[T]:
-    """A path pattern bound to one endpoint per HTTP method."""
+    """A path pattern bound to one endpoint per HTTP method.
 
-    pattern: str
+    The method-decorator form (`@get(...)`) produces a single-method `Route`; the
+    `Router` merges `Route`s that share a pattern into one method map, so the
+    405-vs-404 split still falls out of the trie.
+    """
+
+    pattern: Pattern
     methods: Mapping[str, HttpEndpoint[T]]
 
 
@@ -86,7 +144,7 @@ class Mount[T]:
 
 
 def route[T](
-    pattern: str,
+    pattern: Pattern,
     *,
     get: HttpEndpoint[T] | None = None,
     head: HttpEndpoint[T] | None = None,
@@ -134,24 +192,39 @@ type _HttpLeaf[T] = _Methods[T] | _Delegate[T]
 
 
 def _flatten[T](routes: tuple[Route[T] | Mount[T], ...]) -> list[tuple[tuple[Segment, ...], _HttpLeaf[T]]]:
-    table: list[tuple[tuple[Segment, ...], _HttpLeaf[T]]] = []
+    # Routes are merged by their parsed segments so that `@get` and `@post` on the
+    # same path combine into one method map (the 405-vs-404 split needs them
+    # together); mounts pass through. A method declared twice for one path is a
+    # build-time fault.
+    methods_by_path: dict[tuple[Segment, ...], dict[str, HttpEndpoint[T]]] = {}
+    order: list[tuple[Segment, ...]] = []
+    mounts: list[tuple[tuple[Segment, ...], _HttpLeaf[T]]] = []
     for entry in routes:
         match entry:
             case Route(pattern, methods):
-                table.append((parse_pattern(pattern), _Methods(methods)))
+                segments = _segments(pattern)
+                if segments not in methods_by_path:
+                    methods_by_path[segments] = {}
+                    order.append(segments)
+                bucket = methods_by_path[segments]
+                for method, endpoint in methods.items():
+                    if method in bucket:
+                        raise ValueError(f"duplicate route: method {method} declared twice for one path")
+                    bucket[method] = endpoint
             case Mount(prefix, target):
-                head = parse_pattern(prefix)
+                head: tuple[Segment, ...] = tuple(Literal(segment) for segment in split_path(prefix))
                 if isinstance(target, Router):
-                    table.extend((head + tail, leaf) for tail, leaf in _flatten(target.routes))
+                    mounts.extend((head + tail, leaf) for tail, leaf in _flatten(target.routes))
                     continue
-                if not all(isinstance(segment, Literal) for segment in head):
-                    raise ValueError(f"an opaque mount prefix must be literal segments, got {prefix!r}")
-                leaf = _Delegate(prefix=prefix, target=target)
+                leaf: _HttpLeaf[T] = _Delegate(prefix=prefix, target=target)
                 # The exact prefix and any deeper path both delegate: the
                 # catch-all matches the deeper case, the bare prefix the exact one.
-                table.append((head, leaf))
-                table.append(((*head, CatchAll("__mount__")), leaf))
-    return table
+                mounts.append((head, leaf))
+                mounts.append(((*head, CatchAll("__mount__", PATH)), leaf))
+    routes_table: list[tuple[tuple[Segment, ...], _HttpLeaf[T]]] = [
+        (segments, _Methods(methods_by_path[segments])) for segments in order
+    ]
+    return routes_table + mounts
 
 
 def _method_not_allowed[T](methods: Mapping[str, HttpEndpoint[T]]) -> HttpHandler:
@@ -192,13 +265,12 @@ class Router[T]:
 
     routes: tuple[Route[T] | Mount[T], ...]
     fallback: HttpEndpoint[T]
-    converters: Mapping[str, Converter] = DEFAULT_CONVERTERS
     middleware: HttpMiddleware = _PASSTHROUGH_HTTP
     exception_handlers: Mapping[type[Exception], ExceptionHandler] = field(default_factory=dict)
     tree: Node[_HttpLeaf[T]] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "tree", build(_flatten(self.routes), self.converters))
+        object.__setattr__(self, "tree", build(_flatten(self.routes)))
 
     def dispatch(self, state: T, scope: HttpScope) -> HttpHandler:
         handler = self._resolve(state, scope)
@@ -207,7 +279,7 @@ class Router[T]:
         return self.middleware(handler, scope)
 
     def _resolve(self, state: T, scope: HttpScope) -> HttpHandler:
-        found = walk(self.tree, split_path(scope.path), self.converters)
+        found = walk(self.tree, split_path(scope.path))
         if found is None:
             return self.fallback(state, Match(scope, {}))
         match found.leaf:
@@ -224,11 +296,11 @@ class Router[T]:
 class WebsocketRoute[T]:
     """A path pattern bound to one WebSocket endpoint."""
 
-    pattern: str
+    pattern: Pattern
     endpoint: WebsocketEndpoint[T]
 
 
-def ws_route[T](pattern: str, endpoint: WebsocketEndpoint[T]) -> WebsocketRoute[T]:
+def ws_route[T](pattern: Pattern, endpoint: WebsocketEndpoint[T]) -> WebsocketRoute[T]:
     """Build a `WebsocketRoute`."""
     return WebsocketRoute(pattern, endpoint)
 
@@ -244,17 +316,16 @@ class WebsocketRouter[T]:
 
     routes: tuple[WebsocketRoute[T], ...]
     fallback: WebsocketEndpoint[T]
-    converters: Mapping[str, Converter] = DEFAULT_CONVERTERS
     middleware: WebsocketMiddleware = _PASSTHROUGH_WEBSOCKET
     exception_handlers: Mapping[type[Exception], WebsocketExceptionHandler] = field(default_factory=dict)
     tree: Node[WebsocketEndpoint[T]] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        table = [(parse_pattern(r.pattern), r.endpoint) for r in self.routes]
-        object.__setattr__(self, "tree", build(table, self.converters))
+        table = [(_segments(r.pattern), r.endpoint) for r in self.routes]
+        object.__setattr__(self, "tree", build(table))
 
     def dispatch(self, state: T, scope: WebsocketScope) -> WebsocketHandler:
-        found = walk(self.tree, split_path(scope.path), self.converters)
+        found = walk(self.tree, split_path(scope.path))
         endpoint = self.fallback if found is None else found.leaf
         params = {} if found is None else found.params
         handler = endpoint(state, Match(scope, params))

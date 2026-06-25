@@ -4,7 +4,6 @@ from collections.abc import AsyncIterator
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from typing import assert_never
-from urllib.parse import parse_qs
 
 from pydantic import BaseModel
 from pydantic import ValidationError
@@ -34,20 +33,21 @@ from without_asgi import make_asgi_app
 from without_asgi.routing import HttpMiddleware
 from without_asgi.routing import stack
 from without_asgi.routing import wrap
+from without_web import INT
 from without_web import Match
 from without_web import Mount
-from without_web import QueryParam
-from without_web import RequestBodySpec
-from without_web import ResponseSpec
 from without_web import Router
-from without_web import RouteSpec
 from without_web import WebsocketRouter
-from without_web import buffered
-from without_web import describe
+from without_web import body
+from without_web import get
+from without_web import handle
+from without_web import http_scope
 from without_web import json_response
 from without_web import openapi
-from without_web import route
-from without_web import ws_route
+from without_web import path_param
+from without_web import post
+from without_web import query_param
+from without_web import ws
 
 from integration.todos.core import NewTodo
 from integration.todos.core import Todo
@@ -55,102 +55,76 @@ from integration.todos.core import TodoList
 from integration.todos.core import TodoNotFound
 
 # A todo-list API on without-web: the canonical REST shape, chosen because it
-# exercises the whole router design at once. `/todos/{id:int}` is a typed path
-# parameter; `GET` vs `POST` on `/todos` is method dispatch (so a `PUT` is a 405,
-# not a 404); `?done=` is a handler-owned query filter; `/admin` is a grafted
-# sub-router and `/legacy` an opaque mount; `TodoNotFound`/`ValidationError` are
-# mapped by exception handlers; and the routes describe themselves for OpenAPI.
+# exercises the whole router design at once. `t"/todos/{todo_id}"` is a typed path
+# parameter (the same `todo_id` token names the segment and is passed as the
+# handler's typed `int` argument); `GET` vs `POST` on `/todos` is method dispatch
+# (so a `PUT` is a 405, not a 404); `?done=` is a typed query filter; `/admin` is
+# a grafted sub-router and `/legacy` an opaque mount; `TodoNotFound`/
+# `ValidationError` are mapped by exception handlers; and the routes describe
+# themselves for OpenAPI.
+#
+# Each handler is a plain function of *parsed values* declared by a `@get`/`@post`
+# decorator that ties typed `Extractor`s to its parameters: `show_todo` takes an
+# `int`, not a `Match` it must narrow, and `create_todo` takes a `NewTodo`, not
+# raw bytes. The decorator only annotates and returns a `Route` value; the
+# `Router` is still assembled explicitly from those values. Extractors are the
+# single source of truth: the value that parses the query or body also
+# contributes its OpenAPI fragment.
+#
 # State is a single immutable `TodoList` value held for the connection's life, so
 # this example stays about routing and leaves a shared mutable store (the
 # actor-model question) out of scope: `POST` validates and echoes the would-be
 # todo without persisting it.
-
-_CREATED_SCHEMA: Mapping[str, object] = {
-    "type": "object",
-    "properties": {"id": {"type": "integer"}, "title": {"type": "string"}, "done": {"type": "boolean"}},
-}
 
 
 def _render(todo: Todo) -> dict[str, object]:
     return {"id": todo.id, "title": todo.title, "done": todo.done}
 
 
-def _path_id(match: Match[HttpScope]) -> int:
-    # The `{id:int}` converter already parsed and proved the type; the params
-    # map exposes its values as plain objects, so narrow once at the read.
-    todo_id = match.params["id"]
-    assert isinstance(todo_id, int)
-    return todo_id
-
-
-def done_filter(query_string: bytes) -> bool | None:
+def _done(values: list[str]) -> bool | None:
     """The `done` query filter: `True`/`False` when present, `None` when absent.
 
-    Query parsing is the handler's, never the router's: it reads `query_string`
-    off the scope and never affects which handler was selected.
+    A repeated `?done=` honors the last value, the usual last-wins convention.
     """
-    values = parse_qs(query_string.decode()).get("done")
-    return None if not values else values[0] == "true"
+    return None if not values else values[-1] == "true"
 
 
-@describe(
-    RouteSpec(
-        summary="List todos",
-        query=(QueryParam(name="done", schema={"type": "boolean"}),),
-        responses={200: ResponseSpec(media_type="application/json", description="the matching todos")},
-    )
-)
-@buffered
-def list_todos(todos: TodoList, match: Match[HttpScope], body: bytes) -> Response:
-    matching = todos.matching(done_filter(match.scope.query_string))
-    return json_response(200, {"todos": [_render(todo) for todo in matching]})
+done_query = query_param("done", _done, schema={"type": "boolean"})
+new_todo_body = body(NewTodo.model_validate_json, schema=NewTodo)
+# One token, declared once: it is the route's `{id}` segment (matched and schemed
+# through `INT`) *and* the handler's typed `int` argument, and it binds the
+# websocket feed's id too. No second place to keep "id" or "int" in sync.
+todo_id = path_param("id", INT)
 
 
-@describe(
-    RouteSpec(
-        summary="Create a todo",
-        request_body=RequestBodySpec(media_type="application/json", schema=NewTodo),
-        responses={
-            201: ResponseSpec(media_type="application/json", schema=_CREATED_SCHEMA, description="the created todo"),
-            422: ResponseSpec(media_type="application/json", description="the body failed validation"),
-        },
-    )
-)
-@buffered
-def create_todo(todos: TodoList, match: Match[HttpScope], body: bytes) -> Response:
-    new = NewTodo.model_validate_json(body)
+@get("/todos", done_query, summary="List todos")
+def list_todos(todos: TodoList, done: bool | None) -> Response:
+    return json_response(200, {"todos": [_render(todo) for todo in todos.matching(done)]})
+
+
+@post("/todos", new_todo_body, summary="Create a todo")
+def create_todo(todos: TodoList, new: NewTodo) -> Response:
     _list, created = todos.added(new)
     return json_response(201, _render(created))
 
 
-@describe(
-    RouteSpec(
-        summary="Get one todo",
-        responses={
-            200: ResponseSpec(media_type="application/json", description="the todo"),
-            404: ResponseSpec(media_type="application/json", description="no todo with that id"),
-        },
-    )
-)
-@buffered
-def show_todo(todos: TodoList, match: Match[HttpScope], body: bytes) -> Response:
-    return json_response(200, _render(todos.get(_path_id(match))))
+@get(t"/todos/{todo_id}", todo_id, summary="Get one todo")
+def show_todo(todos: TodoList, requested_id: int) -> Response:
+    return json_response(200, _render(todos.get(requested_id)))
 
 
-@describe(
-    RouteSpec(
-        summary="Todo counts",
-        responses={200: ResponseSpec(media_type="application/json", description="totals")},
-    )
-)
-@buffered
-def stats(todos: TodoList, match: Match[HttpScope], body: bytes) -> Response:
+@get("/stats", summary="Todo counts")
+def stats(todos: TodoList) -> Response:
     return json_response(200, {"total": len(todos.matching(None)), "done": len(todos.matching(True))})
 
 
-@buffered
-def not_found(todos: TodoList, match: Match[HttpScope], body: bytes) -> Response:
-    return json_response(404, {"error": f"no route for {match.scope.method} {match.scope.path}"})
+def not_found(todos: TodoList, scope: HttpScope) -> Response:
+    return json_response(404, {"error": f"no route for {scope.method} {scope.path}"})
+
+
+# The fallback is an endpoint, not a route (no method, no pattern), so it is built
+# with `handle` rather than a method decorator.
+fallback = handle(http_scope(), fn=not_found)
 
 
 def legacy(todos: TodoList, head: HttpScope) -> HttpHandler:
@@ -187,36 +161,34 @@ async def _stamp(outputs: Stream[Outbound], _head: HttpScope) -> AsyncIterator[O
 powered_by: HttpMiddleware = wrap(outbound=_stamp)
 
 
-admin: Router[TodoList] = Router(
-    routes=(route("/stats", get=stats),),
-    fallback=not_found,
-)
+admin: Router[TodoList] = Router(routes=(stats,), fallback=fallback)
 
 todos_router: Router[TodoList] = Router(
     routes=(
-        route("/todos", get=list_todos, post=create_todo),
-        route("/todos/{id:int}", get=show_todo),
+        list_todos,
+        create_todo,
+        show_todo,
         Mount("/admin", admin),
         Mount("/legacy", legacy),
     ),
-    fallback=not_found,
+    fallback=fallback,
     middleware=stack(powered_by),
     exception_handlers={TodoNotFound: _on_missing_todo, ValidationError: _on_invalid_body},
 )
 
 
-def feed(todos: TodoList, match: Match[WebsocketScope]) -> WebsocketHandler:
+@ws(t"/todos/{todo_id}/events", todo_id)
+def feed(todos: TodoList, requested_id: int) -> WebsocketHandler:
     """Stream a todo's title prefixed onto each text frame; reject an unknown id.
 
-    The lookup runs *inside* the processor, before `WebsocketAccept`, so a
-    `TodoNotFound` is raised while the connection can still be rejected and the
-    websocket exception handler maps it to a close (the equivalent of the HTTP
-    404)."""
-    todo_id = match.params["id"]
-    assert isinstance(todo_id, int)
+    The same `todo_id` token names the `{id}` segment and is passed as the typed
+    `int` argument. The lookup runs *inside* the processor, before
+    `WebsocketAccept`, so a `TodoNotFound` is raised while the connection can
+    still be rejected and the websocket exception handler maps it to a close (the
+    equivalent of the HTTP 404)."""
 
     async def processor(inputs: Stream[WebsocketInbound]) -> AsyncIterator[WebsocketOutbound]:
-        todo = todos.get(todo_id)
+        todo = todos.get(requested_id)
         async for event in inputs:
             match event:
                 case WebsocketConnect():
@@ -252,7 +224,7 @@ def _on_missing_todo_socket(exc: Exception) -> WebsocketClose:
 
 
 sockets: WebsocketRouter[TodoList] = WebsocketRouter(
-    routes=(ws_route("/todos/{id:int}/events", feed),),
+    routes=(feed,),
     fallback=refuse,
     exception_handlers={TodoNotFound: _on_missing_todo_socket},
 )

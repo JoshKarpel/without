@@ -38,25 +38,26 @@ class Node[L]:
 @dataclass(slots=True)
 class _Builder[L]:
     literals: dict[str, _Builder[L]] = field(default_factory=dict)
-    params: dict[tuple[str, str], _Builder[L]] = field(default_factory=dict)
-    catchall: tuple[str, _Builder[L]] | None = None
+    params: dict[tuple[str, Converter[object]], _Builder[L]] = field(default_factory=dict)
+    catchall: tuple[CatchAll, _Builder[L]] | None = None
     leaf: L | None = None
 
 
-def build[L](routes: Iterable[tuple[tuple[Segment, ...], L]], converters: Mapping[str, Converter]) -> Node[L]:
+def build[L](routes: Iterable[tuple[tuple[Segment, ...], L]]) -> Node[L]:
     """Fold a flat route table into one immutable trie.
 
-    A duplicate route (two leaves at the same path) and an unknown converter
-    name are both build-time faults, so they raise here at construction rather
-    than surfacing per request.
+    A duplicate route (two leaves at the same path) is a build-time fault, so it
+    raises here at construction rather than surfacing per request. Converters
+    travel on the segments themselves, so there is no registry to resolve and no
+    unknown-converter fault: a path-param token *is* its converter.
     """
     root: _Builder[L] = _Builder()
     for segments, leaf in routes:
-        _insert(root, segments, leaf, converters)
+        _insert(root, segments, leaf)
     return _freeze(root)
 
 
-def _insert[L](node: _Builder[L], segments: tuple[Segment, ...], leaf: L, converters: Mapping[str, Converter]) -> None:
+def _insert[L](node: _Builder[L], segments: tuple[Segment, ...], leaf: L) -> None:
     if not segments:
         if node.leaf is not None:
             raise ValueError("duplicate route: two endpoints resolve to the same path")
@@ -67,14 +68,12 @@ def _insert[L](node: _Builder[L], segments: tuple[Segment, ...], leaf: L, conver
         case Literal(text):
             child = node.literals.setdefault(text, _Builder())
         case Param(name, converter):
-            if converter not in converters:
-                raise ValueError(f"unknown converter {converter!r} for parameter {name!r}")
             child = node.params.setdefault((name, converter), _Builder())
-        case CatchAll(name):
+        case CatchAll():
             if node.catchall is None:
-                node.catchall = (name, _Builder())
+                node.catchall = (head, _Builder())
             child = node.catchall[1]
-    _insert(child, tuple(rest), leaf, converters)
+    _insert(child, tuple(rest), leaf)
 
 
 def _freeze[L](builder: _Builder[L]) -> Node[L]:
@@ -83,19 +82,19 @@ def _freeze[L](builder: _Builder[L]) -> Node[L]:
         (Param(name, converter), _freeze(child))
         for (name, converter), child in sorted(builder.params.items(), key=_param_precedence)
     )
-    catchall = None if builder.catchall is None else (CatchAll(builder.catchall[0]), _freeze(builder.catchall[1]))
+    catchall = None if builder.catchall is None else (builder.catchall[0], _freeze(builder.catchall[1]))
     return Node(literals=literals, params=params, catchall=catchall, leaf=builder.leaf)
 
 
-def _param_precedence[L](item: tuple[tuple[str, str], _Builder[L]]) -> int:
+def _param_precedence[L](item: tuple[tuple[str, Converter[object]], _Builder[L]]) -> int:
     # A typed converter is more specific than the catch-most `str`, so it is
     # tried first; `sorted` is stable, so same-precedence params keep insertion
     # order.
     (_name, converter), _child = item
-    return 1 if converter == "str" else 0
+    return 1 if converter.name == "str" else 0
 
 
-def walk[L](node: Node[L], segments: tuple[str, ...], converters: Mapping[str, Converter]) -> Found[L] | None:
+def walk[L](node: Node[L], segments: tuple[str, ...]) -> Found[L] | None:
     """Match a request target against the trie, backtracking on converter rejection.
 
     Because a typed converter can reject a segment, a literal-then-param descent
@@ -107,14 +106,14 @@ def walk[L](node: Node[L], segments: tuple[str, ...], converters: Mapping[str, C
         return None if node.leaf is None else Found(node.leaf, {})
     head, rest = segments[0], segments[1:]
     literal = node.literals.get(head)
-    if literal is not None and (found := walk(literal, rest, converters)) is not None:
+    if literal is not None and (found := walk(literal, rest)) is not None:
         return found
     for param, child in node.params:
         try:
-            value = converters[param.converter].parse(head)
+            value = param.converter.parse(head)
         except ValueError:
             continue
-        if (found := walk(child, rest, converters)) is not None:
+        if (found := walk(child, rest)) is not None:
             return Found(found.leaf, {param.name: value, **found.params})
     if node.catchall is not None:
         catchall, child = node.catchall

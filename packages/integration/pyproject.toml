@@ -15,7 +15,7 @@ authors = [
 # workflow globs, and this classifier makes PyPI reject an upload if it ever
 # slips through.
 classifiers = ["Private :: Do Not Upload"]
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 dependencies = [
     "without",
     "without-env",

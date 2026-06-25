@@ -53,13 +53,16 @@ chasing.
 `todos` is a user-facing exercise of the opinionated `without-web` router (where
 `transform` hand-rolls one from `without-asgi`'s tools). It is the canonical
 todo-list REST API, chosen because it hits the whole router design at once:
-`/todos/{id:int}` is a typed path parameter, `GET` vs `POST` on `/todos` is
-method dispatch (so a `PUT` is a `405` with `Allow`, not a `404`), `?done=` is a
-handler-owned query filter, `/admin` is a grafted sub-router and `/legacy` an
-opaque mount (handed the prefix-trimmed scope), `TodoNotFound`/`ValidationError`
-are mapped by exception handlers (the websocket feed rejects an unknown id with a
-close, the equivalent commit point to HTTP's `ResponseStart`), and the routes
-describe themselves so `todos_openapi()` merges the router's path/method half with
-each endpoint's body/query/response half. `todos.core` is the pure, immutable
+`t"/todos/{todo_id}"` is a typed path parameter (the same `todo_id` token names
+the segment and is reused as the handler's `int` argument), `GET` vs `POST` on
+`/todos` is method
+dispatch (so a `PUT` is a `405` with `Allow`, not a `404`), `?done=` is a typed
+`query_param` extractor, `/admin` is a grafted sub-router and `/legacy` an opaque
+mount (handed the prefix-trimmed scope), `TodoNotFound`/`ValidationError` are
+mapped by exception handlers (the websocket feed rejects an unknown id with a
+close, the equivalent commit point to HTTP's `ResponseStart`), and each `@get`/
+`@post` handler is a plain function of typed values whose extractors also supply
+the OpenAPI, so `todos_openapi()` merges the router's path/method half with each
+endpoint's body/query/response half. `todos.core` is the pure, immutable
 `TodoList`; `todos.app` is the `without-web` wiring, where `Router.dispatch` snaps
 straight onto `make_asgi_app` because it already *is* an `HttpRouter`.

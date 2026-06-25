@@ -1,4 +1,3 @@
-from integration.todos.app import done_filter
 from integration.todos.app import todos_app
 from integration.todos.app import todos_openapi
 from integration.todos.app import todos_router
@@ -12,7 +11,6 @@ __all__ = [
     "Todo",
     "TodoList",
     "TodoNotFound",
-    "done_filter",
     "todos_app",
     "todos_openapi",
     "todos_router",

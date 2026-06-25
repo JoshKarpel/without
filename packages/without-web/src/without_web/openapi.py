@@ -10,7 +10,6 @@ from typing import runtime_checkable
 from without_asgi import HttpHandler
 from without_asgi import HttpScope
 
-from without_web.converters import Converter
 from without_web.patterns import CatchAll
 from without_web.patterns import Literal
 from without_web.patterns import Param
@@ -30,6 +29,13 @@ type SchemaFor = Callable[[type], Mapping[str, object]]
 
 @dataclass(frozen=True, slots=True)
 class QueryParam:
+    name: str
+    schema: SchemaRef
+    required: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class HeaderParam:
     name: str
     schema: SchemaRef
     required: bool = False
@@ -60,6 +66,7 @@ class RouteSpec:
 
     summary: str = ""
     query: tuple[QueryParam, ...] = ()
+    headers: tuple[HeaderParam, ...] = ()
     request_body: RequestBodySpec | None = None
     responses: Mapping[int, ResponseSpec] = field(default_factory=dict)
 
@@ -125,7 +132,7 @@ def openapi[T](
         if not isinstance(leaf, _Methods):
             continue
         item = paths.setdefault(_template(segments), {})
-        path_params = _path_parameters(segments, router.converters, schema_for)
+        path_params = _path_parameters(segments, schema_for)
         for method, endpoint in leaf.methods.items():
             item[method.lower()] = _operation(endpoint, path_params, schema_for)
     return {"openapi": "3.1.0", "info": {"title": title, "version": version}, "paths": paths}
@@ -139,22 +146,18 @@ def _segment_template(segment: Segment) -> str:
     match segment:
         case Literal(text):
             return text
-        case Param(name, _) | CatchAll(name):
+        case Param(name, _) | CatchAll(name, _):
             return "{" + name + "}"
 
 
-def _path_parameters(
-    segments: tuple[Segment, ...], converters: Mapping[str, Converter], schema_for: SchemaFor
-) -> list[dict[str, object]]:
+def _path_parameters(segments: tuple[Segment, ...], schema_for: SchemaFor) -> list[dict[str, object]]:
     parameters: list[dict[str, object]] = []
     for segment in segments:
         match segment:
             case Literal():
                 continue
-            case Param(name, converter):
-                schema = dict(converters[converter].schema)
-            case CatchAll(name):
-                schema = dict(converters["path"].schema)
+            case Param(name, converter) | CatchAll(name, converter):
+                schema = dict(converter.schema)
         parameters.append({"name": name, "in": "path", "required": True, "schema": schema})
     return parameters
 
@@ -170,6 +173,7 @@ def _operation(endpoint: object, path_params: list[dict[str, object]], schema_fo
     if spec.summary:
         operation["summary"] = spec.summary
     parameters.extend(_query_parameter(param, schema_for) for param in spec.query)
+    parameters.extend(_header_parameter(param, schema_for) for param in spec.headers)
     if parameters:
         operation["parameters"] = parameters
     if spec.request_body is not None:
@@ -185,6 +189,15 @@ def _query_parameter(param: QueryParam, schema_for: SchemaFor) -> dict[str, obje
     return {
         "name": param.name,
         "in": "query",
+        "required": param.required,
+        "schema": dict(_resolve(param.schema, schema_for)),
+    }
+
+
+def _header_parameter(param: HeaderParam, schema_for: SchemaFor) -> dict[str, object]:
+    return {
+        "name": param.name,
+        "in": "header",
         "required": param.required,
         "schema": dict(_resolve(param.schema, schema_for)),
     }

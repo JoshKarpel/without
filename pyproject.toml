@@ -7,7 +7,7 @@ license = "MIT"
 authors = [
     { name = "Josh Karpel", email = "josh.karpel@gmail.com" },
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 dependencies = [
     "without",
     "without-env",

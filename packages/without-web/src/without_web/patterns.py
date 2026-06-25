@@ -2,6 +2,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from without_web.converters import Converter
+
+
+@dataclass(frozen=True, slots=True)
+class PathSpec:
+    """How a path-param extractor appears as a route segment.
+
+    The bridge that lets one `path_param(...)` value be both a pattern segment
+    (the router matches and schemas it through `converter`) and a typed read in
+    the handler. `name` binds the segment; `catch_all` marks the rest-consuming
+    form.
+    """
+
+    name: str
+    converter: Converter[object]
+    catch_all: bool = False
+
 
 @dataclass(frozen=True, slots=True)
 class Literal:
@@ -12,59 +29,31 @@ class Literal:
 
 @dataclass(frozen=True, slots=True)
 class Param:
-    """A single-segment typed parameter, `{name}` or `{name:converter}`."""
+    """A single-segment typed parameter, carrying the converter that parses it."""
 
     name: str
-    converter: str
+    converter: Converter[object]
 
 
 @dataclass(frozen=True, slots=True)
 class CatchAll:
-    """A `{name:path}` parameter that consumes the rest of the target; always last."""
+    """A parameter that consumes the rest of the target; always the last segment."""
 
     name: str
+    converter: Converter[object]
 
 
 type Segment = Literal | Param | CatchAll
 
 
 def split_path(path: str) -> tuple[str, ...]:
-    """Split a request target (or a pattern) into its segments.
+    """Split a request target into its segments.
 
     Leading and trailing slashes are stripped, so `/` is the empty tuple and a
     trailing slash never produces an empty segment: `/users` and `/users/` both
     split to `("users",)`. Matching is therefore trailing-slash insensitive,
-    because patterns and targets are split by this same function.
+    because targets and the literal parts of patterns are split by this same
+    function.
     """
     trimmed = path.strip("/")
     return tuple(trimmed.split("/")) if trimmed else ()
-
-
-def parse_pattern(pattern: str) -> tuple[Segment, ...]:
-    """Parse a route pattern into typed segments.
-
-    A whole segment wrapped in braces is a parameter: `{name}` defaults to the
-    `str` converter, `{name:converter}` names one, and `{name:path}` is the
-    catch-all, which MUST be the final segment. A brace anywhere else in a
-    segment is a malformed pattern and raises, because partial-segment
-    parameters are not supported.
-    """
-    segments = split_path(pattern)
-    parsed = tuple(_parse_segment(piece) for piece in segments)
-    for index, segment in enumerate(parsed):
-        if isinstance(segment, CatchAll) and index != len(parsed) - 1:
-            raise ValueError(f"a catch-all parameter must be the last segment in {pattern!r}")
-    return parsed
-
-
-def _parse_segment(piece: str) -> Segment:
-    if not (piece.startswith("{") and piece.endswith("}")):
-        if "{" in piece or "}" in piece:
-            raise ValueError(f"a parameter must be a whole path segment, got {piece!r}")
-        return Literal(piece)
-    name, _, converter = piece[1:-1].partition(":")
-    if not name.isidentifier():
-        raise ValueError(f"invalid parameter name {name!r} in segment {piece!r}")
-    if converter == "path":
-        return CatchAll(name)
-    return Param(name, converter or "str")
