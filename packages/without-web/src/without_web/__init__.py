@@ -30,14 +30,16 @@ from without_web.handlers import patch
 from without_web.handlers import post
 from without_web.handlers import put
 from without_web.handlers import ws
+from without_web.openapi import Body
 from without_web.openapi import Describable
 from without_web.openapi import HeaderParam
 from without_web.openapi import QueryParam
-from without_web.openapi import RequestBodySpec
 from without_web.openapi import ResponseSpec
 from without_web.openapi import RouteSpec
 from without_web.openapi import SchemaFor
 from without_web.openapi import SchemaRef
+from without_web.openapi import Sequence
+from without_web.openapi import Single
 from without_web.openapi import describe
 from without_web.openapi import openapi
 from without_web.patterns import CatchAll
@@ -68,6 +70,7 @@ __all__ = [
     "PATH",
     "STR",
     "UUID",
+    "Body",
     "CatchAll",
     "Converter",
     "Describable",
@@ -85,7 +88,6 @@ __all__ = [
     "QueryParam",
     "Reply",
     "Request",
-    "RequestBodySpec",
     "ResponseSpec",
     "Returned",
     "Route",
@@ -94,6 +96,8 @@ __all__ = [
     "SchemaFor",
     "SchemaRef",
     "Segment",
+    "Sequence",
+    "Single",
     "WebsocketEndpoint",
     "WebsocketExceptionHandler",
     "WebsocketRoute",

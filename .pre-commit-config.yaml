@@ -41,6 +41,11 @@ repos:
         language: pygrep
         entry: 'PLC0415'
         types: [python]
+      - id: generate-ladders
+        name: regenerate overload ladders (cog + ruff)
+        language: system
+        entry: packages/without-web/tools/regenerate.sh
+        files: ^packages/without-web/src/without_web/(handlers|extractors)\.py$
       - id: format-justfile
         name: format justfile
         language: system

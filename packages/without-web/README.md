@@ -191,6 +191,17 @@ already-built JSON Schema mapping, or a type plus a `schema_for: type -> schema`
 function the app supplies (pydantic's `model_json_schema`, or a dataclass
 walker).
 
+A request or response body is a `Body(media_type, shape)`. The shape is
+`Single(schema)` for one whole document or `Sequence(item_schema)` for a
+sequential media type (NDJSON, SSE `text/event-stream`, `application/json-seq`,
+...): `Single` renders OpenAPI's `schema`, `Sequence` renders 3.2's `itemSchema`
+(one item's shape), and the document is emitted as `3.2.0`. This is
+*documentation only*: `without-web` is agnostic to the framing on the wire, the
+media type is the app's string, and the handler emits the bytes. A
+streaming-input route has no `body` extractor to recover an inbound schema from,
+so it declares one directly: `@post.stream(..., request_body=Body(
+"application/x-ndjson", Sequence(...)))`.
+
 ## WebSocket routing
 
 `WebsocketRouter` reuses the same trie machinery with no method layer (so no

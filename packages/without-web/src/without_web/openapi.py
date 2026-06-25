@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field
 from typing import Protocol
+from typing import assert_never
 from typing import runtime_checkable
 
 from without_asgi import HttpHandler
@@ -42,16 +43,48 @@ class HeaderParam:
 
 
 @dataclass(frozen=True, slots=True)
-class RequestBodySpec:
-    media_type: str
+class Single:
+    """Body content that is one complete document validating against `schema`.
+
+    Renders as OpenAPI's `schema`: the whole request/response body is this value.
+    """
+
     schema: SchemaRef
 
 
 @dataclass(frozen=True, slots=True)
+class Sequence:
+    """Body content that is a sequence of items, each validating against `item_schema`.
+
+    Renders as OpenAPI 3.2's `itemSchema`, the description of a sequential media
+    type (NDJSON, JSON Lines, `application/json-seq`, SSE `text/event-stream`,
+    `multipart/mixed`, ...). `without-web` is agnostic to the framing on the wire:
+    the application names it via `Body.media_type` and emits the bytes itself.
+    This is documentation only; nothing on the runtime path reads it.
+    """
+
+    item_schema: SchemaRef
+
+
+type Shape = Single | Sequence
+
+
+@dataclass(frozen=True, slots=True)
+class Body:
+    """One `content` entry: a media type paired with the shape of its payload.
+
+    The same value describes a request or a response body. `Single` renders a
+    `schema`; `Sequence` renders an `itemSchema`.
+    """
+
+    media_type: str
+    shape: Shape
+
+
+@dataclass(frozen=True, slots=True)
 class ResponseSpec:
-    media_type: str | None = None
-    schema: SchemaRef | None = None
     description: str = ""
+    body: Body | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,7 +100,7 @@ class RouteSpec:
     summary: str = ""
     query: tuple[QueryParam, ...] = ()
     headers: tuple[HeaderParam, ...] = ()
-    request_body: RequestBodySpec | None = None
+    request_body: Body | None = None
     responses: Mapping[int, ResponseSpec] = field(default_factory=dict)
 
 
@@ -120,7 +153,7 @@ def openapi[T](
     version: str = "0.0.0",
     schema_for: SchemaFor = _no_schema_for,
 ) -> dict[str, object]:
-    """Merge a router into an OpenAPI 3.1 document, a pure transform of the table.
+    """Merge a router into an OpenAPI 3.2 document, a pure transform of the table.
 
     The router contributes the half it owns (path, methods, path-param schemas
     from its converters); each endpoint that answers `describe()` contributes
@@ -135,7 +168,7 @@ def openapi[T](
         path_params = _path_parameters(segments, schema_for)
         for method, endpoint in leaf.methods.items():
             item[method.lower()] = _operation(endpoint, path_params, schema_for)
-    return {"openapi": "3.1.0", "info": {"title": title, "version": version}, "paths": paths}
+    return {"openapi": "3.2.0", "info": {"title": title, "version": version}, "paths": paths}
 
 
 def _template(segments: tuple[Segment, ...]) -> str:
@@ -177,8 +210,7 @@ def _operation(endpoint: object, path_params: list[dict[str, object]], schema_fo
     if parameters:
         operation["parameters"] = parameters
     if spec.request_body is not None:
-        body = spec.request_body
-        operation["requestBody"] = {"content": {body.media_type: {"schema": _resolve(body.schema, schema_for)}}}
+        operation["requestBody"] = {"content": _content(spec.request_body, schema_for)}
     operation["responses"] = {
         str(status): _response(response, schema_for) for status, response in spec.responses.items()
     }
@@ -203,11 +235,22 @@ def _header_parameter(param: HeaderParam, schema_for: SchemaFor) -> dict[str, ob
     }
 
 
+def _content(body: Body, schema_for: SchemaFor) -> dict[str, object]:
+    return {body.media_type: _media_type_object(body.shape, schema_for)}
+
+
+def _media_type_object(shape: Shape, schema_for: SchemaFor) -> dict[str, object]:
+    match shape:
+        case Single(schema):
+            return {"schema": _resolve(schema, schema_for)}
+        case Sequence(item_schema):
+            return {"itemSchema": _resolve(item_schema, schema_for)}
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
 def _response(response: ResponseSpec, schema_for: SchemaFor) -> dict[str, object]:
     rendered: dict[str, object] = {"description": response.description}
-    if response.media_type is not None:
-        content: dict[str, object] = {}
-        if response.schema is not None:
-            content["schema"] = _resolve(response.schema, schema_for)
-        rendered["content"] = {response.media_type: content}
+    if response.body is not None:
+        rendered["content"] = _content(response.body, schema_for)
     return rendered

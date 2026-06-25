@@ -37,9 +37,12 @@ from without_asgi.routing import HttpMiddleware
 from without_asgi.routing import stack
 from without_asgi.routing import wrap
 from without_web import INT
+from without_web import Body
 from without_web import Match
 from without_web import Mount
+from without_web import ResponseSpec
 from without_web import Router
+from without_web import Sequence
 from without_web import WebsocketRouter
 from without_web import body
 from without_web import get
@@ -102,6 +105,27 @@ new_todo_body = body(NewTodo.model_validate_json, schema=NewTodo)
 # "id" or "int" in sync.
 todo_id = path_param("id", INT)
 
+# The import stream carries todo bodies in and a result record per line back out.
+# A malformed line is reported in its own record rather than failing the already
+# committed `200`, so a result is a oneOf of the success and error shapes: the
+# same multi-variant payload an SSE/event stream documents with `itemSchema` plus
+# `oneOf`. `without-web` only carries this description; the handler frames the
+# bytes (see `_ndjson`).
+import_result_schema: Mapping[str, object] = {
+    "oneOf": [
+        {
+            "type": "object",
+            "properties": {"ok": {"const": True}, "todo": {"type": "object"}},
+            "required": ["ok", "todo"],
+        },
+        {
+            "type": "object",
+            "properties": {"ok": {"const": False}, "errors": {"type": "integer"}},
+            "required": ["ok", "errors"],
+        },
+    ],
+}
+
 
 @get("/todos", done_query, summary="List todos")
 def list_todos(todos: TodoList, done: bool | None) -> Response:
@@ -114,7 +138,17 @@ def create_todo(todos: TodoList, new: NewTodo) -> Response:
     return json_response(201, _render(created))
 
 
-@post.stream("/todos/import", summary="Bulk-import todos from an NDJSON stream")
+@post.stream(
+    "/todos/import",
+    summary="Bulk-import todos from an NDJSON stream",
+    request_body=Body("application/x-ndjson", Sequence(NewTodo)),
+    responses={
+        200: ResponseSpec(
+            description="one NDJSON result record per imported line",
+            body=Body("application/x-ndjson", Sequence(import_result_schema)),
+        )
+    },
+)
 async def import_todos(todos: TodoList, inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
     """Fold a newline-delimited stream of todo bodies into the list *as it
     arrives*, echoing each created todo immediately rather than buffering the

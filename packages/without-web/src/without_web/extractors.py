@@ -14,10 +14,11 @@ from without_asgi import WebsocketScope
 
 from without_web.converters import PATH
 from without_web.converters import Converter
+from without_web.openapi import Body
 from without_web.openapi import HeaderParam
 from without_web.openapi import QueryParam
-from without_web.openapi import RequestBodySpec
 from without_web.openapi import SchemaRef
+from without_web.openapi import Single
 from without_web.patterns import PathSpec
 
 
@@ -64,7 +65,7 @@ class Extractor(Generic[_V_co]):
     extract: Callable[[Request], _V_co]
     query: tuple[QueryParam, ...] = ()
     headers: tuple[HeaderParam, ...] = ()
-    request_body: RequestBodySpec | None = None
+    request_body: Body | None = None
     path: PathSpec | None = None
 
 
@@ -148,7 +149,7 @@ def body[V](parse: Callable[[bytes], V], *, schema: SchemaRef, media_type: str =
     def extract(request: Request) -> V:
         return parse(request.body)
 
-    return Extractor(extract, request_body=RequestBodySpec(media_type=media_type, schema=schema))
+    return Extractor(extract, request_body=Body(media_type=media_type, shape=Single(schema)))
 
 
 def http_scope() -> Extractor[HttpScope]:
@@ -184,18 +185,45 @@ def websocket_scope() -> Extractor[WebsocketScope]:
     return Extractor(extract)
 
 
+# [[[cog import cog; from ladders import emit; cog.outl(emit("into")) ]]]
 @overload
-def into[M, A](make: Callable[[A], M], a: Extractor[A], /) -> Extractor[M]: ...
+def into[M, A](
+    make: Callable[[A], M],
+    a: Extractor[A],
+    /,
+) -> Extractor[M]: ...
+
+
 @overload
-def into[M, A, B](make: Callable[[A, B], M], a: Extractor[A], b: Extractor[B], /) -> Extractor[M]: ...
+def into[M, A, B](
+    make: Callable[[A, B], M],
+    a: Extractor[A],
+    b: Extractor[B],
+    /,
+) -> Extractor[M]: ...
+
+
 @overload
 def into[M, A, B, C](
-    make: Callable[[A, B, C], M], a: Extractor[A], b: Extractor[B], c: Extractor[C], /
+    make: Callable[[A, B, C], M],
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    /,
 ) -> Extractor[M]: ...
+
+
 @overload
 def into[M, A, B, C, D](
-    make: Callable[[A, B, C, D], M], a: Extractor[A], b: Extractor[B], c: Extractor[C], d: Extractor[D], /
+    make: Callable[[A, B, C, D], M],
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    /,
 ) -> Extractor[M]: ...
+
+
 @overload
 def into[M, A, B, C, D, E](
     make: Callable[[A, B, C, D, E], M],
@@ -206,6 +234,8 @@ def into[M, A, B, C, D, E](
     e: Extractor[E],
     /,
 ) -> Extractor[M]: ...
+
+
 @overload
 def into[M, A, B, C, D, E, F](
     make: Callable[[A, B, C, D, E, F], M],
@@ -217,6 +247,8 @@ def into[M, A, B, C, D, E, F](
     f: Extractor[F],
     /,
 ) -> Extractor[M]: ...
+
+
 @overload
 def into[M, A, B, C, D, E, F, G](
     make: Callable[[A, B, C, D, E, F, G], M],
@@ -229,6 +261,8 @@ def into[M, A, B, C, D, E, F, G](
     g: Extractor[G],
     /,
 ) -> Extractor[M]: ...
+
+
 @overload
 def into[M, A, B, C, D, E, F, G, H](
     make: Callable[[A, B, C, D, E, F, G, H], M],
@@ -242,6 +276,8 @@ def into[M, A, B, C, D, E, F, G, H](
     h: Extractor[H],
     /,
 ) -> Extractor[M]: ...
+
+
 @overload
 def into[M, A, B, C, D, E, F, G, H, J](
     make: Callable[[A, B, C, D, E, F, G, H, J], M],
@@ -256,6 +292,8 @@ def into[M, A, B, C, D, E, F, G, H, J](
     j: Extractor[J],
     /,
 ) -> Extractor[M]: ...
+
+
 @overload
 def into[M, A, B, C, D, E, F, G, H, J, K](
     make: Callable[[A, B, C, D, E, F, G, H, J, K], M],
@@ -271,8 +309,7 @@ def into[M, A, B, C, D, E, F, G, H, J, K](
     k: Extractor[K],
     /,
 ) -> Extractor[M]: ...
-
-
+# [[[end]]]
 def into[M](make: Callable[..., M], *extractors: Extractor[object]) -> Extractor[M]:
     """Combine several extractors into one that builds a typed value.
 
@@ -306,7 +343,7 @@ def into[M](make: Callable[..., M], *extractors: Extractor[object]) -> Extractor
     )
 
 
-def single_body(extractors: tuple[Extractor[object], ...]) -> RequestBodySpec | None:
+def single_body(extractors: tuple[Extractor[object], ...]) -> Body | None:
     """The at-most-one request body among a group of extractors (a build fault if more)."""
     bodies = [extractor.request_body for extractor in extractors if extractor.request_body is not None]
     if len(bodies) > 1:

@@ -1,11 +1,12 @@
-# Checkpoint 15 (IN PROGRESS)
+# Checkpoint 15
 
-A snapshot of work **still underway**, succeeding `CHECKPOINT_14.md`. Unlike the
-previous checkpoints, this one is written mid-stream: the design has settled and
-the code is green (mypy clean, ruff clean, tests passing) at each step described
-below, but the feature set is not finished. See "Open questions and next steps"
-for what remains. For the prior state see `CHECKPOINT_14.md`; for the original
-pitch see `BIG_IDEA.md`.
+A snapshot of where `without` stands, succeeding `CHECKPOINT_14.md` and
+succeeded by `CHECKPOINT_16.md`. It was written mid-stream (hence the
+step-by-step "Open questions and next steps" below), but the work it describes
+landed green: typed request extraction, the input/output 2×2, streaming-input
+routes, and extractor-recovered OpenAPI are all in and tested (mypy clean, ruff
+clean, tests passing). For the prior state see `CHECKPOINT_14.md`; for the
+original pitch see `BIG_IDEA.md`.
 
 ## Headline: typed request extraction for `without-web`
 
@@ -166,10 +167,9 @@ and folds routing, typing, and OpenAPI onto it.
   `Extractor[object]`. `Converter` equality/hash is by `name` alone (it is a trie
   key), so `parse`/`schema` are `compare=False`.
 
-## Status (NOT done)
+## Status
 
-Green and verified at the current step (mypy clean, ruff check + format clean,
-tests passing):
+Green and verified (mypy clean, ruff check + format clean, tests passing):
 
 - `without_web`: `extractors`, `handlers` (incl. the method decorators and the
   streaming-input `handle_stream`/`@post.stream` siblings), string/t-string

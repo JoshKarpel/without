@@ -21,6 +21,7 @@ from without_asgi import read_body
 from without_web.extractors import Extractor
 from without_web.extractors import Request
 from without_web.extractors import single_body
+from without_web.openapi import Body
 from without_web.openapi import ResponseSpec
 from without_web.openapi import RouteSpec
 from without_web.openapi import describe
@@ -44,6 +45,7 @@ type Reply = Response | Stream[Outbound]
 type Returned = Reply | Awaitable[Reply]
 
 
+# [[[cog import cog; from ladders import emit; cog.outl(emit("handle")) ]]]
 @overload
 def handle[T](
     *,
@@ -51,6 +53,8 @@ def handle[T](
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
 ) -> HttpEndpoint[T]: ...
+
+
 @overload
 def handle[T, A](
     a: Extractor[A],
@@ -60,6 +64,8 @@ def handle[T, A](
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
 ) -> HttpEndpoint[T]: ...
+
+
 @overload
 def handle[T, A, B](
     a: Extractor[A],
@@ -70,6 +76,8 @@ def handle[T, A, B](
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
 ) -> HttpEndpoint[T]: ...
+
+
 @overload
 def handle[T, A, B, C](
     a: Extractor[A],
@@ -81,6 +89,8 @@ def handle[T, A, B, C](
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
 ) -> HttpEndpoint[T]: ...
+
+
 @overload
 def handle[T, A, B, C, D](
     a: Extractor[A],
@@ -93,6 +103,8 @@ def handle[T, A, B, C, D](
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
 ) -> HttpEndpoint[T]: ...
+
+
 @overload
 def handle[T, A, B, C, D, E](
     a: Extractor[A],
@@ -106,6 +118,8 @@ def handle[T, A, B, C, D, E](
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
 ) -> HttpEndpoint[T]: ...
+
+
 @overload
 def handle[T, A, B, C, D, E, F](
     a: Extractor[A],
@@ -120,6 +134,8 @@ def handle[T, A, B, C, D, E, F](
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
 ) -> HttpEndpoint[T]: ...
+
+
 @overload
 def handle[T, A, B, C, D, E, F, G](
     a: Extractor[A],
@@ -135,6 +151,8 @@ def handle[T, A, B, C, D, E, F, G](
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
 ) -> HttpEndpoint[T]: ...
+
+
 @overload
 def handle[T, A, B, C, D, E, F, G, H](
     a: Extractor[A],
@@ -151,6 +169,8 @@ def handle[T, A, B, C, D, E, F, G, H](
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
 ) -> HttpEndpoint[T]: ...
+
+
 @overload
 def handle[T, A, B, C, D, E, F, G, H, J](
     a: Extractor[A],
@@ -168,6 +188,8 @@ def handle[T, A, B, C, D, E, F, G, H, J](
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
 ) -> HttpEndpoint[T]: ...
+
+
 @overload
 def handle[T, A, B, C, D, E, F, G, H, J, K](
     a: Extractor[A],
@@ -186,8 +208,7 @@ def handle[T, A, B, C, D, E, F, G, H, J, K](
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
 ) -> HttpEndpoint[T]: ...
-
-
+# [[[end]]]
 def handle[T](
     *extractors: Extractor[object],
     fn: Callable[..., Returned],
@@ -214,13 +235,17 @@ def handle[T](
     return _build_endpoint(extractors, fn, summary, responses)
 
 
+# [[[cog import cog; from ladders import emit; cog.outl(emit("handle_stream")) ]]]
 @overload
 def handle_stream[T](
     *,
     fn: Callable[[T, Stream[Inbound]], Returned],
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
+    request_body: Body | None = ...,
 ) -> HttpEndpoint[T]: ...
+
+
 @overload
 def handle_stream[T, A](
     a: Extractor[A],
@@ -229,7 +254,10 @@ def handle_stream[T, A](
     fn: Callable[[T, A, Stream[Inbound]], Returned],
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
+    request_body: Body | None = ...,
 ) -> HttpEndpoint[T]: ...
+
+
 @overload
 def handle_stream[T, A, B](
     a: Extractor[A],
@@ -239,7 +267,10 @@ def handle_stream[T, A, B](
     fn: Callable[[T, A, B, Stream[Inbound]], Returned],
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
+    request_body: Body | None = ...,
 ) -> HttpEndpoint[T]: ...
+
+
 @overload
 def handle_stream[T, A, B, C](
     a: Extractor[A],
@@ -250,7 +281,10 @@ def handle_stream[T, A, B, C](
     fn: Callable[[T, A, B, C, Stream[Inbound]], Returned],
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
+    request_body: Body | None = ...,
 ) -> HttpEndpoint[T]: ...
+
+
 @overload
 def handle_stream[T, A, B, C, D](
     a: Extractor[A],
@@ -262,7 +296,10 @@ def handle_stream[T, A, B, C, D](
     fn: Callable[[T, A, B, C, D, Stream[Inbound]], Returned],
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
+    request_body: Body | None = ...,
 ) -> HttpEndpoint[T]: ...
+
+
 @overload
 def handle_stream[T, A, B, C, D, E](
     a: Extractor[A],
@@ -275,7 +312,10 @@ def handle_stream[T, A, B, C, D, E](
     fn: Callable[[T, A, B, C, D, E, Stream[Inbound]], Returned],
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
+    request_body: Body | None = ...,
 ) -> HttpEndpoint[T]: ...
+
+
 @overload
 def handle_stream[T, A, B, C, D, E, F](
     a: Extractor[A],
@@ -289,7 +329,10 @@ def handle_stream[T, A, B, C, D, E, F](
     fn: Callable[[T, A, B, C, D, E, F, Stream[Inbound]], Returned],
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
+    request_body: Body | None = ...,
 ) -> HttpEndpoint[T]: ...
+
+
 @overload
 def handle_stream[T, A, B, C, D, E, F, G](
     a: Extractor[A],
@@ -304,7 +347,10 @@ def handle_stream[T, A, B, C, D, E, F, G](
     fn: Callable[[T, A, B, C, D, E, F, G, Stream[Inbound]], Returned],
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
+    request_body: Body | None = ...,
 ) -> HttpEndpoint[T]: ...
+
+
 @overload
 def handle_stream[T, A, B, C, D, E, F, G, H](
     a: Extractor[A],
@@ -320,7 +366,10 @@ def handle_stream[T, A, B, C, D, E, F, G, H](
     fn: Callable[[T, A, B, C, D, E, F, G, H, Stream[Inbound]], Returned],
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
+    request_body: Body | None = ...,
 ) -> HttpEndpoint[T]: ...
+
+
 @overload
 def handle_stream[T, A, B, C, D, E, F, G, H, J](
     a: Extractor[A],
@@ -337,7 +386,10 @@ def handle_stream[T, A, B, C, D, E, F, G, H, J](
     fn: Callable[[T, A, B, C, D, E, F, G, H, J, Stream[Inbound]], Returned],
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
+    request_body: Body | None = ...,
 ) -> HttpEndpoint[T]: ...
+
+
 @overload
 def handle_stream[T, A, B, C, D, E, F, G, H, J, K](
     a: Extractor[A],
@@ -355,14 +407,15 @@ def handle_stream[T, A, B, C, D, E, F, G, H, J, K](
     fn: Callable[[T, A, B, C, D, E, F, G, H, J, K, Stream[Inbound]], Returned],
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
+    request_body: Body | None = ...,
 ) -> HttpEndpoint[T]: ...
-
-
+# [[[end]]]
 def handle_stream[T](
     *extractors: Extractor[object],
     fn: Callable[..., Returned],
     summary: str = "",
     responses: Mapping[int, ResponseSpec] | None = None,
+    request_body: Body | None = None,
 ) -> HttpEndpoint[T]:
     """Build an endpoint whose handler reads the inbound stream live.
 
@@ -381,7 +434,7 @@ def handle_stream[T](
     Reach for the `@get.stream`/`@post.stream`/... method decorators to co-locate
     the streaming route with its handler.
     """
-    return _build_stream_endpoint(extractors, fn, summary, responses)
+    return _build_stream_endpoint(extractors, fn, summary, responses, request_body)
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,6 +456,7 @@ class _Method:
         """The streaming-input form: `@post.stream(...)` reads the inbound stream live."""
         return _StreamMethod(self.method)
 
+    # [[[cog import cog; from ladders import emit; cog.outl(emit("method")) ]]]
     @overload
     def __call__[T](
         self,
@@ -412,6 +466,7 @@ class _Method:
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
     ) -> Callable[[Callable[[T], Returned]], Route[T]]: ...
+
     @overload
     def __call__[T, A](
         self,
@@ -422,6 +477,7 @@ class _Method:
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
     ) -> Callable[[Callable[[T, A], Returned]], Route[T]]: ...
+
     @overload
     def __call__[T, A, B](
         self,
@@ -433,6 +489,7 @@ class _Method:
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
     ) -> Callable[[Callable[[T, A, B], Returned]], Route[T]]: ...
+
     @overload
     def __call__[T, A, B, C](
         self,
@@ -445,6 +502,7 @@ class _Method:
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
     ) -> Callable[[Callable[[T, A, B, C], Returned]], Route[T]]: ...
+
     @overload
     def __call__[T, A, B, C, D](
         self,
@@ -458,6 +516,7 @@ class _Method:
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
     ) -> Callable[[Callable[[T, A, B, C, D], Returned]], Route[T]]: ...
+
     @overload
     def __call__[T, A, B, C, D, E](
         self,
@@ -472,6 +531,7 @@ class _Method:
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
     ) -> Callable[[Callable[[T, A, B, C, D, E], Returned]], Route[T]]: ...
+
     @overload
     def __call__[T, A, B, C, D, E, F](
         self,
@@ -487,6 +547,7 @@ class _Method:
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
     ) -> Callable[[Callable[[T, A, B, C, D, E, F], Returned]], Route[T]]: ...
+
     @overload
     def __call__[T, A, B, C, D, E, F, G](
         self,
@@ -503,6 +564,7 @@ class _Method:
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
     ) -> Callable[[Callable[[T, A, B, C, D, E, F, G], Returned]], Route[T]]: ...
+
     @overload
     def __call__[T, A, B, C, D, E, F, G, H](
         self,
@@ -520,6 +582,7 @@ class _Method:
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
     ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H], Returned]], Route[T]]: ...
+
     @overload
     def __call__[T, A, B, C, D, E, F, G, H, J](
         self,
@@ -538,6 +601,7 @@ class _Method:
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
     ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J], Returned]], Route[T]]: ...
+
     @overload
     def __call__[T, A, B, C, D, E, F, G, H, J, K](
         self,
@@ -557,7 +621,7 @@ class _Method:
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
     ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J, K], Returned]], Route[T]]: ...
-
+    # [[[end]]]
     def __call__(
         self,
         pattern: Pattern,
@@ -597,6 +661,7 @@ class _StreamMethod:
 
     method: str
 
+    # [[[cog import cog; from ladders import emit; cog.outl(emit("stream_method")) ]]]
     @overload
     def __call__[T](
         self,
@@ -605,7 +670,9 @@ class _StreamMethod:
         *,
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
+        request_body: Body | None = ...,
     ) -> Callable[[Callable[[T, Stream[Inbound]], Returned]], Route[T]]: ...
+
     @overload
     def __call__[T, A](
         self,
@@ -615,7 +682,9 @@ class _StreamMethod:
         *,
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
+        request_body: Body | None = ...,
     ) -> Callable[[Callable[[T, A, Stream[Inbound]], Returned]], Route[T]]: ...
+
     @overload
     def __call__[T, A, B](
         self,
@@ -626,7 +695,9 @@ class _StreamMethod:
         *,
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
+        request_body: Body | None = ...,
     ) -> Callable[[Callable[[T, A, B, Stream[Inbound]], Returned]], Route[T]]: ...
+
     @overload
     def __call__[T, A, B, C](
         self,
@@ -638,7 +709,9 @@ class _StreamMethod:
         *,
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
+        request_body: Body | None = ...,
     ) -> Callable[[Callable[[T, A, B, C, Stream[Inbound]], Returned]], Route[T]]: ...
+
     @overload
     def __call__[T, A, B, C, D](
         self,
@@ -651,7 +724,9 @@ class _StreamMethod:
         *,
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
+        request_body: Body | None = ...,
     ) -> Callable[[Callable[[T, A, B, C, D, Stream[Inbound]], Returned]], Route[T]]: ...
+
     @overload
     def __call__[T, A, B, C, D, E](
         self,
@@ -665,7 +740,9 @@ class _StreamMethod:
         *,
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
+        request_body: Body | None = ...,
     ) -> Callable[[Callable[[T, A, B, C, D, E, Stream[Inbound]], Returned]], Route[T]]: ...
+
     @overload
     def __call__[T, A, B, C, D, E, F](
         self,
@@ -680,7 +757,9 @@ class _StreamMethod:
         *,
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
+        request_body: Body | None = ...,
     ) -> Callable[[Callable[[T, A, B, C, D, E, F, Stream[Inbound]], Returned]], Route[T]]: ...
+
     @overload
     def __call__[T, A, B, C, D, E, F, G](
         self,
@@ -696,7 +775,9 @@ class _StreamMethod:
         *,
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
+        request_body: Body | None = ...,
     ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, Stream[Inbound]], Returned]], Route[T]]: ...
+
     @overload
     def __call__[T, A, B, C, D, E, F, G, H](
         self,
@@ -713,7 +794,9 @@ class _StreamMethod:
         *,
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
+        request_body: Body | None = ...,
     ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, Stream[Inbound]], Returned]], Route[T]]: ...
+
     @overload
     def __call__[T, A, B, C, D, E, F, G, H, J](
         self,
@@ -731,7 +814,9 @@ class _StreamMethod:
         *,
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
+        request_body: Body | None = ...,
     ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J, Stream[Inbound]], Returned]], Route[T]]: ...
+
     @overload
     def __call__[T, A, B, C, D, E, F, G, H, J, K](
         self,
@@ -750,33 +835,40 @@ class _StreamMethod:
         *,
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
+        request_body: Body | None = ...,
     ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J, K, Stream[Inbound]], Returned]], Route[T]]: ...
-
+    # [[[end]]]
     def __call__(
         self,
         pattern: Pattern,
         *extractors: Extractor[object],
         summary: str = "",
         responses: Mapping[int, ResponseSpec] | None = None,
+        request_body: Body | None = None,
     ) -> Callable[[Callable[..., Returned]], Route[object]]:
         def decorate(fn: Callable[..., Returned]) -> Route[object]:
-            endpoint = _build_stream_endpoint(extractors, fn, summary, responses)
+            endpoint = _build_stream_endpoint(extractors, fn, summary, responses, request_body)
             return Route(pattern=pattern, methods={self.method: endpoint})
 
         return decorate
 
 
+# [[[cog import cog; from ladders import emit; cog.outl(emit("ws")) ]]]
 @overload
 def ws[T](
     pattern: Pattern,
     /,
 ) -> Callable[[Callable[[T], WebsocketHandler]], WebsocketRoute[T]]: ...
+
+
 @overload
 def ws[T, A](
     pattern: Pattern,
     a: Extractor[A],
     /,
 ) -> Callable[[Callable[[T, A], WebsocketHandler]], WebsocketRoute[T]]: ...
+
+
 @overload
 def ws[T, A, B](
     pattern: Pattern,
@@ -784,6 +876,8 @@ def ws[T, A, B](
     b: Extractor[B],
     /,
 ) -> Callable[[Callable[[T, A, B], WebsocketHandler]], WebsocketRoute[T]]: ...
+
+
 @overload
 def ws[T, A, B, C](
     pattern: Pattern,
@@ -792,6 +886,8 @@ def ws[T, A, B, C](
     c: Extractor[C],
     /,
 ) -> Callable[[Callable[[T, A, B, C], WebsocketHandler]], WebsocketRoute[T]]: ...
+
+
 @overload
 def ws[T, A, B, C, D](
     pattern: Pattern,
@@ -801,6 +897,8 @@ def ws[T, A, B, C, D](
     d: Extractor[D],
     /,
 ) -> Callable[[Callable[[T, A, B, C, D], WebsocketHandler]], WebsocketRoute[T]]: ...
+
+
 @overload
 def ws[T, A, B, C, D, E](
     pattern: Pattern,
@@ -811,6 +909,8 @@ def ws[T, A, B, C, D, E](
     e: Extractor[E],
     /,
 ) -> Callable[[Callable[[T, A, B, C, D, E], WebsocketHandler]], WebsocketRoute[T]]: ...
+
+
 @overload
 def ws[T, A, B, C, D, E, F](
     pattern: Pattern,
@@ -822,6 +922,8 @@ def ws[T, A, B, C, D, E, F](
     f: Extractor[F],
     /,
 ) -> Callable[[Callable[[T, A, B, C, D, E, F], WebsocketHandler]], WebsocketRoute[T]]: ...
+
+
 @overload
 def ws[T, A, B, C, D, E, F, G](
     pattern: Pattern,
@@ -834,6 +936,8 @@ def ws[T, A, B, C, D, E, F, G](
     g: Extractor[G],
     /,
 ) -> Callable[[Callable[[T, A, B, C, D, E, F, G], WebsocketHandler]], WebsocketRoute[T]]: ...
+
+
 @overload
 def ws[T, A, B, C, D, E, F, G, H](
     pattern: Pattern,
@@ -847,6 +951,8 @@ def ws[T, A, B, C, D, E, F, G, H](
     h: Extractor[H],
     /,
 ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H], WebsocketHandler]], WebsocketRoute[T]]: ...
+
+
 @overload
 def ws[T, A, B, C, D, E, F, G, H, J](
     pattern: Pattern,
@@ -861,6 +967,8 @@ def ws[T, A, B, C, D, E, F, G, H, J](
     j: Extractor[J],
     /,
 ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J], WebsocketHandler]], WebsocketRoute[T]]: ...
+
+
 @overload
 def ws[T, A, B, C, D, E, F, G, H, J, K](
     pattern: Pattern,
@@ -876,8 +984,7 @@ def ws[T, A, B, C, D, E, F, G, H, J, K](
     k: Extractor[K],
     /,
 ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J, K], WebsocketHandler]], WebsocketRoute[T]]: ...
-
-
+# [[[end]]]
 def ws[T](
     pattern: Pattern, *extractors: Extractor[object]
 ) -> Callable[[Callable[..., WebsocketHandler]], WebsocketRoute[T]]:
@@ -929,6 +1036,7 @@ def _build_stream_endpoint(
     fn: Callable[..., Returned],
     summary: str,
     responses: Mapping[int, ResponseSpec] | None,
+    request_body: Body | None,
 ) -> HttpEndpoint[object]:
     if any(extractor.request_body is not None for extractor in extractors):
         raise ValueError("a streaming route cannot take a body extractor; it would buffer the input it streams")
@@ -936,7 +1044,7 @@ def _build_stream_endpoint(
         summary=summary,
         query=tuple(param for extractor in extractors for param in extractor.query),
         headers=tuple(param for extractor in extractors for param in extractor.headers),
-        request_body=None,
+        request_body=request_body,
         responses=dict(responses or {}),
     )
 

@@ -230,11 +230,16 @@ async def test_openapi_merges_router_and_handler_halves() -> None:
     # Opaque mounts are black boxes: neither the prefix nor its catch-all appear.
     assert set(paths) == {"/todos", "/todos/import", "/todos/{id}", "/admin/stats"}
 
-    # The streaming-input route describes itself like any other, but carries no
-    # request body: a `body` extractor is rejected, so there is nothing to report.
-    import_op = _dig(spec, "paths", "/todos/import", "post")
-    assert isinstance(import_op, dict)
-    assert "requestBody" not in import_op
+    # The streaming-input route describes its inbound and outbound sequences with
+    # `itemSchema` (one item's shape), not `schema` (the whole body): the body is a
+    # stream of NDJSON records, not a single document. The media type is the app's.
+    import_in = _dig(spec, "paths", "/todos/import", "post", "requestBody", "content", "application/x-ndjson")
+    assert isinstance(import_in, dict)
+    assert "schema" not in import_in and "itemSchema" in import_in
+    import_out = _dig(spec, "paths", "/todos/import", "post", "responses", "200", "content", "application/x-ndjson")
+    assert isinstance(import_out, dict)
+    item_schema = import_out["itemSchema"]
+    assert isinstance(item_schema, dict) and "oneOf" in item_schema
 
     show_params = _dig(spec, "paths", "/todos/{id}", "get", "parameters")
     assert isinstance(show_params, list)

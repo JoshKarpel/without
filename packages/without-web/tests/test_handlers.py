@@ -22,6 +22,7 @@ from without_asgi import WebsocketScope
 from without_web import INT
 from without_web import Describable
 from without_web import Match
+from without_web import Single
 from without_web import body
 from without_web import handle
 from without_web import handle_stream
@@ -111,7 +112,7 @@ def test_handle_recovers_its_openapi_from_the_extractors() -> None:
     spec = endpoint.describe()
     assert spec.summary == "make a thing"
     assert [param.name for param in spec.query] == ["done"]
-    assert spec.request_body is not None and spec.request_body.schema == {"type": "object"}
+    assert spec.request_body is not None and spec.request_body.shape == Single(schema={"type": "object"})
 
 
 def test_handle_rejects_more_than_one_body_extractor() -> None:

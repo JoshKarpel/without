@@ -9,10 +9,11 @@ from without_asgi import HttpScope
 from without_asgi import RawHeaders
 from without_asgi import WebsocketScope
 from without_web import INT
+from without_web import Body
 from without_web import HeaderParam
 from without_web import QueryParam
 from without_web import Request
-from without_web import RequestBodySpec
+from without_web import Single
 from without_web import body
 from without_web import header_param
 from without_web import http_scope
@@ -110,7 +111,7 @@ def test_header_param_contributes_its_openapi_fragment() -> None:
 
 def test_body_contributes_its_request_body_fragment() -> None:
     extractor = body(json.loads, schema={"type": "object"}, media_type="application/json")
-    assert extractor.request_body == RequestBodySpec(media_type="application/json", schema={"type": "object"})
+    assert extractor.request_body == Body(media_type="application/json", shape=Single(schema={"type": "object"}))
 
 
 def test_path_param_contributes_no_openapi_because_the_router_owns_it() -> None:
