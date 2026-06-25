@@ -108,10 +108,11 @@ serve both HTTP and websocket handlers (`Request.scope` is
 an overload ladder, so a `path_param("id", INT)` paired with an `fn` that expects
 a `str` is a mypy error, with no runtime introspection. It buffers the request
 *input* (so a `body` extractor can read it) but does not force buffered *output*:
-`fn` may `return` a `Response` (buffered), be an `async def` that returns one
-(buffered, after async work), or be an `async def ... yield` that streams
-`Outbound` events. A single `_emit` dispatch relays whichever, so the output mode
-is just what the handler hands back.
+`fn` is always `async` (a handler must be able to `await` I/O), and may be an
+`async def` that returns a `Response` (buffered, after async work) or an
+`async def ... yield` that streams `Outbound` events. A single `_emit` dispatch
+relays whichever, so the output mode is just what the handler hands back. A plain
+`def ... return Response` is a type error: there would be no place to `await`.
 
 `handle_stream(*extractors, fn=...)` is the streaming-*input* sibling: it leaves
 the inbound stream untouched and hands it to `fn` as a trailing `Stream[Inbound]`
@@ -211,12 +212,14 @@ so it declares one directly: `@post.stream(..., request_body=Body(
 `@ws(pattern, *extractors)` is the websocket sibling of `@get`/`@post`: it ties
 typed `path_param`/`query_param`/`header_param` tokens to the handler's arguments
 and returns a `WebsocketRoute`. There is no body to buffer (a handshake carries
-none, so a `body` extractor is rejected), and the handler returns a
-`WebsocketHandler` (the frame processor) rather than a `Response`. Because the
-processor *is* the handler's return, a websocket connection folds naturally: see
-`integration.todos`' `/todos/session`, which threads a working `TodoList` across
-its inbound frames (a *scan* over the connection), the bidirectional, long-lived
-sibling of the `POST /todos/import` fold.
+none, so a `body` extractor is rejected). The handler *is* the frame processor,
+exactly as `@post.stream`'s is: it takes the live inbound frames as a trailing
+`Stream[WebsocketInbound]` argument and yields `WebsocketOutbound` directly,
+rather than returning a processor. Because the handler is the processor, a
+websocket connection folds naturally: see `integration.todos`' `/todos/session`,
+which threads a working `TodoList` across its inbound frames (a *scan* over the
+connection), the bidirectional, long-lived sibling of the `POST /todos/import`
+fold.
 
 The `integration` package's `todos` example is built entirely on this package;
 see it for a worked HTTP + WebSocket service.

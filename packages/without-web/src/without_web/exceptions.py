@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Mapping
 
@@ -20,8 +21,8 @@ from without_asgi import encode_response
 from without_asgi.routing import HttpMiddleware
 from without_asgi.routing import WebsocketMiddleware
 
-type ExceptionHandler = Callable[[Exception], Response]
-type WebsocketExceptionHandler = Callable[[Exception], WebsocketClose]
+type ExceptionHandler = Callable[[Exception], Awaitable[Response]]
+type WebsocketExceptionHandler = Callable[[Exception], Awaitable[WebsocketClose]]
 
 
 def catching(handlers: Mapping[type[Exception], ExceptionHandler]) -> HttpMiddleware:
@@ -40,9 +41,9 @@ def catching(handlers: Mapping[type[Exception], ExceptionHandler]) -> HttpMiddle
     """
 
     def middleware(handler: HttpHandler, scope: HttpScope) -> HttpHandler:
-        def recover(exc: Exception) -> tuple[Outbound, ...] | None:
+        async def recover(exc: Exception) -> tuple[Outbound, ...] | None:
             mapped = _lookup(handlers, type(exc))
-            return None if mapped is None else encode_response(mapped(exc))
+            return None if mapped is None else encode_response(await mapped(exc))
 
         return _guarding(handler, _is_response_start, recover)
 
@@ -59,9 +60,9 @@ def catching_websocket(handlers: Mapping[type[Exception], WebsocketExceptionHand
     """
 
     def middleware(handler: WebsocketHandler, scope: WebsocketScope) -> WebsocketHandler:
-        def recover(exc: Exception) -> tuple[WebsocketOutbound, ...] | None:
+        async def recover(exc: Exception) -> tuple[WebsocketOutbound, ...] | None:
             mapped = _lookup(handlers, type(exc))
-            return None if mapped is None else (mapped(exc),)
+            return None if mapped is None else (await mapped(exc),)
 
         return _guarding(handler, _is_websocket_accept, recover)
 
@@ -71,7 +72,7 @@ def catching_websocket(handlers: Mapping[type[Exception], WebsocketExceptionHand
 def _guarding[In, Out](
     handler: Processor[In, Out],
     commits: Callable[[Out], bool],
-    recover: Callable[[Exception], tuple[Out, ...] | None],
+    recover: Callable[[Exception], Awaitable[tuple[Out, ...] | None]],
 ) -> Processor[In, Out]:
     # The shared core: relay the handler's outbound stream, remembering whether
     # the protocol's commit event has gone out. An exception before the commit is
@@ -83,7 +84,7 @@ def _guarding[In, Out](
                 committed = committed or commits(event)
                 yield event
         except Exception as exc:
-            replacement = None if committed else recover(exc)
+            replacement = None if committed else await recover(exc)
             if replacement is None:
                 raise
             for event in replacement:

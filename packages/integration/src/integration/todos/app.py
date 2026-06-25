@@ -128,12 +128,12 @@ import_result_schema: Mapping[str, object] = {
 
 
 @get("/todos", done_query, summary="List todos")
-def list_todos(todos: TodoList, done: bool | None) -> Response:
+async def list_todos(todos: TodoList, done: bool | None) -> Response:
     return json_response(200, {"todos": [_render(todo) for todo in todos.matching(done)]})
 
 
 @post("/todos", new_todo_body, summary="Create a todo")
-def create_todo(todos: TodoList, new: NewTodo) -> Response:
+async def create_todo(todos: TodoList, new: NewTodo) -> Response:
     _list, created = todos.added(new)
     return json_response(201, _render(created))
 
@@ -196,16 +196,16 @@ def _ndjson(record: Mapping[str, object]) -> ResponseBody:
 
 
 @get(t"/todos/{todo_id}", todo_id, summary="Get one todo")
-def show_todo(todos: TodoList, requested_id: int) -> Response:
+async def show_todo(todos: TodoList, requested_id: int) -> Response:
     return json_response(200, _render(todos.get(requested_id)))
 
 
 @get("/stats", summary="Todo counts")
-def stats(todos: TodoList) -> Response:
+async def stats(todos: TodoList) -> Response:
     return json_response(200, {"total": len(todos.matching(None)), "done": len(todos.matching(True))})
 
 
-def not_found(todos: TodoList, scope: HttpScope) -> Response:
+async def not_found(todos: TodoList, scope: HttpScope) -> Response:
     return json_response(404, {"error": f"no route for {scope.method} {scope.path}"})
 
 
@@ -225,12 +225,12 @@ def legacy(todos: TodoList, head: HttpScope) -> HttpHandler:
     return handler
 
 
-def _on_missing_todo(exc: Exception) -> Response:
+async def _on_missing_todo(exc: Exception) -> Response:
     assert isinstance(exc, TodoNotFound)
     return json_response(404, {"error": str(exc), "id": exc.todo_id})
 
 
-def _on_invalid_body(exc: Exception) -> Response:
+async def _on_invalid_body(exc: Exception) -> Response:
     assert isinstance(exc, ValidationError)
     return json_response(422, {"error": "invalid todo body", "fields": exc.error_count()})
 
@@ -266,11 +266,14 @@ todos_router: Router[TodoList] = Router(
 
 
 @ws("/todos/session")
-def session(todos: TodoList) -> WebsocketHandler:
+async def session(todos: TodoList, inputs: Stream[WebsocketInbound]) -> AsyncIterator[WebsocketOutbound]:
     """Fold a live stream of todo submissions into the list across the connection.
 
     The websocket sibling of `POST /todos/import`, but bidirectional and
-    long-lived. The connection holds a working `TodoList`, seeded from the shared
+    long-lived. The handler *is* the frame processor (the same shape as
+    `import_todos`): it takes the live inbound frames as a trailing
+    `Stream[WebsocketInbound]` and yields outbound frames directly, no inner
+    function. The connection holds a working `TodoList`, seeded from the shared
     state, and each inbound text frame is a `NewTodo` JSON folded into it, with the
     created todo and the running total sent straight back. The accumulator is a
     plain value threaded across `async for` iterations, never shared mutable state,
@@ -281,27 +284,24 @@ def session(todos: TodoList) -> WebsocketHandler:
     protocol is text. Nothing persists past the connection, matching `POST /todos`'
     echo stance."""
 
-    async def processor(inputs: Stream[WebsocketInbound]) -> AsyncIterator[WebsocketOutbound]:
-        working = todos
-        async for event in inputs:
-            match event:
-                case WebsocketConnect():
-                    yield WebsocketAccept()
-                case WebsocketReceive(data):
-                    match data:
-                        case WebsocketText(text):
-                            working, reply = _folded(working, text)
-                            yield WebsocketSend(WebsocketText(text=reply))
-                        case WebsocketBinary():
-                            yield WebsocketClose(code=1003, reason="text frames only")
-                        case _ as unreachable:
-                            assert_never(unreachable)
-                case WebsocketDisconnect():
-                    return
-                case _ as unreachable:
-                    assert_never(unreachable)
-
-    return processor
+    working = todos
+    async for event in inputs:
+        match event:
+            case WebsocketConnect():
+                yield WebsocketAccept()
+            case WebsocketReceive(data):
+                match data:
+                    case WebsocketText(text):
+                        working, reply = _folded(working, text)
+                        yield WebsocketSend(WebsocketText(text=reply))
+                    case WebsocketBinary():
+                        yield WebsocketClose(code=1003, reason="text frames only")
+                    case _ as unreachable:
+                        assert_never(unreachable)
+            case WebsocketDisconnect():
+                return
+            case _ as unreachable:
+                assert_never(unreachable)
 
 
 def _folded(working: TodoList, frame: str) -> tuple[TodoList, str]:

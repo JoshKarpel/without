@@ -14,6 +14,8 @@ from without_asgi import Inbound
 from without_asgi import Outbound
 from without_asgi import Response
 from without_asgi import WebsocketHandler
+from without_asgi import WebsocketInbound
+from without_asgi import WebsocketOutbound
 from without_asgi import WebsocketScope
 from without_asgi import encode_response
 from without_asgi import read_body
@@ -31,18 +33,29 @@ from without_web.router import Pattern
 from without_web.router import Route
 from without_web.router import WebsocketRoute
 
-# What a handler's *output* is, once produced: a single `Response` (buffered
-# output) or an already-streaming `Stream[Outbound]`. Input buffering is the one
-# build-time axis (the `@post` vs `@post.stream` split); the output is always just
-# what the handler hands back, relayed through `_emit`.
+# What a handler ultimately produces: a single `Response` (buffered output) or an
+# already-streaming `Stream[Outbound]`. Input buffering is the one build-time axis
+# (the `@post` vs `@post.stream` split); the output is always just what the
+# handler hands back, relayed through `_emit`.
 type Reply = Response | Stream[Outbound]
 
-# What a handler may *return*: a `Reply` directly (a sync handler), or an
-# `Awaitable[Reply]` (an `async def` handler that does I/O, then returns one). An
-# `async def ... yield` handler is already an `AsyncIterator[Outbound]`, i.e. a
-# `Stream[Outbound]`, so it is a `Reply` too. `_emit` collapses all three shapes
-# into the outbound stream, so the output mode is free of the input mode.
-type Returned = Reply | Awaitable[Reply]
+# What a handler may *return*. Handlers are always `async`, so the color is fixed:
+# a buffered handler is an `async def` resolving to a `Reply` (an
+# `Awaitable[Reply]`), and a streaming handler is an `async def ... yield`, already
+# an `AsyncIterator[Outbound]` (a `Stream[Outbound]`). There is no synchronous arm,
+# because a handler must be able to `await` I/O; a plain `def ... return Response`
+# is a type error. `_emit` collapses both shapes into the outbound stream, keeping
+# the output mode free of the input mode.
+type Returned = Awaitable[Reply] | Stream[Outbound]
+
+# What a websocket handler returns: a live stream of outbound frames. The
+# websocket analog of `Returned`, but with no buffered arm (a connection is
+# inherently a stream, never a single value), so it is simply
+# `Stream[WebsocketOutbound]`. Naming it also keeps the generated `ws` ladder free
+# of a triple close-bracket, which would collide with cog's end-of-generator
+# marker, the same reason the HTTP ladders return the bare `Returned` alias rather
+# than a raw stream type.
+type WebsocketReturned = Stream[WebsocketOutbound]
 
 
 # [[[cog import cog; from ladders import emit; cog.outl(emit("handle")) ]]]
@@ -223,11 +236,11 @@ def handle[T](
 
     At dispatch the *input* body is buffered once, a `Request` is built, every
     extractor runs (raising to reject, mapped by the router's exception
-    handlers), and `fn` is called with the typed values. The *output* is free and
-    may be produced synchronously or asynchronously: `fn` returns a `Response`, an
-    `async def` that resolves to one, or an `async def ... yield` that streams
-    `Outbound` events, and `_emit` relays whichever. The endpoint also answers
-    `describe()`, recovering its query/header/body OpenAPI from the same extractors.
+    handlers), and `fn` is called with the typed values. The handler is always
+    `async`; the *output* is free: an `async def` that resolves to a `Response`,
+    or an `async def ... yield` that streams `Outbound` events, and `_emit` relays
+    whichever. The endpoint also answers `describe()`, recovering its
+    query/header/body OpenAPI from the same extractors.
 
     `handle` is the lower-level builder; reach for the `@get`/`@post`/... method
     decorators to co-locate the route with its handler.
@@ -858,7 +871,7 @@ class _StreamMethod:
 def ws[T](
     pattern: Pattern,
     /,
-) -> Callable[[Callable[[T], WebsocketHandler]], WebsocketRoute[T]]: ...
+) -> Callable[[Callable[[T, Stream[WebsocketInbound]], WebsocketReturned]], WebsocketRoute[T]]: ...
 
 
 @overload
@@ -866,7 +879,7 @@ def ws[T, A](
     pattern: Pattern,
     a: Extractor[A],
     /,
-) -> Callable[[Callable[[T, A], WebsocketHandler]], WebsocketRoute[T]]: ...
+) -> Callable[[Callable[[T, A, Stream[WebsocketInbound]], WebsocketReturned]], WebsocketRoute[T]]: ...
 
 
 @overload
@@ -875,7 +888,7 @@ def ws[T, A, B](
     a: Extractor[A],
     b: Extractor[B],
     /,
-) -> Callable[[Callable[[T, A, B], WebsocketHandler]], WebsocketRoute[T]]: ...
+) -> Callable[[Callable[[T, A, B, Stream[WebsocketInbound]], WebsocketReturned]], WebsocketRoute[T]]: ...
 
 
 @overload
@@ -885,7 +898,7 @@ def ws[T, A, B, C](
     b: Extractor[B],
     c: Extractor[C],
     /,
-) -> Callable[[Callable[[T, A, B, C], WebsocketHandler]], WebsocketRoute[T]]: ...
+) -> Callable[[Callable[[T, A, B, C, Stream[WebsocketInbound]], WebsocketReturned]], WebsocketRoute[T]]: ...
 
 
 @overload
@@ -896,7 +909,7 @@ def ws[T, A, B, C, D](
     c: Extractor[C],
     d: Extractor[D],
     /,
-) -> Callable[[Callable[[T, A, B, C, D], WebsocketHandler]], WebsocketRoute[T]]: ...
+) -> Callable[[Callable[[T, A, B, C, D, Stream[WebsocketInbound]], WebsocketReturned]], WebsocketRoute[T]]: ...
 
 
 @overload
@@ -908,7 +921,7 @@ def ws[T, A, B, C, D, E](
     d: Extractor[D],
     e: Extractor[E],
     /,
-) -> Callable[[Callable[[T, A, B, C, D, E], WebsocketHandler]], WebsocketRoute[T]]: ...
+) -> Callable[[Callable[[T, A, B, C, D, E, Stream[WebsocketInbound]], WebsocketReturned]], WebsocketRoute[T]]: ...
 
 
 @overload
@@ -921,7 +934,7 @@ def ws[T, A, B, C, D, E, F](
     e: Extractor[E],
     f: Extractor[F],
     /,
-) -> Callable[[Callable[[T, A, B, C, D, E, F], WebsocketHandler]], WebsocketRoute[T]]: ...
+) -> Callable[[Callable[[T, A, B, C, D, E, F, Stream[WebsocketInbound]], WebsocketReturned]], WebsocketRoute[T]]: ...
 
 
 @overload
@@ -935,7 +948,7 @@ def ws[T, A, B, C, D, E, F, G](
     f: Extractor[F],
     g: Extractor[G],
     /,
-) -> Callable[[Callable[[T, A, B, C, D, E, F, G], WebsocketHandler]], WebsocketRoute[T]]: ...
+) -> Callable[[Callable[[T, A, B, C, D, E, F, G, Stream[WebsocketInbound]], WebsocketReturned]], WebsocketRoute[T]]: ...
 
 
 @overload
@@ -950,7 +963,9 @@ def ws[T, A, B, C, D, E, F, G, H](
     g: Extractor[G],
     h: Extractor[H],
     /,
-) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H], WebsocketHandler]], WebsocketRoute[T]]: ...
+) -> Callable[
+    [Callable[[T, A, B, C, D, E, F, G, H, Stream[WebsocketInbound]], WebsocketReturned]], WebsocketRoute[T]
+]: ...
 
 
 @overload
@@ -966,7 +981,9 @@ def ws[T, A, B, C, D, E, F, G, H, J](
     h: Extractor[H],
     j: Extractor[J],
     /,
-) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J], WebsocketHandler]], WebsocketRoute[T]]: ...
+) -> Callable[
+    [Callable[[T, A, B, C, D, E, F, G, H, J, Stream[WebsocketInbound]], WebsocketReturned]], WebsocketRoute[T]
+]: ...
 
 
 @overload
@@ -983,27 +1000,36 @@ def ws[T, A, B, C, D, E, F, G, H, J, K](
     j: Extractor[J],
     k: Extractor[K],
     /,
-) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J, K], WebsocketHandler]], WebsocketRoute[T]]: ...
+) -> Callable[
+    [Callable[[T, A, B, C, D, E, F, G, H, J, K, Stream[WebsocketInbound]], WebsocketReturned]], WebsocketRoute[T]
+]: ...
 # [[[end]]]
 def ws[T](
     pattern: Pattern, *extractors: Extractor[object]
-) -> Callable[[Callable[..., WebsocketHandler]], WebsocketRoute[T]]:
+) -> Callable[[Callable[..., WebsocketReturned]], WebsocketRoute[T]]:
     """The websocket sibling of `@get`/`@post`, tying extractors to a handler.
 
     `@ws(t"/feed/{room}", room, since)` co-locates the route with the handler and
-    ties each extractor's type to its parameters, just like `@get`, but the
-    handler returns a `WebsocketHandler` (the frame processor) and there is no
-    body to buffer: `path_param`, `query_param`, and `header_param` read the
-    handshake (a `body` extractor is rejected, since a handshake carries none).
-    Returns a `WebsocketRoute` to pass to a `WebsocketRouter`.
+    ties each extractor's type to its parameters, just like `@get`. The handler
+    *is* the frame processor (the same move as `@post.stream`): it takes the live
+    inbound frames as a trailing `Stream[WebsocketInbound]` argument and yields
+    `WebsocketOutbound`, rather than returning a processor. There is no body to
+    buffer: `path_param`, `query_param`, and `header_param` read the handshake (a
+    `body` extractor is rejected, since a handshake carries none). Returns a
+    `WebsocketRoute` to pass to a `WebsocketRouter`.
     """
     if any(extractor.request_body is not None for extractor in extractors):
         raise ValueError("a websocket route cannot take a body extractor; a handshake has no body")
 
-    def decorate(fn: Callable[..., WebsocketHandler]) -> WebsocketRoute[T]:
+    def decorate(fn: Callable[..., WebsocketReturned]) -> WebsocketRoute[T]:
         def endpoint(state: T, match: Match[WebsocketScope]) -> WebsocketHandler:
             request = Request(scope=match.scope, params=match.params, body=b"")
-            return fn(state, *(extractor.extract(request) for extractor in extractors))
+            values = tuple(extractor.extract(request) for extractor in extractors)
+
+            def processor(inputs: Stream[WebsocketInbound]) -> Stream[WebsocketOutbound]:
+                return fn(state, *values, inputs)
+
+            return processor
 
         return WebsocketRoute(pattern=pattern, endpoint=endpoint)
 
@@ -1015,19 +1041,18 @@ async def _emit(result: Returned) -> AsyncIterator[Outbound]:
 
     The single output path shared by buffered- and streamed-input endpoints, so
     the output mode is decided by what the handler returns, not by how its input
-    was read. Three shapes: a `Response` is encoded once (buffered output); an
-    `Awaitable[Reply]` (an `async def` handler) is awaited, then its `Reply` is
-    relayed the same way; an `AsyncIterator[Outbound]` (an `async def ... yield`
-    handler) is relayed event by event. This is the runtime-value dispatch that
-    keeps the four input/output buffering combinations all expressible.
+    was read. Handlers are always async, so there are two shapes: an
+    `Awaitable[Reply]` (an `async def` resolving to a `Response` or a stream) is
+    awaited, then its `Reply` is relayed; an `AsyncIterator[Outbound]` (an
+    `async def ... yield` handler) is relayed event by event. A `Response` is
+    encoded once (buffered output); a stream is forwarded as-is.
     """
-    if isinstance(result, Awaitable):
-        result = await result
-    if isinstance(result, Response):
-        for event in encode_response(result):
+    reply: Reply = await result if isinstance(result, Awaitable) else result
+    if isinstance(reply, Response):
+        for event in encode_response(reply):
             yield event
         return
-    async for event in result:
+    async for event in reply:
         yield event
 
 

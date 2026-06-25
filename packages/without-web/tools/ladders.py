@@ -86,12 +86,18 @@ def _method_ladder(*, stream: bool) -> str:
 
 
 def _ws_ladder() -> str:
-    """`ws`: a leading `pattern`, then extractors, no keyword tail (a handshake has no body)."""
+    """`ws`: a leading `pattern`, then extractors, no keyword tail (a handshake has no body).
+
+    The handler *is* the frame processor (as in `@post.stream`): a trailing
+    `Stream[WebsocketInbound]` carries the live inbound frames and the handler
+    yields `Stream[WebsocketOutbound]`.
+    """
     blocks = []
     for arity in range(11):
         letters = list(LETTERS[:arity])
         params = ["pattern: Pattern,", *_extractor_params(letters), "/,"]
-        return_type = f"Callable[[Callable[[{', '.join(['T', *letters])}], WebsocketHandler]], WebsocketRoute[T]]"
+        fn_params = ["T", *letters, "Stream[WebsocketInbound]"]
+        return_type = f"Callable[[Callable[[{', '.join(fn_params)}], WebsocketReturned]], WebsocketRoute[T]]"
         blocks.append(_overload("ws", ["T", *letters], params, return_type))
     return "\n\n".join(blocks)
 

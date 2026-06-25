@@ -20,6 +20,7 @@ from without_web.extractors import query_param
 from without_web.extractors import websocket_scope
 from without_web.handlers import Reply
 from without_web.handlers import Returned
+from without_web.handlers import WebsocketReturned
 from without_web.handlers import delete
 from without_web.handlers import get
 from without_web.handlers import handle
@@ -100,6 +101,7 @@ __all__ = [
     "Single",
     "WebsocketEndpoint",
     "WebsocketExceptionHandler",
+    "WebsocketReturned",
     "WebsocketRoute",
     "WebsocketRouter",
     "body",

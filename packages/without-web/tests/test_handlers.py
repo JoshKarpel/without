@@ -15,7 +15,6 @@ from without_asgi import RequestBody
 from without_asgi import Response
 from without_asgi import ResponseBody
 from without_asgi import ResponseStart
-from without_asgi import WebsocketHandler
 from without_asgi import WebsocketInbound
 from without_asgi import WebsocketOutbound
 from without_asgi import WebsocketScope
@@ -65,7 +64,7 @@ async def _run(handler: HttpHandler, payload: bytes = b"") -> tuple[int, object]
 async def test_handle_calls_the_function_with_the_typed_extracted_values() -> None:
     seen: dict[str, object] = {}
 
-    def make(state: str, requested_id: int, payload: dict[str, object]) -> Response:
+    async def make(state: str, requested_id: int, payload: dict[str, object]) -> Response:
         seen.update(state=state, requested_id=requested_id, payload=payload)
         return json_response(201, {"ok": True})
 
@@ -94,7 +93,7 @@ async def test_handle_relays_a_streamed_response_without_buffering_the_output() 
 
 
 async def test_handle_with_no_extractors_passes_only_the_state() -> None:
-    def make(state: str) -> Response:
+    async def make(state: str) -> Response:
         return json_response(200, {"state": state})
 
     handler = handle(fn=make)("tenant", Match(_scope(), {}))
@@ -105,7 +104,7 @@ def test_handle_recovers_its_openapi_from_the_extractors() -> None:
     endpoint: object = handle(
         query_param("done", lambda values: values, schema={"type": "boolean"}),
         body(json.loads, schema={"type": "object"}),
-        fn=lambda state, done, payload: json_response(200, {}),
+        fn=_ok,
         summary="make a thing",
     )
     assert isinstance(endpoint, Describable)
@@ -120,7 +119,7 @@ def test_handle_rejects_more_than_one_body_extractor() -> None:
         handle(
             body(json.loads, schema={"type": "object"}),
             body(json.loads, schema={"type": "object"}),
-            fn=lambda state, first, second: json_response(200, {}),
+            fn=_ok,
         )
 
 
@@ -150,12 +149,15 @@ def test_ws_ties_path_and_query_to_the_handler() -> None:
     room = path_param("room", INT)
     since = query_param("since", lambda values: values, schema={"type": "string"})
 
-    def make(state: str, room_id: int, since_values: list[str]) -> WebsocketHandler:
+    def make(
+        state: str, room_id: int, since_values: list[str], inputs: Stream[WebsocketInbound]
+    ) -> Stream[WebsocketOutbound]:
         seen.update(state=state, room_id=room_id, since=since_values)
-        return _noop_ws
+        return _noop_ws(inputs)
 
     route = ws(t"/feed/{room}", room, since)(make)
-    route.endpoint("tenant", Match(_ws_scope(query=b"since=5&since=9"), {"room": 7}))
+    processor = route.endpoint("tenant", Match(_ws_scope(query=b"since=5&since=9"), {"room": 7}))
+    processor(stream(()))
     assert seen == {"state": "tenant", "room_id": 7, "since": ["5", "9"]}
 
 
@@ -272,3 +274,7 @@ async def test_handle_awaits_an_async_handler_that_returns_a_response() -> None:
 
 def _empty() -> Stream[Outbound]:
     return stream(())
+
+
+async def _ok(*args: object) -> Response:
+    return json_response(200, {})

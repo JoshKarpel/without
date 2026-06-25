@@ -30,6 +30,10 @@ class DomainError(Exception):
     pass
 
 
+async def _to_400(exc: Exception) -> Response:
+    return json_response(400, {"error": str(exc)})
+
+
 def _scope(method: str, path: str, *, root_path: str = "") -> HttpScope:
     return HttpScope(
         asgi=Asgi(version="3.0", spec_version="2.0"),
@@ -155,7 +159,7 @@ async def test_an_exception_before_response_start_is_mapped_to_a_response() -> N
     router: Router[object] = Router(
         routes=(route("/boom", get=boom),),
         fallback=_fallback,
-        exception_handlers={DomainError: lambda exc: json_response(400, {"error": str(exc)})},
+        exception_handlers={DomainError: _to_400},
     )
     start, body = await _run(router.dispatch(object(), _scope("GET", "/boom")))
     assert start.status == 400
@@ -173,7 +177,7 @@ async def test_an_exception_after_response_start_propagates() -> None:
     router: Router[object] = Router(
         routes=(route("/boom", get=boom_after),),
         fallback=_fallback,
-        exception_handlers={DomainError: lambda exc: json_response(400, {"error": str(exc)})},
+        exception_handlers={DomainError: _to_400},
     )
     with pytest.raises(DomainError):
         await _run(router.dispatch(object(), _scope("GET", "/boom")))
