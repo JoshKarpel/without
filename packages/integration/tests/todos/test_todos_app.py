@@ -82,6 +82,41 @@ async def _request(
         return status, collected, payload
 
 
+async def _stream_request(app: ASGIApp, method: str, path: str, chunks: list[bytes]) -> tuple[int, list[bytes]]:
+    scope: RawMessage = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": method,
+        "path": path,
+        "headers": [],
+        "query_string": b"",
+    }
+    events = iter(
+        [
+            {"type": "http.request", "body": chunk, "more_body": index < len(chunks) - 1}
+            for index, chunk in enumerate(chunks)
+        ]
+    )
+
+    async def receive() -> RawMessage:
+        return next(events)
+
+    sent: list[RawMessage] = []
+
+    async def send(message: RawMessage) -> None:
+        sent.append(message)
+
+    await app(scope, receive, send)
+    start = sent[0]
+    status = start["status"]
+    assert isinstance(status, int)
+    bodies = [
+        m["body"] for m in sent if m["type"] == "http.response.body" and isinstance(m["body"], bytes) and m["body"]
+    ]
+    return status, bodies
+
+
 async def test_lists_todos_with_the_powered_by_header() -> None:
     app = todos_app(_todos())
     async with _running(app):
@@ -120,6 +155,26 @@ async def test_creating_a_todo_echoes_the_next_id() -> None:
         status, _headers, body = await _request(app, "POST", "/todos", body=b'{"title": "deploy"}')
     assert status == 201
     assert body == {"id": 3, "title": "deploy", "done": False}
+
+
+async def test_import_echoes_each_todo_as_the_ndjson_stream_arrives() -> None:
+    app = todos_app(_todos())
+    async with _running(app):
+        # The "beta" object straddles the first two chunks, so a correct decode
+        # proves the handler reassembles across chunk boundaries as they arrive.
+        status, bodies = await _stream_request(
+            app,
+            "POST",
+            "/todos/import",
+            [b'{"title": "alpha"}\n{"title": ', b'"beta", "done": true}\n', b'{"oops": 1}\n'],
+        )
+    assert status == 200
+    records = [json.loads(line) for line in b"".join(bodies).splitlines() if line]
+    assert records == [
+        {"ok": True, "todo": {"id": 3, "title": "alpha", "done": False}},
+        {"ok": True, "todo": {"id": 4, "title": "beta", "done": True}},
+        {"ok": False, "errors": 1},
+    ]
 
 
 async def test_an_invalid_body_is_a_mapped_422() -> None:
@@ -173,7 +228,13 @@ async def test_openapi_merges_router_and_handler_halves() -> None:
     paths = spec["paths"]
     assert isinstance(paths, dict)
     # Opaque mounts are black boxes: neither the prefix nor its catch-all appear.
-    assert set(paths) == {"/todos", "/todos/{id}", "/admin/stats"}
+    assert set(paths) == {"/todos", "/todos/import", "/todos/{id}", "/admin/stats"}
+
+    # The streaming-input route describes itself like any other, but carries no
+    # request body: a `body` extractor is rejected, so there is nothing to report.
+    import_op = _dig(spec, "paths", "/todos/import", "post")
+    assert isinstance(import_op, dict)
+    assert "requestBody" not in import_op
 
     show_params = _dig(spec, "paths", "/todos/{id}", "get", "parameters")
     assert isinstance(show_params, list)
@@ -206,35 +267,61 @@ async def _websocket(app: ASGIApp, path: str, incoming: list[RawMessage]) -> lis
     return sent
 
 
-async def test_the_feed_prefixes_each_frame_with_the_todo_title() -> None:
+def _sent_replies(sent: list[RawMessage]) -> list[object]:
+    replies: list[object] = []
+    for message in sent:
+        if message["type"] != "websocket.send":
+            continue
+        text = message["text"]
+        assert isinstance(text, str)
+        replies.append(json.loads(text))
+    return replies
+
+
+async def test_the_session_folds_each_submission_into_the_running_list() -> None:
     app = todos_app(_todos())
     async with _running(app):
         sent = await _websocket(
             app,
-            "/todos/1/events",
+            "/todos/session",
             [
                 {"type": "websocket.connect"},
-                {"type": "websocket.receive", "text": "soon"},
+                {"type": "websocket.receive", "text": '{"title": "soon"}'},
+                {"type": "websocket.receive", "text": '{"title": "later", "done": true}'},
                 {"type": "websocket.disconnect", "code": 1000},
             ],
         )
     assert sent[0]["type"] == "websocket.accept"
-    assert sent[1] == {"type": "websocket.send", "text": "write: soon"}
+    # The second reply's id and total advance past the first, proving the fold's
+    # accumulator carries across frames rather than restarting from the seed each time.
+    assert _sent_replies(sent) == [
+        {"ok": True, "todo": {"id": 3, "title": "soon", "done": False}, "total": 3},
+        {"ok": True, "todo": {"id": 4, "title": "later", "done": True}, "total": 4},
+    ]
 
 
-async def test_the_feed_for_an_unknown_todo_closes_before_accept() -> None:
+async def test_the_session_answers_a_malformed_frame_without_closing() -> None:
     app = todos_app(_todos())
-    sent: list[RawMessage] = []
-
-    async def receive() -> RawMessage:
-        raise AssertionError("an unknown todo is rejected without reading frames")
-
-    async def send(message: RawMessage) -> None:
-        sent.append(message)
-
     async with _running(app):
-        await app(
-            {"type": "websocket", "asgi": {"version": "3.0"}, "path": "/todos/99/events", "headers": []}, receive, send
+        sent = await _websocket(
+            app,
+            "/todos/session",
+            [
+                {"type": "websocket.connect"},
+                {"type": "websocket.receive", "text": "{not json}"},
+                {"type": "websocket.disconnect", "code": 1000},
+            ],
         )
+    # Accepted, an error frame, and no close: the handshake is already accepted, so
+    # a bad submission is reported in-band rather than tearing down the connection.
+    assert [m["type"] for m in sent] == ["websocket.accept", "websocket.send"]
+    (reply,) = _sent_replies(sent)
+    assert isinstance(reply, dict)
+    assert reply["ok"] is False and reply["errors"] >= 1
 
-    assert sent == [{"type": "websocket.close", "code": 4404, "reason": "no todo with id 99"}]
+
+async def test_an_unrouted_websocket_path_is_closed_by_the_fallback() -> None:
+    app = todos_app(_todos())
+    async with _running(app):
+        sent = await _websocket(app, "/todos/nope", [{"type": "websocket.connect"}])
+    assert sent == [{"type": "websocket.close", "code": 1000, "reason": ""}]

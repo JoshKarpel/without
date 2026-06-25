@@ -108,8 +108,24 @@ serve both HTTP and websocket handlers (`Request.scope` is
 an overload ladder, so a `path_param("id", INT)` paired with an `fn` that expects
 a `str` is a mypy error, with no runtime introspection. It buffers the request
 *input* (so a `body` extractor can read it) but does not force buffered *output*:
-`fn` returns `Reply = Response | Stream[Outbound]`, so a streaming handler
-(`async def ... yield`) works directly.
+`fn` may `return` a `Response` (buffered), be an `async def` that returns one
+(buffered, after async work), or be an `async def ... yield` that streams
+`Outbound` events. A single `_emit` dispatch relays whichever, so the output mode
+is just what the handler hands back.
+
+`handle_stream(*extractors, fn=...)` is the streaming-*input* sibling: it leaves
+the inbound stream untouched and hands it to `fn` as a trailing `Stream[Inbound]`
+argument, so `fn` *is* the processor (no inner function), reading the live stream
+as it arrives (a streaming upload, a long poll, a loop driven by request chunks).
+The same overload ladder ties the extractor types, but the extractors are
+scope-only (`path_param`/`query_param`/`header_param`/`http_scope`); a `body`
+extractor is rejected, since buffering the body is exactly what a streaming route
+avoids. The output is free here too (yield to stream, return or await a `Response`
+to buffer), so the **input/output 2×2** is fully covered: input buffering is the
+one build-time axis (`handle` vs `handle_stream`), output is always the handler's
+return. The inbound stream is deliberately *not* an extractor: an `Extractor`
+reads the parsed-once `Request` *value*, and a live stream is a consume-once
+*place*, so it is passed as an argument rather than smuggled into `Request`.
 
 `into(make, *extractors)` combines extractors into one that builds a typed value,
 the escape hatch from the per-handler arity ceiling and the way to parse a group
@@ -127,6 +143,13 @@ route with the handler and **returns a `Route` value**: it registers nothing, so
 assembly stays the explicit, declarative `Router(routes=(...))`. The `Router`
 merges `Route`s that share a pattern, so `@get` and `@post` on one path combine
 into a single method map.
+
+Each method decorator carries a `.stream` form for streaming input:
+`@post.stream(pattern, *extractors)` is to `handle_stream` what `@post` is to
+`handle`. The handler *is* the processor, taking the live inbound stream as its
+trailing argument, and a `body` extractor is rejected. See `integration.todos`'
+`POST /todos/import`, which folds a newline-delimited stream into the list as it
+arrives, acknowledging each line while later chunks are still in flight.
 
 `buffered` (the `(state, match, body) -> Response` adapter) and the lower-level
 `Endpoint[T, S, H] = (T, Match[S]) -> H` protocol remain for bring-your-own
@@ -178,7 +201,11 @@ walker).
 typed `path_param`/`query_param`/`header_param` tokens to the handler's arguments
 and returns a `WebsocketRoute`. There is no body to buffer (a handshake carries
 none, so a `body` extractor is rejected), and the handler returns a
-`WebsocketHandler` (the frame processor) rather than a `Response`.
+`WebsocketHandler` (the frame processor) rather than a `Response`. Because the
+processor *is* the handler's return, a websocket connection folds naturally: see
+`integration.todos`' `/todos/session`, which threads a working `TodoList` across
+its inbound frames (a *scan* over the connection), the bidirectional, long-lived
+sibling of the `POST /todos/import` fold.
 
 The `integration` package's `todos` example is built entirely on this package;
 see it for a worked HTTP + WebSocket service.

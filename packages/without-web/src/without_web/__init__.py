@@ -19,9 +19,11 @@ from without_web.extractors import path_param
 from without_web.extractors import query_param
 from without_web.extractors import websocket_scope
 from without_web.handlers import Reply
+from without_web.handlers import Returned
 from without_web.handlers import delete
 from without_web.handlers import get
 from without_web.handlers import handle
+from without_web.handlers import handle_stream
 from without_web.handlers import head
 from without_web.handlers import options
 from without_web.handlers import patch
@@ -85,6 +87,7 @@ __all__ = [
     "Request",
     "RequestBodySpec",
     "ResponseSpec",
+    "Returned",
     "Route",
     "RouteSpec",
     "Router",
@@ -104,6 +107,7 @@ __all__ = [
     "describe",
     "get",
     "handle",
+    "handle_stream",
     "head",
     "header_param",
     "http_scope",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
@@ -14,7 +15,9 @@ from without_asgi import HttpHandler
 from without_asgi import HttpScope
 from without_asgi import Inbound
 from without_asgi import Outbound
+from without_asgi import RequestBody
 from without_asgi import Response
+from without_asgi import ResponseBody
 from without_asgi import ResponseStart
 from without_asgi import WebsocketAccept
 from without_asgi import WebsocketBinary
@@ -74,7 +77,10 @@ from integration.todos.core import TodoNotFound
 # State is a single immutable `TodoList` value held for the connection's life, so
 # this example stays about routing and leaves a shared mutable store (the
 # actor-model question) out of scope: `POST` validates and echoes the would-be
-# todo without persisting it.
+# todo without persisting it. Two endpoints read their input *live* rather than
+# buffering it, folding a stream into a working list that never escapes the
+# connection: `POST /todos/import` (a `@post.stream` route over an NDJSON upload)
+# and the `/todos/session` websocket (the same fold kept open, bidirectionally).
 
 
 def _render(todo: Todo) -> dict[str, object]:
@@ -92,8 +98,8 @@ def _done(values: list[str]) -> bool | None:
 done_query = query_param("done", _done, schema={"type": "boolean"})
 new_todo_body = body(NewTodo.model_validate_json, schema=NewTodo)
 # One token, declared once: it is the route's `{id}` segment (matched and schemed
-# through `INT`) *and* the handler's typed `int` argument, and it binds the
-# websocket feed's id too. No second place to keep "id" or "int" in sync.
+# through `INT`) *and* the handler's typed `int` argument. No second place to keep
+# "id" or "int" in sync.
 todo_id = path_param("id", INT)
 
 
@@ -106,6 +112,53 @@ def list_todos(todos: TodoList, done: bool | None) -> Response:
 def create_todo(todos: TodoList, new: NewTodo) -> Response:
     _list, created = todos.added(new)
     return json_response(201, _render(created))
+
+
+@post.stream("/todos/import", summary="Bulk-import todos from an NDJSON stream")
+async def import_todos(todos: TodoList, inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
+    """Fold a newline-delimited stream of todo bodies into the list *as it
+    arrives*, echoing each created todo immediately rather than buffering the
+    whole upload first. This is the streaming-input dual of `@post`: the route is
+    declared with `@post.stream`, so the handler *is* the processor, taking the
+    live inbound stream as its trailing argument (a `body` extractor would force
+    the buffering this avoids, so one is rejected at build time).
+
+    The `200` is committed before the request body is fully received, so a line in
+    an early chunk is acknowledged while later chunks are still in flight, and a
+    line straddling two chunks is reassembled here. The fold threads a local
+    `TodoList` that never escapes the connection (it stays a value, not shared
+    mutable state); like `POST /todos` it does not persist beyond the request. A
+    malformed line is reported in its own record rather than failing the stream,
+    since the `200` is already on the wire and cannot be rewritten to a `422`."""
+
+    yield ResponseStart(status=200, headers=((b"content-type", b"application/x-ndjson"),))
+    working = todos
+    pending = b""
+    async for event in inputs:
+        assert isinstance(event, RequestBody)
+        pending += event.body
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            if line.strip():
+                working, record = _imported(working, line)
+                yield record
+    if pending.strip():
+        _working, record = _imported(working, pending)
+        yield record
+    yield ResponseBody(body=b"", more_body=False)
+
+
+def _imported(working: TodoList, line: bytes) -> tuple[TodoList, ResponseBody]:
+    try:
+        new = NewTodo.model_validate_json(line)
+    except ValidationError as exc:
+        return working, _ndjson({"ok": False, "errors": exc.error_count()})
+    updated, created = working.added(new)
+    return updated, _ndjson({"ok": True, "todo": _render(created)})
+
+
+def _ndjson(record: Mapping[str, object]) -> ResponseBody:
+    return ResponseBody(body=json.dumps(record).encode() + b"\n", more_body=True)
 
 
 @get(t"/todos/{todo_id}", todo_id, summary="Get one todo")
@@ -167,6 +220,7 @@ todos_router: Router[TodoList] = Router(
     routes=(
         list_todos,
         create_todo,
+        import_todos,
         show_todo,
         Mount("/admin", admin),
         Mount("/legacy", legacy),
@@ -177,18 +231,24 @@ todos_router: Router[TodoList] = Router(
 )
 
 
-@ws(t"/todos/{todo_id}/events", todo_id)
-def feed(todos: TodoList, requested_id: int) -> WebsocketHandler:
-    """Stream a todo's title prefixed onto each text frame; reject an unknown id.
+@ws("/todos/session")
+def session(todos: TodoList) -> WebsocketHandler:
+    """Fold a live stream of todo submissions into the list across the connection.
 
-    The same `todo_id` token names the `{id}` segment and is passed as the typed
-    `int` argument. The lookup runs *inside* the processor, before
-    `WebsocketAccept`, so a `TodoNotFound` is raised while the connection can
-    still be rejected and the websocket exception handler maps it to a close (the
-    equivalent of the HTTP 404)."""
+    The websocket sibling of `POST /todos/import`, but bidirectional and
+    long-lived. The connection holds a working `TodoList`, seeded from the shared
+    state, and each inbound text frame is a `NewTodo` JSON folded into it, with the
+    created todo and the running total sent straight back. The accumulator is a
+    plain value threaded across `async for` iterations, never shared mutable state,
+    so the whole connection is a *scan* over its inbound frames: same shape as the
+    import fold, just kept open. A malformed frame is answered with an error frame
+    rather than closing (the handshake is already accepted, the websocket analog of
+    the import stream's committed `200`); a binary frame closes, since this
+    protocol is text. Nothing persists past the connection, matching `POST /todos`'
+    echo stance."""
 
     async def processor(inputs: Stream[WebsocketInbound]) -> AsyncIterator[WebsocketOutbound]:
-        todo = todos.get(requested_id)
+        working = todos
         async for event in inputs:
             match event:
                 case WebsocketConnect():
@@ -196,7 +256,8 @@ def feed(todos: TodoList, requested_id: int) -> WebsocketHandler:
                 case WebsocketReceive(data):
                     match data:
                         case WebsocketText(text):
-                            yield WebsocketSend(WebsocketText(text=f"{todo.title}: {text}"))
+                            working, reply = _folded(working, text)
+                            yield WebsocketSend(WebsocketText(text=reply))
                         case WebsocketBinary():
                             yield WebsocketClose(code=1003, reason="text frames only")
                         case _ as unreachable:
@@ -209,6 +270,16 @@ def feed(todos: TodoList, requested_id: int) -> WebsocketHandler:
     return processor
 
 
+def _folded(working: TodoList, frame: str) -> tuple[TodoList, str]:
+    """Fold one submission into the working list, returning it and the reply text."""
+    try:
+        new = NewTodo.model_validate_json(frame)
+    except ValidationError as exc:
+        return working, json.dumps({"ok": False, "errors": exc.error_count()})
+    updated, created = working.added(new)
+    return updated, json.dumps({"ok": True, "todo": _render(created), "total": len(updated.todos)})
+
+
 def refuse(todos: TodoList, match: Match[WebsocketScope]) -> WebsocketHandler:
     """The websocket fallback: close an unrouted path without reading any frames."""
 
@@ -218,15 +289,9 @@ def refuse(todos: TodoList, match: Match[WebsocketScope]) -> WebsocketHandler:
     return handler
 
 
-def _on_missing_todo_socket(exc: Exception) -> WebsocketClose:
-    assert isinstance(exc, TodoNotFound)
-    return WebsocketClose(code=4404, reason=str(exc))
-
-
 sockets: WebsocketRouter[TodoList] = WebsocketRouter(
-    routes=(feed,),
+    routes=(session,),
     fallback=refuse,
-    exception_handlers={TodoNotFound: _on_missing_todo_socket},
 )
 
 

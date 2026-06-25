@@ -58,8 +58,51 @@ and folds routing, typing, and OpenAPI onto it.
   returns a `WebsocketRoute`. There is no body to buffer (a handshake has none,
   so a `body` extractor is rejected), so it is synchronous: build the body-less
   `Request`, run the extractors, call the handler. This closes the
-  websocket-extraction gap; `feed` no longer reads `match.params["id"]` with an
-  `assert isinstance`.
+  websocket-extraction gap: a handler reads typed tokens instead of narrowing
+  `match.params["id"]` with an `assert isinstance` (the path-param tying is
+  exercised in `test_handlers`).
+- **Streaming-input HTTP routes (`handle_stream`, `@post.stream`/...) and the
+  input/output 2×2.** The input-side dual of `ws`: where `handle`/`@post` buffer
+  the body and call `fn` with a finished `Request`, `handle_stream(*extractors,
+  fn=...)` leaves the inbound stream untouched and hands it to `fn` as a trailing
+  `Stream[Inbound]` argument, so `fn` *is* the processor (no inner function),
+  reading the live stream as it arrives (a streaming upload, a long poll, a loop
+  driven by request chunks). The same overload ladder ties the extractor types,
+  but extractors are scope-only; a `body` extractor is rejected (buffering the
+  body is exactly what a streaming route avoids), the same constraint `ws` carries
+  for the handshake. Each method decorator gains a `.stream` form
+  (`@post.stream(pattern, *extractors)`) via a `_StreamMethod` reached as a
+  property, so the top-level names stay the seven methods. The live stream is
+  deliberately *not* modeled as an extractor: an `Extractor` reads the parsed-once
+  `Request` *value*, and a consume-once stream is a *place*, so it is passed as an
+  argument rather than smuggled into the frozen `Request`.
+  - **Output is unified across both input modes.** Buffering is a 2×2 (input ×
+    output). Input is the one build-time axis (`handle` vs `handle_stream`); output
+    is always whatever the handler returns, relayed by a single `_emit` dispatch
+    that accepts three runtime shapes: a `Response` (encoded once), an
+    `Awaitable[Reply]` (an `async def` handler awaited, then relayed), or an
+    `AsyncIterator[Outbound]` (an `async def ... yield` handler streamed event by
+    event). This is value dispatch on the result, not signature introspection (the
+    same move as the existing `isinstance(result, Response)` check). It makes all
+    four combinations expressible and adds a previously-missing one: an `async def`
+    buffered handler (`-> Response`) under `@post`, which the old non-awaiting
+    `_reply` silently rejected. `Reply` stays the resolved output value; a new
+    `Returned = Reply | Awaitable[Reply]` is what a handler may return.
+  - `todos` gains `POST /todos/import`, folding a newline-delimited stream into
+    the list as it arrives (reassembling lines across chunk boundaries, echoing
+    each result while later chunks are still in flight, reporting a malformed line
+    in its own record since the `200` is already committed).
+- **Websocket `feed` reshaped into the folding `session`.** The same fold, kept
+  open and bidirectional: the id-scoped title-prefix echo became
+  `/todos/session`, a body-less `@ws` route that threads a working `TodoList`
+  across its inbound frames (each text frame a `NewTodo`, folded in, the created
+  todo and running total sent straight back), a *scan* over the connection. A
+  malformed frame is answered in-band rather than closing (the handshake is
+  already accepted, the websocket analog of the import's committed `200`). This
+  drops the `{todo_id}` path-param and `TodoNotFound`-before-accept demos from
+  the example (both still unit-tested), trading them for the more interesting
+  stateful-fold story; the per-frame parse rejection replaces the handshake-time
+  `TodoNotFound`, so the socket router no longer needs an exception handler.
 - **Patterns are strings and t-strings; the name gap is closed.** A route pattern
   is `str | Template`: a plain string for a literal-only path (`@get("/todos")`)
   or a t-string (PEP 750, Python 3.14) interpolating path-param tokens
@@ -109,9 +152,13 @@ and folds routing, typing, and OpenAPI onto it.
   variadic list of tokens, so the fallback is a body/query *model* extractor (one
   extractor collapsing many fields), which keeps real arity small. There is no
   runtime signature introspection anywhere.
-- **Buffer the input, never force-buffer the output.** Input buffering is
-  unconditional (we never hand the raw body onward, and it consumes the inbound
-  stream cleanly), but the output may stream.
+- **Input buffering is the one build-time axis; output is never forced.** A
+  buffered-input endpoint (`handle`/`@post`) consumes the inbound stream cleanly
+  and hands the handler typed values, never the raw body; a streamed-input
+  endpoint (`handle_stream`/`@post.stream`) hands the live stream through instead.
+  Output is orthogonal and never force-buffered: the handler returns a `Response`,
+  awaits one, or streams `Outbound`, relayed by `_emit`. That is the full 2×2,
+  with input the only mode chosen at build time.
 - **Two covariances are stated explicitly.** `Converter[V]` and `Extractor[V]`
   use a legacy `TypeVar(covariant=True)` because PEP 695's inferred variance
   treats a frozen dataclass field as invariant; the variance is sound (`V` only
@@ -124,30 +171,39 @@ and folds routing, typing, and OpenAPI onto it.
 Green and verified at the current step (mypy clean, ruff check + format clean,
 tests passing):
 
-- `without_web`: `extractors`, `handlers` (incl. the method decorators),
-  string/t-string `Pattern`, value-carrying `Converter`/trie, merge-by-pattern
-  `Router`, extractor-recovered OpenAPI. Re-exports and `__all__` updated.
-- `integration.todos`: rewritten to decorators + t-string/string patterns.
+- `without_web`: `extractors`, `handlers` (incl. the method decorators and the
+  streaming-input `handle_stream`/`@post.stream` siblings), string/t-string
+  `Pattern`, value-carrying `Converter`/trie, merge-by-pattern `Router`,
+  extractor-recovered OpenAPI. Re-exports and `__all__` updated.
+- `integration.todos`: rewritten to decorators + t-string/string patterns, plus a
+  streaming `POST /todos/import` and a folding `/todos/session` websocket.
 
 ## Open questions and next steps
 
 Raised this checkpoint (the in-progress edges):
 
 1. **Websocket extraction (resolved this checkpoint).** `@ws` now ties typed
-   `path_param`/`query_param`/`header_param` tokens to a websocket handler, so
-   `feed` no longer narrows `match.params["id"]` by hand. One small residual:
+   `path_param`/`query_param`/`header_param` tokens to a websocket handler, so a
+   handler reads them instead of narrowing `match.params["id"]` by hand
+   (exercised in `test_handlers`, since the reshaped `todos` session is now
+   body-less and path-param-free). One small residual:
    `http_scope()`/`websocket_scope()` recover the concrete scope with a runtime
    `assert` (the `Request.scope` union is not statically tied to the route's
    protocol); using the wrong one fails loud rather than at compile time.
-2. **No route reads the input stream live.** `handle` (and so every
-   `@get`/`@post`) buffers the request body before the handler runs, and `fn`
-   gets a finished `Request`. There is no decorator/extractor way to register a
-   handler that *reads* the inbound HTTP stream and reacts to it as it arrives
-   (a streaming upload, a long poll, a server-sent loop driven by request
-   chunks); you must drop to a raw `route()` with a hand-written
-   `(state, scope) -> handler` processor. The output side already streams
-   (`Reply`); the input side does not. This is the dual of the websocket gap:
-   both are about live input.
+2. **Live input streaming (resolved this checkpoint).** `handle_stream` and the
+   `@get.stream`/`@post.stream`/... method decorators register a handler that
+   reads the inbound HTTP stream and reacts as it arrives. The handler *is* the
+   processor: it takes the state, the typed extractor values, and the live
+   `Stream[Inbound]` as a trailing argument (no inner function), the input-side
+   dual of `ws`. A `body` extractor is rejected (it would force the buffering a
+   streaming route avoids). Output is free and unified across both input modes via
+   `_emit` (see the 2×2 bullet above), so all four input/output buffering combos
+   are expressible. `todos`' `POST /todos/import` exercises stream-in/stream-out
+   end-to-end. One residual: the stream is not an extractor (it is a place, not a
+   value), so the handler reaches it as a positional argument rather than through
+   the typed extractor list, and a single route mixing buffered-body parsing with
+   live streaming is still not expressible (by design: the two are distinct input
+   contracts).
 3. **Arity ladders cap at 10 extractors.** `handle`, the `@get`/`@post`/...
    decorators (`_Method.__call__`), and `into` each carry an overload ladder up
    to 10 (the ladders are generated, not hand-written). Past 10, the intended

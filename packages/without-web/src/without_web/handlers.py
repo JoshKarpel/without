@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -29,23 +30,33 @@ from without_web.router import Pattern
 from without_web.router import Route
 from without_web.router import WebsocketRoute
 
-# What a handler returns: either a single `Response` (the common buffered-output
-# case) or an already-streaming `Stream[Outbound]`. `handle` buffers the *input*
-# so extractors can read the body, but it does not force the *output* to be
-# buffered: a handler that wants to stream its response yields `Outbound` events.
+# What a handler's *output* is, once produced: a single `Response` (buffered
+# output) or an already-streaming `Stream[Outbound]`. Input buffering is the one
+# build-time axis (the `@post` vs `@post.stream` split); the output is always just
+# what the handler hands back, relayed through `_emit`.
 type Reply = Response | Stream[Outbound]
+
+# What a handler may *return*: a `Reply` directly (a sync handler), or an
+# `Awaitable[Reply]` (an `async def` handler that does I/O, then returns one). An
+# `async def ... yield` handler is already an `AsyncIterator[Outbound]`, i.e. a
+# `Stream[Outbound]`, so it is a `Reply` too. `_emit` collapses all three shapes
+# into the outbound stream, so the output mode is free of the input mode.
+type Returned = Reply | Awaitable[Reply]
 
 
 @overload
 def handle[T](
-    *, fn: Callable[[T], Reply], summary: str = ..., responses: Mapping[int, ResponseSpec] | None = ...
+    *,
+    fn: Callable[[T], Returned],
+    summary: str = ...,
+    responses: Mapping[int, ResponseSpec] | None = ...,
 ) -> HttpEndpoint[T]: ...
 @overload
 def handle[T, A](
     a: Extractor[A],
     /,
     *,
-    fn: Callable[[T, A], Reply],
+    fn: Callable[[T, A], Returned],
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
 ) -> HttpEndpoint[T]: ...
@@ -55,7 +66,7 @@ def handle[T, A, B](
     b: Extractor[B],
     /,
     *,
-    fn: Callable[[T, A, B], Reply],
+    fn: Callable[[T, A, B], Returned],
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
 ) -> HttpEndpoint[T]: ...
@@ -66,7 +77,7 @@ def handle[T, A, B, C](
     c: Extractor[C],
     /,
     *,
-    fn: Callable[[T, A, B, C], Reply],
+    fn: Callable[[T, A, B, C], Returned],
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
 ) -> HttpEndpoint[T]: ...
@@ -78,7 +89,7 @@ def handle[T, A, B, C, D](
     d: Extractor[D],
     /,
     *,
-    fn: Callable[[T, A, B, C, D], Reply],
+    fn: Callable[[T, A, B, C, D], Returned],
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
 ) -> HttpEndpoint[T]: ...
@@ -91,7 +102,7 @@ def handle[T, A, B, C, D, E](
     e: Extractor[E],
     /,
     *,
-    fn: Callable[[T, A, B, C, D, E], Reply],
+    fn: Callable[[T, A, B, C, D, E], Returned],
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
 ) -> HttpEndpoint[T]: ...
@@ -105,7 +116,7 @@ def handle[T, A, B, C, D, E, F](
     f: Extractor[F],
     /,
     *,
-    fn: Callable[[T, A, B, C, D, E, F], Reply],
+    fn: Callable[[T, A, B, C, D, E, F], Returned],
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
 ) -> HttpEndpoint[T]: ...
@@ -120,7 +131,7 @@ def handle[T, A, B, C, D, E, F, G](
     g: Extractor[G],
     /,
     *,
-    fn: Callable[[T, A, B, C, D, E, F, G], Reply],
+    fn: Callable[[T, A, B, C, D, E, F, G], Returned],
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
 ) -> HttpEndpoint[T]: ...
@@ -136,7 +147,7 @@ def handle[T, A, B, C, D, E, F, G, H](
     h: Extractor[H],
     /,
     *,
-    fn: Callable[[T, A, B, C, D, E, F, G, H], Reply],
+    fn: Callable[[T, A, B, C, D, E, F, G, H], Returned],
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
 ) -> HttpEndpoint[T]: ...
@@ -153,7 +164,7 @@ def handle[T, A, B, C, D, E, F, G, H, J](
     j: Extractor[J],
     /,
     *,
-    fn: Callable[[T, A, B, C, D, E, F, G, H, J], Reply],
+    fn: Callable[[T, A, B, C, D, E, F, G, H, J], Returned],
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
 ) -> HttpEndpoint[T]: ...
@@ -171,7 +182,7 @@ def handle[T, A, B, C, D, E, F, G, H, J, K](
     k: Extractor[K],
     /,
     *,
-    fn: Callable[[T, A, B, C, D, E, F, G, H, J, K], Reply],
+    fn: Callable[[T, A, B, C, D, E, F, G, H, J, K], Returned],
     summary: str = ...,
     responses: Mapping[int, ResponseSpec] | None = ...,
 ) -> HttpEndpoint[T]: ...
@@ -179,7 +190,7 @@ def handle[T, A, B, C, D, E, F, G, H, J, K](
 
 def handle[T](
     *extractors: Extractor[object],
-    fn: Callable[..., Reply],
+    fn: Callable[..., Returned],
     summary: str = "",
     responses: Mapping[int, ResponseSpec] | None = None,
 ) -> HttpEndpoint[T]:
@@ -191,16 +202,186 @@ def handle[T](
 
     At dispatch the *input* body is buffered once, a `Request` is built, every
     extractor runs (raising to reject, mapped by the router's exception
-    handlers), and `fn` is called with the typed values. The *output* is not
-    forced to buffer: `fn` returns either a `Response` (encoded into the outbound
-    stream) or a `Stream[Outbound]` that is relayed as it produces. The endpoint
-    also answers `describe()`, recovering its query/header/body OpenAPI from the
-    very same extractors.
+    handlers), and `fn` is called with the typed values. The *output* is free and
+    may be produced synchronously or asynchronously: `fn` returns a `Response`, an
+    `async def` that resolves to one, or an `async def ... yield` that streams
+    `Outbound` events, and `_emit` relays whichever. The endpoint also answers
+    `describe()`, recovering its query/header/body OpenAPI from the same extractors.
 
     `handle` is the lower-level builder; reach for the `@get`/`@post`/... method
     decorators to co-locate the route with its handler.
     """
     return _build_endpoint(extractors, fn, summary, responses)
+
+
+@overload
+def handle_stream[T](
+    *,
+    fn: Callable[[T, Stream[Inbound]], Returned],
+    summary: str = ...,
+    responses: Mapping[int, ResponseSpec] | None = ...,
+) -> HttpEndpoint[T]: ...
+@overload
+def handle_stream[T, A](
+    a: Extractor[A],
+    /,
+    *,
+    fn: Callable[[T, A, Stream[Inbound]], Returned],
+    summary: str = ...,
+    responses: Mapping[int, ResponseSpec] | None = ...,
+) -> HttpEndpoint[T]: ...
+@overload
+def handle_stream[T, A, B](
+    a: Extractor[A],
+    b: Extractor[B],
+    /,
+    *,
+    fn: Callable[[T, A, B, Stream[Inbound]], Returned],
+    summary: str = ...,
+    responses: Mapping[int, ResponseSpec] | None = ...,
+) -> HttpEndpoint[T]: ...
+@overload
+def handle_stream[T, A, B, C](
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    /,
+    *,
+    fn: Callable[[T, A, B, C, Stream[Inbound]], Returned],
+    summary: str = ...,
+    responses: Mapping[int, ResponseSpec] | None = ...,
+) -> HttpEndpoint[T]: ...
+@overload
+def handle_stream[T, A, B, C, D](
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    /,
+    *,
+    fn: Callable[[T, A, B, C, D, Stream[Inbound]], Returned],
+    summary: str = ...,
+    responses: Mapping[int, ResponseSpec] | None = ...,
+) -> HttpEndpoint[T]: ...
+@overload
+def handle_stream[T, A, B, C, D, E](
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    /,
+    *,
+    fn: Callable[[T, A, B, C, D, E, Stream[Inbound]], Returned],
+    summary: str = ...,
+    responses: Mapping[int, ResponseSpec] | None = ...,
+) -> HttpEndpoint[T]: ...
+@overload
+def handle_stream[T, A, B, C, D, E, F](
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    /,
+    *,
+    fn: Callable[[T, A, B, C, D, E, F, Stream[Inbound]], Returned],
+    summary: str = ...,
+    responses: Mapping[int, ResponseSpec] | None = ...,
+) -> HttpEndpoint[T]: ...
+@overload
+def handle_stream[T, A, B, C, D, E, F, G](
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    /,
+    *,
+    fn: Callable[[T, A, B, C, D, E, F, G, Stream[Inbound]], Returned],
+    summary: str = ...,
+    responses: Mapping[int, ResponseSpec] | None = ...,
+) -> HttpEndpoint[T]: ...
+@overload
+def handle_stream[T, A, B, C, D, E, F, G, H](
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    /,
+    *,
+    fn: Callable[[T, A, B, C, D, E, F, G, H, Stream[Inbound]], Returned],
+    summary: str = ...,
+    responses: Mapping[int, ResponseSpec] | None = ...,
+) -> HttpEndpoint[T]: ...
+@overload
+def handle_stream[T, A, B, C, D, E, F, G, H, J](
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    /,
+    *,
+    fn: Callable[[T, A, B, C, D, E, F, G, H, J, Stream[Inbound]], Returned],
+    summary: str = ...,
+    responses: Mapping[int, ResponseSpec] | None = ...,
+) -> HttpEndpoint[T]: ...
+@overload
+def handle_stream[T, A, B, C, D, E, F, G, H, J, K](
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    /,
+    *,
+    fn: Callable[[T, A, B, C, D, E, F, G, H, J, K, Stream[Inbound]], Returned],
+    summary: str = ...,
+    responses: Mapping[int, ResponseSpec] | None = ...,
+) -> HttpEndpoint[T]: ...
+
+
+def handle_stream[T](
+    *extractors: Extractor[object],
+    fn: Callable[..., Returned],
+    summary: str = "",
+    responses: Mapping[int, ResponseSpec] | None = None,
+) -> HttpEndpoint[T]:
+    """Build an endpoint whose handler reads the inbound stream live.
+
+    The streaming-input sibling of `handle`. Where `handle` buffers the request
+    body before the handler runs (so a `body` extractor can read it), this leaves
+    the inbound stream untouched and hands it to the handler as a trailing
+    `Stream[Inbound]` argument: the handler *is* the processor, taking the state,
+    the typed extractor values, and the live stream, reading it as events arrive
+    (a streaming upload, a long poll, a loop driven by request chunks). The
+    extractors are scope-only (`path_param`/`query_param`/`header_param`/
+    `http_scope`); a `body` extractor is rejected, since buffering the body is
+    exactly what a streaming route avoids. The *output* is free, exactly as in
+    `handle`: yield `Outbound` to stream the response, or return (or await) a
+    `Response` to buffer it.
+
+    Reach for the `@get.stream`/`@post.stream`/... method decorators to co-locate
+    the streaming route with its handler.
+    """
+    return _build_stream_endpoint(extractors, fn, summary, responses)
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,10 +398,20 @@ class _Method:
 
     method: str
 
+    @property
+    def stream(self) -> _StreamMethod:
+        """The streaming-input form: `@post.stream(...)` reads the inbound stream live."""
+        return _StreamMethod(self.method)
+
     @overload
     def __call__[T](
-        self, pattern: Pattern, /, *, summary: str = ..., responses: Mapping[int, ResponseSpec] | None = ...
-    ) -> Callable[[Callable[[T], Reply]], Route[T]]: ...
+        self,
+        pattern: Pattern,
+        /,
+        *,
+        summary: str = ...,
+        responses: Mapping[int, ResponseSpec] | None = ...,
+    ) -> Callable[[Callable[[T], Returned]], Route[T]]: ...
     @overload
     def __call__[T, A](
         self,
@@ -230,7 +421,7 @@ class _Method:
         *,
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
-    ) -> Callable[[Callable[[T, A], Reply]], Route[T]]: ...
+    ) -> Callable[[Callable[[T, A], Returned]], Route[T]]: ...
     @overload
     def __call__[T, A, B](
         self,
@@ -241,7 +432,7 @@ class _Method:
         *,
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
-    ) -> Callable[[Callable[[T, A, B], Reply]], Route[T]]: ...
+    ) -> Callable[[Callable[[T, A, B], Returned]], Route[T]]: ...
     @overload
     def __call__[T, A, B, C](
         self,
@@ -253,7 +444,7 @@ class _Method:
         *,
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
-    ) -> Callable[[Callable[[T, A, B, C], Reply]], Route[T]]: ...
+    ) -> Callable[[Callable[[T, A, B, C], Returned]], Route[T]]: ...
     @overload
     def __call__[T, A, B, C, D](
         self,
@@ -266,7 +457,7 @@ class _Method:
         *,
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
-    ) -> Callable[[Callable[[T, A, B, C, D], Reply]], Route[T]]: ...
+    ) -> Callable[[Callable[[T, A, B, C, D], Returned]], Route[T]]: ...
     @overload
     def __call__[T, A, B, C, D, E](
         self,
@@ -280,7 +471,7 @@ class _Method:
         *,
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
-    ) -> Callable[[Callable[[T, A, B, C, D, E], Reply]], Route[T]]: ...
+    ) -> Callable[[Callable[[T, A, B, C, D, E], Returned]], Route[T]]: ...
     @overload
     def __call__[T, A, B, C, D, E, F](
         self,
@@ -295,7 +486,7 @@ class _Method:
         *,
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
-    ) -> Callable[[Callable[[T, A, B, C, D, E, F], Reply]], Route[T]]: ...
+    ) -> Callable[[Callable[[T, A, B, C, D, E, F], Returned]], Route[T]]: ...
     @overload
     def __call__[T, A, B, C, D, E, F, G](
         self,
@@ -311,7 +502,7 @@ class _Method:
         *,
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
-    ) -> Callable[[Callable[[T, A, B, C, D, E, F, G], Reply]], Route[T]]: ...
+    ) -> Callable[[Callable[[T, A, B, C, D, E, F, G], Returned]], Route[T]]: ...
     @overload
     def __call__[T, A, B, C, D, E, F, G, H](
         self,
@@ -328,7 +519,7 @@ class _Method:
         *,
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
-    ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H], Reply]], Route[T]]: ...
+    ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H], Returned]], Route[T]]: ...
     @overload
     def __call__[T, A, B, C, D, E, F, G, H, J](
         self,
@@ -346,7 +537,7 @@ class _Method:
         *,
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
-    ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J], Reply]], Route[T]]: ...
+    ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J], Returned]], Route[T]]: ...
     @overload
     def __call__[T, A, B, C, D, E, F, G, H, J, K](
         self,
@@ -365,7 +556,7 @@ class _Method:
         *,
         summary: str = ...,
         responses: Mapping[int, ResponseSpec] | None = ...,
-    ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J, K], Reply]], Route[T]]: ...
+    ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J, K], Returned]], Route[T]]: ...
 
     def __call__(
         self,
@@ -373,8 +564,8 @@ class _Method:
         *extractors: Extractor[object],
         summary: str = "",
         responses: Mapping[int, ResponseSpec] | None = None,
-    ) -> Callable[[Callable[..., Reply]], Route[object]]:
-        def decorate(fn: Callable[..., Reply]) -> Route[object]:
+    ) -> Callable[[Callable[..., Returned]], Route[object]]:
+        def decorate(fn: Callable[..., Returned]) -> Route[object]:
             endpoint = _build_endpoint(extractors, fn, summary, responses)
             return Route(pattern=pattern, methods={self.method: endpoint})
 
@@ -390,27 +581,235 @@ delete = _Method("DELETE")
 options = _Method("OPTIONS")
 
 
+@dataclass(frozen=True, slots=True)
+class _StreamMethod:
+    """The streaming-input form of a method decorator, reached as `post.stream`.
+
+    `@post.stream(pattern, *extractors)` is to `handle_stream` what `@post` is to
+    `handle`: it ties each extractor's type to the handler's parameters and returns
+    a single-method `Route`, but the handler reads the inbound stream live, taking
+    it as a trailing `Stream[Inbound]` argument after the typed values. A `body`
+    extractor is rejected, since buffering is what a streaming route avoids. The
+    output is free (yield to stream, return or await a `Response` to buffer). Like
+    `@post`, it registers nothing; the `Router` merges it with other `Route`s on
+    the same pattern.
+    """
+
+    method: str
+
+    @overload
+    def __call__[T](
+        self,
+        pattern: Pattern,
+        /,
+        *,
+        summary: str = ...,
+        responses: Mapping[int, ResponseSpec] | None = ...,
+    ) -> Callable[[Callable[[T, Stream[Inbound]], Returned]], Route[T]]: ...
+    @overload
+    def __call__[T, A](
+        self,
+        pattern: Pattern,
+        a: Extractor[A],
+        /,
+        *,
+        summary: str = ...,
+        responses: Mapping[int, ResponseSpec] | None = ...,
+    ) -> Callable[[Callable[[T, A, Stream[Inbound]], Returned]], Route[T]]: ...
+    @overload
+    def __call__[T, A, B](
+        self,
+        pattern: Pattern,
+        a: Extractor[A],
+        b: Extractor[B],
+        /,
+        *,
+        summary: str = ...,
+        responses: Mapping[int, ResponseSpec] | None = ...,
+    ) -> Callable[[Callable[[T, A, B, Stream[Inbound]], Returned]], Route[T]]: ...
+    @overload
+    def __call__[T, A, B, C](
+        self,
+        pattern: Pattern,
+        a: Extractor[A],
+        b: Extractor[B],
+        c: Extractor[C],
+        /,
+        *,
+        summary: str = ...,
+        responses: Mapping[int, ResponseSpec] | None = ...,
+    ) -> Callable[[Callable[[T, A, B, C, Stream[Inbound]], Returned]], Route[T]]: ...
+    @overload
+    def __call__[T, A, B, C, D](
+        self,
+        pattern: Pattern,
+        a: Extractor[A],
+        b: Extractor[B],
+        c: Extractor[C],
+        d: Extractor[D],
+        /,
+        *,
+        summary: str = ...,
+        responses: Mapping[int, ResponseSpec] | None = ...,
+    ) -> Callable[[Callable[[T, A, B, C, D, Stream[Inbound]], Returned]], Route[T]]: ...
+    @overload
+    def __call__[T, A, B, C, D, E](
+        self,
+        pattern: Pattern,
+        a: Extractor[A],
+        b: Extractor[B],
+        c: Extractor[C],
+        d: Extractor[D],
+        e: Extractor[E],
+        /,
+        *,
+        summary: str = ...,
+        responses: Mapping[int, ResponseSpec] | None = ...,
+    ) -> Callable[[Callable[[T, A, B, C, D, E, Stream[Inbound]], Returned]], Route[T]]: ...
+    @overload
+    def __call__[T, A, B, C, D, E, F](
+        self,
+        pattern: Pattern,
+        a: Extractor[A],
+        b: Extractor[B],
+        c: Extractor[C],
+        d: Extractor[D],
+        e: Extractor[E],
+        f: Extractor[F],
+        /,
+        *,
+        summary: str = ...,
+        responses: Mapping[int, ResponseSpec] | None = ...,
+    ) -> Callable[[Callable[[T, A, B, C, D, E, F, Stream[Inbound]], Returned]], Route[T]]: ...
+    @overload
+    def __call__[T, A, B, C, D, E, F, G](
+        self,
+        pattern: Pattern,
+        a: Extractor[A],
+        b: Extractor[B],
+        c: Extractor[C],
+        d: Extractor[D],
+        e: Extractor[E],
+        f: Extractor[F],
+        g: Extractor[G],
+        /,
+        *,
+        summary: str = ...,
+        responses: Mapping[int, ResponseSpec] | None = ...,
+    ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, Stream[Inbound]], Returned]], Route[T]]: ...
+    @overload
+    def __call__[T, A, B, C, D, E, F, G, H](
+        self,
+        pattern: Pattern,
+        a: Extractor[A],
+        b: Extractor[B],
+        c: Extractor[C],
+        d: Extractor[D],
+        e: Extractor[E],
+        f: Extractor[F],
+        g: Extractor[G],
+        h: Extractor[H],
+        /,
+        *,
+        summary: str = ...,
+        responses: Mapping[int, ResponseSpec] | None = ...,
+    ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, Stream[Inbound]], Returned]], Route[T]]: ...
+    @overload
+    def __call__[T, A, B, C, D, E, F, G, H, J](
+        self,
+        pattern: Pattern,
+        a: Extractor[A],
+        b: Extractor[B],
+        c: Extractor[C],
+        d: Extractor[D],
+        e: Extractor[E],
+        f: Extractor[F],
+        g: Extractor[G],
+        h: Extractor[H],
+        j: Extractor[J],
+        /,
+        *,
+        summary: str = ...,
+        responses: Mapping[int, ResponseSpec] | None = ...,
+    ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J, Stream[Inbound]], Returned]], Route[T]]: ...
+    @overload
+    def __call__[T, A, B, C, D, E, F, G, H, J, K](
+        self,
+        pattern: Pattern,
+        a: Extractor[A],
+        b: Extractor[B],
+        c: Extractor[C],
+        d: Extractor[D],
+        e: Extractor[E],
+        f: Extractor[F],
+        g: Extractor[G],
+        h: Extractor[H],
+        j: Extractor[J],
+        k: Extractor[K],
+        /,
+        *,
+        summary: str = ...,
+        responses: Mapping[int, ResponseSpec] | None = ...,
+    ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J, K, Stream[Inbound]], Returned]], Route[T]]: ...
+
+    def __call__(
+        self,
+        pattern: Pattern,
+        *extractors: Extractor[object],
+        summary: str = "",
+        responses: Mapping[int, ResponseSpec] | None = None,
+    ) -> Callable[[Callable[..., Returned]], Route[object]]:
+        def decorate(fn: Callable[..., Returned]) -> Route[object]:
+            endpoint = _build_stream_endpoint(extractors, fn, summary, responses)
+            return Route(pattern=pattern, methods={self.method: endpoint})
+
+        return decorate
+
+
 @overload
-def ws[T](pattern: Pattern, /) -> Callable[[Callable[[T], WebsocketHandler]], WebsocketRoute[T]]: ...
+def ws[T](
+    pattern: Pattern,
+    /,
+) -> Callable[[Callable[[T], WebsocketHandler]], WebsocketRoute[T]]: ...
 @overload
 def ws[T, A](
-    pattern: Pattern, a: Extractor[A], /
+    pattern: Pattern,
+    a: Extractor[A],
+    /,
 ) -> Callable[[Callable[[T, A], WebsocketHandler]], WebsocketRoute[T]]: ...
 @overload
 def ws[T, A, B](
-    pattern: Pattern, a: Extractor[A], b: Extractor[B], /
+    pattern: Pattern,
+    a: Extractor[A],
+    b: Extractor[B],
+    /,
 ) -> Callable[[Callable[[T, A, B], WebsocketHandler]], WebsocketRoute[T]]: ...
 @overload
 def ws[T, A, B, C](
-    pattern: Pattern, a: Extractor[A], b: Extractor[B], c: Extractor[C], /
+    pattern: Pattern,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    /,
 ) -> Callable[[Callable[[T, A, B, C], WebsocketHandler]], WebsocketRoute[T]]: ...
 @overload
 def ws[T, A, B, C, D](
-    pattern: Pattern, a: Extractor[A], b: Extractor[B], c: Extractor[C], d: Extractor[D], /
+    pattern: Pattern,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    /,
 ) -> Callable[[Callable[[T, A, B, C, D], WebsocketHandler]], WebsocketRoute[T]]: ...
 @overload
 def ws[T, A, B, C, D, E](
-    pattern: Pattern, a: Extractor[A], b: Extractor[B], c: Extractor[C], d: Extractor[D], e: Extractor[E], /
+    pattern: Pattern,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    /,
 ) -> Callable[[Callable[[T, A, B, C, D, E], WebsocketHandler]], WebsocketRoute[T]]: ...
 @overload
 def ws[T, A, B, C, D, E, F](
@@ -504,9 +903,58 @@ def ws[T](
     return decorate
 
 
+async def _emit(result: Returned) -> AsyncIterator[Outbound]:
+    """Relay a handler's result to the outbound stream, however it was produced.
+
+    The single output path shared by buffered- and streamed-input endpoints, so
+    the output mode is decided by what the handler returns, not by how its input
+    was read. Three shapes: a `Response` is encoded once (buffered output); an
+    `Awaitable[Reply]` (an `async def` handler) is awaited, then its `Reply` is
+    relayed the same way; an `AsyncIterator[Outbound]` (an `async def ... yield`
+    handler) is relayed event by event. This is the runtime-value dispatch that
+    keeps the four input/output buffering combinations all expressible.
+    """
+    if isinstance(result, Awaitable):
+        result = await result
+    if isinstance(result, Response):
+        for event in encode_response(result):
+            yield event
+        return
+    async for event in result:
+        yield event
+
+
+def _build_stream_endpoint(
+    extractors: tuple[Extractor[object], ...],
+    fn: Callable[..., Returned],
+    summary: str,
+    responses: Mapping[int, ResponseSpec] | None,
+) -> HttpEndpoint[object]:
+    if any(extractor.request_body is not None for extractor in extractors):
+        raise ValueError("a streaming route cannot take a body extractor; it would buffer the input it streams")
+    spec = RouteSpec(
+        summary=summary,
+        query=tuple(param for extractor in extractors for param in extractor.query),
+        headers=tuple(param for extractor in extractors for param in extractor.headers),
+        request_body=None,
+        responses=dict(responses or {}),
+    )
+
+    def endpoint(state: object, match: Match[HttpScope]) -> HttpHandler:
+        request = Request(scope=match.scope, params=match.params, body=b"")
+        values = tuple(extractor.extract(request) for extractor in extractors)
+
+        def processor(inputs: Stream[Inbound]) -> Stream[Outbound]:
+            return _emit(fn(state, *values, inputs))
+
+        return processor
+
+    return describe(spec)(endpoint)
+
+
 def _build_endpoint(
     extractors: tuple[Extractor[object], ...],
-    fn: Callable[..., Reply],
+    fn: Callable[..., Returned],
     summary: str,
     responses: Mapping[int, ResponseSpec] | None,
 ) -> HttpEndpoint[object]:
@@ -532,14 +980,9 @@ async def _reply(
     state: object,
     match: Match[HttpScope],
     extractors: tuple[Extractor[object], ...],
-    fn: Callable[..., Reply],
+    fn: Callable[..., Returned],
 ) -> AsyncIterator[Outbound]:
     body = await read_body(inputs)
     request = Request(scope=match.scope, params=match.params, body=body)
-    result = fn(state, *(extractor.extract(request) for extractor in extractors))
-    if isinstance(result, Response):
-        for event in encode_response(result):
-            yield event
-        return
-    async for event in result:
+    async for event in _emit(fn(state, *(extractor.extract(request) for extractor in extractors))):
         yield event
