@@ -45,16 +45,17 @@ from without_web import Router
 from without_web import Sequence
 from without_web import WebsocketRouter
 from without_web import body
+from without_web import catching
 from without_web import get
 from without_web import handle
 from without_web import http_scope
-from without_web import json_response
 from without_web import openapi
 from without_web import path_param
 from without_web import post
 from without_web import query_param
 from without_web import ws
 
+from integration.responses import json_response
 from integration.todos.core import NewTodo
 from integration.todos.core import Todo
 from integration.todos.core import TodoList
@@ -225,14 +226,17 @@ def legacy(todos: TodoList, head: HttpScope) -> HttpHandler:
     return handler
 
 
-async def _on_missing_todo(exc: Exception) -> Response:
-    assert isinstance(exc, TodoNotFound)
-    return json_response(404, {"error": str(exc), "id": exc.todo_id})
-
-
-async def _on_invalid_body(exc: Exception) -> Response:
-    assert isinstance(exc, ValidationError)
-    return json_response(422, {"error": "invalid todo body", "fields": exc.error_count()})
+async def _recover(exc: Exception) -> Response | None:
+    # The app's exception policy is just a function, not a registry: `match`
+    # narrows each case to its real type (no `assert isinstance`), and the final
+    # `case _` returns `None` to let anything unhandled propagate.
+    match exc:
+        case TodoNotFound():
+            return json_response(404, {"error": str(exc), "id": exc.todo_id})
+        case ValidationError():
+            return json_response(422, {"error": "invalid todo body", "fields": exc.error_count()})
+        case _:
+            return None
 
 
 async def _stamp(outputs: Stream[Outbound], _head: HttpScope) -> AsyncIterator[Outbound]:
@@ -245,10 +249,27 @@ async def _stamp(outputs: Stream[Outbound], _head: HttpScope) -> AsyncIterator[O
 
 # One middleware, to show an ordinary `without-asgi` `stack` still attaches to a
 # `without-web` router unchanged.
-powered_by: HttpMiddleware = wrap(outbound=_stamp)
+powered_by: HttpMiddleware[object] = wrap(outbound=_stamp)
 
 
-admin: Router[TodoList] = Router(routes=(stats,), fallback=fallback)
+def require_authorization(_state: object, handler: HttpHandler, scope: HttpScope) -> HttpHandler:
+    """Gate a request on an `Authorization` header, short-circuiting with a 401.
+
+    The point is *where* it applies: it is the `admin` sub-router's own
+    `middleware`, so the mount carries it to every route under `/admin` and nowhere
+    else (the public todo routes stay open). A middleware can replace the handler
+    outright: with no credential it returns one that never reads the request and
+    emits the 401, so the wrapped endpoint never runs."""
+    if any(name == b"authorization" for name, _ in scope.headers):
+        return handler
+
+    def reject(inputs: Stream[Inbound]) -> Stream[Outbound]:
+        return stream(encode_response(json_response(401, {"error": "admin requires authorization"})))
+
+    return reject
+
+
+admin: Router[TodoList] = Router(routes=(stats,), fallback=fallback, middleware=require_authorization)
 
 todos_router: Router[TodoList] = Router(
     routes=(
@@ -260,8 +281,9 @@ todos_router: Router[TodoList] = Router(
         Mount("/legacy", legacy),
     ),
     fallback=fallback,
-    middleware=stack(powered_by),
-    exception_handlers={TodoNotFound: _on_missing_todo, ValidationError: _on_invalid_body},
+    # `catching` is innermost (last in the stack), so the exception-mapped response
+    # still flows out through `powered_by` and gets stamped like any other.
+    middleware=stack(powered_by, catching(_recover)),
 )
 
 

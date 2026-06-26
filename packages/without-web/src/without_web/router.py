@@ -19,14 +19,11 @@ from without_asgi import WebsocketHandler
 from without_asgi import WebsocketScope
 from without_asgi import encode_response
 from without_asgi.routing import HttpMiddleware
+from without_asgi.routing import Middleware
 from without_asgi.routing import WebsocketMiddleware
 from without_asgi.routing import stack
 
 from without_web.converters import PATH
-from without_web.exceptions import ExceptionHandler
-from without_web.exceptions import WebsocketExceptionHandler
-from without_web.exceptions import catching
-from without_web.exceptions import catching_websocket
 from without_web.patterns import CatchAll
 from without_web.patterns import Literal
 from without_web.patterns import Param
@@ -173,6 +170,25 @@ def route[T](
     return Route(pattern, methods)
 
 
+def with_middleware[T, S, H](endpoint: Endpoint[T, S, H], *middleware: Middleware[T, H, S]) -> Endpoint[T, S, H]:
+    """Scope middleware to one endpoint instead of the whole router.
+
+    The router-wide `middleware` runs on every dispatch; this applies the same
+    `Middleware` vocabulary to a single route (or an opaque mount target). An
+    `Endpoint` builds the handler and a `Middleware` is `(T, H, S) -> H`, so this
+    is just composition: build the handler, then run the middleware over it with
+    the request's scope. First argument is outermost, matching `stack`. Use it per
+    method, e.g. `route("/admin", get=with_middleware(list_admins, require_auth))`;
+    for a whole mounted subtree, give the mounted `Router` its own `middleware`.
+    """
+    composed = stack(*middleware)
+
+    def built(state: T, match: Match[S]) -> H:
+        return composed(state, endpoint(state, match), match.scope)
+
+    return built
+
+
 @dataclass(frozen=True, slots=True)
 class _Methods[T]:
     """A terminal carrying a `Route`'s method map (a real endpoint, or a 405)."""
@@ -189,6 +205,26 @@ class _Delegate[T]:
 
 
 type _HttpLeaf[T] = _Methods[T] | _Delegate[T]
+
+
+_PASSTHROUGH_HTTP: HttpMiddleware[object] = stack()
+_PASSTHROUGH_WEBSOCKET: WebsocketMiddleware[object] = stack()
+
+
+def _behind[T](leaf: _HttpLeaf[T], middleware: HttpMiddleware[T]) -> _HttpLeaf[T]:
+    # Push a mounted sub-router's own `middleware` onto each of its grafted leaves,
+    # so the subtree keeps its middleware once flattened into the parent trie. For a
+    # method map every endpoint is wrapped; for an opaque delegate the middleware
+    # wraps the handler the target builds from the remounted scope.
+    match leaf:
+        case _Methods(methods):
+            return _Methods({method: with_middleware(endpoint, middleware) for method, endpoint in methods.items()})
+        case _Delegate(prefix, target):
+
+            def behind_target(state: T, scope: HttpScope) -> HttpHandler:
+                return middleware(state, target(state, scope), scope)
+
+            return _Delegate(prefix, behind_target)
 
 
 def _flatten[T](routes: tuple[Route[T] | Mount[T], ...]) -> list[tuple[tuple[Segment, ...], _HttpLeaf[T]]]:
@@ -214,7 +250,10 @@ def _flatten[T](routes: tuple[Route[T] | Mount[T], ...]) -> list[tuple[tuple[Seg
             case Mount(prefix, target):
                 head: tuple[Segment, ...] = tuple(Literal(segment) for segment in split_path(prefix))
                 if isinstance(target, Router):
-                    mounts.extend((head + tail, leaf) for tail, leaf in _flatten(target.routes))
+                    grafted = _flatten(target.routes)
+                    if target.middleware is not _PASSTHROUGH_HTTP:
+                        grafted = [(tail, _behind(leaf, target.middleware)) for tail, leaf in grafted]
+                    mounts.extend((head + tail, leaf) for tail, leaf in grafted)
                     continue
                 leaf: _HttpLeaf[T] = _Delegate(prefix=prefix, target=target)
                 # The exact prefix and any deeper path both delegate: the
@@ -248,10 +287,6 @@ def _remount(scope: HttpScope, prefix: str) -> HttpScope:
     return replace(scope, path=trimmed, root_path=scope.root_path + prefix)
 
 
-_PASSTHROUGH_HTTP: HttpMiddleware = stack()
-_PASSTHROUGH_WEBSOCKET: WebsocketMiddleware = stack()
-
-
 @dataclass(frozen=True, slots=True)
 class Router[T]:
     """An opinionated HTTP router whose `dispatch` is an `HttpRouter[T]`.
@@ -265,18 +300,14 @@ class Router[T]:
 
     routes: tuple[Route[T] | Mount[T], ...]
     fallback: HttpEndpoint[T]
-    middleware: HttpMiddleware = _PASSTHROUGH_HTTP
-    exception_handlers: Mapping[type[Exception], ExceptionHandler] = field(default_factory=dict)
+    middleware: HttpMiddleware[T] = _PASSTHROUGH_HTTP
     tree: Node[_HttpLeaf[T]] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tree", build(_flatten(self.routes)))
 
     def dispatch(self, state: T, scope: HttpScope) -> HttpHandler:
-        handler = self._resolve(state, scope)
-        if self.exception_handlers:
-            handler = catching(self.exception_handlers)(handler, scope)
-        return self.middleware(handler, scope)
+        return self.middleware(state, self._resolve(state, scope), scope)
 
     def _resolve(self, state: T, scope: HttpScope) -> HttpHandler:
         found = walk(self.tree, split_path(scope.path))
@@ -316,8 +347,7 @@ class WebsocketRouter[T]:
 
     routes: tuple[WebsocketRoute[T], ...]
     fallback: WebsocketEndpoint[T]
-    middleware: WebsocketMiddleware = _PASSTHROUGH_WEBSOCKET
-    exception_handlers: Mapping[type[Exception], WebsocketExceptionHandler] = field(default_factory=dict)
+    middleware: WebsocketMiddleware[T] = _PASSTHROUGH_WEBSOCKET
     tree: Node[WebsocketEndpoint[T]] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -328,7 +358,4 @@ class WebsocketRouter[T]:
         found = walk(self.tree, split_path(scope.path))
         endpoint = self.fallback if found is None else found.leaf
         params = {} if found is None else found.params
-        handler = endpoint(state, Match(scope, params))
-        if self.exception_handlers:
-            handler = catching_websocket(self.exception_handlers)(handler, scope)
-        return self.middleware(handler, scope)
+        return self.middleware(state, endpoint(state, Match(scope, params)), scope)

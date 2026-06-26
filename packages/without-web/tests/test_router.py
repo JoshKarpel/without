@@ -4,6 +4,7 @@ import json
 from collections.abc import AsyncIterator
 
 import pytest
+from helpers import json_response
 from without import Stream
 from without import stream
 from without_asgi import Asgi
@@ -16,22 +17,28 @@ from without_asgi import Response
 from without_asgi import ResponseBody
 from without_asgi import ResponseStart
 from without_asgi import encode_response
+from without_asgi.routing import HttpMiddleware
 from without_web import INT
 from without_web import Match
 from without_web import Mount
 from without_web import Router
 from without_web import buffered
-from without_web import json_response
+from without_web import catching
 from without_web import path_param
 from without_web import route
+from without_web import with_middleware
 
 
 class DomainError(Exception):
     pass
 
 
-async def _to_400(exc: Exception) -> Response:
-    return json_response(400, {"error": str(exc)})
+async def _to_400(exc: Exception) -> Response | None:
+    match exc:
+        case DomainError():
+            return json_response(400, {"error": str(exc)})
+        case _:
+            return None
 
 
 def _scope(method: str, path: str, *, root_path: str = "") -> HttpScope:
@@ -159,11 +166,55 @@ async def test_an_exception_before_response_start_is_mapped_to_a_response() -> N
     router: Router[object] = Router(
         routes=(route("/boom", get=boom),),
         fallback=_fallback,
-        exception_handlers={DomainError: _to_400},
+        middleware=catching(_to_400),
     )
     start, body = await _run(router.dispatch(object(), _scope("GET", "/boom")))
     assert start.status == 400
     assert json.loads(body) == {"error": "nope"}
+
+
+class Forbidden(Exception):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+async def test_recover_narrows_the_exception_type_and_reads_typed_fields() -> None:
+    async def recover(exc: Exception) -> Response | None:
+        match exc:
+            case Forbidden():
+                return json_response(403, {"reason": exc.reason})
+            case _:
+                return None
+
+    @buffered
+    def deny(state: object, match: Match[HttpScope], body: bytes) -> Response:
+        raise Forbidden("tenant-locked")
+
+    router: Router[object] = Router(
+        routes=(route("/deny", get=deny),),
+        fallback=_fallback,
+        middleware=catching(recover),
+    )
+    start, body = await _run(router.dispatch(object(), _scope("GET", "/deny")))
+    assert start.status == 403
+    assert json.loads(body) == {"reason": "tenant-locked"}
+
+
+async def test_middleware_reads_the_dispatched_state() -> None:
+    def stamp_state(state: str, handler: HttpHandler, scope: HttpScope) -> HttpHandler:
+        async def processor(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
+            async for event in handler(inputs):
+                if isinstance(event, ResponseStart):
+                    yield ResponseStart(status=event.status, headers=(*event.headers, (b"x-state", state.encode())))
+                else:
+                    yield event
+
+        return processor
+
+    router: Router[str] = Router(routes=(route("/who", get=_ok),), fallback=_fallback, middleware=stamp_state)
+    start, _body = await _run(router.dispatch("tenant-7", _scope("GET", "/who")))
+    assert (b"x-state", b"tenant-7") in start.headers
 
 
 async def test_an_exception_after_response_start_propagates() -> None:
@@ -177,7 +228,55 @@ async def test_an_exception_after_response_start_propagates() -> None:
     router: Router[object] = Router(
         routes=(route("/boom", get=boom_after),),
         fallback=_fallback,
-        exception_handlers={DomainError: _to_400},
+        middleware=catching(_to_400),
     )
     with pytest.raises(DomainError):
         await _run(router.dispatch(object(), _scope("GET", "/boom")))
+
+
+def _mark(name: bytes, value: bytes) -> HttpMiddleware[object]:
+    def middleware(_state: object, handler: HttpHandler, scope: HttpScope) -> HttpHandler:
+        async def processor(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
+            async for event in handler(inputs):
+                if isinstance(event, ResponseStart):
+                    yield ResponseStart(status=event.status, headers=(*event.headers, (name, value)))
+                else:
+                    yield event
+
+        return processor
+
+    return middleware
+
+
+async def test_with_middleware_scopes_to_one_route() -> None:
+    router: Router[object] = Router(
+        routes=(route("/guarded", get=with_middleware(_ok, _mark(b"x-auth", b"yes"))), route("/open", get=_created)),
+        fallback=_fallback,
+    )
+    guarded, _ = await _run(router.dispatch(object(), _scope("GET", "/guarded")))
+    open_route, _ = await _run(router.dispatch(object(), _scope("GET", "/open")))
+    assert (b"x-auth", b"yes") in guarded.headers
+    assert not any(name == b"x-auth" for name, _ in open_route.headers)
+
+
+async def test_a_mounted_router_keeps_its_own_middleware() -> None:
+    section: Router[object] = Router(
+        routes=(route("/users", get=_ok),), fallback=_fallback, middleware=_mark(b"x-zone", b"admin")
+    )
+    app: Router[object] = Router(routes=(route("/health", get=_created), Mount("/admin", section)), fallback=_fallback)
+    inside, _ = await _run(app.dispatch(object(), _scope("GET", "/admin/users")))
+    outside, _ = await _run(app.dispatch(object(), _scope("GET", "/health")))
+    assert (b"x-zone", b"admin") in inside.headers
+    assert not any(name == b"x-zone" for name, _ in outside.headers)
+
+
+async def test_parent_and_mounted_middleware_both_apply() -> None:
+    section: Router[object] = Router(
+        routes=(route("/users", get=_ok),), fallback=_fallback, middleware=_mark(b"x-inner", b"section")
+    )
+    app: Router[object] = Router(
+        routes=(Mount("/admin", section),), fallback=_fallback, middleware=_mark(b"x-outer", b"app")
+    )
+    start, _ = await _run(app.dispatch(object(), _scope("GET", "/admin/users")))
+    assert (b"x-outer", b"app") in start.headers
+    assert (b"x-inner", b"section") in start.headers

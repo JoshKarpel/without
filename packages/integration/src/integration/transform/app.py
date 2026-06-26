@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import time
 from collections.abc import AsyncIterator
 from typing import assert_never
@@ -17,7 +16,6 @@ from without_asgi import HttpHandler
 from without_asgi import HttpScope
 from without_asgi import Inbound
 from without_asgi import Outbound
-from without_asgi import RawHeaders
 from without_asgi import RequestBody
 from without_asgi import Response
 from without_asgi import ResponseStart
@@ -42,6 +40,8 @@ from without_asgi.routing import buffered
 from without_asgi.routing import stack
 from without_asgi.routing import wrap
 
+from integration.responses import json_response
+from integration.responses import text_response
 from integration.transform.core import Mode
 from integration.transform.core import TransformConfig
 from integration.transform.core import TransformError
@@ -72,18 +72,6 @@ class Settings(BaseModel):
 
     transform: TransformConfig = TransformConfig()
     http: HttpConfig = HttpConfig()
-
-
-JSON_HEADERS: RawHeaders = ((b"content-type", b"application/json"),)
-TEXT_HEADERS: RawHeaders = ((b"content-type", b"text/plain; charset=utf-8"),)
-
-
-def json_response(status: int, payload: object) -> Response:
-    return Response(status=status, headers=JSON_HEADERS, body=json.dumps(payload, sort_keys=True).encode())
-
-
-def text_response(text: str) -> Response:
-    return Response(status=200, headers=TEXT_HEADERS, body=text.encode())
 
 
 def mode_param(query_string: bytes) -> str | None:
@@ -177,7 +165,7 @@ async def inject_header(outputs: Stream[Outbound], name: bytes, value: bytes) ->
             yield event
 
 
-def with_header(name: bytes, value: bytes) -> HttpMiddleware:
+def with_header(name: bytes, value: bytes) -> HttpMiddleware[object]:
     """Build middleware that appends a header to every response."""
 
     def add_header(outputs: Stream[Outbound], _head: HttpScope) -> Stream[Outbound]:
@@ -201,7 +189,7 @@ async def log_response(outputs: Stream[Outbound], head: HttpScope) -> AsyncItera
 
 # Two independent ends that never share state, so one `wrap` bundles them: the
 # inbound end logs the request as it arrives, the outbound end logs the status.
-access_log: HttpMiddleware = wrap(inbound=log_request, outbound=log_response)
+access_log: HttpMiddleware[object] = wrap(inbound=log_request, outbound=log_response)
 
 
 # The contrast: `access_timing` needs one value, the start time, to span the whole
@@ -211,7 +199,7 @@ access_log: HttpMiddleware = wrap(inbound=log_request, outbound=log_response)
 # stream ends. No inbound transform and no second closure, so no shared mutable
 # state and no `nonlocal`. `wrap` can't express this; its two transformers have no
 # shared scope to hold the value.
-def access_timing(handler: HttpHandler, head: HttpScope) -> HttpHandler:
+def access_timing(_state: object, handler: HttpHandler, head: HttpScope) -> HttpHandler:
     async def processor(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
         started = time.monotonic()
         async for event in handler(inputs):
@@ -221,7 +209,7 @@ def access_timing(handler: HttpHandler, head: HttpScope) -> HttpHandler:
     return processor
 
 
-def request_digest(handler: HttpHandler, head: HttpScope) -> HttpHandler:
+def request_digest(_state: object, handler: HttpHandler, head: HttpScope) -> HttpHandler:
     """Middleware reporting a SHA-256 of the request body back on the response.
 
     The genuine both-sides case: data observed on the inbound stream (each body
@@ -285,13 +273,36 @@ def request_digest(handler: HttpHandler, head: HttpScope) -> HttpHandler:
     return compose(absorb, compose(handler, stamp))
 
 
+# The third kind of middleware: one that reads the *connection state*. `wrap`'s
+# transformers see only the scope, and `access_timing`/`request_digest` carry their
+# own local state, but a cross-cutting concern often needs the same config the
+# handlers do (here the body-size limit, elsewhere an auth secret or a rate-limit
+# budget). The `Middleware` vocabulary threads the lifespan `T` as the leading
+# argument for exactly this: `advertise_limit` reads `settings.http.max_bytes` and
+# surfaces it as a response header, without re-plumbing the config. Because the app
+# snapshots `Settings` per connection, a reload changes the value the next
+# connection advertises.
+def advertise_limit(settings: Settings, handler: HttpHandler, _head: HttpScope) -> HttpHandler:
+    """Stamp the configured request-body limit onto every response, read from state."""
+    limit = str(settings.http.max_bytes).encode()
+
+    async def processor(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
+        async for event in handler(inputs):
+            if isinstance(event, ResponseStart):
+                yield ResponseStart(status=event.status, headers=(*event.headers, (b"x-max-bytes", limit)))
+            else:
+                yield event
+
+    return processor
+
+
 async def log_connect(inputs: Stream[WebsocketInbound], head: WebsocketScope) -> AsyncIterator[WebsocketInbound]:
     print(f"=== WS {head.path}")
     async for event in inputs:
         yield event
 
 
-socket_log: WebsocketMiddleware = wrap(inbound=log_connect)
+socket_log: WebsocketMiddleware[object] = wrap(inbound=log_connect)
 
 
 def text_transform_app(source: Stream[Settings]) -> ASGIApp:
@@ -313,6 +324,10 @@ def text_transform_app(source: Stream[Settings]) -> ASGIApp:
             access_timing,
             access_log,
             request_digest,
+            # Reads the connection state to surface a config value; mixing it with
+            # the state-ignoring middleware shows the vocabulary threads `Settings`
+            # through the whole stack.
+            advertise_limit,
             # https://www.gnuterrypratchett.com: keep his name moving on the overhead.
             with_header(b"x-clacks-overhead", b"GNU Terry Pratchett"),
         ),

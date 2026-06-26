@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from helpers import json_response
 from without_asgi import HttpScope
 from without_asgi import Response
 from without_web import INT
@@ -15,7 +16,6 @@ from without_web import Sequence
 from without_web import Single
 from without_web import buffered
 from without_web import describe
-from without_web import json_response
 from without_web import openapi
 from without_web import path_param
 from without_web import route

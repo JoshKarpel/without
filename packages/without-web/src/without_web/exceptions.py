@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from collections.abc import Callable
-from collections.abc import Mapping
 
 from without import Processor
 from without import Stream
@@ -21,17 +20,24 @@ from without_asgi import encode_response
 from without_asgi.routing import HttpMiddleware
 from without_asgi.routing import WebsocketMiddleware
 
-type ExceptionHandler = Callable[[Exception], Awaitable[Response]]
-type WebsocketExceptionHandler = Callable[[Exception], Awaitable[WebsocketClose]]
+# An app's exception policy: given a raised exception, produce the reply to send
+# instead, or `None` to let it propagate. Writing this as `match exc:` (or
+# `try/except`) gives natural narrowing and full control, so there is no registry
+# of types to handlers and no per-type erasure: the policy is just a function.
+type ExceptionRecover = Callable[[Exception], Awaitable[Response | None]]
+type WebsocketExceptionRecover = Callable[[Exception], Awaitable[WebsocketClose | None]]
 
 
-def catching(handlers: Mapping[type[Exception], ExceptionHandler]) -> HttpMiddleware:
-    """Build middleware that maps declared exceptions to responses.
+def catching(recover: ExceptionRecover) -> HttpMiddleware[object]:
+    """Build middleware that maps exceptions to a response, before the status commits.
 
     Exception handling is not a new mechanism: it is a `Middleware` that wraps a
-    handler and watches its outbound stream. An exception whose type (or a base
-    of it) is in `handlers` becomes that handler's `Response`; anything else
-    propagates unchanged.
+    handler and watches its outbound stream. `recover` is the app's policy: it is
+    handed a raised exception and returns the `Response` to send instead, or
+    `None` to let the exception propagate. There is deliberately no registry of
+    `type -> handler`: a `recover` written as `match exc:` narrows each case to
+    its real type (no `assert isinstance`) and can re-raise, chain, or do async
+    work, all of which a heterogeneous mapping could not express without a cast.
 
     Honest limitation: the mapping applies only while the status line can still
     be set, i.e. until the first `ResponseStart` flows out. Informational events
@@ -40,31 +46,32 @@ def catching(handlers: Mapping[type[Exception], ExceptionHandler]) -> HttpMiddle
     wire the exception re-raises, because the handler can abort but not re-status.
     """
 
-    def middleware(handler: HttpHandler, scope: HttpScope) -> HttpHandler:
-        async def recover(exc: Exception) -> tuple[Outbound, ...] | None:
-            mapped = _lookup(handlers, type(exc))
-            return None if mapped is None else encode_response(await mapped(exc))
+    def middleware(_state: object, handler: HttpHandler, scope: HttpScope) -> HttpHandler:
+        async def recovering(exc: Exception) -> tuple[Outbound, ...] | None:
+            response = await recover(exc)
+            return None if response is None else encode_response(response)
 
-        return _guarding(handler, _is_response_start, recover)
+        return _guarding(handler, _is_response_start, recovering)
 
     return middleware
 
 
-def catching_websocket(handlers: Mapping[type[Exception], WebsocketExceptionHandler]) -> WebsocketMiddleware:
+def catching_websocket(recover: WebsocketExceptionRecover) -> WebsocketMiddleware[object]:
     """The WebSocket sibling of `catching`, mapping exceptions to a close.
 
     The equivalent commit point is `WebsocketAccept`: before the handshake is
     accepted a close still rejects the connection (the server turns it into a
     `403`), so a mapped exception becomes that `WebsocketClose`. Once accepted
-    the connection is established and the exception re-raises.
+    the connection is established and the exception re-raises. `recover` returns
+    the `WebsocketClose` to send, or `None` to propagate.
     """
 
-    def middleware(handler: WebsocketHandler, scope: WebsocketScope) -> WebsocketHandler:
-        async def recover(exc: Exception) -> tuple[WebsocketOutbound, ...] | None:
-            mapped = _lookup(handlers, type(exc))
-            return None if mapped is None else (await mapped(exc),)
+    def middleware(_state: object, handler: WebsocketHandler, scope: WebsocketScope) -> WebsocketHandler:
+        async def recovering(exc: Exception) -> tuple[WebsocketOutbound, ...] | None:
+            close = await recover(exc)
+            return None if close is None else (close,)
 
-        return _guarding(handler, _is_websocket_accept, recover)
+        return _guarding(handler, _is_websocket_accept, recovering)
 
     return middleware
 
@@ -99,10 +106,3 @@ def _is_response_start(event: Outbound) -> bool:
 
 def _is_websocket_accept(event: WebsocketOutbound) -> bool:
     return isinstance(event, WebsocketAccept)
-
-
-def _lookup[H](handlers: Mapping[type[Exception], H], raised: type[BaseException]) -> H | None:
-    for klass in raised.__mro__:
-        if (handler := handlers.get(klass)) is not None:
-            return handler
-    return None

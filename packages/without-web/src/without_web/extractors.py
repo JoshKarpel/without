@@ -55,7 +55,7 @@ class Extractor(Generic[_V_co]):
     """A typed piece of a request, paired with the OpenAPI it contributes.
 
     `extract` is a pure `Request -> V` that raises to *reject* a bad request
-    (the router's `exception_handlers` map the raised type to a 4xx); it never
+    (a `catching` middleware's `recover` maps the raised type to a 4xx); it never
     decides which handler runs. The same value carries its own OpenAPI fragment,
     so a handler's parameter list and request body are *recovered* from the
     extractors it declares, never restated: one declaration, two consumers

@@ -5,7 +5,8 @@ An opinionated HTTP and WebSocket router for
 router, only the unopinionated boundary (scope/event parsing) and composition
 tools (`Middleware`, `stack`, `wrap`, `buffered`). `without-web` is the
 opinionated layer on top: tuple patterns with typed parameters, typed request
-extraction, 405-vs-404, mounting, exception handlers, and OpenAPI.
+extraction, 405-vs-404, mounting, scoped middleware, exception handlers, and
+OpenAPI.
 
 It snaps onto the boundary through nothing but the existing `HttpRouter` type:
 `Router.dispatch` *is* an `HttpRouter[T]`, so `make_asgi_app(http=router.dispatch)`
@@ -13,18 +14,27 @@ just works, and bring-your-own (or no router at all) stays first-class. Neither
 package imports the other's routing opinions.
 
 ```python
-from without_asgi import make_asgi_app
-from without_web import INT, Router, get, json_response, path_param
+import json
+
+from without_asgi import Response, make_asgi_app
+from without_web import INT, Router, get, path_param
 
 uid = path_param("id", INT)              # one token: a pattern segment AND a typed read
 
 @get(t"/users/{uid}", uid)               # t-string pattern; `@get` returns a Route value
-def show_user(state, user_id: int):      # user_id is an int, no `assert isinstance`
-    return json_response(200, {"id": user_id})
+async def show_user(state, user_id: int):    # user_id is an int, no `assert isinstance`
+    body = json.dumps({"id": user_id}).encode()
+    return Response(status=200, headers=((b"content-type", b"application/json"),), body=body)
 
 router = Router(routes=(show_user,), fallback=not_found)
 app = make_asgi_app(lifespan, http=router.dispatch)
 ```
+
+Encoding (the serializer, its options, the content type) is the application's
+choice, so `without-web` ships no `json_response`-style helper: a handler returns
+a `Response` (status, headers, bytes) however it likes. The same stance the
+router takes toward schemas (`schema_for` is injected) it takes toward response
+bodies.
 
 ## A router dispatches on the scope, never the body
 
@@ -161,16 +171,56 @@ handlers; `Match` carries the scope plus the already-parsed path params.
 `Mount(prefix, target)` composes a sub-application as a value. Two cases:
 
 - a **`without-web` `Router`** is grafted: its routes are prepended with the
-  prefix, so matching and OpenAPI see straight through;
+  prefix, so matching and OpenAPI see straight through, and the sub-router's own
+  `middleware` is carried onto each grafted route (so middleware on a mounted
+  router applies to its whole subtree, and nowhere else);
 - an **opaque `HttpRouter`** (a BYO router or another app) is handed the
   prefix-trimmed scope (ASGI `root_path` semantics) and treated as a black box.
 
+## Middleware: router-wide, per-subtree, or per-route
+
+A `Router`'s `middleware` runs on every dispatch. To scope middleware to *part* of
+an app, two composing tools, no new mechanism:
+
+- **A subtree:** give a mounted sub-`Router` its own `middleware` (see Mounting).
+  It applies to every route under the mount and nothing outside it. This is the
+  natural home for cross-cutting concerns like auth on `/admin`. See
+  `integration.todos`, whose `admin` mount carries an `Authorization`-header gate.
+- **One route:** `with_middleware(endpoint, *middleware)` wraps a single endpoint.
+  An `Endpoint` builds the handler and a `Middleware` is `(T, H, S) -> H`, so this
+  is just composition; the result is a narrower `Endpoint`. Use it per method, e.g.
+  `route("/admin", get=with_middleware(list_admins, require_auth))`.
+
+Both reuse the same `Middleware` vocabulary (`stack`, `wrap`, a plain
+`(T, handler, scope) -> handler`) as the router-wide hook, including the ability to
+read connection state and to replace the handler outright (a 401 without calling
+the wrapped endpoint).
+
 ## Exception handlers
 
-`exception_handlers: Mapping[type[Exception], (Exc) -> Response]` is implemented
-as a middleware that wraps each endpoint and maps caught exceptions to a
-`Response`, reusing the existing `stack`/`wrap`/`compose` machinery rather than
-inventing a new mechanism. An unmapped exception propagates.
+Exception handling is not a new mechanism: it is a `Middleware`. `catching(recover)`
+wraps an endpoint, watches its outbound stream, and turns a raised exception into a
+`Response`, reusing the existing `stack`/`wrap`/`compose` machinery. There is *no
+registry*: `recover` is the app's policy, an ordinary
+`(Exception) -> Awaitable[Response | None]` function. Write it as `match exc:` and
+each case narrows to its real type (no `assert isinstance`, no cast); return `None`
+to let the exception propagate.
+
+```python
+async def recover(exc: Exception) -> Response | None:
+    match exc:
+        case TodoNotFound():
+            return Response(status=404, ...)   # exc is TodoNotFound here
+        case _:
+            return None                        # propagate
+
+router = Router(routes=(...), middleware=stack(catching(recover)))
+```
+
+Because it is plain middleware, the app controls where it sits in the stack (an
+outer `catching` handles what an inner one returns `None` for) and `recover` has
+full control: re-raise, chain, or do async work. `catching_websocket` is the
+sibling that maps to a `WebsocketClose`.
 
 Honest limitation: once a `ResponseStart` has been emitted, the status line is
 on the wire and cannot be rewritten, so the mapping applies only to exceptions

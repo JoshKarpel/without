@@ -4,8 +4,8 @@ from without_web.converters import PATH
 from without_web.converters import STR
 from without_web.converters import UUID
 from without_web.converters import Converter
-from without_web.exceptions import ExceptionHandler
-from without_web.exceptions import WebsocketExceptionHandler
+from without_web.exceptions import ExceptionRecover
+from without_web.exceptions import WebsocketExceptionRecover
 from without_web.exceptions import catching
 from without_web.exceptions import catching_websocket
 from without_web.extractors import Extractor
@@ -50,8 +50,6 @@ from without_web.patterns import PathSpec
 from without_web.patterns import Segment
 from without_web.patterns import split_path
 from without_web.responses import buffered
-from without_web.responses import json_response
-from without_web.responses import text_response
 from without_web.router import Endpoint
 from without_web.router import HttpEndpoint
 from without_web.router import Match
@@ -63,6 +61,7 @@ from without_web.router import WebsocketEndpoint
 from without_web.router import WebsocketRoute
 from without_web.router import WebsocketRouter
 from without_web.router import route
+from without_web.router import with_middleware
 from without_web.router import ws_route
 
 __all__ = [
@@ -76,7 +75,7 @@ __all__ = [
     "Converter",
     "Describable",
     "Endpoint",
-    "ExceptionHandler",
+    "ExceptionRecover",
     "Extractor",
     "HeaderParam",
     "HttpEndpoint",
@@ -100,7 +99,7 @@ __all__ = [
     "Sequence",
     "Single",
     "WebsocketEndpoint",
-    "WebsocketExceptionHandler",
+    "WebsocketExceptionRecover",
     "WebsocketReturned",
     "WebsocketRoute",
     "WebsocketRouter",
@@ -118,7 +117,6 @@ __all__ = [
     "header_param",
     "http_scope",
     "into",
-    "json_response",
     "openapi",
     "options",
     "patch",
@@ -128,8 +126,8 @@ __all__ = [
     "query_param",
     "route",
     "split_path",
-    "text_response",
     "websocket_scope",
+    "with_middleware",
     "ws",
     "ws_route",
 ]

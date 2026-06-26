@@ -4,6 +4,7 @@ import json
 from collections.abc import AsyncIterator
 
 import pytest
+from helpers import json_response
 from without import Stream
 from without import stream
 from without_asgi import Asgi
@@ -25,7 +26,6 @@ from without_web import Single
 from without_web import body
 from without_web import handle
 from without_web import handle_stream
-from without_web import json_response
 from without_web import path_param
 from without_web import post
 from without_web import query_param

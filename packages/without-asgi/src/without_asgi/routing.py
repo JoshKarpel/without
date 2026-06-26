@@ -34,22 +34,26 @@ __all__ = [
 # The `make_asgi_app` seam still asks for nothing but an `HttpRouter[T]` function;
 # these just make one easy to assemble.
 
-# `Middleware` wraps a connection handler with the parsed scope in hand: it is
-# handed the inner handler to call and returns a replacement. It is generic over
-# the protocol's handler `H` and scope `S` so one vocabulary serves HTTP and
-# WebSocket; the aliases name the two concrete instances.
-type Middleware[H, S] = Callable[[H, S], H]
-type HttpMiddleware = Middleware[HttpHandler, HttpScope]
-type WebsocketMiddleware = Middleware[WebsocketHandler, WebsocketScope]
+# `Middleware` wraps a connection handler with the lifespan state and the parsed
+# scope in hand: it is handed the connection state `T`, the inner handler to call,
+# and the scope, and returns a replacement handler. State leads so a cross-cutting
+# middleware (auth, rate limiting, config-driven behavior) can read the same `T`
+# the dispatched handler sees; a middleware that does not need it ignores the
+# argument. It is generic over `T`, the protocol's handler `H`, and scope `S`, so
+# one vocabulary serves HTTP and WebSocket; the aliases name the two concrete
+# instances and stay generic over `T`.
+type Middleware[T, H, S] = Callable[[T, H, S], H]
+type HttpMiddleware[T] = Middleware[T, HttpHandler, HttpScope]
+type WebsocketMiddleware[T] = Middleware[T, WebsocketHandler, WebsocketScope]
 
 
-def stack[H, S](*middleware: Middleware[H, S]) -> Middleware[H, S]:
+def stack[T, H, S](*middleware: Middleware[T, H, S]) -> Middleware[T, H, S]:
     """Compose middleware into one, first argument outermost. A stack of
     middleware is itself a `Middleware`, so it nests, and `stack()` is identity."""
 
-    def composed(handler: H, scope: S) -> H:
+    def composed(state: T, handler: H, scope: S) -> H:
         for one in reversed(middleware):
-            handler = one(handler, scope)
+            handler = one(state, handler, scope)
         return handler
 
     return composed
@@ -59,7 +63,7 @@ def wrap[In, Out, S](
     *,
     inbound: Callable[[Stream[In], S], Stream[In]] | None = None,
     outbound: Callable[[Stream[Out], S], Stream[Out]] | None = None,
-) -> Middleware[Processor[In, Out], S]:
+) -> Middleware[object, Processor[In, Out], S]:
     """Build a (type-preserving) `Middleware` from scope-aware stream
     transformers. Each is given the parsed scope, so a no-config middleware is
     just `wrap(inbound=..., outbound=...)`; either omitted leaves that side
@@ -68,9 +72,15 @@ def wrap[In, Out, S](
     A stream transformer is itself a `Processor`, so wrapping is composition:
     `inbound` runs before the handler, `outbound` after it. Keeping both sides
     same-type makes the result an endomorphism, which is what `stack` composes.
+
+    `wrap` is the scope-only end of the vocabulary: its transformers see the
+    scope but not the connection state, so the produced middleware ignores `T`
+    (typed `object`, and contravariantly usable in a `stack` over any state).
+    A middleware that must read the state is written directly as a
+    `(T, handler, scope) -> handler` function.
     """
 
-    def middleware(handler: Processor[In, Out], scope: S) -> Processor[In, Out]:
+    def middleware(_state: object, handler: Processor[In, Out], scope: S) -> Processor[In, Out]:
         wrapped = handler
         if inbound is not None:
             before = inbound

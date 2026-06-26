@@ -56,13 +56,17 @@ which also orders teardown.
 Writing a router is opinionated work (what a route matches on, how dispatch falls
 back), so this package ships no router. The optional `without_asgi.routing`
 submodule provides only the unopinionated tools you assemble one from: a
-`Middleware` vocabulary, generic over the protocol's handler and scope (with
-`HttpMiddleware` / `WebsocketMiddleware` aliases), so a middleware wraps a handler
-with the scope in hand; `stack`, which composes a sequence of middleware into one
+`Middleware` vocabulary, generic over the connection state `T`, the protocol's
+handler, and scope (with `HttpMiddleware[T]` / `WebsocketMiddleware[T]` aliases),
+so a middleware wraps a handler with the lifespan state and scope in hand
+(`(T, handler, scope) -> handler`); state leads so a cross-cutting middleware can
+read the same `T` the handler sees, while one that does not need it ignores the
+argument; `stack`, which composes a sequence of middleware into one
 (first outermost), so a stack of middleware is itself a `Middleware`; `wrap`, which
 builds a middleware from scope-aware inbound and/or outbound stream transformers
 (composing them around the handler, so a logging or header middleware is a
-one-liner); and `buffered`, which adapts a `(state, scope, body) -> Response`
+one-liner; `wrap` is the scope-only end, so its product ignores `T`); and
+`buffered`, which adapts a `(state, scope, body) -> Response`
 function into the `HttpRouter` shape for the common request/response case (it reads
 as a decorator).
 The `integration` package's `transform.router` shows a small protocol-generic
@@ -70,10 +74,10 @@ The `integration` package's `transform.router` shows a small protocol-generic
 
 For a full, opinionated router you don't have to hand-roll, the sibling
 [`without-web`](../without-web) package provides trie matching with typed path
-parameters, 405-vs-404, mounting, exception handlers, and OpenAPI. It snaps onto
-this boundary through nothing but the `HttpRouter` type (`Router.dispatch` *is*
-one), so adopting it is opt-in and bring-your-own stays first-class. The
-`integration` package's `todos` example is built on it.
+parameters, 405-vs-404, mounting, scoped middleware, exception handlers, and
+OpenAPI. It snaps onto this boundary through nothing but the `HttpRouter` type
+(`Router.dispatch` *is* one), so adopting it is opt-in and bring-your-own stays
+first-class. The `integration` package's `todos` example is built on it.
 
 A `Middleware` wraps the whole handler, a `Processor[Inbound, Outbound]`, so it can
 transform the inbound stream, the outbound stream, or both. The body is not a

@@ -43,7 +43,13 @@ async def _running(app: ASGIApp) -> AsyncIterator[None]:
 
 
 async def _request(
-    app: ASGIApp, method: str, path: str, *, query: bytes = b"", body: bytes = b""
+    app: ASGIApp,
+    method: str,
+    path: str,
+    *,
+    query: bytes = b"",
+    body: bytes = b"",
+    headers: list[tuple[bytes, bytes]] | None = None,
 ) -> tuple[int, dict[str, list[bytes]], object]:
     scope: RawMessage = {
         "type": "http",
@@ -51,7 +57,7 @@ async def _request(
         "http_version": "1.1",
         "method": method,
         "path": path,
-        "headers": [],
+        "headers": headers or [],
         "query_string": query,
     }
     request = iter([{"type": "http.request", "body": body, "more_body": False}])
@@ -68,10 +74,10 @@ async def _request(
     start = sent[0]
     status = start["status"]
     assert isinstance(status, int)
-    headers = start["headers"]
-    assert isinstance(headers, list)
+    raw_headers = start["headers"]
+    assert isinstance(raw_headers, list)
     collected: dict[str, list[bytes]] = {}
-    for name, value in headers:
+    for name, value in raw_headers:
         collected.setdefault(name.decode(), []).append(value)
     payload = b"".join(m["body"] for m in sent if m["type"] == "http.response.body" and isinstance(m["body"], bytes))
     if not payload:
@@ -204,9 +210,19 @@ async def test_an_unknown_path_is_the_404_fallback() -> None:
 async def test_the_admin_router_is_grafted_under_its_prefix() -> None:
     app = todos_app(_todos())
     async with _running(app):
-        status, _headers, body = await _request(app, "GET", "/admin/stats")
+        status, _headers, body = await _request(app, "GET", "/admin/stats", headers=[(b"authorization", b"token")])
     assert status == 200
     assert body == {"total": 2, "done": 1}
+
+
+async def test_the_mounted_admin_middleware_gates_the_subtree() -> None:
+    app = todos_app(_todos())
+    async with _running(app):
+        admin_status, _admin_headers, admin_body = await _request(app, "GET", "/admin/stats")
+        open_status, _open_headers, _open_body = await _request(app, "GET", "/todos")
+    assert admin_status == 401
+    assert admin_body == {"error": "admin requires authorization"}
+    assert open_status == 200
 
 
 async def test_the_opaque_mount_sees_the_prefix_trimmed_scope() -> None:
