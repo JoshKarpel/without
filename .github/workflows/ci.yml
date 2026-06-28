@@ -38,4 +38,4 @@ jobs:
       - name: Run pre-commit checks
         run: uv run pre-commit run --all-files --show-diff-on-failure --color=always
       - name: Run type checking and tests
-        run: just test --cov -vvv
+        run: just test --cov --durations 20 -vvv
