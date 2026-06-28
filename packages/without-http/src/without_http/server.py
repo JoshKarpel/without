@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import errno
 import logging
-import socket
 import ssl
-from asyncio.constants import ACCEPT_RETRY_DELAY
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from collections.abc import Callable
@@ -543,96 +540,24 @@ async def _serve_h2_connection(
         await cancel_futures(tasks)
 
 
-def _listen(host: str, port: int, backlog: int) -> socket.socket:
-    """Bind and listen on a single resolved address, returning a non-blocking socket.
-
-    The server drives its own accept loop (to gate admission), so it owns the
-    listening socket directly rather than handing it to `asyncio.start_server`. It
-    binds the first address `host` resolves to; a `host` that resolves to several
-    (a dual-stack `localhost`, or `""`) is served on only the first.
-    """
-    family, socktype, proto, _canon, sockaddr = socket.getaddrinfo(
-        host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
-    )[0]
-    listener = socket.socket(family, socktype, proto)
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind(sockaddr)
-    listener.listen(backlog)
-    listener.setblocking(False)
-    return listener
-
-
-async def _serve_accepted(
-    app: ASGIApp,
-    conn: socket.socket,
-    *,
-    ssl_context: ssl.SSLContext | None,
-    ssl_handshake_timeout: float | None,
-    ssl_shutdown_timeout: float | None,
-) -> None:
-    """Wrap a freshly accepted socket in streams, then serve one connection.
-
-    The dual of what `asyncio.start_server` does internally per accepted socket,
-    spelled out here because the server drives its own accept loop: build a
-    `StreamReader`/`StreamWriter` over the socket (performing the TLS handshake when
-    `ssl_context` is set), then hand them to `_serve_connection`. A handshake that
-    fails closes the socket without disturbing the accept loop.
-    """
-    loop = asyncio.get_running_loop()
-    reader = asyncio.StreamReader(loop=loop)
-    protocol = asyncio.StreamReaderProtocol(reader, loop=loop)
-    try:
-        transport, _ = await loop.connect_accepted_socket(
-            lambda: protocol,
-            conn,
-            ssl=ssl_context,
-            ssl_handshake_timeout=ssl_handshake_timeout,
-            ssl_shutdown_timeout=ssl_shutdown_timeout,
-        )
-    except ssl.SSLError, OSError:
-        conn.close()
-        return
-    writer = asyncio.StreamWriter(transport, protocol, reader, loop)
-    await _serve_connection(app, reader, writer)
-
-
 @dataclass(slots=True)
-class _Slots:
-    """Admission gate and in-flight gauge for served connections.
+class _LiveConnections:
+    """A live count of connections currently being served, for observability.
 
-    Wraps the optional concurrency ceiling so the accept loop and the per-connection
-    task never branch on whether a cap is set. `reserve` waits for capacity (a no-op
-    when uncapped) before the loop accepts; `release` returns capacity reserved for an
-    accept that then failed; `occupied` brackets a live connection, moving `in_flight`
-    and freeing the slot when it ends. `in_flight` is always readable, so the server
-    can report how many connections it is serving. Reserve happens in the accept loop
-    and the slot is freed when the connection ends, two different coroutines, which is
-    why only the connection-lifetime half is a context manager.
+    `tracked` brackets one connection's lifetime, moving the count up while it runs
+    and back down when it ends; `in_flight` is always readable, so the server can
+    report how many connections it is serving.
     """
 
-    _semaphore: asyncio.Semaphore | None
     in_flight: int = 0
 
-    @classmethod
-    def with_limit(cls, limit: int | None) -> _Slots:
-        return cls(asyncio.Semaphore(limit) if limit is not None else None)
-
-    async def reserve(self) -> None:
-        if self._semaphore is not None:
-            await self._semaphore.acquire()
-
-    def release(self) -> None:
-        if self._semaphore is not None:
-            self._semaphore.release()
-
     @asynccontextmanager
-    async def occupied(self) -> AsyncIterator[None]:
+    async def tracked(self) -> AsyncIterator[None]:
         self.in_flight += 1
         try:
             yield
         finally:
             self.in_flight -= 1
-            self.release()
 
 
 @dataclass(frozen=True, slots=True)
@@ -641,17 +566,17 @@ class Server:
 
     `host`/`port` are the bound address (`port` is the OS-assigned one when `port=0`
     was requested). `in_flight` reports how many connections are being served right
-    now, for metrics and observability; the admission gate behind it stays internal.
-    More fields (request counts, byte totals) can join as the server grows.
+    now, for metrics and observability. More fields (request counts, byte totals) can
+    join as the server grows.
     """
 
     host: str
     port: int
-    _slots: _Slots
+    _connections: _LiveConnections
 
     @property
     def in_flight(self) -> int:
-        return self._slots.in_flight
+        return self._connections.in_flight
 
 
 @asynccontextmanager
@@ -661,19 +586,18 @@ async def serving(
     host: str = "127.0.0.1",
     port: int = 0,
     max_pending_connections: int = 100,
-    max_concurrent_connections: int | None = None,
-    accept_error_cooldown: float = ACCEPT_RETRY_DELAY,
     ssl_context: ssl.SSLContext | None = None,
     ssl_handshake_timeout: float | None = None,
     ssl_shutdown_timeout: float | None = None,
 ) -> AsyncIterator[Server]:
     """Serve `app` over HTTP for the duration of the `with` block.
 
-    Drives the lifespan cycle, binds a socket (`port=0` picks a free one), and
-    yields a `Server` (its bound `host`/`port`, plus live metrics like `in_flight`).
-    On exit it stops accepting, cancels any in-flight connections, and runs lifespan
-    shutdown. To run a server until cancelled, hold the block open with
-    `without.sleep_forever()` (or your own run loop, e.g. one that handles signals).
+    Drives the lifespan cycle, binds a socket (`port=0` picks a free one) with
+    `asyncio.start_server`, and yields a `Server` (its bound `host`/`port`, plus live
+    metrics like `in_flight`). On exit it stops accepting, cancels any in-flight
+    connections, and runs lifespan shutdown. To run a server until cancelled, hold the
+    block open with `without.sleep_forever()` (or your own run loop, e.g. one that
+    handles signals).
 
     `max_pending_connections` is the kernel's listen backlog: the depth of the
     queue of connections that have completed the TCP handshake but have not yet
@@ -684,70 +608,48 @@ async def serving(
     times out (a client may also see "connection refused" on platforms that
     reset instead). Nothing is queued in the server process.
 
-    `max_concurrent_connections` caps how many connections are accepted and served
-    at once (default: unlimited). At the cap the server stops calling `accept()`,
-    so additional connections wait in that kernel pending queue rather than as
-    parked tasks: no per-connection task is created and no TLS handshake or request
-    parsing begins until a slot frees.
+    To bound *in-flight requests* (the right limit once HTTP/2 multiplexes many
+    requests over one connection), wrap the app in `limit_concurrent_requests`, which
+    sheds with a `503` rather than capping connections. This server does not cap raw
+    connections: the kernel listen backlog above and OS resource limits provide that
+    backpressure, and `Server.in_flight` reports the live connection count for metrics.
 
-    The server always drives its own accept loop over a single listening socket
-    (`accept`-gating is the reason; see `_listen`), so a `host` resolving to several
-    addresses is served on only the first, with or without a cap.
-
-    `accept_error_cooldown` is how long the accept loop pauses after an `accept()`
-    that failed for a reason that leaves the connection queued (running out of file
-    descriptors: `EMFILE`/`ENFILE`, or kernel memory: `ENOBUFS`/`ENOMEM`, plus any
-    unexpected error). Without a pause an immediate retry would busy-loop on the same
-    failure; the loop logs and waits this long instead, then resumes, so transient
-    pressure neither spins the CPU nor silently kills the server. It defaults to
-    asyncio's own `ACCEPT_RETRY_DELAY`, the value its built-in accept loop uses. An
-    aborted connection (`ECONNABORTED`) is skipped without a pause, since it is
-    per-connection and self-clearing.
+    `asyncio.start_server` owns the accept loop, so it survives transient accept
+    failures (pausing for `ACCEPT_RETRY_DELAY` on resource exhaustion) and binds every
+    address `host` resolves to.
 
     Pass `ssl_context` to serve `https`/`wss` directly; `server_ssl_context` builds
     one for the common case. `ssl_handshake_timeout` bounds a single TLS handshake
     (asyncio's default is 60s) and `ssl_shutdown_timeout` the closing `close_notify`
     exchange (default 30s); both are meaningful only alongside `ssl_context`.
     """
-    listener = _listen(host, port, max_pending_connections)
-    bound_host, bound_port = listener.getsockname()[:2]
-    loop = asyncio.get_running_loop()
-    # Reserving a slot *before* `accept` is what gates admission: at the cap the loop
-    # blocks on `reserve` and never calls `accept`, so excess connections wait in the
-    # kernel queue with no task and no handshake. `_Slots` also counts in-flight
-    # connections and folds away the uncapped case, so this loop never branches on it.
-    slots = _Slots.with_limit(max_concurrent_connections)
+    live = _LiveConnections()
     connections: set[asyncio.Task[None]] = set()
 
-    async def serve_one(conn: socket.socket) -> None:
-        async with slots.occupied():
-            await _serve_accepted(
-                app,
-                conn,
-                ssl_context=ssl_context,
-                ssl_handshake_timeout=ssl_handshake_timeout,
-                ssl_shutdown_timeout=ssl_shutdown_timeout,
-            )
-
-    async def accept() -> None:
-        while True:
-            await slots.reserve()
-            try:
-                conn, _ = await loop.sock_accept(listener)
-            except OSError as error:
-                slots.release()
-                if error.errno != errno.ECONNABORTED:
-                    logger.warning(f"accept failed, retrying in {accept_error_cooldown}s: {error}")
-                    await asyncio.sleep(accept_error_cooldown)
-                continue
-            task = asyncio.create_task(serve_one(conn))
-            connections.add(task)
-            task.add_done_callback(connections.discard)
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        connections.add(task)
+        try:
+            async with live.tracked():
+                await _serve_connection(app, reader, writer)
+        finally:
+            connections.discard(task)
 
     async with run_lifespan(app):
+        server = await asyncio.start_server(
+            handle,
+            host,
+            port,
+            backlog=max_pending_connections,
+            ssl=ssl_context,
+            ssl_handshake_timeout=ssl_handshake_timeout,
+            ssl_shutdown_timeout=ssl_shutdown_timeout,
+        )
+        bound_host, bound_port = server.sockets[0].getsockname()[:2]
         try:
-            async with background_task(accept()):
-                yield Server(host=bound_host, port=bound_port, _slots=slots)
+            yield Server(host=bound_host, port=bound_port, _connections=live)
         finally:
-            listener.close()
+            server.close()
             await cancel_futures(connections)
+            await server.wait_closed()

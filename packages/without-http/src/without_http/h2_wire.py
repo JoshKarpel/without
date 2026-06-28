@@ -87,3 +87,49 @@ def response_headers(status: int, headers: RawHeaders) -> list[tuple[bytes, byte
 def early_hint_headers(links: Iterable[bytes]) -> list[tuple[bytes, bytes]]:
     """Render a 103 Early Hints informational response as an h2 header block."""
     return [(b":status", b"103"), *((b"link", link) for link in links)]
+
+
+def request_headers(
+    method: bytes,
+    target: bytes,
+    scheme: str,
+    authority: bytes,
+    headers: RawHeaders,
+) -> list[tuple[bytes, bytes]]:
+    """Render a client request as the h2 header block: the pseudo-headers, then the rest.
+
+    The dual of `scope_from_h2_headers`: the request line and `Host` become the
+    `:method`/`:path`/`:scheme`/`:authority` pseudo-headers (h2 carries the host as
+    `:authority`, never an ordinary `host` header). Names are lowercased and the
+    hop-by-hop headers illegal over h2 are dropped, so a request written for
+    HTTP/1.1 round-trips over HTTP/2 without tripping hpack.
+    """
+    block = [
+        (b":method", method),
+        (b":path", target),
+        (b":scheme", scheme.encode("ascii")),
+        (b":authority", authority),
+    ]
+    block.extend(
+        (name.lower(), value) for name, value in headers if name.lower() not in _HOP_BY_HOP and name.lower() != b"host"
+    )
+    return block
+
+
+def response_status_and_headers(headers: Iterable[tuple[bytes, bytes]]) -> tuple[int, RawHeaders]:
+    """Read an h2 response header block back into a status and ordinary headers.
+
+    The dual of `response_headers`: the `:status` pseudo-header becomes the numeric
+    status and every other pseudo-header is dropped, leaving the ordinary response
+    headers the client surfaces.
+    """
+    status = 0
+    ordinary: list[tuple[bytes, bytes]] = []
+    for name, value in headers:
+        if name == b":status":
+            status = int(value)
+        elif name.startswith(b":"):
+            continue
+        else:
+            ordinary.append((bytes(name), bytes(value)))
+    return status, tuple(ordinary)

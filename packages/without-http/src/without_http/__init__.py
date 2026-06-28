@@ -3,11 +3,13 @@ from without_http.client import ClientMiddleware
 from without_http.client import ClientRequest
 from without_http.client import ClientResponse
 from without_http.client import Session
-from without_http.client import default_headers
+from without_http.client import add_headers
 from without_http.client import follow_redirects
 from without_http.client import open_session
 from without_http.h2_wire import early_hint_headers
+from without_http.h2_wire import request_headers
 from without_http.h2_wire import response_headers
+from without_http.h2_wire import response_status_and_headers
 from without_http.h2_wire import scope_from_h2_headers
 from without_http.h11_wire import h11_events_from_outbound
 from without_http.h11_wire import inbound_from_event
@@ -31,14 +33,16 @@ __all__ = [
     "LifespanError",
     "Server",
     "Session",
-    "default_headers",
+    "add_headers",
     "early_hint_headers",
     "follow_redirects",
     "h11_events_from_outbound",
     "inbound_from_event",
     "is_websocket_upgrade",
     "open_session",
+    "request_headers",
     "response_headers",
+    "response_status_and_headers",
     "run_lifespan",
     "scope_from_h2_headers",
     "scope_from_request",

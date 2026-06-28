@@ -141,12 +141,11 @@ def limit_concurrent_requests(limit: int, *, overloaded: Response = _OVERLOADED)
     (a JSON payload, a different `Retry-After`, a `429`); it is a fixed value rather
     than a per-request callback, since the point of shedding is to answer cheaply.
 
-    This is request-level overload shedding, the complement to a transport's
-    connection-admission cap: a connection cap bounds *pipes* (and under HTTP/1.1
-    that nearly bounds requests too), but one HTTP/2 connection multiplexes many
-    requests, so bounding in-flight *work* belongs here, where it wraps the app
-    invocation and so applies under any transport. Mount it only on the HTTP router
-    to leave long-lived WebSocket connections uncounted.
+    This is request-level overload shedding. A connection-level cap would bound
+    *pipes* (and under HTTP/1.1 that nearly bounds requests too), but one HTTP/2
+    connection multiplexes many requests, so bounding in-flight *work* belongs here,
+    where it wraps the app invocation and so applies under any transport. Mount it only
+    on the HTTP router to leave long-lived WebSocket connections uncounted.
 
     Coverage is controlled by *where* you mount it, not a per-request flag, so it
     composes with route-scoped mounting (see `without-web`) to carve out exemptions.

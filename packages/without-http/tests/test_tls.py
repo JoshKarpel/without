@@ -93,17 +93,6 @@ async def test_serves_wss_with_the_scheme_marked_secure(
     assert reported.data == "wss"
 
 
-async def test_serves_https_under_a_concurrency_cap(
-    server_context: ssl.SSLContext, trusting_client_context: ssl.SSLContext
-) -> None:
-    async with serving(scheme_app, ssl_context=server_context, max_concurrent_connections=1) as server:
-        async with httpx.AsyncClient(verify=trusting_client_context) as client:
-            response = await client.get(f"https://{server.host}:{server.port}/where")
-
-    assert response.status_code == 200
-    assert response.text == "https"
-
-
 async def _negotiated_alpn(host: str, port: int, offered: list[str]) -> str | None:
     client_context = ssl.create_default_context()
     client_context.check_hostname = False

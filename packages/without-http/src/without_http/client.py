@@ -2,42 +2,120 @@ from __future__ import annotations
 
 import asyncio
 import ssl
+from collections.abc import AsyncGenerator
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from contextlib import suppress
 from dataclasses import dataclass
+from dataclasses import field
 from dataclasses import replace
+from urllib.parse import SplitResult
 from urllib.parse import urljoin
 from urllib.parse import urlsplit
 
+import h2.config
+import h2.connection
+import h2.events
+import h2.exceptions
 import h11
+from without import Stream
 from without_asgi import RawHeaders
 from without_asgi.routing import Middleware
 from without_asgi.routing import stack
+
+from without_http.h2_wire import request_headers
+from without_http.h2_wire import response_status_and_headers
 
 _BUFFER = 65536
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 
+async def _empty_body() -> AsyncIterator[bytes]:
+    return
+    yield  # unreachable: makes this an (empty) async generator
+
+
+async def _single(chunk: bytes) -> AsyncIterator[bytes]:
+    yield chunk
+
+
+@dataclass(frozen=True, slots=True)
+class Origin:
+    """A request's destination: the key a connection is pooled and reused under.
+
+    Frozen and hashable so it serves directly as a `dict` key in the pool. `secure`
+    is derived from the scheme rather than stored, so the two can never disagree.
+    """
+
+    scheme: str
+    host: str
+    port: int
+
+    @property
+    def secure(self) -> bool:
+        return self.scheme == "https"
+
+
 @dataclass(frozen=True, slots=True)
 class ClientRequest:
-    """A whole client request as one value: the method, absolute URL, and body."""
+    """A client request as a value: the head plus a streaming body.
+
+    The body is a `Stream[bytes]` (an async iterable of chunks), so a request can be
+    buffered (one chunk) or streamed (many), the upload half of the buffered/streaming
+    matrix. Because the whole request is the value a `ClientExchange` transforms,
+    middleware can rewrite it: add headers, change the URL, wrap the body.
+    """
 
     method: str
     url: str
     headers: RawHeaders = ()
-    body: bytes = b""
+    body: Stream[bytes] = field(default_factory=_empty_body)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class ClientResponse:
-    """A whole client response as one value, the buffered counterpart of a request."""
+    """A client response: the head, with the body as a live stream of chunks.
+
+    Stream the body with `async for chunk in response`, the download half of the
+    matrix, or `await response.read()` to buffer the whole body into `bytes`. The
+    connection is released exactly once, when the body is finished: an HTTP/1.1
+    connection returns to the pool only if its body was read to the end (otherwise it
+    is closed, since unread bytes remain on the wire), and an HTTP/2 stream is reset if
+    abandoned early. `Session.request` finalizes the response on exit, so a body that
+    is never read still releases its connection rather than stranding it.
+    """
 
     status: int
     headers: RawHeaders
-    body: bytes
+    _body: AsyncGenerator[bytes, None]
+    _release: Callable[[bool], Awaitable[None]]
+    _fully_read: bool = False
+    _released: bool = False
+
+    async def stream(self) -> AsyncIterator[bytes]:
+        async for chunk in self._body:
+            yield chunk
+        self._fully_read = True
+        await self._finalize()
+
+    def __aiter__(self) -> AsyncIterator[bytes]:
+        return self.stream()
+
+    async def read(self) -> bytes:
+        return b"".join([chunk async for chunk in self.stream()])
+
+    async def aclose(self) -> None:
+        await self._finalize()
+
+    async def _finalize(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        if not self._fully_read:
+            await self._body.aclose()
+        await self._release(self._fully_read)
 
 
 # A client exchange is the dual of a server handler: where a handler maps a
@@ -45,69 +123,535 @@ class ClientResponse:
 # a `ClientResponse`. Modeling it as a node lets the *same* `Middleware`
 # vocabulary (`stack`) that wraps server handlers wrap client exchanges: a
 # `ClientMiddleware` is `(state, inner_exchange, request) -> exchange`, the
-# request playing the role the scope plays server-side.
+# request playing the role the scope plays server-side. The request is the value
+# (not a fixed scope) so middleware can rewrite it before the inner exchange runs.
 type ClientExchange = Callable[[ClientRequest], Awaitable[ClientResponse]]
 type ClientMiddleware = Middleware[object, ClientExchange, ClientRequest]
 
 _PASSTHROUGH: ClientMiddleware = stack()
 
 
+async def _peek(body: Stream[bytes]) -> tuple[bytes | None, AsyncIterator[bytes]]:
+    """The first non-empty chunk of a body and the iterator positioned after it.
+
+    `None` means the body is empty, which lets a sender end the request on the headers
+    (no DATA frame, no chunked body) instead of sending an empty body.
+    """
+    iterator = aiter(body)
+    async for chunk in iterator:
+        if chunk:
+            return chunk, iterator
+    return None, iterator
+
+
 def _has(headers: RawHeaders, name: bytes) -> bool:
     return any(existing.lower() == name for existing, _ in headers)
 
 
-async def _read_response(conn: h11.Connection, reader: asyncio.StreamReader) -> ClientResponse:
-    status: int | None = None
-    headers: RawHeaders = ()
-    body = bytearray()
-    while True:
-        event = conn.next_event()
-        if event is h11.NEED_DATA:
-            conn.receive_data(await reader.read(_BUFFER))
-            continue
-        if isinstance(event, h11.Response):
-            status = event.status_code
-            headers = tuple((bytes(name), bytes(value)) for name, value in event.headers)
-        elif isinstance(event, h11.Data):
-            body.extend(event.data)
-        elif not isinstance(event, h11.InformationalResponse):
-            break
-    if status is None:
-        raise ConnectionError("the server closed the connection before sending a response")
-    return ClientResponse(status=status, headers=headers, body=bytes(body))
-
-
-async def _send(request: ClientRequest) -> ClientResponse:
-    """The base client exchange: open one connection, send the request, read the response."""
-    parts = urlsplit(request.url)
+def _origin(parts: SplitResult) -> Origin:
     if parts.hostname is None:
-        raise ValueError(f"client request URL must be absolute, got {request.url!r}")
-    secure = parts.scheme == "https"
-    port = parts.port or (443 if secure else 80)
+        raise ValueError(f"client request URL must be absolute, got {parts.geturl()!r}")
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    return Origin(scheme=parts.scheme, host=parts.hostname, port=port)
+
+
+def _target(parts: SplitResult) -> str:
     target = parts.path or "/"
     if parts.query:
         target = f"{target}?{parts.query}"
+    return target
 
-    headers = list(request.headers)
-    if not _has(request.headers, b"host"):
-        headers.insert(0, (b"host", parts.netloc.encode("ascii")))
-    if request.body and not _has(request.headers, b"content-length"):
-        headers.append((b"content-length", str(len(request.body)).encode("ascii")))
 
-    context = ssl.create_default_context() if secure else None
-    reader, writer = await asyncio.open_connection(parts.hostname, port, ssl=context)
-    try:
-        conn = h11.Connection(our_role=h11.CLIENT)
-        writer.write(conn.send(h11.Request(method=request.method, target=target, headers=headers)))
-        if request.body:
-            writer.write(conn.send(h11.Data(data=request.body)))
-        writer.write(conn.send(h11.EndOfMessage()))
-        await writer.drain()
-        return await _read_response(conn, reader)
-    finally:
-        writer.close()
+def _build_request(method: str, url: str, headers: RawHeaders, content: bytes | Stream[bytes]) -> ClientRequest:
+    """Assemble a `ClientRequest`, picking the body framing from `content`.
+
+    Buffered `bytes` get a `content-length`; a streaming body whose length is unknown
+    gets `transfer-encoding: chunked` (HTTP/1.1 frames it as chunks; over HTTP/2 the
+    framing headers are dropped and the body rides DATA frames either way).
+    """
+    if isinstance(content, bytes):
+        if not content:
+            return ClientRequest(method, url, headers, _empty_body())
+        if not _has(headers, b"content-length"):
+            headers = (*headers, (b"content-length", str(len(content)).encode("ascii")))
+        return ClientRequest(method, url, headers, _single(content))
+    if not _has(headers, b"content-length") and not _has(headers, b"transfer-encoding"):
+        headers = (*headers, (b"transfer-encoding", b"chunked"))
+    return ClientRequest(method, url, headers, content)
+
+
+async def _open(
+    host: str, port: int, *, secure: bool, http2: bool, ssl_context: ssl.SSLContext | None
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, str]:
+    """Open a connection and report the negotiated wire protocol.
+
+    Over TLS the protocol is settled by ALPN (`h2` when offered and the server
+    selects it, else `http/1.1`). Cleartext has no negotiation, so it is always
+    `http/1.1`; prior-knowledge h2c is opened directly by the pool instead.
+    """
+    if not secure:
+        reader, writer = await asyncio.open_connection(host, port)
+        return reader, writer, "http/1.1"
+    context = ssl_context if ssl_context is not None else ssl.create_default_context()
+    if http2:
+        context.set_alpn_protocols(["h2", "http/1.1"])
+    reader, writer = await asyncio.open_connection(host, port, ssl=context)
+    ssl_object = writer.get_extra_info("ssl_object")
+    negotiated = ssl_object.selected_alpn_protocol() if ssl_object is not None else None
+    return reader, writer, "h2" if negotiated == "h2" else "http/1.1"
+
+
+@dataclass(slots=True, eq=False)
+class _Http11Connection:
+    """One HTTP/1.1 connection, served one request at a time and kept for reuse.
+
+    Serial, unlike the multiplexed `_Http2Connection`: a request is sent, its response
+    head read, then its body streamed, then the connection reset for the next request
+    (`h11.start_next_cycle`). `finish` reports whether the completed cycle left the
+    connection reusable (it does not, when the server signalled `Connection: close` or
+    closed the socket), so the pool knows whether to keep or drop it.
+    """
+
+    _reader: asyncio.StreamReader
+    _writer: asyncio.StreamWriter
+    _conn: h11.Connection
+
+    @classmethod
+    def new(cls, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> _Http11Connection:
+        return cls(reader, writer, h11.Connection(our_role=h11.CLIENT))
+
+    @property
+    def usable(self) -> bool:
+        """Whether an idle pooled connection still looks open before it is reused.
+
+        Catches the common stale case where the server closed the kept-alive
+        connection while it sat idle: asyncio surfaces the peer's `FIN` on the event
+        loop, so the transport is closing or the reader is at EOF by checkout time.
+        """
+        return not self._writer.is_closing() and not self._reader.at_eof()
+
+    async def send_request(self, request: ClientRequest, parts: SplitResult) -> None:
+        headers = list(request.headers)
+        if not _has(request.headers, b"host"):
+            headers.insert(0, (b"host", parts.netloc.encode("ascii")))
+        self._writer.write(self._conn.send(h11.Request(method=request.method, target=_target(parts), headers=headers)))
+        async for chunk in request.body:
+            if chunk:
+                self._writer.write(self._conn.send(h11.Data(data=chunk)))
+        self._writer.write(self._conn.send(h11.EndOfMessage()))
+        await self._writer.drain()
+
+    async def read_head(self) -> tuple[int, RawHeaders]:
+        while True:
+            event = self._conn.next_event()
+            if event is h11.NEED_DATA:
+                self._conn.receive_data(await self._reader.read(_BUFFER))
+                continue
+            if isinstance(event, h11.InformationalResponse):
+                continue
+            if isinstance(event, h11.Response):
+                return event.status_code, tuple((bytes(name), bytes(value)) for name, value in event.headers)
+            raise ConnectionError("the server closed the connection before sending a response")
+
+    async def iter_body(self) -> AsyncGenerator[bytes, None]:
+        while True:
+            event = self._conn.next_event()
+            if event is h11.NEED_DATA:
+                self._conn.receive_data(await self._reader.read(_BUFFER))
+                continue
+            if isinstance(event, h11.Data):
+                yield bytes(event.data)
+            else:
+                return
+
+    def finish(self) -> bool:
+        try:
+            self._conn.start_next_cycle()
+            return True
+        except h11.LocalProtocolError:
+            return False
+
+    def close(self) -> None:
+        self._writer.close()
+
+    async def aclose(self) -> None:
+        self._writer.close()
         with suppress(OSError):
-            await writer.wait_closed()
+            await self._writer.wait_closed()
+
+
+@dataclass(slots=True)
+class _Stream:
+    """The per-request mutable state the read loop and a request coroutine share.
+
+    `head` is set when the response start arrives; `chunks` carries the response body
+    as `(data, flow_controlled_length)` pairs, ended by `None`, so the consumer
+    acknowledges flow control only as it reads, keeping the window (and the buffer)
+    bounded. `window` gates the *request* body sender on `WINDOW_UPDATE`.
+    """
+
+    window: asyncio.Event
+    head: asyncio.Event
+    chunks: asyncio.Queue[tuple[bytes, int] | None]
+    status: int = 0
+    headers: RawHeaders = ()
+    error: BaseException | None = None
+
+
+@dataclass(slots=True, eq=False)
+class _Http2Connection:
+    """One client-side `h2.Connection`, multiplexing many requests over one socket.
+
+    The dual of the server's `_serve_h2_connection`: a read loop feeds wire bytes to
+    the shared connection and dispatches its events, while each in-flight request
+    coroutine writes its own stream out through that same connection. A single `lock`
+    serializes all access to the connection object and the writer; `drain` happens
+    outside it. The request-body flow-control invariant holds as on the server: a
+    sender clears its wake event and waits *under the lock*, and the read loop sets it
+    only after applying a `WINDOW_UPDATE` under that lock, so a growing window can
+    never be a lost wakeup. Response-body flow control runs the other way: the read
+    loop never acknowledges received data, the body consumer does, so an unread
+    response cannot outrun the window.
+    """
+
+    _reader: asyncio.StreamReader
+    _writer: asyncio.StreamWriter
+    _conn: h2.connection.H2Connection
+    _lock: asyncio.Lock
+    _streams: dict[int, _Stream]
+    _closed: asyncio.Event
+    _task: asyncio.Task[None] | None = None
+
+    @classmethod
+    def start(cls, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> _Http2Connection:
+        conn = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=True, header_encoding=None))
+        connection = cls(reader, writer, conn, asyncio.Lock(), {}, asyncio.Event())
+        conn.initiate_connection()
+        # The preface sits in the writer's buffer; the first request's drain flushes
+        # it. `start` runs synchronously to completion, so no other coroutine can write
+        # before the preface is buffered first.
+        writer.write(conn.data_to_send())
+        connection._task = asyncio.create_task(connection._run())
+        return connection
+
+    @property
+    def usable(self) -> bool:
+        return not self._closed.is_set()
+
+    async def request(
+        self,
+        *,
+        method: bytes,
+        target: bytes,
+        scheme: str,
+        authority: bytes,
+        headers: RawHeaders,
+        body: Stream[bytes],
+    ) -> tuple[int, RawHeaders, int, AsyncGenerator[bytes, None]]:
+        first, rest = await _peek(body)
+        stream = _Stream(window=asyncio.Event(), head=asyncio.Event(), chunks=asyncio.Queue())
+        async with self._lock:
+            if self._closed.is_set():
+                raise ConnectionError("the HTTP/2 connection closed before the request was sent")
+            stream_id = self._conn.get_next_available_stream_id()
+            self._streams[stream_id] = stream
+            self._conn.send_headers(
+                stream_id, request_headers(method, target, scheme, authority, headers), end_stream=first is None
+            )
+            self._writer.write(self._conn.data_to_send())
+        await self._writer.drain()
+        if first is not None:
+            await self._send_body(stream_id, stream, first, rest)
+        await stream.head.wait()
+        if stream.error is not None:
+            raise stream.error
+        return stream.status, stream.headers, stream_id, self._iter_body(stream_id, stream)
+
+    async def _send_body(self, stream_id: int, stream: _Stream, first: bytes, rest: AsyncIterator[bytes]) -> None:
+        await self._send_data(stream_id, stream, first, end=False)
+        async for chunk in rest:
+            if chunk:
+                await self._send_data(stream_id, stream, chunk, end=False)
+        await self._send_data(stream_id, stream, b"", end=True)
+
+    async def _send_data(self, stream_id: int, stream: _Stream, data: bytes, *, end: bool) -> None:
+        remaining = memoryview(data)
+        while True:
+            async with self._lock:
+                if self._closed.is_set():
+                    raise ConnectionError("the HTTP/2 connection closed before the request body was sent")
+                try:
+                    window = self._conn.local_flow_control_window(stream_id)
+                except h2.exceptions.StreamClosedError:
+                    return
+                sendable = min(len(remaining), window, self._conn.max_outbound_frame_size)
+                if sendable > 0 or len(remaining) == 0:
+                    chunk, remaining = remaining[:sendable].tobytes(), remaining[sendable:]
+                    last = end and len(remaining) == 0
+                    try:
+                        self._conn.send_data(stream_id, chunk, end_stream=last)
+                    except h2.exceptions.ProtocolError, h2.exceptions.StreamClosedError:
+                        return
+                    self._writer.write(self._conn.data_to_send())
+                    blocked = False
+                else:
+                    stream.window.clear()
+                    blocked = True
+            if blocked:
+                await stream.window.wait()
+                continue
+            await self._writer.drain()
+            if len(remaining) == 0:
+                return
+
+    async def _iter_body(self, stream_id: int, stream: _Stream) -> AsyncGenerator[bytes, None]:
+        while True:
+            item = await stream.chunks.get()
+            if item is None:
+                break
+            data, length = item
+            yield data
+            async with self._lock:
+                if not self._closed.is_set():
+                    self._conn.acknowledge_received_data(length, stream_id)
+                    self._writer.write(self._conn.data_to_send())
+            await self._writer.drain()
+        if stream.error is not None:
+            raise stream.error
+
+    async def abort(self, stream_id: int) -> None:
+        """Reset a stream abandoned before its response ended, so the server stops sending."""
+        if stream_id not in self._streams:
+            return
+        self._streams.pop(stream_id, None)
+        with suppress(h2.exceptions.ProtocolError, h2.exceptions.StreamClosedError, OSError):
+            async with self._lock:
+                self._conn.reset_stream(stream_id)
+                self._writer.write(self._conn.data_to_send())
+            await self._writer.drain()
+
+    async def _run(self) -> None:
+        try:
+            while not self._closed.is_set():
+                data = await self._reader.read(_BUFFER)
+                if not data:
+                    break
+                async with self._lock:
+                    try:
+                        events = self._conn.receive_data(data)
+                    except h2.exceptions.ProtocolError:
+                        self._writer.write(self._conn.data_to_send())
+                        self._closed.set()
+                        events = []
+                    else:
+                        self._writer.write(self._conn.data_to_send())
+                await self._writer.drain()
+                for event in events:
+                    self._handle(event)
+        except OSError:
+            pass
+        finally:
+            self._fail_pending()
+
+    def _fail_pending(self) -> None:
+        self._closed.set()
+        error = ConnectionError("the HTTP/2 connection closed before the response completed")
+        for stream in self._streams.values():
+            if not stream.head.is_set():
+                stream.error = error
+                stream.head.set()
+            stream.chunks.put_nowait(None)
+            stream.window.set()
+        self._streams.clear()
+
+    def _handle(self, event: h2.events.Event) -> None:
+        match event:
+            case h2.events.ResponseReceived(stream_id=stream_id, headers=headers):
+                if (stream := self._streams.get(stream_id)) is not None:
+                    stream.status, stream.headers = response_status_and_headers(headers)
+                    stream.head.set()
+            case h2.events.DataReceived(stream_id=stream_id, data=data, flow_controlled_length=length):
+                if (stream := self._streams.get(stream_id)) is not None:
+                    stream.chunks.put_nowait((bytes(data), length))
+            case h2.events.StreamEnded(stream_id=stream_id):
+                if (stream := self._streams.pop(stream_id, None)) is not None:
+                    stream.chunks.put_nowait(None)
+            case h2.events.StreamReset(stream_id=stream_id):
+                if (stream := self._streams.pop(stream_id, None)) is not None:
+                    stream.error = ConnectionError("the server reset the HTTP/2 stream")
+                    stream.head.set()
+                    stream.chunks.put_nowait(None)
+                    stream.window.set()
+            case h2.events.WindowUpdated(stream_id=stream_id):
+                if stream_id == 0:
+                    for stream in self._streams.values():
+                        stream.window.set()
+                elif (stream := self._streams.get(stream_id)) is not None:
+                    stream.window.set()
+            case h2.events.RemoteSettingsChanged():
+                for stream in self._streams.values():
+                    stream.window.set()
+            case h2.events.ConnectionTerminated():
+                self._closed.set()
+            case _:
+                pass
+
+    async def aclose(self) -> None:
+        self._closed.set()
+        if self._task is not None:
+            self._task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._task
+        with suppress(h2.exceptions.ProtocolError, OSError):
+            async with self._lock:
+                self._conn.close_connection()
+                self._writer.write(self._conn.data_to_send())
+        self._writer.close()
+        with suppress(OSError):
+            await self._writer.wait_closed()
+
+
+@dataclass(slots=True)
+class Pool:
+    """The connection store behind a `Session`, keyed by origin.
+
+    HTTP/2 connections are kept and reused: many concurrent requests to one origin
+    multiplex over a single connection, which is the point of h2. HTTP/1.1
+    connections are kept too but used serially: an idle one is checked out for a
+    request and returned once its response body is read (keep-alive), so a fresh one
+    is opened only when none is idle. An h2 connection is negotiated over TLS by ALPN,
+    or over cleartext by *prior knowledge* when `http2_cleartext` is set (the caller
+    asserting the server speaks h2c, since cleartext cannot negotiate); otherwise the
+    origin speaks HTTP/1.1.
+    """
+
+    http2: bool = True
+    http2_cleartext: bool = False
+    ssl_context: ssl.SSLContext | None = None
+    _h2: dict[Origin, _Http2Connection] = field(default_factory=dict)
+    _idle_h11: dict[Origin, list[_Http11Connection]] = field(default_factory=dict)
+    _h11_only: set[Origin] = field(default_factory=set)
+    _origin_locks: dict[Origin, asyncio.Lock] = field(default_factory=dict)
+    _closed: bool = False
+
+    async def request(self, request: ClientRequest) -> ClientResponse:
+        parts = urlsplit(request.url)
+        origin = _origin(parts)
+        if origin.secure and self.http2:
+            return await self._request_secure(origin, request, parts)
+        if not origin.secure and self.http2_cleartext:
+            return await self._h2_response(await self._acquire_h2c(origin), request, parts)
+        return await self._request_h11(origin, request, parts)
+
+    async def _request_secure(self, origin: Origin, request: ClientRequest, parts: SplitResult) -> ClientResponse:
+        connection = self._reusable_h2(origin)
+        if connection is None and origin not in self._h11_only:
+            async with self._lock_for(origin):
+                connection = self._reusable_h2(origin)
+                if connection is None and origin not in self._h11_only:
+                    reader, writer, protocol = await _open(
+                        origin.host, origin.port, secure=True, http2=True, ssl_context=self.ssl_context
+                    )
+                    if protocol == "h2":
+                        connection = _Http2Connection.start(reader, writer)
+                        self._h2[origin] = connection
+                    else:
+                        # ALPN fell back to HTTP/1.1; remember it so future requests
+                        # skip the h2 handshake, and pool this connection for reuse.
+                        self._h11_only.add(origin)
+                        self._return_h11(origin, _Http11Connection.new(reader, writer))
+        if connection is not None:
+            return await self._h2_response(connection, request, parts)
+        return await self._request_h11(origin, request, parts)
+
+    async def _acquire_h2c(self, origin: Origin) -> _Http2Connection:
+        connection = self._reusable_h2(origin)
+        if connection is None:
+            async with self._lock_for(origin):
+                connection = self._reusable_h2(origin)
+                if connection is None:
+                    reader, writer, _ = await _open(
+                        origin.host, origin.port, secure=False, http2=False, ssl_context=self.ssl_context
+                    )
+                    connection = _Http2Connection.start(reader, writer)
+                    self._h2[origin] = connection
+        return connection
+
+    async def _h2_response(
+        self, connection: _Http2Connection, request: ClientRequest, parts: SplitResult
+    ) -> ClientResponse:
+        status, headers, stream_id, body = await connection.request(
+            method=request.method.encode("ascii"),
+            target=_target(parts).encode("ascii"),
+            scheme=parts.scheme,
+            authority=parts.netloc.encode("ascii"),
+            headers=request.headers,
+            body=request.body,
+        )
+
+        async def release(fully_read: bool) -> None:
+            if not fully_read:
+                await connection.abort(stream_id)
+
+        return ClientResponse(status, headers, body, release)
+
+    async def _request_h11(self, origin: Origin, request: ClientRequest, parts: SplitResult) -> ClientResponse:
+        connection = self._checkout_h11(origin)
+        if connection is None:
+            reader, writer, _ = await _open(
+                origin.host, origin.port, secure=origin.secure, http2=False, ssl_context=self.ssl_context
+            )
+            connection = _Http11Connection.new(reader, writer)
+        await connection.send_request(request, parts)
+        status, headers = await connection.read_head()
+
+        async def release(fully_read: bool) -> None:
+            if fully_read and connection.finish() and connection.usable and not self._closed:
+                self._return_h11(origin, connection)
+            else:
+                await connection.aclose()
+
+        return ClientResponse(status, headers, connection.iter_body(), release)
+
+    def _checkout_h11(self, origin: Origin) -> _Http11Connection | None:
+        idle = self._idle_h11.get(origin)
+        while idle:
+            connection = idle.pop()
+            if connection.usable:
+                return connection
+            connection.close()
+        return None
+
+    def _return_h11(self, origin: Origin, connection: _Http11Connection) -> None:
+        if self._closed:
+            connection.close()
+            return
+        self._idle_h11.setdefault(origin, []).append(connection)
+
+    def _reusable_h2(self, origin: Origin) -> _Http2Connection | None:
+        connection = self._h2.get(origin)
+        if connection is not None and not connection.usable:
+            del self._h2[origin]
+            return None
+        return connection
+
+    def _lock_for(self, origin: Origin) -> asyncio.Lock:
+        lock = self._origin_locks.get(origin)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._origin_locks[origin] = lock
+        return lock
+
+    async def aclose(self) -> None:
+        self._closed = True
+        multiplexed = list(self._h2.values())
+        idle = [connection for connections in self._idle_h11.values() for connection in connections]
+        self._h2.clear()
+        self._idle_h11.clear()
+        for multiplexed_connection in multiplexed:
+            await multiplexed_connection.aclose()
+        for idle_connection in idle:
+            await idle_connection.aclose()
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,15 +659,18 @@ class Session:
     """A reusable client session, opened once and shared, in the aiohttp style.
 
     A session is the mandated entrypoint rather than free `get`/`post`: it is the
-    home for default headers, the middleware stack, and (later) the connection
-    pool, so lifetime and limits stay explicit and injected. v1 opens a fresh
-    connection per request; pooling is a contained follow-up behind this same
-    surface. Open it with `open_session()` and make requests through
-    `async with session.request(...) as response`.
+    home for the middleware stack and the connection `Pool`, so lifetime and limits
+    stay explicit and injected. Cross-cutting request decoration (default headers,
+    auth) is a `middleware` concern, not a session field; reach for `add_headers`.
+    HTTP/2 requests to one origin multiplex over a single pooled connection; HTTP/1.1
+    reuses a kept-alive connection per origin. Open it with `open_session()` so the
+    pool's connections are closed on exit; a directly-constructed `Session` works for
+    short-lived use but does not manage long-lived pooled connections. Make requests
+    through `async with session.request(...) as response`.
     """
 
-    default_headers: RawHeaders = ()
     middleware: ClientMiddleware = _PASSTHROUGH
+    _pool: Pool = field(default_factory=Pool)
 
     @asynccontextmanager
     async def request(
@@ -132,28 +679,57 @@ class Session:
         url: str,
         *,
         headers: RawHeaders = (),
-        body: bytes = b"",
+        content: bytes | Stream[bytes] = b"",
     ) -> AsyncIterator[ClientResponse]:
-        request = ClientRequest(method=method, url=url, headers=self.default_headers + headers, body=body)
-        exchange = self.middleware(None, _send, request)
-        yield await exchange(request)
+        """Send a request and yield its response for the block, then release the connection.
+
+        `content` is the request body: `bytes` to buffer it, or a `Stream[bytes]` to
+        stream it. Read the response with `await response.read()` or by iterating
+        `response` chunk by chunk; on exit any unread body is drained or aborted so the
+        connection is never stranded.
+        """
+        request = _build_request(method, url, headers, content)
+        exchange = self.middleware(None, self._pool.request, request)
+        response = await exchange(request)
+        try:
+            yield response
+        finally:
+            await response.aclose()
 
 
 @asynccontextmanager
 async def open_session(
     *,
-    headers: RawHeaders = (),
     middleware: ClientMiddleware = _PASSTHROUGH,
+    http2: bool = True,
+    http2_cleartext: bool = False,
+    ssl_context: ssl.SSLContext | None = None,
 ) -> AsyncIterator[Session]:
-    """Open a `Session` for the duration of the `with` block."""
-    yield Session(default_headers=headers, middleware=middleware)
+    """Open a `Session` for the duration of the `with` block, closing its pool on exit.
+
+    Cross-cutting request decoration is a `middleware` concern: to send default
+    headers on every request, pass `add_headers(...)` (alone or in a `stack`) rather
+    than a session-level header list. `http2` controls whether h2 is offered via ALPN
+    over TLS (default on, falling back to HTTP/1.1 when the server does not select it).
+    `http2_cleartext` enables *prior-knowledge* h2c over cleartext (default off): there
+    is no negotiation, so the caller is asserting the target speaks HTTP/2, and a
+    server that does not will fail rather than fall back. `ssl_context` overrides the
+    default TLS context, for a custom CA or client certificate; the session sets the
+    ALPN protocols on it when `http2` is enabled.
+    """
+    pool = Pool(http2=http2, http2_cleartext=http2_cleartext, ssl_context=ssl_context)
+    try:
+        yield Session(middleware=middleware, _pool=pool)
+    finally:
+        await pool.aclose()
 
 
-def default_headers(*headers: tuple[bytes, bytes]) -> ClientMiddleware:
-    """Client middleware that adds default headers to every request.
+def add_headers(*headers: tuple[bytes, bytes]) -> ClientMiddleware:
+    """Client middleware that adds headers to every request.
 
     The mirror of a server's request-decorating middleware: it sits in the same
-    `stack` and rewrites the request before the inner exchange runs.
+    `stack` and rewrites the request before the inner exchange runs. This is how a
+    session sends default headers (auth tokens, a user agent) on every request.
     """
 
     extra: RawHeaders = tuple(headers)
@@ -168,7 +744,13 @@ def default_headers(*headers: tuple[bytes, bytes]) -> ClientMiddleware:
 
 
 def follow_redirects(max_hops: int = 5) -> ClientMiddleware:
-    """Client middleware that follows `3xx` redirects, up to `max_hops`."""
+    """Client middleware that follows `3xx` redirects, up to `max_hops`.
+
+    Each intermediate response is drained before the next hop, so its connection is
+    released. The follow re-issues the same request body, so redirects with a
+    one-shot streaming body are not replayable; in practice redirects follow bodyless
+    requests.
+    """
 
     def middleware(state: object, inner: ClientExchange, request: ClientRequest) -> ClientExchange:
         async def exchange(outgoing: ClientRequest) -> ClientResponse:
@@ -179,6 +761,7 @@ def follow_redirects(max_hops: int = 5) -> ClientMiddleware:
                 location = next((value for name, value in response.headers if name.lower() == b"location"), None)
                 if location is None:
                     return response
+                await response.aclose()
                 outgoing = replace(outgoing, url=urljoin(outgoing.url, location.decode("ascii")))
                 response = await inner(outgoing)
             return response

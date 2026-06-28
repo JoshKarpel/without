@@ -59,10 +59,11 @@ needs, and in the package that owns the exchange shape it wraps.**
   OpenAPI-aware pieces. Only that layer can see route metadata.
 - **`without-http`** holds the **client** middleware, since the client exchange
   (`ClientRequest -> ClientResponse`) is a `Processor` too and lives there
-  (`default_headers`, `follow_redirects`, and future retry / auth / response
+  (`add_headers`, `follow_redirects`, and future retry / auth / response
   decompression). Its server side keeps only the concerns that **cannot** be
-  middleware because they run before any app invocation exists: connection
-  admission and TLS.
+  middleware because they run below the app: the wire protocols and TLS. (It used to
+  also own a connection-admission cap; that was dropped in favour of the kernel
+  listen backlog plus the `limit_concurrent_requests` middleware.)
 
 Server and client share the *same* `Middleware` / `stack` vocabulary, so a concept
 like decompression appears as parallel server-side (here) and client-side

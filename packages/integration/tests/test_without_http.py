@@ -13,8 +13,8 @@ import httpx
 from integration.todos.app import todos_app
 from integration.todos.core import Todo
 from integration.todos.core import TodoList
-from without_http import Session
-from without_http import default_headers
+from without_http import add_headers
+from without_http import open_session
 from without_http import serving
 from wsproto import ConnectionType
 from wsproto import WSConnection
@@ -82,28 +82,31 @@ async def test_todos_router_served_over_without_http_is_reachable_by_httpx() -> 
 async def test_without_http_client_gets_one_todo() -> None:
     async with (
         serving(todos_app(_todos())) as server,
-        Session().request("GET", f"http://{server.host}:{server.port}/todos/1") as response,
+        open_session() as session,
+        session.request("GET", f"http://{server.host}:{server.port}/todos/1") as response,
     ):
         assert response.status == 200
-        assert json.loads(response.body) == {"id": 1, "title": "write", "done": False}
+        assert json.loads(await response.read()) == {"id": 1, "title": "write", "done": False}
 
 
 async def test_a_missing_todo_maps_to_404() -> None:
     async with (
         serving(todos_app(_todos())) as server,
-        Session().request("GET", f"http://{server.host}:{server.port}/todos/999") as response,
+        open_session() as session,
+        session.request("GET", f"http://{server.host}:{server.port}/todos/999") as response,
     ):
         assert response.status == 404
 
 
 async def test_client_middleware_supplies_the_admin_authorization_header() -> None:
     async with serving(todos_app(_todos())) as server:
-        async with Session().request("GET", f"http://{server.host}:{server.port}/admin/stats") as anonymous:
-            assert anonymous.status == 401
+        async with open_session() as session:
+            async with session.request("GET", f"http://{server.host}:{server.port}/admin/stats") as anonymous:
+                assert anonymous.status == 401
 
-        authorized = Session(middleware=default_headers((b"authorization", b"Bearer let-me-in")))
-        async with authorized.request("GET", f"http://{server.host}:{server.port}/admin/stats") as response:
-            assert response.status == 200
+        async with open_session(middleware=add_headers((b"authorization", b"Bearer let-me-in"))) as authorized:
+            async with authorized.request("GET", f"http://{server.host}:{server.port}/admin/stats") as response:
+                assert response.status == 200
 
 
 async def test_websocket_session_route_over_without_http() -> None:

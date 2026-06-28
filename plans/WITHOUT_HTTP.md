@@ -69,7 +69,7 @@ Consequences (vs. the original plan):
   WebSocket via a small `wsproto` client).
 - **Client shipped as a mandated `Session`** (see the aiohttp note in Phase 4):
   `open_session()` / `Session.request(...)`, with client middleware reusing the
-  server's `stack` (`default_headers`, `follow_redirects`). v1 opens a connection
+  server's `stack` (`add_headers`, `follow_redirects`). v1 opens a connection
   per request; pooling is the documented follow-up.
 - **HTTP/2 was deferred** to a documented fast-follow (see "Gaps to address
   later"); the first cut is HTTP/1.1 + WebSockets, a complete ASGI server.
@@ -462,10 +462,16 @@ edge-supplied forwarded metadata (`Forwarded` / `X-Forwarded-Proto` /
 
 ### Request-concurrency shedding (503)
 
-The shipped `max_concurrent_connections` is *connection admission*: at the cap the
-server stops accepting, so excess connections wait in the kernel's listen backlog
-with no task and no handshake started. That is the leaner choice for the current
-HTTP/1.1 server (effectively one in-flight request per connection).
+> Update (post-Checkpoint 22): the `max_concurrent_connections` cap discussed below
+> was subsequently **dropped**. With HTTP/2 multiplexing it no longer tracks
+> in-flight work, and the kernel listen backlog plus the `limit_concurrent_requests`
+> middleware cover its job; `serving` now uses `asyncio.start_server`. The reasoning
+> below is kept as the rationale for why request shedding lives in middleware.
+
+The (since-removed) `max_concurrent_connections` was *connection admission*: at the
+cap the server stopped accepting, so excess connections waited in the kernel's listen
+backlog with no task and no handshake started. That was the leaner choice for the
+HTTP/1.1-only server (effectively one in-flight request per connection).
 
 It is **not** request-level overload shedding. Uvicorn's `--limit-concurrency`
 takes the opposite approach: it accepts every connection and returns an immediate

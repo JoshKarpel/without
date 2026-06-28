@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import errno
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
-from pytest_mock import MockerFixture
 from without_asgi import ASGIApp
 from without_asgi import HttpScope
 from without_asgi import RawMessage
@@ -16,7 +14,7 @@ from without_asgi import Send
 from without_asgi import make_asgi_app
 from without_asgi.routing import buffered
 from without_http import serving
-from without_http.server import _Slots
+from without_http.server import _LiveConnections
 
 
 async def echo_app(scope: RawMessage, receive: Receive, send: Send) -> None:
@@ -115,116 +113,36 @@ async def test_a_crashing_handler_returns_500() -> None:
     assert response.status_code == 500
 
 
-async def test_caps_the_number_of_connections_served_at_once() -> None:
-    started = 0
-    active = 0
-    peak = 0
+async def test_live_connections_counts_in_flight_connections() -> None:
+    live = _LiveConnections()
+
+    assert live.in_flight == 0
+    async with live.tracked():
+        assert live.in_flight == 1
+        async with live.tracked():
+            assert live.in_flight == 2
+        assert live.in_flight == 1
+    assert live.in_flight == 0
+
+
+async def test_reports_in_flight_connections_while_a_request_is_served() -> None:
     release = asyncio.Event()
 
-    async def gated_app(scope: RawMessage, receive: Receive, send: Send) -> None:
-        nonlocal started, active, peak
+    async def slow_app(scope: RawMessage, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             raise RuntimeError("this app serves only http")
-        started += 1
-        active += 1
-        peak = max(peak, active)
-        try:
-            await release.wait()
-        finally:
-            active -= 1
-        # `connection: close` frees the connection's slot as soon as it responds,
-        # so a waiting connection can then be accepted.
+        await release.wait()
         await send({"type": "http.response.start", "status": 200, "headers": [(b"connection", b"close")]})
         await send({"type": "http.response.body", "body": b"ok"})
 
-    async with serving(gated_app, max_concurrent_connections=2) as server:
+    async with serving(slow_app) as server:
+        assert server.in_flight == 0
         async with httpx.AsyncClient(base_url=f"http://{server.host}:{server.port}") as client:
-            requests = [asyncio.create_task(client.get("/")) for _ in range(3)]
+            request = asyncio.create_task(client.get("/"))
             async with asyncio.timeout(5):
-                while started < 2:
+                while server.in_flight == 0:
                     await asyncio.sleep(0.001)
-            await asyncio.sleep(0.1)  # a third connection, if accepted, would start here
-
-            assert started == 2  # the third was not even accepted, so its app never ran
-            assert active == 2
-
+            assert server.in_flight == 1
             release.set()
-            responses = await asyncio.gather(*requests)
-
-    assert peak == 2
-    assert [response.status_code for response in responses] == [200, 200, 200]
-
-
-async def test_slots_counts_in_flight_connections() -> None:
-    slots = _Slots.with_limit(None)
-
-    assert slots.in_flight == 0
-    async with slots.occupied():
-        assert slots.in_flight == 1
-        async with slots.occupied():
-            assert slots.in_flight == 2
-        assert slots.in_flight == 1
-    assert slots.in_flight == 0
-
-
-async def test_slots_reserve_blocks_at_the_cap_until_released() -> None:
-    slots = _Slots.with_limit(1)
-    await slots.reserve()
-
-    waiting = asyncio.create_task(slots.reserve())
-    await asyncio.sleep(0.02)
-    assert not waiting.done()  # the only slot is taken
-
-    slots.release()
-    await asyncio.wait_for(waiting, 1)
-
-
-async def test_slots_reserve_never_blocks_when_uncapped() -> None:
-    slots = _Slots.with_limit(None)
-
-    await asyncio.wait_for(slots.reserve(), 1)
-    await asyncio.wait_for(slots.reserve(), 1)
-
-
-async def test_survives_a_transient_accept_error(mocker: MockerFixture) -> None:
-    loop = asyncio.get_running_loop()
-    real_accept = loop.sock_accept
-    aborted = False
-
-    async def flaky(sock: object) -> object:
-        nonlocal aborted
-        if not aborted:
-            aborted = True
-            raise OSError(errno.ECONNABORTED, "connection aborted")
-        return await real_accept(sock)  # type: ignore[arg-type]
-
-    mocker.patch.object(loop, "sock_accept", flaky)
-
-    async with serving(echo_app) as server:
-        async with httpx.AsyncClient(base_url=f"http://{server.host}:{server.port}") as client:
-            response = await client.get("/after-abort")
-
-    assert aborted
-    assert response.text == "GET /after-abort "
-
-
-async def test_recovers_from_a_resource_exhaustion_accept_error(mocker: MockerFixture) -> None:
-    loop = asyncio.get_running_loop()
-    real_accept = loop.sock_accept
-    exhausted = False
-
-    async def flaky(sock: object) -> object:
-        nonlocal exhausted
-        if not exhausted:
-            exhausted = True
-            raise OSError(errno.EMFILE, "too many open files")
-        return await real_accept(sock)  # type: ignore[arg-type]
-
-    mocker.patch.object(loop, "sock_accept", flaky)
-
-    async with serving(echo_app, accept_error_cooldown=0.01) as server:
-        async with httpx.AsyncClient(base_url=f"http://{server.host}:{server.port}") as client:
-            response = await client.get("/after-emfile")
-
-    assert exhausted
-    assert response.text == "GET /after-emfile "
+            response = await request
+            assert response.status_code == 200
