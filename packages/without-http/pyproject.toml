@@ -24,6 +24,7 @@ dependencies = [
     "without",
     "without-asgi",
     "h11>=0.16",
+    "h2>=4.1",
     "wsproto>=1.2",
 ]
 

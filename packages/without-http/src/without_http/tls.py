@@ -3,10 +3,10 @@ from __future__ import annotations
 import ssl
 from pathlib import Path
 
-# The ALPN protocol identifiers `without-http` can serve. HTTP/1.1 is the only
-# wire protocol in this cut; "h2" joins this tuple when HTTP/2 lands, and ALPN
-# negotiation then selects between them during the handshake.
-ALPN_PROTOCOLS = ("http/1.1",)
+# The ALPN protocol identifiers `without-http` can serve, in server-preference
+# order: HTTP/2 is preferred when a client offers it, falling back to HTTP/1.1.
+# ALPN negotiation selects between them during the TLS handshake.
+ALPN_PROTOCOLS = ("h2", "http/1.1")
 
 
 def server_ssl_context(certfile: Path, keyfile: Path | None = None) -> ssl.SSLContext:

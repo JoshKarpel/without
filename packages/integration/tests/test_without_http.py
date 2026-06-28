@@ -69,8 +69,8 @@ async def _websocket(host: str, port: int, path: str) -> AsyncIterator[_WebSocke
 
 
 async def test_todos_router_served_over_without_http_is_reachable_by_httpx() -> None:
-    async with serving(todos_app(_todos())) as (host, port):
-        async with httpx.AsyncClient(base_url=f"http://{host}:{port}") as client:
+    async with serving(todos_app(_todos())) as server:
+        async with httpx.AsyncClient(base_url=f"http://{server.host}:{server.port}") as client:
             response = await client.get("/todos")
 
     assert response.status_code == 200
@@ -81,8 +81,8 @@ async def test_todos_router_served_over_without_http_is_reachable_by_httpx() -> 
 
 async def test_without_http_client_gets_one_todo() -> None:
     async with (
-        serving(todos_app(_todos())) as (host, port),
-        Session().request("GET", f"http://{host}:{port}/todos/1") as response,
+        serving(todos_app(_todos())) as server,
+        Session().request("GET", f"http://{server.host}:{server.port}/todos/1") as response,
     ):
         assert response.status == 200
         assert json.loads(response.body) == {"id": 1, "title": "write", "done": False}
@@ -90,24 +90,24 @@ async def test_without_http_client_gets_one_todo() -> None:
 
 async def test_a_missing_todo_maps_to_404() -> None:
     async with (
-        serving(todos_app(_todos())) as (host, port),
-        Session().request("GET", f"http://{host}:{port}/todos/999") as response,
+        serving(todos_app(_todos())) as server,
+        Session().request("GET", f"http://{server.host}:{server.port}/todos/999") as response,
     ):
         assert response.status == 404
 
 
 async def test_client_middleware_supplies_the_admin_authorization_header() -> None:
-    async with serving(todos_app(_todos())) as (host, port):
-        async with Session().request("GET", f"http://{host}:{port}/admin/stats") as anonymous:
+    async with serving(todos_app(_todos())) as server:
+        async with Session().request("GET", f"http://{server.host}:{server.port}/admin/stats") as anonymous:
             assert anonymous.status == 401
 
         authorized = Session(middleware=default_headers((b"authorization", b"Bearer let-me-in")))
-        async with authorized.request("GET", f"http://{host}:{port}/admin/stats") as response:
+        async with authorized.request("GET", f"http://{server.host}:{server.port}/admin/stats") as response:
             assert response.status == 200
 
 
 async def test_websocket_session_route_over_without_http() -> None:
-    async with serving(todos_app(_todos())) as (host, port), _websocket(host, port, "/todos/session") as socket:
+    async with serving(todos_app(_todos())) as server, _websocket(server.host, server.port, "/todos/session") as socket:
         accept = await socket.next_event()
         assert isinstance(accept, AcceptConnection)
 

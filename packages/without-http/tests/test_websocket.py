@@ -113,7 +113,7 @@ async def reject_ws_app(scope: RawScope, receive: Receive, send: Send) -> None:
 
 
 async def test_accepts_and_echoes_a_text_message() -> None:
-    async with serving(echo_ws_app) as (host, port), ws_session(host, port, "/live") as client:
+    async with serving(echo_ws_app) as server, ws_session(server.host, server.port, "/live") as client:
         accept = await client.next_event()
         assert isinstance(accept, AcceptConnection)
 
@@ -124,7 +124,7 @@ async def test_accepts_and_echoes_a_text_message() -> None:
 
 
 async def test_a_close_before_accept_rejects_the_handshake() -> None:
-    async with serving(reject_ws_app) as (host, port), ws_session(host, port, "/live") as client:
+    async with serving(reject_ws_app) as server, ws_session(server.host, server.port, "/live") as client:
         event = await client.next_event()
 
     assert isinstance(event, RejectConnection)
@@ -146,7 +146,7 @@ async def test_a_client_close_reaches_the_app_as_a_disconnect() -> None:
                     seen.append("disconnect")
                     return
 
-    async with serving(recording_ws_app) as (host, port), ws_session(host, port, "/live") as client:
+    async with serving(recording_ws_app) as server, ws_session(server.host, server.port, "/live") as client:
         accept = await client.next_event()
         assert isinstance(accept, AcceptConnection)
         await client.close()

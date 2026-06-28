@@ -7,7 +7,8 @@ side: it owns the socket and the HTTP wire protocol, and drives any ASGI app via
 `app(scope, receive, send)`.
 
 The wire-protocol state machines are themselves sans-IO libraries:
-[`h11`](https://h11.readthedocs.io/) for HTTP/1.1 and
+[`h11`](https://h11.readthedocs.io/) for HTTP/1.1,
+[`h2`](https://python-hyper.org/projects/h2/) for HTTP/2, and
 [`wsproto`](https://python-hyper.org/projects/wsproto/) for WebSockets.
 `without-http` reads and writes socket bytes with `asyncio`, feeds them through
 those state machines, and uses `without-asgi`'s server-direction codecs to
@@ -16,28 +17,30 @@ translate between typed events and the ASGI dicts an app expects.
 ## Server
 
 ```python
+from without import sleep_forever
 from without_asgi import make_asgi_app
-from without_http import serve
+from without_http import serving
 
 app = make_asgi_app(lifespan, http=router.dispatch, websocket=sockets.dispatch)
 
-await serve(app, host="127.0.0.1", port=8000)   # runs until cancelled
+async with serving(app, host="127.0.0.1", port=8000):
+    await sleep_forever()   # run until cancelled
 ```
 
 Because `without-http` speaks plain ASGI to the app, *any* ASGI app runs over it,
 interchangeably with uvicorn: a [`without-web`](../without-web) router, a bare
 `without-asgi` handler, or a third-party app (Starlette, FastAPI).
 
-`serve(app, ...)` runs forever (until cancelled). For tests and programmatic
-control, `serving(app, ...)` is an async context manager that binds the socket,
-yields the bound `(host, port)` (pass `port=0` to let the OS pick), and shuts down
-cleanly on exit:
+`serving(app, ...)` is the entrypoint: an async context manager that drives the
+lifespan cycle, binds the socket (pass `port=0` to let the OS pick), yields a
+`Server`, and shuts down cleanly on exit. There is no separate run-until-cancelled
+wrapper: hold the block open however you like, with `sleep_forever()` for the simple
+case or your own loop (signal handling, several servers under `asyncio.gather`). The
+yielded `Server` exposes the bound address and live metrics:
 
 ```python
-from without_http import serving
-
-async with serving(app, port=0) as (host, port):
-    ...  # hit http://{host}:{port}
+async with serving(app, port=0) as server:
+    ...  # hit http://{server.host}:{server.port}; server.in_flight is the live count
 ```
 
 What the server handles:
@@ -51,6 +54,13 @@ What the server handles:
   builds one for the common case, advertising the protocols the server speaks via
   ALPN. `ssl_handshake_timeout` and `ssl_shutdown_timeout` bound the TLS handshake
   and close.
+- **HTTP/2.** Selected by ALPN (`h2`) over TLS, or by *prior knowledge* over
+  cleartext (the h2 connection preface is sniffed off the first bytes, since `h11`
+  would mis-parse `PRI` as an HTTP/1 method). Each request stream drives its own
+  ASGI app invocation, so many run concurrently over one connection; a single lock
+  serializes the shared `h2.Connection` and the writer, and body sends respect
+  per-stream `WINDOW_UPDATE` flow control. The same `without-asgi` server-direction
+  codecs carry over; only the wire mapping (`h2_wire`) is new.
 - **Keep-alive.** Sequential requests on one HTTP/1.1 connection reuse it
   (`h11`'s `start_next_cycle`).
 - **WebSockets** over the HTTP/1.1 `Upgrade`: the handshake is handed to `wsproto`,
@@ -62,14 +72,23 @@ What the server handles:
 - **Connection limits.** `max_pending_connections` is the kernel listen backlog
   (the queue of accepted-by-the-OS-but-not-yet-served connections; when it fills,
   the OS drops or refuses further connection attempts). `max_concurrent_connections`
-  caps how many connections are served at once: at the cap the server stops
-  *accepting*, so excess connections wait in the kernel queue without a parked task
-  or a started TLS handshake, rather than being accepted and blocked. It is built on
-  `without`'s `limit_concurrency`.
+  caps how many connections are served at once: the server drives its own accept
+  loop and acquires a slot *before* calling `accept()`, so at the cap it simply
+  stops accepting and excess connections wait in the kernel queue without a parked
+  task or a started TLS handshake, rather than being accepted and blocked. The same
+  single accept loop serves the uncapped case (no slot to acquire), so there is one
+  code path either way. Driving accept ourselves is also why a `host` resolving to
+  several addresses is served on only the first.
+- **Accept resilience.** A failed `accept()` does not kill the loop: an aborted
+  connection is skipped, and a resource-exhaustion error (out of file descriptors or
+  kernel memory) is logged and retried after `accept_error_cooldown` (default:
+  asyncio's own `ACCEPT_RETRY_DELAY`) so the server neither busy-loops nor silently
+  stops accepting.
 
-The pure wire core (`h11_wire`, `ws_wire`) is sans-IO and unit-tested: it maps
-`h11`/`wsproto` events to the typed `without-asgi` vocabulary and back, with no
-sockets. The `asyncio` shell (`server.py`) is the only part that touches I/O.
+The pure wire cores (`h11_wire`, `h2_wire`, `ws_wire`) are sans-IO and unit-tested:
+they map `h11`/`h2`/`wsproto` events to the typed `without-asgi` vocabulary and
+back, with no sockets. The `asyncio` shell (`server.py`) is the only part that
+touches I/O.
 
 ## Client
 
@@ -108,11 +127,19 @@ session = Session(middleware=stack(
 A `ClientMiddleware` is `(state, inner_exchange, request) -> exchange`, the request
 playing the role the scope plays server-side.
 
-## Deferred: HTTP/2
+## Deferred
 
-The first cut is HTTP/1.1 + WebSockets, a complete ASGI server. HTTP/2 (`h2`) is a
-documented fast-follow: it needs concurrent multiplexed streams with
-`WINDOW_UPDATE` flow control and careful lock discipline, so it is its own focused
-piece. The design (ALPN plus cleartext prior-knowledge detection, per-stream app
-invocations, the same server-direction codecs) is settled in
-[`plans/WITHOUT_HTTP.md`](../../plans/WITHOUT_HTTP.md).
+The server speaks HTTP/1.1, HTTP/2, and WebSockets (over the HTTP/1.1 upgrade).
+Still ahead, building on the shipped per-stream machinery (see
+[`plans/WITHOUT_HTTP.md`](../../plans/WITHOUT_HTTP.md)):
+
+- **WebSockets over HTTP/2** (RFC 8441 extended CONNECT), which needs `wsproto`'s
+  lower-level frame layer rather than its h11-bound handshake connection.
+- **HTTP/2 response extensions:** server push and trailers. The h2 wire mapping
+  currently supports the response start/body and 103 early hints, and rejects the
+  rest, mirroring the HTTP/1.1 path.
+- **HTTP/2 on the client.** The `Session` client is HTTP/1.1 only so far.
+- **HTTP/3** over QUIC (`aioquic`), a separate transport path producing the same
+  vocabulary.
+- **A 503 request-concurrency limit** alongside the connection-admission cap, more
+  relevant now that one h2 connection multiplexes many requests.

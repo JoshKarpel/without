@@ -36,8 +36,9 @@ packages). Each package is its own top-level import.
   `without-asgi`: trie matching, typed path params, 405-vs-404, mounting, scoped
   middleware, exception handlers, and OpenAPI. Imported as `without_web`.
 - `packages/without-http` — an `asyncio` ASGI **server** (and HTTP client) built
-  on the sans-IO `h11`/`wsproto` state machines: `serve(app)` owns the socket and
-  the wire protocol and drives any ASGI app. Imported as `without_http`.
+  on the sans-IO `h11`/`h2`/`wsproto` state machines: `serving(app)` owns the socket
+  and the wire protocol (HTTP/1.1, HTTP/2, and WebSockets) and drives any ASGI app.
+  Imported as `without_http`.
 - `packages/integration` — not a real package (and never published: its name
   sits outside the `without*` family, so the publish workflow skips it): depends
   on `without` and every plugin so they can be exercised together in
@@ -70,8 +71,9 @@ Planned plugins, in the order they should be attempted:
 3. a toy line-protocol server (Redis-ish); proves long-lived processor state.
    **(done: `integration.kv`)**
 4. HTTP (sans-IO deps); the real test of the contract. **(done: `without-asgi`
-   adapters, the `without-web` router, and `without-http` (an `h11`/`wsproto`
-   ASGI server plus client). HTTP/2 is a documented fast-follow.)**
+   adapters, the `without-web` router, and `without-http` (an `h11`/`h2`/`wsproto`
+   ASGI server plus client, serving HTTP/1.1, HTTP/2, and WebSockets). HTTP/3 and
+   WebSockets-over-HTTP/2 are documented fast-follows.)**
 
 ## Development
 

@@ -1,23 +1,37 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import logging
 import socket
 import ssl
+from asyncio.constants import ACCEPT_RETRY_DELAY
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from contextlib import suppress
+from dataclasses import dataclass
 
+import h2.config
+import h2.connection
+import h2.events
+import h2.exceptions
 import h11
 from without import background_task
 from without import cancel_futures
-from without import limit_concurrency
-from without import sleep_forever
 from without_asgi import ASGIApp
 from without_asgi import Disconnect
+from without_asgi import EarlyHint
+from without_asgi import Inbound
+from without_asgi import PathSend
 from without_asgi import RawMessage
 from without_asgi import RequestBody
+from without_asgi import ResponseBody
+from without_asgi import ResponseDebug
+from without_asgi import ResponseStart
+from without_asgi import ResponseTrailers
+from without_asgi import ServerPush
 from without_asgi import WebsocketAccept
 from without_asgi import WebsocketBinary
 from without_asgi import WebsocketClose
@@ -25,6 +39,7 @@ from without_asgi import WebsocketConnect
 from without_asgi import WebsocketDisconnect
 from without_asgi import WebsocketReceive
 from without_asgi import WebsocketText
+from without_asgi import ZeroCopySend
 from without_asgi import encode_http_scope
 from without_asgi import encode_inbound
 from without_asgi import encode_websocket_inbound
@@ -39,6 +54,10 @@ from wsproto.events import Ping
 from wsproto.events import Pong
 from wsproto.events import TextMessage
 
+from without_http.h2_wire import H2_PREFACE
+from without_http.h2_wire import early_hint_headers
+from without_http.h2_wire import response_headers
+from without_http.h2_wire import scope_from_h2_headers
 from without_http.h11_wire import h11_events_from_outbound
 from without_http.h11_wire import inbound_from_event
 from without_http.h11_wire import scope_from_request
@@ -48,6 +67,8 @@ from without_http.ws_wire import websocket_scope_from_request
 from without_http.ws_wire import ws_events_from_outbound
 
 _BUFFER = 65536
+
+logger = logging.getLogger(__name__)
 
 
 def _address(info: object) -> tuple[str, int] | None:
@@ -248,44 +269,297 @@ async def _serve_connection(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
 ) -> None:
-    conn = h11.Connection(our_role=h11.SERVER)
+    """Pick the wire protocol for one connection, serve it, then close the socket.
+
+    HTTP/2 is selected two ways: by ALPN (`h2`) when serving over TLS, and by
+    *prior knowledge* over cleartext, recognizing the h2 connection preface in the
+    first bytes (which must be peeked before feeding `h11`, since `h11` would
+    mis-parse `PRI` as an HTTP/1 method). Everything else is HTTP/1.1.
+    """
     server = _address(writer.get_extra_info("sockname"))
     client = _address(writer.get_extra_info("peername"))
-    secure = writer.get_extra_info("ssl_object") is not None
+    ssl_object = writer.get_extra_info("ssl_object")
+    secure = ssl_object is not None
+    alpn = ssl_object.selected_alpn_protocol() if ssl_object is not None else None
     try:
-        while True:
-            try:
-                request = await _read_request(conn, reader)
-            except h11.RemoteProtocolError as exc:
-                await _send_simple(conn, writer, exc.error_status_hint, b"bad request\n")
-                return
-            if request is None:
-                return
-            if is_websocket_upgrade(request):
-                scheme = "wss" if secure else "ws"
-                await _serve_websocket(
-                    app, conn, reader, writer, scheme=scheme, server=server, client=client, request=request
+        if alpn == "h2":
+            await _serve_h2_connection(app, reader, writer, initial=b"", secure=secure, server=server, client=client)
+            return
+        initial = b""
+        if alpn is None:
+            initial = await reader.read(_BUFFER)
+            if initial.startswith(H2_PREFACE):
+                await _serve_h2_connection(
+                    app, reader, writer, initial=initial, secure=secure, server=server, client=client
                 )
                 return
-            scheme = "https" if secure else "http"
-            keep_alive = await _run_request(
-                app, conn, reader, writer, scheme=scheme, server=server, client=client, request=request
-            )
-            if not keep_alive:
-                return
-            try:
-                conn.start_next_cycle()
-            except h11.LocalProtocolError:
-                return
+        await _serve_h11_connection(app, reader, writer, initial=initial, secure=secure, server=server, client=client)
     finally:
         with suppress(OSError):
             writer.close()
             await writer.wait_closed()
 
 
-def _bound_address(server: asyncio.Server) -> tuple[str, int]:
-    host, port = server.sockets[0].getsockname()[:2]
-    return host, port
+async def _serve_h11_connection(
+    app: ASGIApp,
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    *,
+    initial: bytes,
+    secure: bool,
+    server: tuple[str, int] | None,
+    client: tuple[str, int] | None,
+) -> None:
+    """Serve sequential HTTP/1.1 requests (and WebSocket upgrades) on one connection."""
+    conn = h11.Connection(our_role=h11.SERVER)
+    if initial:
+        conn.receive_data(initial)
+    while True:
+        try:
+            request = await _read_request(conn, reader)
+        except h11.RemoteProtocolError as exc:
+            await _send_simple(conn, writer, exc.error_status_hint, b"bad request\n")
+            return
+        if request is None:
+            return
+        if is_websocket_upgrade(request):
+            scheme = "wss" if secure else "ws"
+            await _serve_websocket(
+                app, conn, reader, writer, scheme=scheme, server=server, client=client, request=request
+            )
+            return
+        scheme = "https" if secure else "http"
+        keep_alive = await _run_request(
+            app, conn, reader, writer, scheme=scheme, server=server, client=client, request=request
+        )
+        if not keep_alive:
+            return
+        try:
+            conn.start_next_cycle()
+        except h11.LocalProtocolError:
+            return
+
+
+@dataclass(slots=True)
+class _H2Stream:
+    """The per-request mutable state the read loop and the stream's app task share."""
+
+    inbound: asyncio.Queue[Inbound]
+    window: asyncio.Event
+    head: bool
+    response_started: bool = False
+    response_done: bool = False
+
+
+async def _serve_h2_connection(
+    app: ASGIApp,
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    *,
+    initial: bytes,
+    secure: bool,
+    server: tuple[str, int] | None,
+    client: tuple[str, int] | None,
+) -> None:
+    """Serve concurrent multiplexed HTTP/2 requests on one connection.
+
+    Each request stream drives its own ASGI app invocation (the per-request
+    processor model), so many run at once over the single connection. The read loop
+    feeds wire bytes to one shared `h2.Connection` and dispatches its events; every
+    stream's `send` writes back through that same connection. A single `lock`
+    serializes all access to the connection object and the writer.
+
+    The flow-control invariant: a body sender that finds the stream's window empty
+    clears its wake event and waits *while holding the lock*, and the read loop only
+    ever sets that event after applying a `WINDOW_UPDATE` under the same lock. So the
+    window can never grow between a sender's check and its wait, which would
+    otherwise be a lost wakeup that strands the response.
+    """
+    scheme = "https" if secure else "http"
+    conn = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=False, header_encoding=None))
+    lock = asyncio.Lock()
+    streams: dict[int, _H2Stream] = {}
+    tasks: set[asyncio.Task[None]] = set()
+    closed = asyncio.Event()
+
+    async def send_body(stream_id: int, stream: _H2Stream, body: bytes, *, end: bool) -> None:
+        remaining = memoryview(b"" if stream.head else body)
+        while True:
+            async with lock:
+                try:
+                    window = conn.local_flow_control_window(stream_id)
+                except h2.exceptions.StreamClosedError:
+                    return
+                sendable = min(len(remaining), window, conn.max_outbound_frame_size)
+                if sendable > 0 or len(remaining) == 0:
+                    chunk, remaining = remaining[:sendable].tobytes(), remaining[sendable:]
+                    last = end and len(remaining) == 0
+                    try:
+                        conn.send_data(stream_id, chunk, end_stream=last)
+                    except h2.exceptions.ProtocolError, h2.exceptions.StreamClosedError:
+                        return
+                    writer.write(conn.data_to_send())
+                    blocked = False
+                else:
+                    stream.window.clear()
+                    blocked = True
+            if blocked:
+                await stream.window.wait()
+                continue
+            await writer.drain()
+            if last:
+                return
+
+    async def send_outbound(stream_id: int, stream: _H2Stream, message: RawMessage) -> None:
+        outbound = parse_outbound(message)
+        match outbound:
+            case ResponseStart(status, headers, _trailers):
+                stream.response_started = True
+                async with lock:
+                    conn.send_headers(stream_id, response_headers(status, headers))
+                    writer.write(conn.data_to_send())
+                await writer.drain()
+            case ResponseBody(body, more_body):
+                await send_body(stream_id, stream, body, end=not more_body)
+                if not more_body:
+                    stream.response_done = True
+            case EarlyHint(links):
+                async with lock:
+                    conn.send_headers(stream_id, early_hint_headers(links))
+                    writer.write(conn.data_to_send())
+                await writer.drain()
+            case ServerPush() | ZeroCopySend() | PathSend() | ResponseTrailers() | ResponseDebug():
+                raise NotImplementedError(f"{type(outbound).__name__} is not supported over HTTP/2")
+
+    async def finalize_incomplete(stream_id: int, stream: _H2Stream) -> None:
+        async with lock:
+            with suppress(h2.exceptions.ProtocolError, h2.exceptions.StreamClosedError):
+                if stream.response_started:
+                    conn.reset_stream(stream_id)
+                else:
+                    conn.send_headers(
+                        stream_id, [(b":status", b"500"), (b"content-type", b"text/plain; charset=utf-8")]
+                    )
+                    conn.send_data(stream_id, b"internal server error\n", end_stream=True)
+                writer.write(conn.data_to_send())
+        await writer.drain()
+
+    async def run_stream(stream_id: int, headers: list[tuple[bytes, bytes]], stream: _H2Stream) -> None:
+        scope = scope_from_h2_headers(headers, scheme=scheme, server=server, client=client)
+        request_done = False
+
+        async def receive() -> RawMessage:
+            nonlocal request_done
+            if request_done:
+                return encode_inbound(Disconnect())
+            inbound = await stream.inbound.get()
+            if isinstance(inbound, Disconnect) or (isinstance(inbound, RequestBody) and not inbound.more_body):
+                request_done = True
+            return encode_inbound(inbound)
+
+        async def send(message: RawMessage) -> None:
+            await send_outbound(stream_id, stream, message)
+
+        try:
+            try:
+                await app(encode_http_scope(scope), receive, send)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            if not stream.response_done:
+                await finalize_incomplete(stream_id, stream)
+        finally:
+            streams.pop(stream_id, None)
+
+    async def handle_event(event: h2.events.Event) -> None:
+        match event:
+            case h2.events.RequestReceived(stream_id=stream_id, headers=headers):
+                method = next((v for n, v in headers if n == b":method"), b"")
+                new = _H2Stream(inbound=asyncio.Queue(), window=asyncio.Event(), head=method == b"HEAD")
+                streams[stream_id] = new
+                task = asyncio.create_task(run_stream(stream_id, list(headers), new))
+                tasks.add(task)
+                task.add_done_callback(tasks.discard)
+            case h2.events.DataReceived(stream_id=stream_id, data=data, flow_controlled_length=length):
+                if (target := streams.get(stream_id)) is not None:
+                    target.inbound.put_nowait(RequestBody(body=bytes(data), more_body=True))
+                async with lock:
+                    conn.acknowledge_received_data(length, stream_id)
+                    writer.write(conn.data_to_send())
+                await writer.drain()
+            case h2.events.StreamEnded(stream_id=stream_id):
+                if (target := streams.get(stream_id)) is not None:
+                    target.inbound.put_nowait(RequestBody(body=b"", more_body=False))
+            case h2.events.StreamReset(stream_id=stream_id):
+                if (target := streams.get(stream_id)) is not None:
+                    target.inbound.put_nowait(Disconnect())
+                    # Wake a sender blocked on the window so it observes the closed
+                    # stream and unwinds, rather than lingering until connection close.
+                    target.window.set()
+            case h2.events.WindowUpdated(stream_id=stream_id):
+                if stream_id == 0:
+                    for target in streams.values():
+                        target.window.set()
+                elif (target := streams.get(stream_id)) is not None:
+                    target.window.set()
+            case h2.events.RemoteSettingsChanged():
+                # A changed initial window resizes every stream's window, so wake all
+                # blocked senders to re-check rather than tracking which grew.
+                for target in streams.values():
+                    target.window.set()
+            case h2.events.ConnectionTerminated():
+                closed.set()
+            case _:
+                pass
+
+    async def feed(data: bytes) -> bool:
+        async with lock:
+            try:
+                events = conn.receive_data(data)
+            except h2.exceptions.ProtocolError:
+                writer.write(conn.data_to_send())
+                events = []
+                closed.set()
+            else:
+                writer.write(conn.data_to_send())
+        await writer.drain()
+        for event in events:
+            await handle_event(event)
+        return not closed.is_set()
+
+    async with lock:
+        conn.initiate_connection()
+        writer.write(conn.data_to_send())
+    await writer.drain()
+    try:
+        if initial and not await feed(initial):
+            return
+        while True:
+            data = await reader.read(_BUFFER)
+            if not data or not await feed(data):
+                return
+    finally:
+        await cancel_futures(tasks)
+
+
+def _listen(host: str, port: int, backlog: int) -> socket.socket:
+    """Bind and listen on a single resolved address, returning a non-blocking socket.
+
+    The server drives its own accept loop (to gate admission), so it owns the
+    listening socket directly rather than handing it to `asyncio.start_server`. It
+    binds the first address `host` resolves to; a `host` that resolves to several
+    (a dual-stack `localhost`, or `""`) is served on only the first.
+    """
+    family, socktype, proto, _canon, sockaddr = socket.getaddrinfo(
+        host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+    )[0]
+    listener = socket.socket(family, socktype, proto)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(sockaddr)
+    listener.listen(backlog)
+    listener.setblocking(False)
+    return listener
 
 
 async def _serve_accepted(
@@ -299,7 +573,7 @@ async def _serve_accepted(
     """Wrap a freshly accepted socket in streams, then serve one connection.
 
     The dual of what `asyncio.start_server` does internally per accepted socket,
-    spelled out here because the bounded path drives its own accept loop: build a
+    spelled out here because the server drives its own accept loop: build a
     `StreamReader`/`StreamWriter` over the socket (performing the TLS handshake when
     `ssl_context` is set), then hand them to `_serve_connection`. A handshake that
     fails closes the socket without disturbing the accept loop.
@@ -322,6 +596,64 @@ async def _serve_accepted(
     await _serve_connection(app, reader, writer)
 
 
+@dataclass(slots=True)
+class _Slots:
+    """Admission gate and in-flight gauge for served connections.
+
+    Wraps the optional concurrency ceiling so the accept loop and the per-connection
+    task never branch on whether a cap is set. `reserve` waits for capacity (a no-op
+    when uncapped) before the loop accepts; `release` returns capacity reserved for an
+    accept that then failed; `occupied` brackets a live connection, moving `in_flight`
+    and freeing the slot when it ends. `in_flight` is always readable, so the server
+    can report how many connections it is serving. Reserve happens in the accept loop
+    and the slot is freed when the connection ends, two different coroutines, which is
+    why only the connection-lifetime half is a context manager.
+    """
+
+    _semaphore: asyncio.Semaphore | None
+    in_flight: int = 0
+
+    @classmethod
+    def with_limit(cls, limit: int | None) -> _Slots:
+        return cls(asyncio.Semaphore(limit) if limit is not None else None)
+
+    async def reserve(self) -> None:
+        if self._semaphore is not None:
+            await self._semaphore.acquire()
+
+    def release(self) -> None:
+        if self._semaphore is not None:
+            self._semaphore.release()
+
+    @asynccontextmanager
+    async def occupied(self) -> AsyncIterator[None]:
+        self.in_flight += 1
+        try:
+            yield
+        finally:
+            self.in_flight -= 1
+            self.release()
+
+
+@dataclass(frozen=True, slots=True)
+class Server:
+    """A handle to a running server, yielded by `serving` for the block's duration.
+
+    `host`/`port` are the bound address (`port` is the OS-assigned one when `port=0`
+    was requested). `in_flight` reports how many connections are being served right
+    now, for metrics and observability; the admission gate behind it stays internal.
+    More fields (request counts, byte totals) can join as the server grows.
+    """
+
+    host: str
+    port: int
+    _slots: _Slots
+
+    @property
+    def in_flight(self) -> int:
+        return self._slots.in_flight
+
+
 @asynccontextmanager
 async def serving(
     app: ASGIApp,
@@ -330,16 +662,18 @@ async def serving(
     port: int = 0,
     max_pending_connections: int = 100,
     max_concurrent_connections: int | None = None,
+    accept_error_cooldown: float = ACCEPT_RETRY_DELAY,
     ssl_context: ssl.SSLContext | None = None,
     ssl_handshake_timeout: float | None = None,
     ssl_shutdown_timeout: float | None = None,
-) -> AsyncIterator[tuple[str, int]]:
+) -> AsyncIterator[Server]:
     """Serve `app` over HTTP for the duration of the `with` block.
 
     Drives the lifespan cycle, binds a socket (`port=0` picks a free one), and
-    yields the bound `(host, port)`. On exit it stops accepting, cancels any
-    in-flight connections, and runs lifespan shutdown. This is the testable seam
-    `serve` runs forever around.
+    yields a `Server` (its bound `host`/`port`, plus live metrics like `in_flight`).
+    On exit it stops accepting, cancels any in-flight connections, and runs lifespan
+    shutdown. To run a server until cancelled, hold the block open with
+    `without.sleep_forever()` (or your own run loop, e.g. one that handles signals).
 
     `max_pending_connections` is the kernel's listen backlog: the depth of the
     queue of connections that have completed the TCP handshake but have not yet
@@ -354,65 +688,40 @@ async def serving(
     at once (default: unlimited). At the cap the server stops calling `accept()`,
     so additional connections wait in that kernel pending queue rather than as
     parked tasks: no per-connection task is created and no TLS handshake or request
-    parsing begins until a slot frees. Enforcing this requires a single listening
-    socket, so it cannot be combined with a `host` that resolves to several
-    addresses.
+    parsing begins until a slot frees.
+
+    The server always drives its own accept loop over a single listening socket
+    (`accept`-gating is the reason; see `_listen`), so a `host` resolving to several
+    addresses is served on only the first, with or without a cap.
+
+    `accept_error_cooldown` is how long the accept loop pauses after an `accept()`
+    that failed for a reason that leaves the connection queued (running out of file
+    descriptors: `EMFILE`/`ENFILE`, or kernel memory: `ENOBUFS`/`ENOMEM`, plus any
+    unexpected error). Without a pause an immediate retry would busy-loop on the same
+    failure; the loop logs and waits this long instead, then resumes, so transient
+    pressure neither spins the CPU nor silently kills the server. It defaults to
+    asyncio's own `ACCEPT_RETRY_DELAY`, the value its built-in accept loop uses. An
+    aborted connection (`ECONNABORTED`) is skipped without a pause, since it is
+    per-connection and self-clearing.
 
     Pass `ssl_context` to serve `https`/`wss` directly; `server_ssl_context` builds
     one for the common case. `ssl_handshake_timeout` bounds a single TLS handshake
     (asyncio's default is 60s) and `ssl_shutdown_timeout` the closing `close_notify`
     exchange (default 30s); both are meaningful only alongside `ssl_context`.
     """
-    if max_concurrent_connections is None:
-        connections: set[asyncio.Task[None]] = set()
-
-        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-            task = asyncio.current_task()
-            assert task is not None
-            connections.add(task)
-            try:
-                await _serve_connection(app, reader, writer)
-            finally:
-                connections.discard(task)
-
-        async with run_lifespan(app):
-            server = await asyncio.start_server(
-                handle,
-                host,
-                port,
-                backlog=max_pending_connections,
-                ssl=ssl_context,
-                ssl_handshake_timeout=ssl_handshake_timeout,
-                ssl_shutdown_timeout=ssl_shutdown_timeout,
-            )
-            try:
-                yield _bound_address(server)
-            finally:
-                server.close()
-                await server.wait_closed()
-                await cancel_futures(connections)
-        return
-
-    # The bounded path drives its own accept loop, so it owns the listening
-    # socket directly (a single address, which is what gating the accept needs)
-    # rather than handing it to `asyncio.start_server`'s built-in accept loop.
-    family, socktype, proto, _canon, sockaddr = socket.getaddrinfo(
-        host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
-    )[0]
-    listener = socket.socket(family, socktype, proto)
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind(sockaddr)
-    listener.listen(max_pending_connections)
-    listener.setblocking(False)
+    listener = _listen(host, port, max_pending_connections)
     bound_host, bound_port = listener.getsockname()[:2]
     loop = asyncio.get_running_loop()
+    # Reserving a slot *before* `accept` is what gates admission: at the cap the loop
+    # blocks on `reserve` and never calls `accept`, so excess connections wait in the
+    # kernel queue with no task and no handshake. `_Slots` also counts in-flight
+    # connections and folds away the uncapped case, so this loop never branches on it.
+    slots = _Slots.with_limit(max_concurrent_connections)
+    connections: set[asyncio.Task[None]] = set()
 
-    async def incoming() -> AsyncIterator[Awaitable[None]]:
-        # `limit_concurrency` advances this generator (and so awaits the next
-        # `accept`) only while below the limit, so the accept itself is gated.
-        while True:
-            conn, _ = await loop.sock_accept(listener)
-            yield _serve_accepted(
+    async def serve_one(conn: socket.socket) -> None:
+        async with slots.occupied():
+            await _serve_accepted(
                 app,
                 conn,
                 ssl_context=ssl_context,
@@ -421,37 +730,24 @@ async def serving(
             )
 
     async def accept() -> None:
-        async for _done in limit_concurrency(incoming(), max_concurrent_connections):
-            pass
+        while True:
+            await slots.reserve()
+            try:
+                conn, _ = await loop.sock_accept(listener)
+            except OSError as error:
+                slots.release()
+                if error.errno != errno.ECONNABORTED:
+                    logger.warning(f"accept failed, retrying in {accept_error_cooldown}s: {error}")
+                    await asyncio.sleep(accept_error_cooldown)
+                continue
+            task = asyncio.create_task(serve_one(conn))
+            connections.add(task)
+            task.add_done_callback(connections.discard)
 
     async with run_lifespan(app):
         try:
             async with background_task(accept()):
-                yield bound_host, bound_port
+                yield Server(host=bound_host, port=bound_port, _slots=slots)
         finally:
             listener.close()
-
-
-async def serve(
-    app: ASGIApp,
-    *,
-    host: str = "127.0.0.1",
-    port: int = 8000,
-    max_pending_connections: int = 100,
-    max_concurrent_connections: int | None = None,
-    ssl_context: ssl.SSLContext | None = None,
-    ssl_handshake_timeout: float | None = None,
-    ssl_shutdown_timeout: float | None = None,
-) -> None:
-    """Serve `app` over HTTP until cancelled. The simple entrypoint over `serving`."""
-    async with serving(
-        app,
-        host=host,
-        port=port,
-        max_pending_connections=max_pending_connections,
-        max_concurrent_connections=max_concurrent_connections,
-        ssl_context=ssl_context,
-        ssl_handshake_timeout=ssl_handshake_timeout,
-        ssl_shutdown_timeout=ssl_shutdown_timeout,
-    ):
-        await sleep_forever()
+            await cancel_futures(connections)

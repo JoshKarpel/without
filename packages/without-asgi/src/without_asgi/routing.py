@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from without import Processor
 from without import Stream
@@ -23,6 +24,7 @@ __all__ = [
     "Middleware",
     "WebsocketMiddleware",
     "buffered",
+    "limit_concurrent_requests",
     "stack",
     "wrap",
 ]
@@ -97,6 +99,89 @@ def wrap[In, Out, S](
 
             wrapped = compose(wrapped, on_outbound)
         return wrapped
+
+    return middleware
+
+
+@dataclass(slots=True)
+class _RequestBudget:
+    # A process-wide count of in-flight requests against a fixed ceiling. Mutation
+    # is safe without a lock: `admit` checks and increments with no `await` between,
+    # so on the single-threaded event loop it is atomic against other admits.
+    limit: int
+    in_flight: int = 0
+
+    def admit(self) -> bool:
+        if self.in_flight >= self.limit:
+            return False
+        self.in_flight += 1
+        return True
+
+    def release(self) -> None:
+        self.in_flight -= 1
+
+
+_OVERLOADED = Response(
+    status=503,
+    headers=(
+        (b"content-type", b"text/plain; charset=utf-8"),
+        (b"retry-after", b"1"),
+    ),
+    body=b"server overloaded\n",
+)
+
+
+def limit_concurrent_requests(limit: int, *, overloaded: Response = _OVERLOADED) -> HttpMiddleware[object]:
+    """An `HttpMiddleware` that sheds load past `limit` concurrent in-flight requests.
+
+    While `limit` requests are already running, further requests are answered
+    immediately with the `overloaded` response (a `503 Service Unavailable` carrying
+    `Retry-After: 1` by default), without invoking the inner handler or reading the
+    request body. Pass your own `Response` to control the status, body, and headers
+    (a JSON payload, a different `Retry-After`, a `429`); it is a fixed value rather
+    than a per-request callback, since the point of shedding is to answer cheaply.
+
+    This is request-level overload shedding, the complement to a transport's
+    connection-admission cap: a connection cap bounds *pipes* (and under HTTP/1.1
+    that nearly bounds requests too), but one HTTP/2 connection multiplexes many
+    requests, so bounding in-flight *work* belongs here, where it wraps the app
+    invocation and so applies under any transport. Mount it only on the HTTP router
+    to leave long-lived WebSocket connections uncounted.
+
+    Coverage is controlled by *where* you mount it, not a per-request flag, so it
+    composes with route-scoped mounting (see `without-web`) to carve out exemptions.
+    Kubernetes health probes are the motivating case, and the two kinds want
+    opposite treatment: a **liveness** probe should bypass the limit, since failing
+    it restarts a pod that is merely busy rather than broken (and the restart sheds
+    that pod's in-flight work onto already-loaded siblings). A **readiness** probe is
+    the opposite: letting it shed under load is often desirable, since a `503` there
+    removes the pod from the Service endpoints until it recovers, steering new
+    traffic away while the backlog drains.
+
+    The ceiling is held in one budget built when the middleware is constructed and
+    shared across every request through the closure; install it once at app
+    assembly. An admitted request holds a slot for as long as the handler's output
+    stream runs, releasing it when that stream finishes, fails, or is cancelled.
+    """
+    budget = _RequestBudget(limit)
+    shed = tuple(encode_response(overloaded))
+
+    async def gated(handler: HttpHandler, inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
+        if not budget.admit():
+            for event in shed:
+                yield event
+            return
+        try:
+            async for event in handler(inputs):
+                yield event
+        finally:
+            budget.release()
+
+    def middleware(_state: object, handler: HttpHandler, _scope: HttpScope) -> HttpHandler:
+        def processor(inputs: Stream[Inbound]) -> Stream[Outbound]:
+            return gated(handler, inputs)
+
+        return processor
 
     return middleware
 

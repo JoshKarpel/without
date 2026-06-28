@@ -56,28 +56,28 @@ async def redirect_app(scope: RawScope, receive: Receive, send: Send) -> None:
 
 
 async def test_session_gets_a_response() -> None:
-    async with serving(echo_app) as (host, port), open_session() as session:
-        async with session.request("GET", f"http://{host}:{port}/items") as response:
+    async with serving(echo_app) as server, open_session() as session:
+        async with session.request("GET", f"http://{server.host}:{server.port}/items") as response:
             assert response.status == 200
             assert response.body == b"GET /items test= body="
 
 
 async def test_session_posts_a_body() -> None:
-    async with serving(echo_app) as (host, port), open_session() as session:
-        async with session.request("POST", f"http://{host}:{port}/submit", body=b"payload") as response:
+    async with serving(echo_app) as server, open_session() as session:
+        async with session.request("POST", f"http://{server.host}:{server.port}/submit", body=b"payload") as response:
             assert response.body == b"POST /submit test= body=payload"
 
 
 async def test_default_headers_middleware_injects_a_header_seen_server_side() -> None:
     session = Session(middleware=default_headers((b"x-test", b"injected")))
-    async with serving(echo_app) as (host, port):
-        async with session.request("GET", f"http://{host}:{port}/items") as response:
+    async with serving(echo_app) as server:
+        async with session.request("GET", f"http://{server.host}:{server.port}/items") as response:
             assert response.body == b"GET /items test=injected body="
 
 
 async def test_follow_redirects_middleware_follows_a_302() -> None:
     session = Session(middleware=follow_redirects())
-    async with serving(redirect_app) as (host, port):
-        async with session.request("GET", f"http://{host}:{port}/start") as response:
+    async with serving(redirect_app) as server:
+        async with session.request("GET", f"http://{server.host}:{server.port}/start") as response:
             assert response.status == 200
             assert response.body == b"arrived"

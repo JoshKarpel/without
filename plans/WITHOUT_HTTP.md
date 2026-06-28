@@ -404,6 +404,62 @@ sans-IO framing on top. This is a **separate transport path** within
 model carry over unchanged; the transport shell is new. Clearly the largest of
 the deferred items.
 
+#### One entrypoint, not a separate `serve_quic`
+
+When HTTP/3 lands it MUST be reachable through the existing `serving` entrypoint,
+not a parallel `serve_quic` the caller composes by hand. `serving` is the
+imperative shell whose job is "bring up the server for this app", so owning all
+three transports for one app is its concern; the vocabulary and per-request
+processor layers stay transport-agnostic, and only the shell composes. With h3
+enabled, `serving` brings up the TCP listener (h1/h2) and the QUIC/UDP listener
+(h3) concurrently over the same app, and handles the glue the caller would
+otherwise hand-write: binding TCP and UDP to the same port number, and injecting
+the `Alt-Svc` response header into h1/h2 responses so clients discover h3.
+
+Two constraints keep h3 from being unconditionally automatic, and both point to a
+single **explicit opt-in, default off** parameter (`http3=True`) rather than
+auto-enabling whenever `aioquic` happens to be importable:
+
+- **`aioquic` is a heavy optional dependency** (a full QUIC + crypto stack). It
+  MUST live behind an extra (`without-http[http3]`) so h1/h2-only users never
+  drag it in.
+- **QUIC is TLS-only.** There is no cleartext h3, so h3 can come up only when a
+  cert is configured.
+
+`serving` MUST reject illegal combinations at startup rather than silently
+degrading (parse, don't validate): `http3=True` without TLS, or without `aioquic`
+installed, fails loudly with a clear message. Auto-enabling on a stray importable
+dependency is rejected as implicit magic: a call site should make plain that it
+opens a UDP port, matching how the rest of `without` injects choices rather than
+sniffing the environment.
+
+#### HTTP/3 is an edge concern: TLS-terminating tier only
+
+HTTP/3 cannot reach an app that sits behind upstream TLS termination (a service
+mesh like Istio, an ingress gateway, any L7 proxy that terminates TLS). Because
+QUIC welds TLS 1.3 into the transport, there is no plaintext HTTP/3 to forward
+inward: "terminate TLS, then hand the app plaintext h3" describes something that
+cannot exist. So h3 and upstream-TLS-termination are mutually exclusive at the app
+boundary:
+
+- **TLS terminated upstream** → the app receives plaintext, hence h1/h2c, hence
+  not h3. The gateway terminates the client's QUIC connection (where h3's wins
+  on the lossy public/mobile hop actually matter) and forwards h2/h1 upstream;
+  the app runs `serving(app)` over plaintext TCP exactly as today, with
+  `http3=False`. This is the overwhelmingly common production deployment, which is
+  why default-off is correct.
+- **App terminates its own TLS** (it is the public edge, or sits behind TLS
+  passthrough) → it brings its own cert and runs QUIC directly with `http3=True`.
+  This is where the dual-listener + `Alt-Svc` convenience pays off.
+
+This makes one rule load-bearing, not merely tidy: **`Alt-Svc` auto-injection MUST
+be gated on this process actually terminating h3.** A backend app must never
+advertise `Alt-Svc`, since it would point clients at an h3 endpoint it does not
+run, on a port nothing is listening on; the advertising belongs to whichever tier
+terminates QUIC. A meshed app that wants to know the client used h3 reads it from
+edge-supplied forwarded metadata (`Forwarded` / `X-Forwarded-Proto` /
+`x-envoy-*`), not the ASGI scope, which honestly reports the hop the app is on.
+
 ### Request-concurrency shedding (503)
 
 The shipped `max_concurrent_connections` is *connection admission*: at the cap the
@@ -418,10 +474,32 @@ actionable "back off" signal and bounds *in-flight requests* rather than
 connections, but it pays accept + (TLS) handshake + response cost per rejection.
 
 The two are complementary, not either/or, so a 503 request-concurrency limit is a
-reasonable later addition *alongside* the connection cap: gate accepts to bound
+reasonable addition *alongside* the connection cap: gate accepts to bound
 resource consumption cheaply, and shed with `503` when request concurrency spikes.
 This matters much more once **HTTP/2** lands, where one connection multiplexes many
 concurrent requests and a connection cap no longer bounds in-flight work.
+
+**Resolved: this is middleware, not transport code.** The 503 limit wraps the app
+invocation, which is exactly the shape of an `HttpMiddleware`, so it ships as
+`limit_concurrent_requests(limit, *, overloaded=<503 Response>)` in `without-asgi`'s
+`routing`, not as a guard baked into `without-http`'s wire paths. The shed response
+is a caller-supplied `Response` value (defaulting to `503` + `Retry-After: 1`), so
+a JSON API or a `429` is just a different value, not a new code path. That dividing
+line is principled and is the clean resolution of the connection-vs-request
+confusion: **connection admission cannot be middleware** (it happens before any
+scope or handler exists, so it stays the transport's `max_concurrent_connections`),
+while **request shedding is middleware** (one implementation that applies under any
+transport, h1/h2/h3, and even under uvicorn, because it wraps the handler rather
+than the socket). Mounting it only on the HTTP router leaves long-lived WebSocket
+connections uncounted; the shared budget is built once at app assembly and injected
+through the closure.
+
+The one case that would still justify a *transport-level* 503 in `without-http` is
+bounding an **arbitrary hosted ASGI app** the server runs via plain ASGI (FastAPI,
+Starlette), into which without-middleware cannot be injected. That is uvicorn's own
+reason for putting the limit in the transport, and it is deferred until we care
+about overload-protecting third-party hosted apps; without-native apps are fully
+covered by the middleware.
 
 ## End-to-end verification
 
