@@ -9,6 +9,7 @@ from without.contracts import from_map
 from without.contracts import from_scan
 from without.contracts import from_sink
 from without.tasks import background_task
+from without.tasks import sleep_forever
 from without.wiring import Sample
 from without.wiring import broadcast
 from without.wiring import collect
@@ -41,6 +42,7 @@ __all__ = [
     "merge",
     "route",
     "sample",
+    "sleep_forever",
     "stream",
     "stream_from_queue",
     "tee",

@@ -11,6 +11,17 @@ from contextlib import asynccontextmanager
 from contextlib import suppress
 
 
+async def sleep_forever() -> None:
+    """Suspend the current task until it is cancelled.
+
+    The idiom for a coroutine whose job is to stay alive until its surrounding
+    scope tears it down: a server's run loop holding a bound socket open, a
+    process that should idle until signalled. It awaits a future that never
+    resolves, so it consumes nothing and ends only on cancellation.
+    """
+    await asyncio.get_running_loop().create_future()
+
+
 @asynccontextmanager
 async def background_task(coro: Coroutine[object, object, object]) -> AsyncIterator[asyncio.Task[object]]:
     """Run `coro` as a task for the duration of the `with` block.

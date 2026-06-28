@@ -21,9 +21,11 @@ dependencies = [
     "without-env",
     "without-configmap",
     "without-asgi",
+    "without-http",
     "without-web",
     "pydantic>=2",
     "pydantic-settings>=2.7",
+    "httpx>=0.28",
 ]
 
 [tool.uv.sources]
@@ -31,4 +33,5 @@ without = { workspace = true }
 without-env = { workspace = true }
 without-configmap = { workspace = true }
 without-asgi = { workspace = true }
+without-http = { workspace = true }
 without-web = { workspace = true }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from without_asgi import EarlyHint
 from without_asgi import LifespanReply
+from without_asgi import Outbound
 from without_asgi import PathSend
 from without_asgi import RawMessage
 from without_asgi import Response
@@ -12,11 +13,13 @@ from without_asgi import ResponseStart
 from without_asgi import ResponseTrailers
 from without_asgi import ServerPush
 from without_asgi import ShutdownComplete
+from without_asgi import ShutdownFailed
 from without_asgi import StartupComplete
 from without_asgi import StartupFailed
 from without_asgi import WebsocketAccept
 from without_asgi import WebsocketBinary
 from without_asgi import WebsocketClose
+from without_asgi import WebsocketOutbound
 from without_asgi import WebsocketResponseBody
 from without_asgi import WebsocketResponseStart
 from without_asgi import WebsocketSend
@@ -26,6 +29,9 @@ from without_asgi import encode_lifespan_reply
 from without_asgi import encode_outbound
 from without_asgi import encode_response
 from without_asgi import encode_websocket_outbound
+from without_asgi import parse_lifespan_reply
+from without_asgi import parse_outbound
+from without_asgi import parse_websocket_outbound
 
 
 class _FileDescriptor:
@@ -195,3 +201,65 @@ def test_encode_websocket_outbound_renders_a_denial_response_body() -> None:
         "body": b"denied",
         "more_body": False,
     }
+
+
+def test_parse_outbound_classifies_a_response_start() -> None:
+    message: RawMessage = {
+        "type": "http.response.start",
+        "status": 201,
+        "headers": [[b"content-type", b"application/json"]],
+        "trailers": True,
+    }
+
+    assert parse_outbound(message) == ResponseStart(
+        status=201, headers=((b"content-type", b"application/json"),), trailers=True
+    )
+
+
+def test_parse_outbound_rejects_an_unknown_event() -> None:
+    with pytest.raises(ValueError, match="unexpected http event"):
+        parse_outbound({"type": "http.response.surprise"})
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        ResponseStart(status=200, headers=((b"x-app", b"flags"),), trailers=False),
+        ResponseStart(status=204, headers=(), trailers=True),
+        ResponseBody(body=b"hello", more_body=True),
+        ResponseBody(body=b"", more_body=False),
+        ServerPush(path="/style.css", headers=((b"accept", b"text/css"),)),
+        ZeroCopySend(file=_FileDescriptor(), offset=64, count=2048, more_body=True),
+        ZeroCopySend(file=_FileDescriptor(), offset=None, count=None, more_body=False),
+        PathSend(path="/var/www/big.iso"),
+        EarlyHint(links=(b"</style.css>; rel=preload",)),
+        ResponseTrailers(headers=((b"digest", b"sha-256=abc"),), more_trailers=False),
+        ResponseDebug(info={"trace_id": "xyz"}),
+    ],
+)
+def test_parse_outbound_round_trips_through_encode_outbound(event: Outbound) -> None:
+    assert parse_outbound(encode_outbound(event)) == event
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        WebsocketAccept(subprotocol="graphql-ws", headers=((b"x-app", b"flags"),)),
+        WebsocketAccept(subprotocol=None, headers=()),
+        WebsocketSend(data=WebsocketText(text="ping")),
+        WebsocketSend(data=WebsocketBinary(data=b"\xff")),
+        WebsocketClose(code=1011, reason="boom"),
+        WebsocketResponseStart(status=403, headers=((b"content-type", b"text/plain"),)),
+        WebsocketResponseBody(body=b"denied", more_body=False),
+    ],
+)
+def test_parse_websocket_outbound_round_trips_through_encode(event: WebsocketOutbound) -> None:
+    assert parse_websocket_outbound(encode_websocket_outbound(event)) == event
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [StartupComplete(), ShutdownComplete(), StartupFailed(message="boom"), ShutdownFailed(message="late")],
+)
+def test_parse_lifespan_reply_round_trips_through_encode(reply: LifespanReply) -> None:
+    assert parse_lifespan_reply(encode_lifespan_reply(reply)) == reply

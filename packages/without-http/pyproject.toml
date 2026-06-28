@@ -1,0 +1,32 @@
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[project]
+name = "without-http"
+version = "0.0.0"
+description = "A sans-IO-backed ASGI server (and HTTP client) for without: h11/h2/wsproto over asyncio sockets."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Josh Karpel", email = "josh.karpel@gmail.com" },
+]
+requires-python = ">=3.14"
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
+dependencies = [
+    "without",
+    "without-asgi",
+    "h11>=0.16",
+    "wsproto>=1.2",
+]
+
+[tool.uv.sources]
+without = { workspace = true }
+without-asgi = { workspace = true }

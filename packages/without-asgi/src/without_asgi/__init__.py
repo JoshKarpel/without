@@ -16,6 +16,9 @@ from without_asgi.inbound import WebsocketConnect
 from without_asgi.inbound import WebsocketDisconnect
 from without_asgi.inbound import WebsocketInbound
 from without_asgi.inbound import WebsocketReceive
+from without_asgi.inbound import encode_inbound
+from without_asgi.inbound import encode_lifespan_event
+from without_asgi.inbound import encode_websocket_inbound
 from without_asgi.inbound import parse_inbound
 from without_asgi.inbound import parse_lifespan_event
 from without_asgi.inbound import parse_websocket_inbound
@@ -45,6 +48,9 @@ from without_asgi.outbound import encode_lifespan_reply
 from without_asgi.outbound import encode_outbound
 from without_asgi.outbound import encode_response
 from without_asgi.outbound import encode_websocket_outbound
+from without_asgi.outbound import parse_lifespan_reply
+from without_asgi.outbound import parse_outbound
+from without_asgi.outbound import parse_websocket_outbound
 from without_asgi.scope import Asgi
 from without_asgi.scope import ConnectionScope
 from without_asgi.scope import HttpScope
@@ -52,6 +58,9 @@ from without_asgi.scope import LifespanScope
 from without_asgi.scope import Scope
 from without_asgi.scope import Tls
 from without_asgi.scope import WebsocketScope
+from without_asgi.scope import encode_http_scope
+from without_asgi.scope import encode_scope
+from without_asgi.scope import encode_websocket_scope
 from without_asgi.scope import extension
 from without_asgi.scope import parse_http_scope
 from without_asgi.scope import parse_scope
@@ -130,10 +139,16 @@ __all__ = [
     "WebsocketSend",
     "WebsocketText",
     "ZeroCopySend",
+    "encode_http_scope",
+    "encode_inbound",
+    "encode_lifespan_event",
     "encode_lifespan_reply",
     "encode_outbound",
     "encode_response",
+    "encode_scope",
+    "encode_websocket_inbound",
     "encode_websocket_outbound",
+    "encode_websocket_scope",
     "extension",
     "http_inbound",
     "http_outbound",
@@ -143,9 +158,12 @@ __all__ = [
     "parse_http_scope",
     "parse_inbound",
     "parse_lifespan_event",
+    "parse_lifespan_reply",
+    "parse_outbound",
     "parse_scope",
     "parse_tls",
     "parse_websocket_inbound",
+    "parse_websocket_outbound",
     "parse_websocket_scope",
     "read_body",
     "refuse_http",

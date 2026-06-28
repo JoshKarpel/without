@@ -5,8 +5,10 @@ from without_asgi import Asgi
 from without_asgi import HttpScope
 from without_asgi import LifespanScope
 from without_asgi import RawMessage
+from without_asgi import Scope
 from without_asgi import Tls
 from without_asgi import WebsocketScope
+from without_asgi import encode_scope
 from without_asgi import extension
 from without_asgi import parse_http_scope
 from without_asgi import parse_scope
@@ -208,3 +210,72 @@ def test_extension_is_none_for_an_unadvertised_extension() -> None:
 
 def test_extension_is_none_when_the_server_advertised_no_extensions() -> None:
     assert extension(None, "http.response.trailers") is None
+
+
+def test_encode_http_scope_renders_the_raw_dict() -> None:
+    scope = HttpScope(
+        asgi=Asgi(version="3.0", spec_version="2.3"),
+        http_version="1.1",
+        method="POST",
+        scheme="https",
+        path="/flags",
+        raw_path=b"/flags",
+        query_string=b"name=dark_mode",
+        root_path="/api",
+        headers=((b"accept", b"application/json"),),
+        client=("198.51.100.7", 54321),
+        server=("example.test", 443),
+        extensions={"http.response.zerocopysend": {}},
+    )
+
+    assert encode_scope(scope) == {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "https",
+        "path": "/flags",
+        "raw_path": b"/flags",
+        "query_string": b"name=dark_mode",
+        "root_path": "/api",
+        "headers": [[b"accept", b"application/json"]],
+        "client": ["198.51.100.7", 54321],
+        "server": ["example.test", 443],
+        "extensions": {"http.response.zerocopysend": {}},
+    }
+
+
+_HTTP_SCOPE = HttpScope(
+    asgi=Asgi(version="3.0", spec_version="2.3"),
+    http_version="1.1",
+    method="PATCH",
+    scheme="https",
+    path="/flags",
+    raw_path=b"/flags",
+    query_string=b"name=dark_mode",
+    root_path="/api",
+    headers=((b"accept", b"application/json"),),
+    client=("198.51.100.7", 54321),
+    server=("/run/app.sock", None),
+    extensions={"http.response.trailers": {}},
+)
+_WEBSOCKET_SCOPE = WebsocketScope(
+    asgi=Asgi(version="3.0", spec_version="2.3"),
+    http_version="2",
+    scheme="wss",
+    path="/live",
+    raw_path=b"/live",
+    query_string=b"room=lobby",
+    root_path="/api",
+    headers=((b"origin", b"https://example.test"),),
+    client=("198.51.100.7", 54321),
+    server=("example.test", 443),
+    subprotocols=("graphql-ws", "json"),
+    extensions={"websocket.http.response": {}},
+)
+_LIFESPAN_SCOPE = LifespanScope(asgi=Asgi(version="3.0", spec_version="2.0"))
+
+
+@pytest.mark.parametrize("scope", [_HTTP_SCOPE, _WEBSOCKET_SCOPE, _LIFESPAN_SCOPE])
+def test_encode_scope_round_trips_through_parse_scope(scope: Scope) -> None:
+    assert parse_scope(encode_scope(scope)) == scope

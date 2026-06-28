@@ -323,6 +323,72 @@ def extension(extensions: Mapping[str, Mapping[str, object]] | None, name: str) 
     return extensions.get(name)
 
 
+def _encode_asgi(asgi: Asgi) -> dict[str, object]:
+    return {"version": asgi.version, "spec_version": asgi.spec_version}
+
+
+def _encode_pair(pair: tuple[str, int | None] | None) -> list[object] | None:
+    return None if pair is None else [pair[0], pair[1]]
+
+
+def _encode_headers(headers: RawHeaders) -> list[list[bytes]]:
+    return [[name, value] for name, value in headers]
+
+
+def encode_http_scope(scope: HttpScope) -> RawScope:
+    """Render a typed `HttpScope` as the raw `http` scope dict an ASGI app expects.
+
+    The server-direction dual of `parse_http_scope`: a transport that owns the
+    wire (without-http) builds the typed scope from the request line and renders
+    it back to the dict the ASGI contract hands an app.
+    """
+    return {
+        "type": "http",
+        "asgi": _encode_asgi(scope.asgi),
+        "http_version": scope.http_version,
+        "method": scope.method,
+        "scheme": scope.scheme,
+        "path": scope.path,
+        "raw_path": scope.raw_path,
+        "query_string": scope.query_string,
+        "root_path": scope.root_path,
+        "headers": _encode_headers(scope.headers),
+        "client": _encode_pair(scope.client),
+        "server": _encode_pair(scope.server),
+        "extensions": scope.extensions,
+    }
+
+
+def encode_websocket_scope(scope: WebsocketScope) -> RawScope:
+    """Render a typed `WebsocketScope` as the raw `websocket` scope dict an ASGI app expects."""
+    return {
+        "type": "websocket",
+        "asgi": _encode_asgi(scope.asgi),
+        "http_version": scope.http_version,
+        "scheme": scope.scheme,
+        "path": scope.path,
+        "raw_path": scope.raw_path,
+        "query_string": scope.query_string,
+        "root_path": scope.root_path,
+        "headers": _encode_headers(scope.headers),
+        "client": _encode_pair(scope.client),
+        "server": _encode_pair(scope.server),
+        "subprotocols": list(scope.subprotocols),
+        "extensions": scope.extensions,
+    }
+
+
+def encode_scope(scope: Scope) -> RawScope:
+    """Render any typed scope as its raw ASGI dict, the dual of `parse_scope`."""
+    match scope:
+        case HttpScope():
+            return encode_http_scope(scope)
+        case WebsocketScope():
+            return encode_websocket_scope(scope)
+        case LifespanScope(asgi):
+            return {"type": "lifespan", "asgi": _encode_asgi(asgi)}
+
+
 def parse_tls(extensions: Mapping[str, Mapping[str, object]] | None) -> Tls | None:
     """Read the `tls` extension's connection info from a scope's `extensions`.
 

@@ -13,6 +13,7 @@ dependencies = [
     "without-env",
     "without-configmap",
     "without-asgi",
+    "without-http",
     "without-web",
 ]
 
@@ -28,6 +29,7 @@ without = { workspace = true }
 without-env = { workspace = true }
 without-configmap = { workspace = true }
 without-asgi = { workspace = true }
+without-http = { workspace = true }
 without-web = { workspace = true }
 integration = { workspace = true }
 
@@ -41,6 +43,7 @@ dev = [
     "pytest-xdist>=3",
     "pytest-asyncio>=1",
     "pytest-mock>=3",
+    "pytest-timeout>=2.3",
     "hypothesis>=6.80",
     "mypy>=1",
     "ruff>=0.15.4",
@@ -55,7 +58,13 @@ addopts = [
     "--strict-markers",
     "-Werror",
 ]
-testpaths = ["packages"]
+testpaths = ["packages/**/tests"]
+
+# A global per-test timeout so a deadlocked async test (e.g. a server that never
+# replies) fails loudly instead of hanging the suite. `thread` works without
+# signals, so it is xdist-safe.
+timeout = 30
+timeout_method = "thread"
 
 markers = ["slow"]
 

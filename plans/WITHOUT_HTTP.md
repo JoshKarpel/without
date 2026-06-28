@@ -31,6 +31,64 @@ dependency-light package both can share, and the result is full composition:
   handlers applies to client exchanges (auth injection, redirects,
   decompression, retry, logging).
 
+## Revision: what we actually built
+
+The sections below this one are the *original* plan. During implementation the
+user corrected its central premise, which simplified the design substantially.
+This section records what was actually built; where it conflicts with the
+original sections, this section wins.
+
+The correction: `without-web` is not a transport, and it should keep working with
+*any* ASGI server. `without-http` is itself **an ASGI server** (a uvicorn
+alternative): it owns the socket and the wire protocol and drives any ASGI app
+via `app(scope, receive, send)`. So the request/response *vocabulary* did not
+need to be extracted into a shared package, and there is no inverse adapter to
+write: the server speaks plain ASGI to apps.
+
+Consequences (vs. the original plan):
+
+- **No `without-http-types` package.** The vocabulary stayed in `without-asgi`.
+  `without-web` is unchanged and still depends on `without-asgi`.
+- **No `from_asgi`.** `without-http` runs any ASGI app natively, so there is
+  nothing to adapt; `make_asgi_app`-built apps, bare `without-asgi` handlers, and
+  third-party apps (Starlette/FastAPI) all just run.
+- **`without-asgi` gained the reverse-direction codecs instead.** A server needs
+  the dual of the app-side parse/encode: `encode_scope` /
+  `encode_http_scope` / `encode_websocket_scope` (typed scope to dict),
+  `encode_inbound` / `encode_websocket_inbound` / `encode_lifespan_event` (typed
+  to the dict `receive` returns), and `parse_outbound` /
+  `parse_websocket_outbound` / `parse_lifespan_reply` (the dict the app `send`s to
+  typed). The vocabulary now round-trips both directions, and `without-http`
+  works in typed values at the boundary while talking ASGI dicts to the app.
+- **`without-http` shipped:** an `asyncio` ASGI server, `serve(app, ...)` and the
+  testable `serving(app, ...)` context manager, over `h11` (HTTP/1.1) with
+  keep-alive, the ASGI lifespan cycle (with the standard "app raised, so lifespan
+  unsupported, serve anyway" fallback), and WebSockets over the HTTP/1.1 upgrade
+  via `wsproto`. The pure wire cores (`h11_wire`, `ws_wire`) are unit-tested; the
+  server and client are tested end-to-end over loopback (HTTP via `httpx`,
+  WebSocket via a small `wsproto` client).
+- **Client shipped as a mandated `Session`** (see the aiohttp note in Phase 4):
+  `open_session()` / `Session.request(...)`, with client middleware reusing the
+  server's `stack` (`default_headers`, `follow_redirects`). v1 opens a connection
+  per request; pooling is the documented follow-up.
+- **HTTP/2 was deferred** to a documented fast-follow (see "Gaps to address
+  later"); the first cut is HTTP/1.1 + WebSockets, a complete ASGI server.
+- **Substrate touch-up:** `without.sleep_forever()` was added for `serve`'s run
+  loop, and the test suite gained `pytest-timeout` (a global per-test timeout) so
+  a deadlocked async server test fails loudly instead of hanging.
+
+Resulting package graph (no cycles):
+
+```text
+without
+  ^
+without-asgi   (ASGI <-> typed vocabulary, both directions; make_asgi_app)
+  ^        ^
+without-web   without-http   (asyncio ASGI server + client; deps h11, wsproto; h2 added when HTTP/2 lands)
+(router)      dep: without, without-asgi
+dep: without, without-asgi
+```
+
 ## Design decisions (resolved with the user)
 
 - **Both server and client** in the first cut.
@@ -207,6 +265,20 @@ serve a `without-asgi`-based app (and optionally a Starlette app) via
   instance, reusing `stack`/`wrap` from `without-http-types` unchanged. Ship a
   couple of example middlewares (default headers, redirect-follow) to prove the
   symmetry with server middleware.
+- **Mandated session (aiohttp-style), connection pooling later.** The client
+  surface should be a `Session` you open once and reuse, not a per-request
+  free function: aiohttp's
+  [request lifecycle](https://docs.aiohttp.org/en/v3.7.3/http_request_lifecycle.html)
+  is the look-and-feel to follow, where almost all programs want one shared,
+  long-lived session rather than one-shot requests. The session is the natural
+  home for connection pooling (keep-alive reuse, per-host limits, HTTP/2 stream
+  multiplexing over one connection): callers go through `async with
+  session.request(...)` and the pool stays an implementation detail behind it.
+  v1 can open a fresh connection per request inside the session; the pool is a
+  contained follow-up that does not change the session API. A mandated session
+  (no free `get`/`post` that hides a global pool) keeps lifetime and limits
+  explicit and injected, matching the dependency-injection stance, and gives the
+  pooling work one clear place to land.
 
 **Verification:** client hits the Phase 2 server (loopback) and a public/local
 HTTP server; assert a `wrap`-based middleware mutates the request/response
@@ -252,9 +324,48 @@ Docs:
 
 ## Gaps to address later
 
-These are explicitly out of v1 but should land as fast-follows. Both reuse v1
-infrastructure (the HTTP/2 multiplexed-stream machinery, the WebSocket
-vocabulary, the per-connection-processor model), so neither is a redesign.
+These are explicitly out of the first shipped cut but should land as
+fast-follows. They reuse the shipped infrastructure (the per-connection /
+per-request processor model, the bidirectional ASGI codec, the WebSocket
+vocabulary), so none is a redesign.
+
+### HTTP/2 request/response (`h2`)
+
+The first cut ships HTTP/1.1 (`h11`) plus WebSockets over the HTTP/1.1 upgrade
+(`wsproto`), which together are a complete, tested ASGI server. HTTP/2 was
+deferred from this cut: a correct h2 server needs concurrent multiplexed streams,
+each driving its own ASGI app invocation, with `WINDOW_UPDATE` flow control and
+careful lock discipline (the read loop and every stream's `send` share one
+`H2Connection`, so a sender must not hold the connection lock while awaiting a
+window update, or it deadlocks the read loop that would deliver it). That is a
+large, intricate addition with real bug surface, so it is its own focused piece
+rather than rushed in alongside the h11/ws work.
+
+The design is settled and the `h2` API is proven (a happy-path request/response
+round-trips through `h2.connection.H2Connection` already):
+
+- **Detection.** Select h2 two ways: by ALPN (`h2` vs `http/1.1`) when serving
+  over TLS, and by *prior knowledge* over cleartext, recognizing the connection
+  preface `b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"` in the first bytes (peek before
+  feeding `h11`, since `h11` would mis-parse `PRI` as an HTTP/1 method). Default
+  to h11 when neither matches.
+- **Per-stream apps.** Each `RequestReceived(stream_id)` builds an `HttpScope`
+  from the h2 pseudo-headers (`:method`/`:path`/`:scheme`/`:authority`, the rest
+  as ordinary headers, `:authority` folded into a synthesized `host`) and spawns
+  a per-request app invocation, the same per-request-processor model the h11 path
+  uses. `DataReceived` feeds that stream's inbound queue (and acknowledges flow
+  control); `StreamEnded` closes the body; `StreamReset` cancels the app task.
+- **Flow control.** A stream's `send` chunks the body by
+  `local_flow_control_window(stream_id)` and `max_outbound_frame_size`, releasing
+  the connection lock to await a per-stream event the read loop sets on
+  `WindowUpdated`.
+- **Codec reuse.** The same `without-asgi` server-direction codecs
+  (`encode_http_scope`, `encode_inbound`, `parse_outbound`) carry over unchanged;
+  only the wire mapping (h2 events ↔ typed vocabulary) is new, mirroring
+  `h11_wire`.
+
+WebSockets over HTTP/2 (below) build on this h2 stream machinery, so this lands
+first.
 
 ### WebSockets over HTTP/2 (RFC 8441, "extended CONNECT")
 

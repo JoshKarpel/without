@@ -29,12 +29,38 @@ packages). Each package is its own top-level import.
   `pydantic`); the context-updated-by-a-stream half of the model. Imported as
   `without_configmap`.
 - `packages/without-asgi` — adapters that turn an ASGI app's `receive`/`send`
-  into typed event streams and back (the boundary only, no routing or
-  framework). Imported as `without_asgi`.
+  into typed event streams and back, in *both* directions (so it serves an app
+  adapter and an ASGI server equally). The boundary only, no routing or
+  framework. Imported as `without_asgi`.
+- `packages/without-web` — an opinionated HTTP/WebSocket router over
+  `without-asgi`: trie matching, typed path params, 405-vs-404, mounting, scoped
+  middleware, exception handlers, and OpenAPI. Imported as `without_web`.
+- `packages/without-http` — an `asyncio` ASGI **server** (and HTTP client) built
+  on the sans-IO `h11`/`wsproto` state machines: `serve(app)` owns the socket and
+  the wire protocol and drives any ASGI app. Imported as `without_http`.
 - `packages/integration` — not a real package (and never published: its name
   sits outside the `without*` family, so the publish workflow skips it): depends
   on `without` and every plugin so they can be exercised together in
   cross-package tests. Imported as `integration`.
+
+The package dependency graph (each arrow is "depends on"):
+
+```mermaid
+graph TD
+    without_env[without-env] --> without
+    without_configmap[without-configmap] --> without
+    without_asgi[without-asgi] --> without
+    without_web[without-web] --> without
+    without_web --> without_asgi
+    without_http[without-http] --> without
+    without_http --> without_asgi
+    integration --> without
+    integration --> without_env
+    integration --> without_configmap
+    integration --> without_asgi
+    integration --> without_web
+    integration --> without_http
+```
 
 Planned plugins, in the order they should be attempted:
 
@@ -43,9 +69,9 @@ Planned plugins, in the order they should be attempted:
    proves the context-updated-by-a-stream loop. **(done)**
 3. a toy line-protocol server (Redis-ish); proves long-lived processor state.
    **(done: `integration.kv`)**
-4. HTTP (sans-IO deps); the real test of the contract. **(in progress:
-   `without-asgi` adapters plus a text-transform example in
-   `integration.transform`)**
+4. HTTP (sans-IO deps); the real test of the contract. **(done: `without-asgi`
+   adapters, the `without-web` router, and `without-http` (an `h11`/`wsproto`
+   ASGI server plus client). HTTP/2 is a documented fast-follow.)**
 
 ## Development
 

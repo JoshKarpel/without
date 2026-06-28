@@ -102,3 +102,23 @@ socket: build a `scope`, a scripted `receive`, and a capturing `send`, then call
 `app` directly. See the `integration` package for a worked text-transform service
 that reads the request body and dynamic config from a `without-configmap`
 `Context`.
+
+## The codec runs both directions
+
+Everything above is the *app* side of the boundary: parse the dicts an ASGI
+server hands an app (`parse_*`), encode the typed values the app sends back
+(`encode_outbound`, `encode_lifespan_reply`). The vocabulary is also complete in
+the *server* direction, which is what a transport provider needs to drive an app:
+
+- `encode_scope` (and `encode_http_scope` / `encode_websocket_scope`) renders a
+  typed scope into the dict an app expects, the dual of `parse_scope`.
+- `encode_inbound` / `encode_websocket_inbound` / `encode_lifespan_event` build
+  the dicts an app's `receive` returns, the duals of the `parse_*` events.
+- `parse_outbound` / `parse_websocket_outbound` / `parse_lifespan_reply` classify
+  the dicts an app passes to `send`, the duals of the `encode_*` reply encoders.
+
+So the same typed vocabulary parses and encodes in both directions, and a server
+that owns the wire can work in typed values at the boundary rather than raw dicts.
+The sibling [`without-http`](../without-http) package is exactly that: an ASGI
+server built on `h11`/`h2`/`wsproto` that uses these server-direction codecs to
+talk ASGI to any app, `make_asgi_app`-built or third-party.
