@@ -11,6 +11,7 @@ from contextlib import suppress
 
 import h11
 from without import background_task
+from without import cancel_futures
 from without import limit_concurrency
 from without import sleep_forever
 from without_asgi import ASGIApp
@@ -389,12 +390,7 @@ async def serving(
             finally:
                 server.close()
                 await server.wait_closed()
-                pending = list(connections)
-                for task in pending:
-                    task.cancel()
-                for task in pending:
-                    with suppress(asyncio.CancelledError):
-                        await task
+                await cancel_futures(connections)
         return
 
     # The bounded path drives its own accept loop, so it owns the listening

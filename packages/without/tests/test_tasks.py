@@ -4,7 +4,9 @@ from collections.abc import Awaitable
 from contextlib import suppress
 
 import pytest
+from without import as_async_iterator
 from without import background_task
+from without import cancel_futures
 from without import limit_concurrency
 from without import sleep_forever
 
@@ -41,6 +43,55 @@ async def test_sleep_forever_blocks_until_cancelled() -> None:
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+async def test_cancel_futures_cancels_then_awaits_every_future() -> None:
+    torn_down = 0
+
+    async def worker() -> None:
+        nonlocal torn_down
+        try:
+            await sleep_forever()
+        finally:
+            torn_down += 1
+
+    tasks = [asyncio.create_task(worker()) for _ in range(4)]
+    await asyncio.sleep(0)
+
+    await cancel_futures(tasks)
+
+    assert all(task.cancelled() for task in tasks)
+    assert torn_down == 4
+
+
+async def test_cancel_futures_propagates_a_non_cancellation_teardown_error() -> None:
+    async def worker() -> None:
+        try:
+            await sleep_forever()
+        except asyncio.CancelledError:
+            raise ValueError("teardown failed") from None
+
+    task = asyncio.create_task(worker())
+    await asyncio.sleep(0)
+
+    with pytest.raises(ValueError, match="teardown failed"):
+        await cancel_futures([task])
+
+
+async def test_as_async_iterator_wraps_a_sync_iterable() -> None:
+    collected = [value async for value in as_async_iterator([3, 1, 4, 1, 5])]
+
+    assert collected == [3, 1, 4, 1, 5]
+
+
+async def test_as_async_iterator_passes_through_an_async_iterable() -> None:
+    async def counts() -> AsyncIterator[int]:
+        for value in (9, 8, 7):
+            yield value
+
+    collected = [value async for value in as_async_iterator(counts())]
+
+    assert collected == [9, 8, 7]
 
 
 async def test_limit_concurrency_runs_every_awaitable_and_yields_its_result() -> None:

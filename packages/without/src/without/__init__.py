@@ -8,7 +8,9 @@ from without.contracts import from_fold
 from without.contracts import from_map
 from without.contracts import from_scan
 from without.contracts import from_sink
+from without.tasks import as_async_iterator
 from without.tasks import background_task
+from without.tasks import cancel_futures
 from without.tasks import limit_concurrency
 from without.tasks import sleep_forever
 from without.wiring import Sample
@@ -31,8 +33,10 @@ __all__ = [
     "Sink",
     "Stream",
     "Transition",
+    "as_async_iterator",
     "background_task",
     "broadcast",
+    "cancel_futures",
     "collect",
     "compose",
     "distribute",

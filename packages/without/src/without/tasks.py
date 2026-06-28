@@ -1,7 +1,3 @@
-# Run a coroutine as a task scoped to a `with` block: started on entry,
-# cancelled on exit, so it cannot outlive the block. The behavior-edge `sample`
-# connector uses this, and stream sources and servers will too.
-
 from __future__ import annotations
 
 import asyncio
@@ -25,8 +21,25 @@ async def sleep_forever() -> None:
     await asyncio.get_running_loop().create_future()
 
 
+async def cancel_futures[T](futures: Iterable[asyncio.Future[T]]) -> None:
+    """Cancel every future, then await them all so their teardown completes.
+
+    Two phases on purpose: cancelling the whole set *before* awaiting any of them
+    lets them tear down concurrently, instead of serially cancelling and waiting
+    for one at a time. The futures are materialized first, so a caller may pass a
+    live set the awaits will mutate. Each future's own `CancelledError` is
+    suppressed; any other exception it raises during teardown propagates.
+    """
+    futures = list(futures)
+    for future in futures:
+        future.cancel()
+    for future in futures:
+        with suppress(asyncio.CancelledError):
+            await future
+
+
 @asynccontextmanager
-async def background_task(coro: Coroutine[object, object, object]) -> AsyncIterator[asyncio.Task[object]]:
+async def background_task[T](coro: Coroutine[object, object, T]) -> AsyncIterator[asyncio.Task[T]]:
     """Run `coro` as a task for the duration of the `with` block.
 
     The task is started on entry and cancelled (then awaited) on exit, so it is
@@ -37,17 +50,20 @@ async def background_task(coro: Coroutine[object, object, object]) -> AsyncItera
     try:
         yield task
     finally:
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+        await cancel_futures([task])
 
 
-async def _as_async[T](aws: AsyncIterable[T] | Iterable[T]) -> AsyncIterator[T]:
-    if isinstance(aws, AsyncIterable):
-        async for item in aws:
+async def as_async_iterator[T](items: AsyncIterable[T] | Iterable[T]) -> AsyncIterator[T]:
+    """Normalize a sync or async iterable into a single async iterator.
+
+    Lets code that consumes via `async for`/`anext` accept either kind without
+    branching on the iteration protocol at every use.
+    """
+    if isinstance(items, AsyncIterable):
+        async for item in items:
             yield item
     else:
-        for item in aws:
+        for item in items:
             yield item
 
 
@@ -72,7 +88,7 @@ async def limit_concurrency[T](
     Adapted from [Limiting concurrency in
     asyncio](https://death.andgravity.com/limit-concurrency).
     """
-    source = _as_async(aws)
+    source = as_async_iterator(aws)
     ended = False
     pending: set[asyncio.Future[T]] = set()
     try:
@@ -90,8 +106,4 @@ async def limit_concurrency[T](
             while done:
                 yield done.pop()
     finally:
-        for task in pending:
-            task.cancel()
-        for task in pending:
-            with suppress(asyncio.CancelledError):
-                await task
+        await cancel_futures(pending)

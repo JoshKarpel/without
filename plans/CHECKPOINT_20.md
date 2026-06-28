@@ -64,12 +64,12 @@ Two knobs on `serving`/`serve`, with `backlog` renamed to say what it is:
   is why the bounded path owns a real `socket.socket` rather than borrowing
   `start_server`'s.
 
-## New substrate primitive: `without.tasks.limit_concurrency`
+## New substrate primitives in `without.tasks`
 
 The bounded-accept idiom is general, not HTTP-specific (it is the
 [death.andgravity](https://death.andgravity.com/limit-concurrency) pattern the
 Python rules already reference), so it lives in `without.tasks` and is re-exported
-from `without`:
+from `without`, along with two helpers it factored out:
 
 ```python
 async def limit_concurrency[T](
@@ -81,11 +81,22 @@ async def limit_concurrency[T](
 It runs at most `limit` awaitables at once, yielding each as a `Future` when it
 finishes, and **pulls the source lazily** (only while below the limit), so a lazy
 side-effecting source (an accept loop) is never advanced past the limit. On early
-exit or cancellation it cancels and awaits the in-flight set, so nothing leaks. A
-small `_as_async` adapter normalizes sync and async iterables into one
-`await anext` path (cleaner than branching `next`/`anext` with a `type: ignore`).
-Unit-tested for: running every awaitable, never exceeding the limit, lazy pulling,
-cancel-on-exit, and surfacing a failure through the yielded `Future`.
+exit or cancellation it cancels and awaits the in-flight set, so nothing leaks.
+
+Two reusable helpers came out of writing it (both re-exported from `without`):
+
+- **`cancel_futures(futures)`**: cancel an entire set, *then* await them all, so
+  they tear down concurrently rather than one-at-a-time. Replaces the open-coded
+  two-phase teardown that `limit_concurrency` and the server's unlimited shutdown
+  path both had.
+- **`as_async_iterator(items)`**: normalize a sync or async iterable into one
+  async iterator, so `limit_concurrency` consumes both kinds through a single
+  `await anext` path (cleaner than branching `next`/`anext` with a `type: ignore`).
+
+Unit-tested: `limit_concurrency` (run-all, never-exceed-limit, lazy pulling,
+cancel-on-exit, failure surfaced through the `Future`), `cancel_futures`
+(cancel-then-await all, non-cancellation teardown error propagates), and
+`as_async_iterator` (sync and async sources).
 
 ## Design notes worth keeping
 
