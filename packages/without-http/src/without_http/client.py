@@ -20,10 +20,10 @@ import h2.connection
 import h2.events
 import h2.exceptions
 import h11
+from without import Endo
 from without import Stream
+from without import stack
 from without_asgi import RawHeaders
-from without_asgi.routing import Middleware
-from without_asgi.routing import stack
 
 from without_http.h2_wire import request_headers
 from without_http.h2_wire import response_status_and_headers
@@ -83,8 +83,8 @@ class ClientResponse:
     connection is released exactly once, when the body is finished: an HTTP/1.1
     connection returns to the pool only if its body was read to the end (otherwise it
     is closed, since unread bytes remain on the wire), and an HTTP/2 stream is reset if
-    abandoned early. `Session.request` finalizes the response on exit, so a body that
-    is never read still releases its connection rather than stranding it.
+    abandoned early. `ConnectionPool.request` finalizes the response on exit, so a body
+    that is never read still releases its connection rather than stranding it.
     """
 
     status: int
@@ -118,15 +118,17 @@ class ClientResponse:
         await self._release(self._fully_read)
 
 
-# A client exchange is the dual of a server handler: where a handler maps a
-# request to a response over streams, an exchange maps a whole `ClientRequest` to
-# a `ClientResponse`. Modeling it as a node lets the *same* `Middleware`
-# vocabulary (`stack`) that wraps server handlers wrap client exchanges: a
-# `ClientMiddleware` is `(state, inner_exchange, request) -> exchange`, the
-# request playing the role the scope plays server-side. The request is the value
-# (not a fixed scope) so middleware can rewrite it before the inner exchange runs.
+# A client exchange is the dual of a server handler: where a handler maps a request to
+# a response over streams, an exchange maps a whole `ClientRequest` to a
+# `ClientResponse`. A `ClientMiddleware` wraps an exchange into an exchange (`Endo`):
+# it can rewrite the request before, or the response after, the inner exchange runs.
+# This is the zero-context case of the shared `stack` vocabulary: a server middleware
+# is `(handler, state, scope)`, a client one needs no context (the request is the value
+# it transforms, not a fixed scope), so it is simply `(exchange) -> exchange`, and the
+# same `stack` composes them. State a middleware must keep lives in a closure (see
+# `cookies`), as it does server-side.
 type ClientExchange = Callable[[ClientRequest], Awaitable[ClientResponse]]
-type ClientMiddleware = Middleware[object, ClientExchange, ClientRequest]
+type ClientMiddleware = Endo[ClientExchange]
 
 _PASSTHROUGH: ClientMiddleware = stack()
 
@@ -512,8 +514,13 @@ class _Http2Connection:
 
 
 @dataclass(slots=True)
-class Pool:
-    """The connection store behind a `Session`, keyed by origin.
+class ConnectionPool:
+    """Connections keyed by origin, and the entrypoint for making requests.
+
+    Open it as an async context manager (`async with ConnectionPool(...) as pool`) so
+    its connections are closed on exit; a directly-constructed pool works for
+    short-lived use but does not manage the long-lived connections keep-alive retains.
+    Make requests through `async with pool.request(...) as response`.
 
     HTTP/2 connections are kept and reused: many concurrent requests to one origin
     multiplex over a single connection, which is the point of h2. HTTP/1.1
@@ -523,18 +530,62 @@ class Pool:
     or over cleartext by *prior knowledge* when `http2_cleartext` is set (the caller
     asserting the server speaks h2c, since cleartext cannot negotiate); otherwise the
     origin speaks HTTP/1.1.
+
+    `middleware` decorates every request through the pool; per-request `middleware` on
+    `request` composes inside it. Keep pool-level middleware to *pure* decoration
+    (default headers, redirect following, retry): things that are values, not state.
+    Anything carrying mutable, request-spanning identity (a `CookieJar`, an auth
+    session) belongs in a value you own and pass per request, so that connection reuse
+    (a transport concern) and application identity stay independent rather than both
+    hiding in the pool.
     """
 
     http2: bool = True
     http2_cleartext: bool = False
     ssl_context: ssl.SSLContext | None = None
+    middleware: ClientMiddleware = _PASSTHROUGH
     _h2: dict[Origin, _Http2Connection] = field(default_factory=dict)
     _idle_h11: dict[Origin, list[_Http11Connection]] = field(default_factory=dict)
     _h11_only: set[Origin] = field(default_factory=set)
     _origin_locks: dict[Origin, asyncio.Lock] = field(default_factory=dict)
     _closed: bool = False
 
-    async def request(self, request: ClientRequest) -> ClientResponse:
+    async def __aenter__(self) -> ConnectionPool:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()
+
+    @asynccontextmanager
+    async def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: RawHeaders = (),
+        content: bytes | Stream[bytes] = b"",
+        middleware: ClientMiddleware = _PASSTHROUGH,
+    ) -> AsyncIterator[ClientResponse]:
+        """Send a request and yield its response for the block, then release the connection.
+
+        `content` is the request body: `bytes` to buffer it, or a `Stream[bytes]` to
+        stream it. Read the response with `await response.read()` or by iterating
+        `response` chunk by chunk; on exit any unread body is drained or aborted so the
+        connection is never stranded.
+
+        `middleware` is composed inside the pool's own `middleware`, so a single request
+        can add decoration (a `CookieJar` via `cookies`, an extra header) on top of the
+        pool-wide stack for this call alone.
+        """
+        outgoing = _build_request(method, url, headers, content)
+        exchange = stack(self.middleware, middleware)(self.exchange)
+        response = await exchange(outgoing)
+        try:
+            yield response
+        finally:
+            await response.aclose()
+
+    async def exchange(self, request: ClientRequest) -> ClientResponse:
         parts = urlsplit(request.url)
         origin = _origin(parts)
         if origin.secure and self.http2:
@@ -654,89 +705,20 @@ class Pool:
             await idle_connection.aclose()
 
 
-@dataclass(frozen=True, slots=True)
-class Session:
-    """A reusable client session, opened once and shared, in the aiohttp style.
-
-    A session is the mandated entrypoint rather than free `get`/`post`: it is the
-    home for the middleware stack and the connection `Pool`, so lifetime and limits
-    stay explicit and injected. Cross-cutting request decoration (default headers,
-    auth) is a `middleware` concern, not a session field; reach for `add_headers`.
-    HTTP/2 requests to one origin multiplex over a single pooled connection; HTTP/1.1
-    reuses a kept-alive connection per origin. Open it with `open_session()` so the
-    pool's connections are closed on exit; a directly-constructed `Session` works for
-    short-lived use but does not manage long-lived pooled connections. Make requests
-    through `async with session.request(...) as response`.
-    """
-
-    middleware: ClientMiddleware = _PASSTHROUGH
-    _pool: Pool = field(default_factory=Pool)
-
-    @asynccontextmanager
-    async def request(
-        self,
-        method: str,
-        url: str,
-        *,
-        headers: RawHeaders = (),
-        content: bytes | Stream[bytes] = b"",
-    ) -> AsyncIterator[ClientResponse]:
-        """Send a request and yield its response for the block, then release the connection.
-
-        `content` is the request body: `bytes` to buffer it, or a `Stream[bytes]` to
-        stream it. Read the response with `await response.read()` or by iterating
-        `response` chunk by chunk; on exit any unread body is drained or aborted so the
-        connection is never stranded.
-        """
-        request = _build_request(method, url, headers, content)
-        exchange = self.middleware(None, self._pool.request, request)
-        response = await exchange(request)
-        try:
-            yield response
-        finally:
-            await response.aclose()
-
-
-@asynccontextmanager
-async def open_session(
-    *,
-    middleware: ClientMiddleware = _PASSTHROUGH,
-    http2: bool = True,
-    http2_cleartext: bool = False,
-    ssl_context: ssl.SSLContext | None = None,
-) -> AsyncIterator[Session]:
-    """Open a `Session` for the duration of the `with` block, closing its pool on exit.
-
-    Cross-cutting request decoration is a `middleware` concern: to send default
-    headers on every request, pass `add_headers(...)` (alone or in a `stack`) rather
-    than a session-level header list. `http2` controls whether h2 is offered via ALPN
-    over TLS (default on, falling back to HTTP/1.1 when the server does not select it).
-    `http2_cleartext` enables *prior-knowledge* h2c over cleartext (default off): there
-    is no negotiation, so the caller is asserting the target speaks HTTP/2, and a
-    server that does not will fail rather than fall back. `ssl_context` overrides the
-    default TLS context, for a custom CA or client certificate; the session sets the
-    ALPN protocols on it when `http2` is enabled.
-    """
-    pool = Pool(http2=http2, http2_cleartext=http2_cleartext, ssl_context=ssl_context)
-    try:
-        yield Session(middleware=middleware, _pool=pool)
-    finally:
-        await pool.aclose()
-
-
 def add_headers(*headers: tuple[bytes, bytes]) -> ClientMiddleware:
     """Client middleware that adds headers to every request.
 
     The mirror of a server's request-decorating middleware: it sits in the same
     `stack` and rewrites the request before the inner exchange runs. This is how a
-    session sends default headers (auth tokens, a user agent) on every request.
+    pool sends default headers (auth tokens, a user agent) on every request, or a
+    single request adds its own.
     """
 
     extra: RawHeaders = tuple(headers)
 
-    def middleware(state: object, inner: ClientExchange, request: ClientRequest) -> ClientExchange:
-        async def exchange(outgoing: ClientRequest) -> ClientResponse:
-            return await inner(replace(outgoing, headers=extra + outgoing.headers))
+    def middleware(inner: ClientExchange) -> ClientExchange:
+        async def exchange(request: ClientRequest) -> ClientResponse:
+            return await inner(replace(request, headers=extra + request.headers))
 
         return exchange
 
@@ -752,9 +734,9 @@ def follow_redirects(max_hops: int = 5) -> ClientMiddleware:
     requests.
     """
 
-    def middleware(state: object, inner: ClientExchange, request: ClientRequest) -> ClientExchange:
-        async def exchange(outgoing: ClientRequest) -> ClientResponse:
-            response = await inner(outgoing)
+    def middleware(inner: ClientExchange) -> ClientExchange:
+        async def exchange(request: ClientRequest) -> ClientResponse:
+            response = await inner(request)
             for _ in range(max_hops):
                 if response.status not in _REDIRECT_STATUSES:
                     return response
@@ -762,8 +744,172 @@ def follow_redirects(max_hops: int = 5) -> ClientMiddleware:
                 if location is None:
                     return response
                 await response.aclose()
-                outgoing = replace(outgoing, url=urljoin(outgoing.url, location.decode("ascii")))
-                response = await inner(outgoing)
+                request = replace(request, url=urljoin(request.url, location.decode("ascii")))
+                response = await inner(request)
+            return response
+
+        return exchange
+
+    return middleware
+
+
+@dataclass(frozen=True, slots=True)
+class _Cookie:
+    """One stored cookie: its value plus the attributes that decide where it is sent.
+
+    Identified by `(domain, path, name)`, the RFC 6265 cookie identity. `host_only`
+    records whether the `Set-Cookie` carried a `Domain` attribute: without one a cookie
+    is sent only to the exact host that set it, with one it is sent to that domain and
+    its subdomains.
+    """
+
+    name: str
+    value: str
+    domain: str
+    path: str
+    secure: bool
+    host_only: bool
+
+
+def _default_path(request_path: str) -> str:
+    """The RFC 6265 default-path for a cookie set without a `Path`: the request path up
+    to (not including) its last `/`, or `/`."""
+    if not request_path.startswith("/") or request_path == "/":
+        return "/"
+    return request_path[: request_path.rindex("/")] or "/"
+
+
+def _domain_matches(host: str, cookie: _Cookie) -> bool:
+    if cookie.host_only:
+        return host == cookie.domain
+    return host == cookie.domain or host.endswith(f".{cookie.domain}")
+
+
+def _path_matches(request_path: str, cookie: _Cookie) -> bool:
+    if request_path == cookie.path:
+        return True
+    if not request_path.startswith(cookie.path):
+        return False
+    return cookie.path.endswith("/") or request_path[len(cookie.path)] == "/"
+
+
+def _deletes(max_age: str | None) -> bool:
+    if max_age is None:
+        return False
+    try:
+        return int(max_age) <= 0
+    except ValueError:
+        return False
+
+
+def _parse_set_cookie(header: str, host: str, request_path: str) -> tuple[_Cookie, bool] | None:
+    """Parse one `Set-Cookie` value into a `_Cookie` and whether it deletes one.
+
+    `None` for a header with no `name=value`. A `Max-Age` of zero or less marks the
+    cookie for deletion (the second tuple element); `Expires` is not parsed, so
+    date-based expiry is not yet honored.
+    """
+    pair, _, rest = header.partition(";")
+    name, sep, value = pair.partition("=")
+    name, value = name.strip(), value.strip()
+    if not sep or not name:
+        return None
+    attributes: dict[str, str] = {}
+    for attribute in rest.split(";"):
+        key, _, val = attribute.partition("=")
+        key = key.strip().lower()
+        if key:
+            attributes[key] = val.strip()
+    domain = attributes.get("domain", "").lstrip(".").lower()
+    path = attributes.get("path", "")
+    cookie = _Cookie(
+        name=name,
+        value=value,
+        domain=domain or host,
+        path=path if path.startswith("/") else _default_path(request_path),
+        secure="secure" in attributes,
+        host_only=not domain,
+    )
+    return cookie, _deletes(attributes.get("max-age"))
+
+
+@dataclass(slots=True)
+class CookieJar:
+    """A mutable cookie store you construct and hand to the `cookies` middleware.
+
+    Deliberately *not* owned by a `ConnectionPool`: cookie scope (application identity)
+    and connection reuse (transport) are independent, so binding them the way a single
+    client object would is a needless coupling. Construct a jar, pass it to `cookies`,
+    and *which requests share it* decides what shares cookies, one jar per logical user
+    session regardless of how connections are pooled.
+
+    Supports host-only and `Domain` (subdomain) matching, `Path` matching, the `Secure`
+    attribute, and deletion via `Max-Age<=0`. Not yet: `Expires` date-based expiry.
+    """
+
+    _cookies: dict[tuple[str, str, str], _Cookie] = field(default_factory=dict)
+
+    def store(self, url: str, headers: RawHeaders) -> None:
+        """Fold every `Set-Cookie` in a response into the jar."""
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        for name, value in headers:
+            if name.lower() != b"set-cookie":
+                continue
+            parsed = _parse_set_cookie(value.decode("latin-1"), host, parts.path)
+            if parsed is None:
+                continue
+            cookie, deletes = parsed
+            key = (cookie.domain, cookie.path, cookie.name)
+            if deletes:
+                self._cookies.pop(key, None)
+            else:
+                self._cookies[key] = cookie
+
+    def header_for(self, url: str) -> bytes | None:
+        """The `Cookie` header value for a request to `url`, or `None` if none match."""
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        path = parts.path or "/"
+        secure = parts.scheme == "https"
+        matched = [
+            cookie
+            for cookie in self._cookies.values()
+            if _domain_matches(host, cookie) and _path_matches(path, cookie) and (secure or not cookie.secure)
+        ]
+        if not matched:
+            return None
+        matched.sort(key=lambda cookie: len(cookie.path), reverse=True)
+        return "; ".join(f"{cookie.name}={cookie.value}" for cookie in matched).encode("latin-1")
+
+
+def _with_cookie(headers: RawHeaders, value: bytes) -> RawHeaders:
+    existing = next((current for name, current in headers if name.lower() == b"cookie"), None)
+    merged = value if existing is None else existing + b"; " + value
+    others = tuple((name, current) for name, current in headers if name.lower() != b"cookie")
+    return (*others, (b"cookie", merged))
+
+
+def cookies(jar: CookieJar) -> ClientMiddleware:
+    """Client middleware that carries cookies through a `CookieJar` you own.
+
+    Reads `Set-Cookie` off each response into `jar` and writes the matching `Cookie`
+    header onto each outgoing request. This is the stateful counterpart to `add_headers`:
+    its mutable jar is passed in explicitly rather than hidden in the pool, so two
+    requests share cookies exactly when they share a jar.
+
+    Place it *inside* `follow_redirects` in a `stack` (`stack(follow_redirects(),
+    cookies(jar))`) so each redirect hop both sends the jar's cookies and collects any
+    the hop sets.
+    """
+
+    def middleware(inner: ClientExchange) -> ClientExchange:
+        async def exchange(request: ClientRequest) -> ClientResponse:
+            header = jar.header_for(request.url)
+            if header is not None:
+                request = replace(request, headers=_with_cookie(request.headers, header))
+            response = await inner(request)
+            jar.store(request.url, response.headers)
             return response
 
         return exchange

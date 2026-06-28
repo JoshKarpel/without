@@ -13,6 +13,7 @@ from without.tasks import background_task
 from without.tasks import cancel_futures
 from without.tasks import limit_concurrency
 from without.tasks import sleep_forever
+from without.wiring import Endo
 from without.wiring import Sample
 from without.wiring import broadcast
 from without.wiring import collect
@@ -21,12 +22,14 @@ from without.wiring import distribute
 from without.wiring import merge
 from without.wiring import route
 from without.wiring import sample
+from without.wiring import stack
 from without.wiring import stream
 from without.wiring import stream_from_queue
 from without.wiring import tee
 
 __all__ = [
     "Context",
+    "Endo",
     "Fold",
     "Processor",
     "Sample",
@@ -49,6 +52,7 @@ __all__ = [
     "route",
     "sample",
     "sleep_forever",
+    "stack",
     "stream",
     "stream_from_queue",
     "tee",

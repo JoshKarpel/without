@@ -202,7 +202,7 @@ async def test_recover_narrows_the_exception_type_and_reads_typed_fields() -> No
 
 
 async def test_middleware_reads_the_dispatched_state() -> None:
-    def stamp_state(state: str, handler: HttpHandler, scope: HttpScope) -> HttpHandler:
+    def stamp_state(handler: HttpHandler, state: str, scope: HttpScope) -> HttpHandler:
         async def processor(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
             async for event in handler(inputs):
                 if isinstance(event, ResponseStart):
@@ -235,7 +235,7 @@ async def test_an_exception_after_response_start_propagates() -> None:
 
 
 def _mark(name: bytes, value: bytes) -> HttpMiddleware[object]:
-    def middleware(_state: object, handler: HttpHandler, scope: HttpScope) -> HttpHandler:
+    def middleware(handler: HttpHandler, _state: object, scope: HttpScope) -> HttpHandler:
         async def processor(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
             async for event in handler(inputs):
                 if isinstance(event, ResponseStart):

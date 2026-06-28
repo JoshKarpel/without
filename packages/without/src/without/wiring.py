@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from collections.abc import Callable
 from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -34,6 +35,34 @@ def compose[A, B, C](first: Processor[A, B], second: Processor[B, C]) -> Process
 
     def composed(inputs: Stream[A]) -> Stream[C]:
         return second(first(inputs))
+
+    return composed
+
+
+type Endo[T] = Callable[[T], T]
+
+
+def stack[H, *Ctx](*middleware: Callable[[H, *Ctx], H]) -> Callable[[H, *Ctx], H]:
+    """Compose middleware into one, first argument outermost; `stack()` is identity.
+
+    A *middleware* is `(handler, *context) -> handler`: it wraps a handler, given some
+    fixed context, into a new handler of the same type. The context is whatever the
+    setting threads through unchanged: nothing for a client exchange (`Endo[H]`), the
+    connection state and scope for a server handler. `stack` threads the *same* context
+    into every middleware and chains the handler through them, first outermost, so
+    `stack(f, g)(handler, *context)` is `f(g(handler, *context), *context)`.
+
+    Generic over the handler `H` (the value each middleware transforms) and the context
+    pack `*Ctx`, which is bound once per call: every middleware in one `stack(...)` must
+    therefore share a shape, and mixing shapes is a type error. The pack passes through
+    untouched (never wrapped element-wise), which is exactly why one variadic generic
+    covers every arity here where a heterogeneous ladder would be needed.
+    """
+
+    def composed(handler: H, *context: *Ctx) -> H:
+        for one in reversed(middleware):
+            handler = one(handler, *context)
+        return handler
 
     return composed
 

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from without import Processor
 from without import Stream
 from without import compose
+from without import stack
 
 from without_asgi.app import HttpHandler
 from without_asgi.app import HttpRouter
@@ -36,29 +37,18 @@ __all__ = [
 # The `make_asgi_app` seam still asks for nothing but an `HttpRouter[T]` function;
 # these just make one easy to assemble.
 
-# `Middleware` wraps a connection handler with the lifespan state and the parsed
-# scope in hand: it is handed the connection state `T`, the inner handler to call,
-# and the scope, and returns a replacement handler. State leads so a cross-cutting
-# middleware (auth, rate limiting, config-driven behavior) can read the same `T`
-# the dispatched handler sees; a middleware that does not need it ignores the
-# argument. It is generic over `T`, the protocol's handler `H`, and scope `S`, so
-# one vocabulary serves HTTP and WebSocket; the aliases name the two concrete
-# instances and stay generic over `T`.
-type Middleware[T, H, S] = Callable[[T, H, S], H]
+# `Middleware` wraps a connection handler given the lifespan state and the parsed
+# scope: it is handed the inner handler plus the connection state `T` and the scope
+# `S`, and returns a replacement handler. The handler leads so the type matches the
+# generic `stack`'s `(handler, *context)` shape, with `(state, scope)` as the context
+# threaded unchanged into every middleware in a stack; a cross-cutting middleware
+# (auth, rate limiting, config-driven behavior) reads the same `T` the dispatched
+# handler sees, and one that does not need it ignores the argument. Generic over `T`,
+# the protocol's handler `H`, and scope `S`, so one vocabulary serves HTTP and
+# WebSocket; the aliases name the two concrete instances and stay generic over `T`.
+type Middleware[T, H, S] = Callable[[H, T, S], H]
 type HttpMiddleware[T] = Middleware[T, HttpHandler, HttpScope]
 type WebsocketMiddleware[T] = Middleware[T, WebsocketHandler, WebsocketScope]
-
-
-def stack[T, H, S](*middleware: Middleware[T, H, S]) -> Middleware[T, H, S]:
-    """Compose middleware into one, first argument outermost. A stack of
-    middleware is itself a `Middleware`, so it nests, and `stack()` is identity."""
-
-    def composed(state: T, handler: H, scope: S) -> H:
-        for one in reversed(middleware):
-            handler = one(state, handler, scope)
-        return handler
-
-    return composed
 
 
 def wrap[In, Out, S](
@@ -79,10 +69,10 @@ def wrap[In, Out, S](
     scope but not the connection state, so the produced middleware ignores `T`
     (typed `object`, and contravariantly usable in a `stack` over any state).
     A middleware that must read the state is written directly as a
-    `(T, handler, scope) -> handler` function.
+    `(handler, state, scope) -> handler` function.
     """
 
-    def middleware(_state: object, handler: Processor[In, Out], scope: S) -> Processor[In, Out]:
+    def middleware(handler: Processor[In, Out], _state: object, scope: S) -> Processor[In, Out]:
         wrapped = handler
         if inbound is not None:
             before = inbound
@@ -176,7 +166,7 @@ def limit_concurrent_requests(limit: int, *, overloaded: Response = _OVERLOADED)
         finally:
             budget.release()
 
-    def middleware(_state: object, handler: HttpHandler, _scope: HttpScope) -> HttpHandler:
+    def middleware(handler: HttpHandler, _state: object, _scope: HttpScope) -> HttpHandler:
         def processor(inputs: Stream[Inbound]) -> Stream[Outbound]:
             return gated(handler, inputs)
 

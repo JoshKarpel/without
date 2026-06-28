@@ -73,7 +73,7 @@ async def _started_reaching(gate: _Gate, count: int) -> None:
 async def test_admits_requests_up_to_the_limit() -> None:
     gate = _Gate()
     middleware = limit_concurrent_requests(3)
-    handler = middleware(object(), _holding_handler(gate), _scope())
+    handler = middleware(_holding_handler(gate), object(), _scope())
 
     in_flight = [asyncio.create_task(_collect(handler)) for _ in range(3)]
     try:
@@ -87,7 +87,7 @@ async def test_admits_requests_up_to_the_limit() -> None:
 async def test_sheds_an_extra_concurrent_request_with_503() -> None:
     gate = _Gate()
     middleware = limit_concurrent_requests(2)
-    handler = middleware(object(), _holding_handler(gate), _scope())
+    handler = middleware(_holding_handler(gate), object(), _scope())
 
     in_flight = [asyncio.create_task(_collect(handler)) for _ in range(2)]
     try:
@@ -112,7 +112,7 @@ async def test_sheds_with_a_caller_supplied_overload_response() -> None:
         body=b'{"error":"too busy"}',
     )
     middleware = limit_concurrent_requests(1, overloaded=overloaded)
-    handler = middleware(object(), _holding_handler(gate), _scope())
+    handler = middleware(_holding_handler(gate), object(), _scope())
 
     held = asyncio.create_task(_collect(handler))
     try:
@@ -134,7 +134,7 @@ async def test_sheds_with_a_caller_supplied_overload_response() -> None:
 async def test_releases_the_slot_when_a_request_finishes() -> None:
     gate = _Gate()
     middleware = limit_concurrent_requests(1)
-    handler = middleware(object(), _holding_handler(gate), _scope())
+    handler = middleware(_holding_handler(gate), object(), _scope())
 
     first = asyncio.create_task(_collect(handler))
     await _started_reaching(gate, 1)

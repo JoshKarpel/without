@@ -43,6 +43,7 @@ dev = [
     "pytest-xdist>=3",
     "pytest-asyncio>=1",
     "pytest-mock>=3",
+    "pytest-randomly>=3",
     "pytest-timeout>=2.3",
     "trustme>=1.1",
     "hypothesis>=6.80",

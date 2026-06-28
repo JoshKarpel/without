@@ -252,7 +252,7 @@ async def _stamp(outputs: Stream[Outbound], _head: HttpScope) -> AsyncIterator[O
 powered_by: HttpMiddleware[object] = wrap(outbound=_stamp)
 
 
-def require_authorization(_state: object, handler: HttpHandler, scope: HttpScope) -> HttpHandler:
+def require_authorization(handler: HttpHandler, _state: object, scope: HttpScope) -> HttpHandler:
     """Gate a request on an `Authorization` header, short-circuiting with a 401.
 
     The point is *where* it applies: it is the `admin` sub-router's own

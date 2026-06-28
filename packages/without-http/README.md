@@ -86,14 +86,14 @@ touches I/O.
 
 ## Client
 
-The client is a reusable [aiohttp-style](https://docs.aiohttp.org/en/stable/client_quickstart.html)
-session you open once and share, not free `get`/`post` functions:
+The client is a `ConnectionPool` you open once and make requests through, not free
+`get`/`post` functions:
 
 ```python
-from without_http import open_session
+from without_http import ConnectionPool
 
-async with open_session() as session:
-    async with session.request("GET", "http://127.0.0.1:8000/items") as response:
+async with ConnectionPool() as pool:
+    async with pool.request("GET", "http://127.0.0.1:8000/items") as response:
         assert response.status == 200
         body = await response.read()
 ```
@@ -102,7 +102,7 @@ async with open_session() as session:
 
 Request and response bodies each cover the full buffered/streaming matrix, the
 client mirror of `without-web`'s server handlers. The request body is `content=`
-on `session.request`: pass `bytes` to buffer it, or a `Stream[bytes]` (any async
+on `pool.request`: pass `bytes` to buffer it, or a `Stream[bytes]` (any async
 iterable of chunks) to stream it. The response body is a live stream: iterate it
 chunk by chunk, or `await response.read()` to buffer the whole thing.
 
@@ -111,7 +111,7 @@ async def upload() -> AsyncIterator[bytes]:
     for path in paths:
         yield path.read_bytes()
 
-async with session.request("POST", url, content=upload()) as response:
+async with pool.request("POST", url, content=upload()) as response:
     async for chunk in response:          # stream the response as it arrives
         sink.write(chunk)
 ```
@@ -119,53 +119,62 @@ async with session.request("POST", url, content=upload()) as response:
 The connection is released when the body is finished: an HTTP/1.1 connection is
 returned to the pool only if its body was read to the end (a partial read closes
 it, since unread bytes remain on the wire), and an HTTP/2 stream is reset if
-abandoned early. `session.request` finalizes the response on block exit, so a body
+abandoned early. `pool.request` finalizes the response on block exit, so a body
 you never read still releases its connection rather than stranding it.
 
 ### Connection pooling
 
-The session is the home for default headers, the middleware stack, and the
-connection pool. HTTP/2 requests to one origin multiplex over a single pooled
-connection; HTTP/1.1 connections are kept alive and reused serially (an idle one
-is checked out per request and returned once its response body is read). h2 is
-negotiated by ALPN over TLS (`open_session(http2=True)`, the default; pass a custom
-`ssl_context` for a private CA), or over cleartext by *prior knowledge* with
-`open_session(http2_cleartext=True)` (no negotiation, so the caller is asserting the
-server speaks h2c); otherwise the origin speaks HTTP/1.1.
+`ConnectionPool` keys connections by origin. HTTP/2 requests to one origin
+multiplex over a single pooled connection; HTTP/1.1 connections are kept alive and
+reused serially (an idle one is checked out per request and returned once its
+response body is read). h2 is negotiated by ALPN over TLS
+(`ConnectionPool(http2=True)`, the default; pass a custom `ssl_context` for a private
+CA), or over cleartext by *prior knowledge* with `ConnectionPool(http2_cleartext=True)`
+(no negotiation, so the caller is asserting the server speaks h2c); otherwise the
+origin speaks HTTP/1.1.
 
 ```python
-async with open_session(http2=True, ssl_context=ctx) as session:
+async with ConnectionPool(http2=True, ssl_context=ctx) as pool:
     # eight concurrent requests, multiplexed over one h2 connection
-    bodies = await asyncio.gather(*(fetch(session, n) for n in range(8)))
+    bodies = await asyncio.gather(*(fetch(pool, n) for n in range(8)))
 ```
 
-Open the session with `open_session` so the pool's connections are closed on exit;
-a directly-constructed `Session()` works for short-lived use but does not manage
-long-lived pooled connections.
+Open the pool as an async context manager so its connections are closed on exit; a
+directly-constructed `ConnectionPool()` works for short-lived use but does not manage
+the long-lived connections keep-alive retains.
 
 ### Client middleware
 
 A client *exchange* (`ClientRequest -> ClientResponse`) is the dual of a server
-handler, so the **same** `Middleware` vocabulary and `stack` that wrap server
-handlers wrap client exchanges. The session has no header field of its own:
-cross-cutting request decoration (default headers, auth) is middleware. Two are
-shipped:
+handler, and a `ClientMiddleware` wraps one into another: `ClientExchange ->
+ClientExchange`. That is the zero-context case of the **same** `stack` that composes
+server middleware (a server middleware is `(handler, state, scope) -> handler`; a
+client one needs no context because the request *is* the value it transforms), so the
+one `stack` serves both. The pool carries a default `middleware` applied to every
+request, and `pool.request(..., middleware=...)` composes more *inside* it for a
+single call:
 
 ```python
-from without_http import open_session, add_headers, follow_redirects
-from without_asgi.routing import stack
+from without_http import ConnectionPool, add_headers, follow_redirects, cookies, CookieJar, stack
 
-async with open_session(middleware=stack(
-    add_headers((b"authorization", b"Bearer ...")),
-    follow_redirects(max_hops=5),
-)) as session:
-    ...
+jar = CookieJar()
+async with ConnectionPool(middleware=add_headers((b"authorization", b"Bearer ..."))) as pool:
+    async with pool.request("GET", url, middleware=stack(follow_redirects(), cookies(jar))) as response:
+        ...
 ```
 
-A `ClientMiddleware` is `(state, inner_exchange, request) -> exchange`, the request
-playing the role the scope plays server-side. Because the whole request is the value
-the exchange transforms (not a fixed scope), middleware can rewrite it: inject
-headers, change the URL on redirect, wrap the body.
+Because the whole request is the value the exchange transforms (not a fixed scope),
+middleware can rewrite it on the way out (inject headers, change the URL on redirect,
+attach cookies) and wrap the response on the way back.
+
+Keep the pool's own middleware to *pure* decoration (default headers, redirect
+following, retry): things that are values, not state. Anything carrying mutable,
+request-spanning identity belongs in a value you own and pass per request. A
+`CookieJar` is the canonical case: you construct the jar and hand it to `cookies(jar)`,
+so cookie scope (application identity) stays independent of connection reuse
+(transport) rather than both hiding in the pool. Two requests share cookies exactly
+when they share a jar. Place `cookies` *inside* `follow_redirects` in a `stack` so each
+redirect hop both sends and collects cookies.
 
 ## Deferred
 

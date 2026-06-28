@@ -32,13 +32,13 @@ class Router[T, S, H]:
     middleware: Middleware[T, H, S]
 
     def dispatch(self, state: T, scope: S) -> H:
-        # An `HttpRouter`/`WebsocketRouter`, ready for `make_asgi_app`: pick the
-        # first matching route (or the fallback), build its handler, then wrap the
-        # whole thing in the middleware stack so every route shares it. The state
-        # is handed to the middleware too, so a cross-cutting middleware can read
-        # the same `T` the endpoint sees.
+        # An `HttpRouter`/`WebsocketRouter`, ready for `make_asgi_app`: pick the first
+        # matching route (or the fallback), build its handler, then wrap the whole
+        # thing in the middleware so every route shares it. The user pre-composes the
+        # middleware (with `stack`) and hands us one; the state and scope are passed
+        # alongside so a cross-cutting middleware can read the same `T` the endpoint sees.
         endpoint = next((route.endpoint for route in self.routes if route.matches(scope)), self.fallback)
-        return self.middleware(state, endpoint(state, scope), scope)
+        return self.middleware(endpoint(state, scope), state, scope)
 
 
 def http_route[T](

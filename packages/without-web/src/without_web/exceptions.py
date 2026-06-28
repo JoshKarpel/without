@@ -46,7 +46,7 @@ def catching(recover: ExceptionRecover) -> HttpMiddleware[object]:
     wire the exception re-raises, because the handler can abort but not re-status.
     """
 
-    def middleware(_state: object, handler: HttpHandler, scope: HttpScope) -> HttpHandler:
+    def middleware(handler: HttpHandler, _state: object, scope: HttpScope) -> HttpHandler:
         async def recovering(exc: Exception) -> tuple[Outbound, ...] | None:
             response = await recover(exc)
             return None if response is None else encode_response(response)
@@ -66,7 +66,7 @@ def catching_websocket(recover: WebsocketExceptionRecover) -> WebsocketMiddlewar
     the `WebsocketClose` to send, or `None` to propagate.
     """
 
-    def middleware(_state: object, handler: WebsocketHandler, scope: WebsocketScope) -> WebsocketHandler:
+    def middleware(handler: WebsocketHandler, _state: object, scope: WebsocketScope) -> WebsocketHandler:
         async def recovering(exc: Exception) -> tuple[WebsocketOutbound, ...] | None:
             close = await recover(exc)
             return None if close is None else (close,)

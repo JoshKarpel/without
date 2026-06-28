@@ -199,7 +199,7 @@ access_log: HttpMiddleware[object] = wrap(inbound=log_request, outbound=log_resp
 # stream ends. No inbound transform and no second closure, so no shared mutable
 # state and no `nonlocal`. `wrap` can't express this; its two transformers have no
 # shared scope to hold the value.
-def access_timing(_state: object, handler: HttpHandler, head: HttpScope) -> HttpHandler:
+def access_timing(handler: HttpHandler, _state: object, head: HttpScope) -> HttpHandler:
     async def processor(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
         started = time.monotonic()
         async for event in handler(inputs):
@@ -209,7 +209,7 @@ def access_timing(_state: object, handler: HttpHandler, head: HttpScope) -> Http
     return processor
 
 
-def request_digest(_state: object, handler: HttpHandler, head: HttpScope) -> HttpHandler:
+def request_digest(handler: HttpHandler, _state: object, head: HttpScope) -> HttpHandler:
     """Middleware reporting a SHA-256 of the request body back on the response.
 
     The genuine both-sides case: data observed on the inbound stream (each body
@@ -282,7 +282,7 @@ def request_digest(_state: object, handler: HttpHandler, head: HttpScope) -> Htt
 # surfaces it as a response header, without re-plumbing the config. Because the app
 # snapshots `Settings` per connection, a reload changes the value the next
 # connection advertises.
-def advertise_limit(settings: Settings, handler: HttpHandler, _head: HttpScope) -> HttpHandler:
+def advertise_limit(handler: HttpHandler, settings: Settings, _head: HttpScope) -> HttpHandler:
     """Stamp the configured request-body limit onto every response, read from state."""
     limit = str(settings.http.max_bytes).encode()
 

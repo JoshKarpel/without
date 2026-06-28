@@ -2,10 +2,12 @@ from without_http.client import ClientExchange
 from without_http.client import ClientMiddleware
 from without_http.client import ClientRequest
 from without_http.client import ClientResponse
-from without_http.client import Session
+from without_http.client import ConnectionPool
+from without_http.client import CookieJar
 from without_http.client import add_headers
+from without_http.client import cookies
 from without_http.client import follow_redirects
-from without_http.client import open_session
+from without_http.client import stack
 from without_http.h2_wire import early_hint_headers
 from without_http.h2_wire import request_headers
 from without_http.h2_wire import response_headers
@@ -30,16 +32,17 @@ __all__ = [
     "ClientMiddleware",
     "ClientRequest",
     "ClientResponse",
+    "ConnectionPool",
+    "CookieJar",
     "LifespanError",
     "Server",
-    "Session",
     "add_headers",
+    "cookies",
     "early_hint_headers",
     "follow_redirects",
     "h11_events_from_outbound",
     "inbound_from_event",
     "is_websocket_upgrade",
-    "open_session",
     "request_headers",
     "response_headers",
     "response_status_and_headers",
@@ -48,6 +51,7 @@ __all__ = [
     "scope_from_request",
     "server_ssl_context",
     "serving",
+    "stack",
     "websocket_scope_from_request",
     "ws_events_from_outbound",
 ]

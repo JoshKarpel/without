@@ -175,16 +175,15 @@ def with_middleware[T, S, H](endpoint: Endpoint[T, S, H], *middleware: Middlewar
 
     The router-wide `middleware` runs on every dispatch; this applies the same
     `Middleware` vocabulary to a single route (or an opaque mount target). An
-    `Endpoint` builds the handler and a `Middleware` is `(T, H, S) -> H`, so this
-    is just composition: build the handler, then run the middleware over it with
-    the request's scope. First argument is outermost, matching `stack`. Use it per
+    `Endpoint` builds the handler and a `Middleware` is `(handler, T, S) -> handler`,
+    so this is just composition: build the handler, then run the middleware over it
+    with the request's scope. First argument is outermost, matching `stack`. Use it per
     method, e.g. `route("/admin", get=with_middleware(list_admins, require_auth))`;
     for a whole mounted subtree, give the mounted `Router` its own `middleware`.
     """
-    composed = stack(*middleware)
 
     def built(state: T, match: Match[S]) -> H:
-        return composed(state, endpoint(state, match), match.scope)
+        return stack(*middleware)(endpoint(state, match), state, match.scope)
 
     return built
 
@@ -222,7 +221,7 @@ def _behind[T](leaf: _HttpLeaf[T], middleware: HttpMiddleware[T]) -> _HttpLeaf[T
         case _Delegate(prefix, target):
 
             def behind_target(state: T, scope: HttpScope) -> HttpHandler:
-                return middleware(state, target(state, scope), scope)
+                return middleware(target(state, scope), state, scope)
 
             return _Delegate(prefix, behind_target)
 
@@ -307,7 +306,7 @@ class Router[T]:
         object.__setattr__(self, "tree", build(_flatten(self.routes)))
 
     def dispatch(self, state: T, scope: HttpScope) -> HttpHandler:
-        return self.middleware(state, self._resolve(state, scope), scope)
+        return self.middleware(self._resolve(state, scope), state, scope)
 
     def _resolve(self, state: T, scope: HttpScope) -> HttpHandler:
         found = walk(self.tree, split_path(scope.path))
@@ -358,4 +357,4 @@ class WebsocketRouter[T]:
         found = walk(self.tree, split_path(scope.path))
         endpoint = self.fallback if found is None else found.leaf
         params = {} if found is None else found.params
-        return self.middleware(state, endpoint(state, Match(scope, params)), scope)
+        return self.middleware(endpoint(state, Match(scope, params)), state, scope)

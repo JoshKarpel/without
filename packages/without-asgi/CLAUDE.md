@@ -42,8 +42,10 @@ default `"2.0"`, lifespan `"1.0"`).
 
 ## Where built-in middleware lives
 
-`without-asgi` owns the `Middleware` / `stack` / `wrap` vocabulary (`routing.py`),
-so it is the default home for built-in middleware. The placement rule across the
+`without-asgi` owns the `Middleware` / `wrap` vocabulary (`routing.py`) and
+re-exports the generic `stack` from `without` core (`stack` composes any
+`(handler, *context) -> handler` middleware, server or client, so it lives in core),
+making it the default home for built-in middleware. The placement rule across the
 three HTTP packages: **a middleware lives in the lowest layer whose vocabulary it
 needs, and in the package that owns the exchange shape it wraps.**
 
@@ -59,8 +61,8 @@ needs, and in the package that owns the exchange shape it wraps.**
   OpenAPI-aware pieces. Only that layer can see route metadata.
 - **`without-http`** holds the **client** middleware, since the client exchange
   (`ClientRequest -> ClientResponse`) is a `Processor` too and lives there
-  (`add_headers`, `follow_redirects`, and future retry / auth / response
-  decompression). Its server side keeps only the concerns that **cannot** be
+  (`add_headers`, `follow_redirects`, `cookies` over a caller-owned `CookieJar`,
+  and future retry / auth / response decompression). Its server side keeps only the concerns that **cannot** be
   middleware because they run below the app: the wire protocols and TLS. (It used to
   also own a connection-admission cap; that was dropped in favour of the kernel
   listen backlog plus the `limit_concurrent_requests` middleware.)
@@ -69,7 +71,8 @@ Server and client share the *same* `Middleware` / `stack` vocabulary, so a conce
 like decompression appears as parallel server-side (here) and client-side
 (`without-http`) instances that differ only in the request/response shape they wrap.
 A middleware that must read the per-connection state is written directly as a
-`(state, handler, scope) -> handler` function; one that only transforms streams by
+`(handler, state, scope) -> handler` function (handler first, so it matches the
+generic `stack`'s `(handler, *context)` shape); one that only transforms streams by
 scope uses `wrap`. Cross-request shared state (a rate-limit budget, a cache) is
 built once when the middleware is constructed and captured in its closure, then
 injected at app assembly, not reached into as a global.
