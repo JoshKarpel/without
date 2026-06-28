@@ -46,6 +46,11 @@ What the server handles:
   lifetime: `startup` on entry, `shutdown` on exit. An app that does not support
   lifespan signals so by raising before it acks startup; the server then serves
   without a lifespan cycle (the standard ASGI fallback).
+- **TLS.** Pass an `ssl.SSLContext` as `ssl_context` to serve `https`/`wss`
+  directly (the scope's `scheme` becomes `https`/`wss`). `server_ssl_context`
+  builds one for the common case, advertising the protocols the server speaks via
+  ALPN. `ssl_handshake_timeout` and `ssl_shutdown_timeout` bound the TLS handshake
+  and close.
 - **Keep-alive.** Sequential requests on one HTTP/1.1 connection reuse it
   (`h11`'s `start_next_cycle`).
 - **WebSockets** over the HTTP/1.1 `Upgrade`: the handshake is handed to `wsproto`,
@@ -54,6 +59,13 @@ What the server handles:
   before `websocket.accept` becomes an HTTP `403`, per the ASGI contract.
 - **Isolation.** A crashing request handler is contained: it becomes a `500` (when
   no response has started yet) without taking the connection or server down.
+- **Connection limits.** `max_pending_connections` is the kernel listen backlog
+  (the queue of accepted-by-the-OS-but-not-yet-served connections; when it fills,
+  the OS drops or refuses further connection attempts). `max_concurrent_connections`
+  caps how many connections are served at once: at the cap the server stops
+  *accepting*, so excess connections wait in the kernel queue without a parked task
+  or a started TLS handshake, rather than being accepted and blocked. It is built on
+  `without`'s `limit_concurrency`.
 
 The pure wire core (`h11_wire`, `ws_wire`) is sans-IO and unit-tested: it maps
 `h11`/`wsproto` events to the typed `without-asgi` vocabulary and back, with no

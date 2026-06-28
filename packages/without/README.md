@@ -6,7 +6,10 @@ stream connectors and a `with`-scoped background task helper.
 See `without.contracts` for the typed sketch of the core types and the builders
 that lift a step into a processor or a leaf, `without.wiring` for the edge
 connectors that wire processors together (plus the source adapters that feed
-them), and `without.tasks` for the `with`-scoped background task helper.
+them), and `without.tasks` for the async task helpers: `sleep_forever`, the
+`with`-scoped `background_task`, and `limit_concurrency` (a bounded-concurrency
+driver that pulls work from a source only while below the limit, so a lazy
+source is never advanced past it).
 
 Graph/DAG recovery from declared inputs (the `@node` decorator and mermaid
 visualizer) was prototyped and then set aside to focus on the streams core; it

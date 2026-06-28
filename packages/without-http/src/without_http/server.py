@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import socket
+import ssl
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from collections.abc import Callable
@@ -9,6 +11,7 @@ from contextlib import suppress
 
 import h11
 from without import background_task
+from without import limit_concurrency
 from without import sleep_forever
 from without_asgi import ASGIApp
 from without_asgi import Disconnect
@@ -247,6 +250,7 @@ async def _serve_connection(
     conn = h11.Connection(our_role=h11.SERVER)
     server = _address(writer.get_extra_info("sockname"))
     client = _address(writer.get_extra_info("peername"))
+    secure = writer.get_extra_info("ssl_object") is not None
     try:
         while True:
             try:
@@ -257,12 +261,14 @@ async def _serve_connection(
             if request is None:
                 return
             if is_websocket_upgrade(request):
+                scheme = "wss" if secure else "ws"
                 await _serve_websocket(
-                    app, conn, reader, writer, scheme="ws", server=server, client=client, request=request
+                    app, conn, reader, writer, scheme=scheme, server=server, client=client, request=request
                 )
                 return
+            scheme = "https" if secure else "http"
             keep_alive = await _run_request(
-                app, conn, reader, writer, scheme="http", server=server, client=client, request=request
+                app, conn, reader, writer, scheme=scheme, server=server, client=client, request=request
             )
             if not keep_alive:
                 return
@@ -281,13 +287,51 @@ def _bound_address(server: asyncio.Server) -> tuple[str, int]:
     return host, port
 
 
+async def _serve_accepted(
+    app: ASGIApp,
+    conn: socket.socket,
+    *,
+    ssl_context: ssl.SSLContext | None,
+    ssl_handshake_timeout: float | None,
+    ssl_shutdown_timeout: float | None,
+) -> None:
+    """Wrap a freshly accepted socket in streams, then serve one connection.
+
+    The dual of what `asyncio.start_server` does internally per accepted socket,
+    spelled out here because the bounded path drives its own accept loop: build a
+    `StreamReader`/`StreamWriter` over the socket (performing the TLS handshake when
+    `ssl_context` is set), then hand them to `_serve_connection`. A handshake that
+    fails closes the socket without disturbing the accept loop.
+    """
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader(loop=loop)
+    protocol = asyncio.StreamReaderProtocol(reader, loop=loop)
+    try:
+        transport, _ = await loop.connect_accepted_socket(
+            lambda: protocol,
+            conn,
+            ssl=ssl_context,
+            ssl_handshake_timeout=ssl_handshake_timeout,
+            ssl_shutdown_timeout=ssl_shutdown_timeout,
+        )
+    except ssl.SSLError, OSError:
+        conn.close()
+        return
+    writer = asyncio.StreamWriter(transport, protocol, reader, loop)
+    await _serve_connection(app, reader, writer)
+
+
 @asynccontextmanager
 async def serving(
     app: ASGIApp,
     *,
     host: str = "127.0.0.1",
     port: int = 0,
-    backlog: int = 100,
+    max_pending_connections: int = 100,
+    max_concurrent_connections: int | None = None,
+    ssl_context: ssl.SSLContext | None = None,
+    ssl_handshake_timeout: float | None = None,
+    ssl_shutdown_timeout: float | None = None,
 ) -> AsyncIterator[tuple[str, int]]:
     """Serve `app` over HTTP for the duration of the `with` block.
 
@@ -295,31 +339,101 @@ async def serving(
     yields the bound `(host, port)`. On exit it stops accepting, cancels any
     in-flight connections, and runs lifespan shutdown. This is the testable seam
     `serve` runs forever around.
-    """
-    connections: set[asyncio.Task[None]] = set()
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        task = asyncio.current_task()
-        assert task is not None
-        connections.add(task)
-        try:
-            await _serve_connection(app, reader, writer)
-        finally:
-            connections.discard(task)
+    `max_pending_connections` is the kernel's listen backlog: the depth of the
+    queue of connections that have completed the TCP handshake but have not yet
+    been accepted. It absorbs accept bursts; once a connection is accepted it no
+    longer counts against it. When the queue is *full*, the OS handles further
+    connection attempts: on Linux the new `SYN` is dropped, so the client's
+    `connect()` retransmits and either succeeds once room frees or eventually
+    times out (a client may also see "connection refused" on platforms that
+    reset instead). Nothing is queued in the server process.
+
+    `max_concurrent_connections` caps how many connections are accepted and served
+    at once (default: unlimited). At the cap the server stops calling `accept()`,
+    so additional connections wait in that kernel pending queue rather than as
+    parked tasks: no per-connection task is created and no TLS handshake or request
+    parsing begins until a slot frees. Enforcing this requires a single listening
+    socket, so it cannot be combined with a `host` that resolves to several
+    addresses.
+
+    Pass `ssl_context` to serve `https`/`wss` directly; `server_ssl_context` builds
+    one for the common case. `ssl_handshake_timeout` bounds a single TLS handshake
+    (asyncio's default is 60s) and `ssl_shutdown_timeout` the closing `close_notify`
+    exchange (default 30s); both are meaningful only alongside `ssl_context`.
+    """
+    if max_concurrent_connections is None:
+        connections: set[asyncio.Task[None]] = set()
+
+        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            task = asyncio.current_task()
+            assert task is not None
+            connections.add(task)
+            try:
+                await _serve_connection(app, reader, writer)
+            finally:
+                connections.discard(task)
+
+        async with run_lifespan(app):
+            server = await asyncio.start_server(
+                handle,
+                host,
+                port,
+                backlog=max_pending_connections,
+                ssl=ssl_context,
+                ssl_handshake_timeout=ssl_handshake_timeout,
+                ssl_shutdown_timeout=ssl_shutdown_timeout,
+            )
+            try:
+                yield _bound_address(server)
+            finally:
+                server.close()
+                await server.wait_closed()
+                pending = list(connections)
+                for task in pending:
+                    task.cancel()
+                for task in pending:
+                    with suppress(asyncio.CancelledError):
+                        await task
+        return
+
+    # The bounded path drives its own accept loop, so it owns the listening
+    # socket directly (a single address, which is what gating the accept needs)
+    # rather than handing it to `asyncio.start_server`'s built-in accept loop.
+    family, socktype, proto, _canon, sockaddr = socket.getaddrinfo(
+        host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+    )[0]
+    listener = socket.socket(family, socktype, proto)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(sockaddr)
+    listener.listen(max_pending_connections)
+    listener.setblocking(False)
+    bound_host, bound_port = listener.getsockname()[:2]
+    loop = asyncio.get_running_loop()
+
+    async def incoming() -> AsyncIterator[Awaitable[None]]:
+        # `limit_concurrency` advances this generator (and so awaits the next
+        # `accept`) only while below the limit, so the accept itself is gated.
+        while True:
+            conn, _ = await loop.sock_accept(listener)
+            yield _serve_accepted(
+                app,
+                conn,
+                ssl_context=ssl_context,
+                ssl_handshake_timeout=ssl_handshake_timeout,
+                ssl_shutdown_timeout=ssl_shutdown_timeout,
+            )
+
+    async def accept() -> None:
+        async for _done in limit_concurrency(incoming(), max_concurrent_connections):
+            pass
 
     async with run_lifespan(app):
-        server = await asyncio.start_server(handle, host, port, backlog=backlog)
         try:
-            yield _bound_address(server)
+            async with background_task(accept()):
+                yield bound_host, bound_port
         finally:
-            server.close()
-            await server.wait_closed()
-            pending = list(connections)
-            for task in pending:
-                task.cancel()
-            for task in pending:
-                with suppress(asyncio.CancelledError):
-                    await task
+            listener.close()
 
 
 async def serve(
@@ -327,8 +441,21 @@ async def serve(
     *,
     host: str = "127.0.0.1",
     port: int = 8000,
-    backlog: int = 100,
+    max_pending_connections: int = 100,
+    max_concurrent_connections: int | None = None,
+    ssl_context: ssl.SSLContext | None = None,
+    ssl_handshake_timeout: float | None = None,
+    ssl_shutdown_timeout: float | None = None,
 ) -> None:
     """Serve `app` over HTTP until cancelled. The simple entrypoint over `serving`."""
-    async with serving(app, host=host, port=port, backlog=backlog):
+    async with serving(
+        app,
+        host=host,
+        port=port,
+        max_pending_connections=max_pending_connections,
+        max_concurrent_connections=max_concurrent_connections,
+        ssl_context=ssl_context,
+        ssl_handshake_timeout=ssl_handshake_timeout,
+        ssl_shutdown_timeout=ssl_shutdown_timeout,
+    ):
         await sleep_forever()

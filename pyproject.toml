@@ -44,6 +44,7 @@ dev = [
     "pytest-asyncio>=1",
     "pytest-mock>=3",
     "pytest-timeout>=2.3",
+    "trustme>=1.1",
     "hypothesis>=6.80",
     "mypy>=1",
     "ruff>=0.15.4",

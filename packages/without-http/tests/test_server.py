@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -109,3 +110,43 @@ async def test_a_crashing_handler_returns_500() -> None:
         response = await client.get("/boom")
 
     assert response.status_code == 500
+
+
+async def test_caps_the_number_of_connections_served_at_once() -> None:
+    started = 0
+    active = 0
+    peak = 0
+    release = asyncio.Event()
+
+    async def gated_app(scope: RawMessage, receive: Receive, send: Send) -> None:
+        nonlocal started, active, peak
+        if scope["type"] != "http":
+            raise RuntimeError("this app serves only http")
+        started += 1
+        active += 1
+        peak = max(peak, active)
+        try:
+            await release.wait()
+        finally:
+            active -= 1
+        # `connection: close` frees the connection's slot as soon as it responds,
+        # so a waiting connection can then be accepted.
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"connection", b"close")]})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    async with serving(gated_app, max_concurrent_connections=2) as (host, port):
+        async with httpx.AsyncClient(base_url=f"http://{host}:{port}") as client:
+            requests = [asyncio.create_task(client.get("/")) for _ in range(3)]
+            async with asyncio.timeout(5):
+                while started < 2:
+                    await asyncio.sleep(0.001)
+            await asyncio.sleep(0.1)  # a third connection, if accepted, would start here
+
+            assert started == 2  # the third was not even accepted, so its app never ran
+            assert active == 2
+
+            release.set()
+            responses = await asyncio.gather(*requests)
+
+    assert peak == 2
+    assert [response.status_code for response in responses] == [200, 200, 200]

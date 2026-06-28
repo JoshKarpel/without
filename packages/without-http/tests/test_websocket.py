@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ssl
 from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -34,8 +35,16 @@ class WebSocketClient:
     pending: deque[Event] = field(default_factory=deque)
 
     @classmethod
-    async def connect(cls, host: str, port: int, path: str, *, subprotocols: tuple[str, ...] = ()) -> WebSocketClient:
-        reader, writer = await asyncio.open_connection(host, port)
+    async def connect(
+        cls,
+        host: str,
+        port: int,
+        path: str,
+        *,
+        subprotocols: tuple[str, ...] = (),
+        ssl_context: ssl.SSLContext | None = None,
+    ) -> WebSocketClient:
+        reader, writer = await asyncio.open_connection(host, port, ssl=ssl_context)
         conn = WSConnection(ConnectionType.CLIENT)
         writer.write(conn.send(Request(host=host, target=path, subprotocols=list(subprotocols))))
         await writer.drain()

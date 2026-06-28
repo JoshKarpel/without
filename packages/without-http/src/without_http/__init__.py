@@ -13,11 +13,14 @@ from without_http.lifespan import LifespanError
 from without_http.lifespan import run_lifespan
 from without_http.server import serve
 from without_http.server import serving
+from without_http.tls import ALPN_PROTOCOLS
+from without_http.tls import server_ssl_context
 from without_http.ws_wire import is_websocket_upgrade
 from without_http.ws_wire import websocket_scope_from_request
 from without_http.ws_wire import ws_events_from_outbound
 
 __all__ = [
+    "ALPN_PROTOCOLS",
     "ClientExchange",
     "ClientMiddleware",
     "ClientRequest",
@@ -33,6 +36,7 @@ __all__ = [
     "run_lifespan",
     "scope_from_request",
     "serve",
+    "server_ssl_context",
     "serving",
     "websocket_scope_from_request",
     "ws_events_from_outbound",

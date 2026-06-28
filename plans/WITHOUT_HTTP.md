@@ -404,6 +404,25 @@ sans-IO framing on top. This is a **separate transport path** within
 model carry over unchanged; the transport shell is new. Clearly the largest of
 the deferred items.
 
+### Request-concurrency shedding (503)
+
+The shipped `max_concurrent_connections` is *connection admission*: at the cap the
+server stops accepting, so excess connections wait in the kernel's listen backlog
+with no task and no handshake started. That is the leaner choice for the current
+HTTP/1.1 server (effectively one in-flight request per connection).
+
+It is **not** request-level overload shedding. Uvicorn's `--limit-concurrency`
+takes the opposite approach: it accepts every connection and returns an immediate
+`503` (with `Retry-After`) once over the limit. That gives the client a clear,
+actionable "back off" signal and bounds *in-flight requests* rather than
+connections, but it pays accept + (TLS) handshake + response cost per rejection.
+
+The two are complementary, not either/or, so a 503 request-concurrency limit is a
+reasonable later addition *alongside* the connection cap: gate accepts to bound
+resource consumption cheaply, and shed with `503` when request concurrency spikes.
+This matters much more once **HTTP/2** lands, where one connection multiplexes many
+concurrent requests and a connection cap no longer bounds in-flight work.
+
 ## End-to-end verification
 
 - `just test` green after every phase (mypy strict + pytest, `-Werror`).
