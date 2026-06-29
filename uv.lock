@@ -395,7 +395,7 @@ dependencies = [
 requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
     { name = "pydantic", specifier = ">=2" },
-    { name = "pydantic-settings", specifier = ">=2.14.2" },
+    { name = "pydantic-settings", specifier = ">=2.7" },
     { name = "without", editable = "packages/without" },
     { name = "without-asgi", editable = "packages/without-asgi" },
     { name = "without-configmap", editable = "packages/without-configmap" },
@@ -950,7 +950,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "pydantic-settings", specifier = ">=2.14.2" },
+    { name = "pydantic-settings", specifier = ">=2.7" },
     { name = "without", editable = "packages/without" },
 ]
 
