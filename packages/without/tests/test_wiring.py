@@ -65,23 +65,35 @@ async def test_sample_tracks_the_latest_value() -> None:
 
 
 async def test_sample_publish_skips_a_waiter_cancelled_before_it_resolves() -> None:
-    # Cancelling a task awaiting `updated` cancels its future in place; the next
-    # publish must skip that dead waiter rather than crash on it, and still
-    # resolve a live one.
+    # In the window between cancelling a waiter and its own deregistration, the
+    # dead future is still in the set when the next publish runs: publish must skip
+    # it (not crash on set_result) and still resolve the live waiter.
     queue: asyncio.Queue[int] = asyncio.Queue()
     queue.put_nowait(1)
     async with sample(stream_from_queue(queue)) as latest:
         doomed = asyncio.create_task(latest.updated())
         live = asyncio.create_task(latest.updated())
         await yield_once()  # one turn so both updated() calls register their waiters
-        doomed.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await doomed
-
-        queue.put_nowait(2)
+        queue.put_nowait(2)  # queue the publish first, so the drain wakes before doomed...
+        doomed.cancel()  # ...then cancel doomed: its future is now done but not yet deregistered
 
         assert await live == 2
         assert latest.current() == 2
+        with pytest.raises(asyncio.CancelledError):
+            await doomed
+
+
+async def test_sample_cancels_a_pending_updated_waiter_on_exit() -> None:
+    # A task still awaiting `updated` when the context closes must be cancelled,
+    # not left hanging on a sample whose drain has stopped.
+    queue: asyncio.Queue[int] = asyncio.Queue()
+    queue.put_nowait(1)
+    async with sample(stream_from_queue(queue)) as latest:
+        waiting = asyncio.create_task(latest.updated())
+        await yield_once()  # the task is parked awaiting the next publish
+
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
 
 
 async def test_sample_rejects_an_empty_stream() -> None:

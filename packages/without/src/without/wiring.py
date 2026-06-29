@@ -131,8 +131,8 @@ class Sample[T]:
         needs.
 
         Each call registers its own one-shot future resolved by the next publish,
-        so concurrent waiters are independent and cancelling one never disturbs
-        another. Like `current`, it inherits latest-wins: a waiter sees only
+        so concurrent waiters are independent: cancelling one deregisters it at
+        once and never disturbs another. Like `current`, it inherits latest-wins: a waiter sees only
         publishes after it starts waiting, and a source that publishes faster
         than the reader re-arms collapses the values it missed. So `updated` is a
         "the state has moved on" signal, not a way to observe every value;
@@ -140,7 +140,10 @@ class Sample[T]:
         """
         waiter: asyncio.Future[T] = asyncio.get_running_loop().create_future()
         self._waiters.add(waiter)
-        return await waiter
+        try:
+            return await waiter
+        finally:
+            self._waiters.discard(waiter)
 
     def _publish(self, value: T) -> None:
         self._value = value
@@ -148,6 +151,10 @@ class Sample[T]:
             waiter = self._waiters.pop()
             if not waiter.done():
                 waiter.set_result(value)
+
+    def _close(self) -> None:
+        while self._waiters:
+            self._waiters.pop().cancel()
 
 
 @asynccontextmanager
@@ -161,7 +168,9 @@ async def sample[T](source: Stream[T]) -> AsyncIterator[Sample[T]]:
     the held value through `current` (latest, non-blocking) or waits for the next
     one through `updated` (the deterministic "await next update" signal); the held
     value is mutated only by the drain. The yielded `Sample` is a `Context`, so a
-    caller that only reads `current` can treat it as one.
+    caller that only reads `current` can treat it as one. When the block exits,
+    any still-pending `updated` waits are cancelled, so a task awaiting one is not
+    left hanging on a context that has closed.
     """
     iterator = source.__aiter__()
     try:
@@ -175,4 +184,7 @@ async def sample[T](source: Stream[T]) -> AsyncIterator[Sample[T]]:
             sampled._publish(value)  # noqa: SLF001 - the drain is the sole publisher of the sampled value by design
 
     async with background_task(drain()):
-        yield sampled
+        try:
+            yield sampled
+        finally:
+            sampled._close()  # noqa: SLF001 - the context owns the sample's lifecycle, so it releases the waiters

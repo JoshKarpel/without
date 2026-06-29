@@ -38,3 +38,20 @@ async def yield_once() -> None:
     is a race, no matter how many times you call it. Use an explicit signal there.
     """
     await asyncio.sleep(0)
+
+
+async def resolved_next_turn[T](value: T) -> T:
+    """
+    Suspend for one event-loop turn, then return `value`.
+
+    A deterministic stand-in for awaited contained I/O (a DB read, an RPC) in a
+    test that needs a step or a unit of work to *genuinely* suspend and resume.
+    The future is resolved on the next turn via `call_soon`, which forces a real
+    suspension; awaiting an already-resolved future returns without ever yielding
+    control, so the "contained I/O suspends" path would go untested. Like
+    `yield_once`, it is one deterministic turn, not a timing guess.
+    """
+    loop = asyncio.get_running_loop()
+    result: asyncio.Future[T] = loop.create_future()
+    loop.call_soon(result.set_result, value)
+    return await result

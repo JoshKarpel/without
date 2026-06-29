@@ -9,6 +9,7 @@ from without import background_task
 from without import cancel_futures
 from without import limit_concurrency
 from without import sleep_forever
+from without.testing import resolved_next_turn
 from without.testing import yield_once
 
 
@@ -127,9 +128,7 @@ async def test_as_async_iterator_passes_through_an_async_iterable() -> None:
 
 async def test_limit_concurrency_runs_every_awaitable_and_yields_its_result() -> None:
     async def work(value: int) -> int:
-        fetched: asyncio.Future[int] = asyncio.get_running_loop().create_future()
-        fetched.set_result(value)
-        return (await fetched) * 10
+        return (await resolved_next_turn(value)) * 10
 
     results = [future.result() async for future in limit_concurrency((work(n) for n in range(1, 6)), limit=2)]
 
