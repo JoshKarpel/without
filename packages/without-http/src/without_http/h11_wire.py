@@ -32,7 +32,8 @@ def scope_from_request(
     server: tuple[str, int | None] | None,
     client: tuple[str, int] | None,
 ) -> HttpScope:
-    """Build the typed `HttpScope` an ASGI app expects from an `h11.Request`.
+    """
+    Build the typed `HttpScope` an ASGI app expects from an `h11.Request`.
 
     Pure: it reads only the request event and the connection facts the transport
     already knows (peer addresses, scheme). The ASGI `path` is the percent-decoded
@@ -57,7 +58,8 @@ def scope_from_request(
 
 
 def inbound_from_event(event: h11.Event) -> Inbound | None:
-    """Classify one body-phase `h11` event as a typed `Inbound`, or `None` to skip.
+    """
+    Classify one body-phase `h11` event as a typed `Inbound`, or `None` to skip.
 
     `h11.Data` is a body chunk (more to come); `h11.EndOfMessage` is the final,
     empty chunk that closes the request body; `h11.ConnectionClosed` is the client
@@ -75,7 +77,8 @@ def inbound_from_event(event: h11.Event) -> Inbound | None:
 
 
 def h11_events_from_outbound(outbound: Outbound) -> list[h11.Event]:
-    """Render one typed `Outbound` as the `h11` events that put it on the wire.
+    """
+    Render one typed `Outbound` as the `h11` events that put it on the wire.
 
     HTTP/1.1 carries the response start, body, and 103 early hints. The
     server-offload and HTTP/2-only extensions (server push, zero-copy/path send,

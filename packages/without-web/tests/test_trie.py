@@ -23,25 +23,32 @@ def test_a_literal_segment_beats_a_typed_parameter() -> None:
         ((Literal("todos"), Param("id", INT)), "param"),
     )
     found = walk(tree, ("todos", "new"))
-    assert found is not None and found.leaf == "literal"
+    assert found is not None
+    assert found.leaf == "literal"
 
 
 def test_a_parameter_binds_the_converted_value() -> None:
     tree = _tree(((Literal("todos"), Param("id", INT)), "show"))
     found = walk(tree, ("todos", "42"))
-    assert found is not None and found.leaf == "show" and found.params == {"id": 42}
+    assert found is not None
+    assert found.leaf == "show"
+    assert found.params == {"id": 42}
 
 
 def test_a_typed_parameter_is_tried_before_a_str_sibling() -> None:
     tree = _tree(((Literal("x"), Param("n", INT)), "int"), ((Literal("x"), Param("n", STR)), "str"))
     numeric = walk(tree, ("x", "7"))
-    assert numeric is not None and numeric.leaf == "int" and numeric.params == {"n": 7}
+    assert numeric is not None
+    assert numeric.leaf == "int"
+    assert numeric.params == {"n": 7}
 
 
 def test_a_rejected_converter_backtracks_to_a_str_sibling() -> None:
     tree = _tree(((Literal("x"), Param("n", INT)), "int"), ((Literal("x"), Param("n", STR)), "str"))
     word = walk(tree, ("x", "abc"))
-    assert word is not None and word.leaf == "str" and word.params == {"n": "abc"}
+    assert word is not None
+    assert word.leaf == "str"
+    assert word.params == {"n": "abc"}
 
 
 def test_a_deeper_dead_end_backtracks_to_a_sibling_branch() -> None:
@@ -52,19 +59,24 @@ def test_a_deeper_dead_end_backtracks_to_a_sibling_branch() -> None:
         ((Param("a", STR), Literal("items")), "str-items"),
     )
     found = walk(tree, ("7", "items"))
-    assert found is not None and found.leaf == "str-items" and found.params == {"a": "7"}
+    assert found is not None
+    assert found.leaf == "str-items"
+    assert found.params == {"a": "7"}
 
 
 def test_a_catch_all_captures_the_remaining_segments_joined() -> None:
     tree = _tree(((Literal("files"), CatchAll("rest", PATH)), "files"))
     found = walk(tree, ("files", "a", "b", "c"))
-    assert found is not None and found.params == {"rest": "a/b/c"}
+    assert found is not None
+    assert found.params == {"rest": "a/b/c"}
 
 
 def test_a_catch_all_binds_the_converted_remainder() -> None:
     tree = _tree(((Literal("ids"), CatchAll("n", INT)), "ids"))
     found = walk(tree, ("ids", "42"))
-    assert found is not None and found.leaf == "ids" and found.params == {"n": 42}
+    assert found is not None
+    assert found.leaf == "ids"
+    assert found.params == {"n": 42}
 
 
 def test_a_catch_all_whose_converter_rejects_the_remainder_returns_none() -> None:
@@ -78,10 +90,10 @@ def test_an_unmatched_path_returns_none() -> None:
 
 
 def test_a_duplicate_route_is_a_build_error() -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="duplicate route"):
         _tree(((Literal("todos"),), "first"), ((Literal("todos"),), "second"))
 
 
 def test_a_segment_after_a_catch_all_is_a_build_error() -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="catch-all must be the last segment"):
         _tree(((CatchAll("rest", PATH), Literal("more")), "unreachable"))

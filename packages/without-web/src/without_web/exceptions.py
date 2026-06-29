@@ -29,7 +29,8 @@ type WebsocketExceptionRecover = Callable[[Exception], Awaitable[WebsocketClose 
 
 
 def catching(recover: ExceptionRecover) -> HttpMiddleware[object]:
-    """Build middleware that maps exceptions to a response, before the status commits.
+    """
+    Build middleware that maps exceptions to a response, before the status commits.
 
     Exception handling is not a new mechanism: it is a `Middleware` that wraps a
     handler and watches its outbound stream. `recover` is the app's policy: it is
@@ -57,7 +58,8 @@ def catching(recover: ExceptionRecover) -> HttpMiddleware[object]:
 
 
 def catching_websocket(recover: WebsocketExceptionRecover) -> WebsocketMiddleware[object]:
-    """The WebSocket sibling of `catching`, mapping exceptions to a close.
+    """
+    The WebSocket sibling of `catching`, mapping exceptions to a close.
 
     The equivalent commit point is `WebsocketAccept`: before the handshake is
     accepted a close still rejects the connection (the server turns it into a

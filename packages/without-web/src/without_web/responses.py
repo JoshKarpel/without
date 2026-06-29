@@ -17,7 +17,8 @@ from without_web.router import Match
 
 
 def buffered[T](make: Callable[[T, Match[HttpScope], bytes], Response]) -> Endpoint[T, HttpScope, HttpHandler]:
-    """Adapt a body-reading `(state, match, body) -> Response` into an `Endpoint`.
+    """
+    Adapt a body-reading `(state, match, body) -> Response` into an `Endpoint`.
 
     The web-flavored sibling of `without_asgi.routing.buffered`: it hands the
     handler the `Match` (the scope plus the router's already-parsed path

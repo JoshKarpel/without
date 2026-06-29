@@ -44,7 +44,8 @@ class HeaderParam:
 
 @dataclass(frozen=True, slots=True)
 class Single:
-    """Body content that is one complete document validating against `schema`.
+    """
+    Body content that is one complete document validating against `schema`.
 
     Renders as OpenAPI's `schema`: the whole request/response body is this value.
     """
@@ -54,7 +55,8 @@ class Single:
 
 @dataclass(frozen=True, slots=True)
 class Sequence:
-    """Body content that is a sequence of items, each validating against `item_schema`.
+    """
+    Body content that is a sequence of items, each validating against `item_schema`.
 
     Renders as OpenAPI 3.2's `itemSchema`, the description of a sequential media
     type (NDJSON, JSON Lines, `application/json-seq`, SSE `text/event-stream`,
@@ -71,7 +73,8 @@ type Shape = Single | Sequence
 
 @dataclass(frozen=True, slots=True)
 class Body:
-    """One `content` entry: a media type paired with the shape of its payload.
+    """
+    One `content` entry: a media type paired with the shape of its payload.
 
     The same value describes a request or a response body. `Single` renders a
     `schema`; `Sequence` renders an `itemSchema`.
@@ -89,7 +92,8 @@ class ResponseSpec:
 
 @dataclass(frozen=True, slots=True)
 class RouteSpec:
-    """The handler-owned half of an endpoint's OpenAPI description.
+    """
+    The handler-owned half of an endpoint's OpenAPI description.
 
     The router never sees the body or interprets the query, so it cannot be the
     source of those schemas: an endpoint declares them here, in the one place
@@ -124,7 +128,8 @@ class _Described[T]:
 def describe[T](
     spec: RouteSpec,
 ) -> Callable[[Endpoint[T, HttpScope, HttpHandler]], Endpoint[T, HttpScope, HttpHandler]]:
-    """Attach a `RouteSpec` to an endpoint, making it self-describing.
+    """
+    Attach a `RouteSpec` to an endpoint, making it self-describing.
 
     The same value the handler is built around (its body/response types) becomes
     its OpenAPI contribution: one declaration, two consumers. Reads as a
@@ -153,7 +158,8 @@ def openapi[T](
     version: str = "0.0.0",
     schema_for: SchemaFor = _no_schema_for,
 ) -> dict[str, object]:
-    """Merge a router into an OpenAPI 3.2 document, a pure transform of the table.
+    """
+    Merge a router into an OpenAPI 3.2 document, a pure transform of the table.
 
     The router contributes the half it owns (path, methods, path-param schemas
     from its converters); each endpoint that answers `describe()` contributes

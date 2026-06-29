@@ -7,7 +7,8 @@ from without_web.converters import Converter
 
 @dataclass(frozen=True, slots=True)
 class PathSpec:
-    """How a path-param extractor appears as a route segment.
+    """
+    How a path-param extractor appears as a route segment.
 
     The bridge that lets one `path_param(...)` value be both a pattern segment
     (the router matches and schemas it through `converter`) and a typed read in
@@ -47,7 +48,8 @@ type Segment = Literal | Param | CatchAll
 
 
 def split_path(path: str) -> tuple[str, ...]:
-    """Split a request target into its segments.
+    """
+    Split a request target into its segments.
 
     Leading and trailing slashes are stripped, so `/` is the empty tuple and a
     trailing slash never produces an empty segment: `/users` and `/users/` both

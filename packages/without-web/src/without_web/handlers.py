@@ -228,7 +228,8 @@ def handle[T](
     summary: str = "",
     responses: Mapping[int, ResponseSpec] | None = None,
 ) -> HttpEndpoint[T]:
-    """Build a self-describing endpoint from typed extractors and a handler.
+    """
+    Build a self-describing endpoint from typed extractors and a handler.
 
     Each extractor is a typed piece of the request; the overloads tie the
     extractors' types to `fn`'s parameters, so a `path_param(..., INT)` paired
@@ -430,7 +431,8 @@ def handle_stream[T](
     responses: Mapping[int, ResponseSpec] | None = None,
     request_body: Body | None = None,
 ) -> HttpEndpoint[T]:
-    """Build an endpoint whose handler reads the inbound stream live.
+    """
+    Build an endpoint whose handler reads the inbound stream live.
 
     The streaming-input sibling of `handle`. Where `handle` buffers the request
     body before the handler runs (so a `body` extractor can read it), this leaves
@@ -452,7 +454,8 @@ def handle_stream[T](
 
 @dataclass(frozen=True, slots=True)
 class _Method:
-    """A method-bound route decorator.
+    """
+    A method-bound route decorator.
 
     `@get(pattern, *extractors)` annotates a handler with its route and returns a
     single-method `Route`, tying each extractor's type to the handler's
@@ -660,7 +663,8 @@ options = _Method("OPTIONS")
 
 @dataclass(frozen=True, slots=True)
 class _StreamMethod:
-    """The streaming-input form of a method decorator, reached as `post.stream`.
+    """
+    The streaming-input form of a method decorator, reached as `post.stream`.
 
     `@post.stream(pattern, *extractors)` is to `handle_stream` what `@post` is to
     `handle`: it ties each extractor's type to the handler's parameters and returns
@@ -1007,7 +1011,8 @@ def ws[T, A, B, C, D, E, F, G, H, J, K](
 def ws[T](
     pattern: Pattern, *extractors: Extractor[object]
 ) -> Callable[[Callable[..., WebsocketReturned]], WebsocketRoute[T]]:
-    """The websocket sibling of `@get`/`@post`, tying extractors to a handler.
+    """
+    The websocket sibling of `@get`/`@post`, tying extractors to a handler.
 
     `@ws(t"/feed/{room}", room, since)` co-locates the route with the handler and
     ties each extractor's type to its parameters, just like `@get`. The handler
@@ -1037,7 +1042,8 @@ def ws[T](
 
 
 async def _emit(result: Returned) -> AsyncIterator[Outbound]:
-    """Relay a handler's result to the outbound stream, however it was produced.
+    """
+    Relay a handler's result to the outbound stream, however it was produced.
 
     The single output path shared by buffered- and streamed-input endpoints, so
     the output mode is decided by what the handler returns, not by how its input
