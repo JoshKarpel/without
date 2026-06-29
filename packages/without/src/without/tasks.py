@@ -87,6 +87,9 @@ async def limit_concurrency[T](
     still-running awaitables are cancelled and awaited, so none outlive the
     iteration.
 
+    `limit` must be at least 1; a non-positive limit is a `ValueError`, since it
+    could only ever stall the source rather than run it.
+
     Adapted from [Limiting concurrency in
     asyncio](https://death.andgravity.com/limit-concurrency).
     """
