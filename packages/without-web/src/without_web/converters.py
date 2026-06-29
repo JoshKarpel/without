@@ -17,8 +17,9 @@ _V_co = TypeVar("_V_co", covariant=True)
 
 
 @dataclass(frozen=True, slots=True)
-class Converter(Generic[_V_co]):
-    """A path-segment parser paired with the JSON Schema it parses into.
+class Converter(Generic[_V_co]):  # noqa: UP046 - PEP 695 infers a frozen dataclass field as invariant; the covariant TypeVar is deliberate (see above)
+    """
+    A path-segment parser paired with the JSON Schema it parses into.
 
     `parse` turns a single matched segment into a typed value, raising
     `ValueError` to *reject* a segment that does not fit (`int` against `"abc"`).

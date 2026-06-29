@@ -28,7 +28,8 @@ from without_asgi.types import Send
 
 
 async def http_inbound(receive: Receive) -> AsyncIterator[Inbound]:
-    """An `http` request's inbound events as a stream.
+    """
+    An `http` request's inbound events as a stream.
 
     The stream ends when the request is fully received (the last body chunk, or
     a disconnect), so a downstream processor's input runs dry exactly when the
@@ -51,7 +52,8 @@ class ClientDisconnect(Exception):
 
 
 async def read_body(events: Stream[Inbound]) -> bytes:
-    """Accumulate an `http` request's body across its `RequestBody` chunks.
+    """
+    Accumulate an `http` request's body across its `RequestBody` chunks.
 
     Raises `ClientDisconnect` if the client goes away before the final chunk,
     so a truncated body fails loudly rather than passing for a complete one.
@@ -78,7 +80,8 @@ def http_outbound(send: Send) -> Sink[Outbound]:
 
 
 async def websocket_inbound(receive: Receive) -> AsyncIterator[WebsocketInbound]:
-    """A websocket connection's inbound events as a stream.
+    """
+    A websocket connection's inbound events as a stream.
 
     The stream ends on `WebsocketDisconnect`, so the connection's lifecycle *is*
     this stream's lifecycle, the same shape as `http_inbound`.

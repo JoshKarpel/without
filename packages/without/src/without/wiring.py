@@ -24,7 +24,8 @@ from without.tasks import background_task
 
 
 def compose[A, B, C](first: Processor[A, B], second: Processor[B, C]) -> Processor[A, C]:
-    """Compose two processors on the event edge: `first` then `second`.
+    """
+    Compose two processors on the event edge: `first` then `second`.
 
     The join type `B` may differ from `A` and `C`, so this adapts as well as
     chains. Pure composition (the only event-edge connector that needs nothing
@@ -41,7 +42,8 @@ type Endo[T] = Callable[[T], T]
 
 
 def stack[H, *Ctx](*middleware: Callable[[H, *Ctx], H]) -> Callable[[H, *Ctx], H]:
-    """Compose middleware into one, first argument outermost; `stack()` is identity.
+    """
+    Compose middleware into one, first argument outermost; `stack()` is identity.
 
     A *middleware* is `(handler, *context) -> handler`: it wraps a handler, given some
     fixed context, into a new handler of the same type. The context is whatever the
@@ -66,7 +68,8 @@ def stack[H, *Ctx](*middleware: Callable[[H, *Ctx], H]) -> Callable[[H, *Ctx], H
 
 
 async def stream_from_queue[T](queue: asyncio.Queue[T]) -> AsyncIterator[T]:
-    """Expose a queue as a Stream: the bridge from a push source to a pull stream.
+    """
+    Expose a queue as a Stream: the bridge from a push source to a pull stream.
 
     A source that *pushes* (a server's accept loop, a callback-based client, a
     pub/sub subscriber) drops values into a queue; this turns that queue into the
@@ -85,7 +88,8 @@ async def stream_from_queue[T](queue: asyncio.Queue[T]) -> AsyncIterator[T]:
 
 
 async def stream[T](values: Iterable[T]) -> AsyncIterator[T]:
-    """Expose a fixed iterable as a `Stream`: the simplest source.
+    """
+    Expose a fixed iterable as a `Stream`: the simplest source.
 
     Turns already-in-hand values into the pull-based `Stream` the rest of
     `without` consumes, e.g. to emit a fixed reply or to feed a processor under
@@ -96,7 +100,8 @@ async def stream[T](values: Iterable[T]) -> AsyncIterator[T]:
 
 
 async def collect[T](source: Stream[T]) -> list[T]:
-    """Drain a `Stream` into a list: the terminal that materializes every value.
+    """
+    Drain a `Stream` into a list: the terminal that materializes every value.
 
     The dual of `stream`. It runs until the source ends, so it suits bounded
     streams (a finished request, a shut-down queue); an endless source never
@@ -115,7 +120,8 @@ class Sample[T]:
 
 @asynccontextmanager
 async def sample[T](source: Stream[T]) -> AsyncIterator[Context[T]]:
-    """Connect to a stream on the behavior edge: read its latest value, not each.
+    """
+    Connect to a stream on the behavior edge: read its latest value, not each.
 
     The first value is sampled eagerly, so the context is never "not ready". A
     background task keeps the held value current while the `with` block is open,
@@ -131,7 +137,7 @@ async def sample[T](source: Stream[T]) -> AsyncIterator[Context[T]]:
 
     async def drain() -> None:
         async for value in iterator:
-            sampled._value = value
+            sampled._value = value  # noqa: SLF001 - the drain is the sole writer of the sampled value by design
 
     async with background_task(drain()):
         yield sampled

@@ -92,7 +92,8 @@ def _render(todo: Todo) -> dict[str, object]:
 
 
 def _done(values: list[str]) -> bool | None:
-    """The `done` query filter: `True`/`False` when present, `None` when absent.
+    """
+    The `done` query filter: `True`/`False` when present, `None` when absent.
 
     A repeated `?done=` honors the last value, the usual last-wins convention.
     """
@@ -151,7 +152,8 @@ async def create_todo(todos: TodoList, new: NewTodo) -> Response:
     },
 )
 async def import_todos(todos: TodoList, inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
-    """Fold a newline-delimited stream of todo bodies into the list *as it
+    """
+    Fold a newline-delimited stream of todo bodies into the list *as it
     arrives*, echoing each created todo immediately rather than buffering the
     whole upload first. This is the streaming-input dual of `@post`: the route is
     declared with `@post.stream`, so the handler *is* the processor, taking the
@@ -164,8 +166,8 @@ async def import_todos(todos: TodoList, inputs: Stream[Inbound]) -> AsyncIterato
     `TodoList` that never escapes the connection (it stays a value, not shared
     mutable state); like `POST /todos` it does not persist beyond the request. A
     malformed line is reported in its own record rather than failing the stream,
-    since the `200` is already on the wire and cannot be rewritten to a `422`."""
-
+    since the `200` is already on the wire and cannot be rewritten to a `422`.
+    """
     yield ResponseStart(status=200, headers=((b"content-type", b"application/x-ndjson"),))
     working = todos
     pending = b""
@@ -216,9 +218,11 @@ fallback = handle(http_scope(), fn=not_found)
 
 
 def legacy(todos: TodoList, head: HttpScope) -> HttpHandler:
-    """An opaque `HttpRouter` mounted at `/legacy`: it never learns about its
+    """
+    An opaque `HttpRouter` mounted at `/legacy`: it never learns about its
     mount point beyond the trimmed scope, echoing the prefix-stripped `path` and
-    the `root_path` the mount folded the prefix into."""
+    the `root_path` the mount folded the prefix into.
+    """
 
     def handler(inputs: Stream[Inbound]) -> Stream[Outbound]:
         return stream(encode_response(json_response(200, {"path": head.path, "root_path": head.root_path})))
@@ -253,13 +257,15 @@ powered_by: HttpMiddleware[object] = wrap(outbound=_stamp)
 
 
 def require_authorization(handler: HttpHandler, _state: object, scope: HttpScope) -> HttpHandler:
-    """Gate a request on an `Authorization` header, short-circuiting with a 401.
+    """
+    Gate a request on an `Authorization` header, short-circuiting with a 401.
 
     The point is *where* it applies: it is the `admin` sub-router's own
     `middleware`, so the mount carries it to every route under `/admin` and nowhere
     else (the public todo routes stay open). A middleware can replace the handler
     outright: with no credential it returns one that never reads the request and
-    emits the 401, so the wrapped endpoint never runs."""
+    emits the 401, so the wrapped endpoint never runs.
+    """
     if any(name == b"authorization" for name, _ in scope.headers):
         return handler
 
@@ -289,7 +295,8 @@ todos_router: Router[TodoList] = Router(
 
 @ws("/todos/session")
 async def session(todos: TodoList, inputs: Stream[WebsocketInbound]) -> AsyncIterator[WebsocketOutbound]:
-    """Fold a live stream of todo submissions into the list across the connection.
+    """
+    Fold a live stream of todo submissions into the list across the connection.
 
     The websocket sibling of `POST /todos/import`, but bidirectional and
     long-lived. The handler *is* the frame processor (the same shape as
@@ -304,8 +311,8 @@ async def session(todos: TodoList, inputs: Stream[WebsocketInbound]) -> AsyncIte
     rather than closing (the handshake is already accepted, the websocket analog of
     the import stream's committed `200`); a binary frame closes, since this
     protocol is text. Nothing persists past the connection, matching `POST /todos`'
-    echo stance."""
-
+    echo stance.
+    """
     working = todos
     async for event in inputs:
         match event:
@@ -357,8 +364,10 @@ async def _hold(todos: TodoList) -> AsyncIterator[TodoList]:
 
 
 def todos_app(todos: TodoList) -> ASGIApp:
-    """The ASGI app: `Router.dispatch` *is* an `HttpRouter`, so it snaps straight
-    onto `make_asgi_app` with no adapter, and the websocket router likewise."""
+    """
+    The ASGI app: `Router.dispatch` *is* an `HttpRouter`, so it snaps straight
+    onto `make_asgi_app` with no adapter, and the websocket router likewise.
+    """
     return make_asgi_app(lambda: _hold(todos), http=todos_router.dispatch, websocket=sockets.dispatch)
 
 
@@ -368,7 +377,9 @@ def _schema_for(model: type) -> Mapping[str, object]:
 
 
 def todos_openapi() -> dict[str, object]:
-    """The merged OpenAPI document: the router's path/method/path-param half plus
+    """
+    The merged OpenAPI document: the router's path/method/path-param half plus
     each endpoint's `describe()` half, with pydantic models resolved to schema by
-    the injected `schema_for`."""
+    the injected `schema_for`.
+    """
     return openapi(todos_router, title="todos", version="1.0.0", schema_for=_schema_for)

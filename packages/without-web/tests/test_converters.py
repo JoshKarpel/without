@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from uuid import UUID as Uuid
+from uuid import UUID as Uuid  # noqa: N811 - aliased to avoid clashing with without_web's UUID converter
 
 import pytest
 from without_web import FLOAT
@@ -30,7 +30,7 @@ def test_converter_parses_a_valid_segment(converter: Converter[object], segment:
     [(INT, "abc"), (INT, "3.5"), (FLOAT, "words"), (UUID, "not-a-uuid")],
 )
 def test_converter_rejects_an_unfit_segment_with_value_error(converter: Converter[object], segment: str) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError):  # noqa: PT011 - parametrized over converters whose stdlib parsers raise differing messages; only the rejection type is asserted
         converter.parse(segment)
 
 

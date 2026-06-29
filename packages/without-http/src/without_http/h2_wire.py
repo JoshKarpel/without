@@ -27,7 +27,8 @@ def scope_from_h2_headers(
     server: tuple[str, int | None] | None,
     client: tuple[str, int] | None,
 ) -> HttpScope:
-    """Build the typed `HttpScope` an ASGI app expects from an h2 request's headers.
+    """
+    Build the typed `HttpScope` an ASGI app expects from an h2 request's headers.
 
     Pure: it reads only the request pseudo-headers (`:method`/`:path`/`:authority`)
     and the connection facts the transport already knows (peer addresses, scheme).
@@ -73,7 +74,8 @@ def scope_from_h2_headers(
 
 
 def response_headers(status: int, headers: RawHeaders) -> list[tuple[bytes, bytes]]:
-    """Render a response start as the h2 header block: `:status` first, then the rest.
+    """
+    Render a response start as the h2 header block: `:status` first, then the rest.
 
     Header names are lowercased (HTTP/2 requires it) and the hop-by-hop headers that
     are illegal over h2 are dropped, so a response written for HTTP/1.1 round-trips
@@ -96,7 +98,8 @@ def request_headers(
     authority: bytes,
     headers: RawHeaders,
 ) -> list[tuple[bytes, bytes]]:
-    """Render a client request as the h2 header block: the pseudo-headers, then the rest.
+    """
+    Render a client request as the h2 header block: the pseudo-headers, then the rest.
 
     The dual of `scope_from_h2_headers`: the request line and `Host` become the
     `:method`/`:path`/`:scheme`/`:authority` pseudo-headers (h2 carries the host as
@@ -117,7 +120,8 @@ def request_headers(
 
 
 def response_status_and_headers(headers: Iterable[tuple[bytes, bytes]]) -> tuple[int, RawHeaders]:
-    """Read an h2 response header block back into a status and ordinary headers.
+    """
+    Read an h2 response header block back into a status and ordinary headers.
 
     The dual of `response_headers`: the `:status` pseudo-header becomes the numeric
     status and every other pseudo-header is dropped, leaving the ordinary response

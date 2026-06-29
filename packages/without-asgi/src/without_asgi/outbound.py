@@ -48,7 +48,8 @@ class ServerPush:
 
 @dataclass(frozen=True, slots=True)
 class ZeroCopySend:
-    """A zero-copy file-descriptor send (`http.response.zerocopysend` extension).
+    """
+    A zero-copy file-descriptor send (`http.response.zerocopysend` extension).
 
     The application is responsible for closing `file` afterwards.
     """
@@ -115,7 +116,8 @@ class WebsocketSend:
 
 @dataclass(frozen=True, slots=True)
 class WebsocketClose:
-    """Close a websocket connection, or reject it when sent before `WebsocketAccept`.
+    """
+    Close a websocket connection, or reject it when sent before `WebsocketAccept`.
 
     `code` is a
     [WebSocket close code](https://developer.mozilla.org/en-US/docs/Web/API/CloseEvent/code);
@@ -284,7 +286,8 @@ def _as_info(value: object) -> Mapping[str, object]:
 
 
 def parse_outbound(message: RawMessage) -> Outbound:
-    """Classify one outbound `http` event from the raw dict an app passed to `send`.
+    """
+    Classify one outbound `http` event from the raw dict an app passed to `send`.
 
     The server-direction dual of `encode_outbound`: a transport that owns the wire
     (without-http) reads the dicts the app sends and parses them into typed

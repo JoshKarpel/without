@@ -188,7 +188,8 @@ async def test_an_invalid_body_is_a_mapped_422() -> None:
     async with _running(app):
         status, _headers, body = await _request(app, "POST", "/todos", body=b"{}")
     assert status == 422
-    assert isinstance(body, dict) and body["error"] == "invalid todo body"
+    assert isinstance(body, dict)
+    assert body["error"] == "invalid todo body"
 
 
 async def test_a_known_path_with_the_wrong_method_is_405_with_allow() -> None:
@@ -251,11 +252,13 @@ async def test_openapi_merges_router_and_handler_halves() -> None:
     # stream of NDJSON records, not a single document. The media type is the app's.
     import_in = _dig(spec, "paths", "/todos/import", "post", "requestBody", "content", "application/x-ndjson")
     assert isinstance(import_in, dict)
-    assert "schema" not in import_in and "itemSchema" in import_in
+    assert "schema" not in import_in
+    assert "itemSchema" in import_in
     import_out = _dig(spec, "paths", "/todos/import", "post", "responses", "200", "content", "application/x-ndjson")
     assert isinstance(import_out, dict)
     item_schema = import_out["itemSchema"]
-    assert isinstance(item_schema, dict) and "oneOf" in item_schema
+    assert isinstance(item_schema, dict)
+    assert "oneOf" in item_schema
 
     show_params = _dig(spec, "paths", "/todos/{id}", "get", "parameters")
     assert isinstance(show_params, list)
@@ -338,7 +341,8 @@ async def test_the_session_answers_a_malformed_frame_without_closing() -> None:
     assert [m["type"] for m in sent] == ["websocket.accept", "websocket.send"]
     (reply,) = _sent_replies(sent)
     assert isinstance(reply, dict)
-    assert reply["ok"] is False and reply["errors"] >= 1
+    assert reply["ok"] is False
+    assert reply["errors"] >= 1
 
 
 async def test_an_unrouted_websocket_path_is_closed_by_the_fallback() -> None:

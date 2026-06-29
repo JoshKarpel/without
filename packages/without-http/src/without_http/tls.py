@@ -10,7 +10,8 @@ ALPN_PROTOCOLS = ("h2", "http/1.1")
 
 
 def server_ssl_context(certfile: Path, keyfile: Path | None = None) -> ssl.SSLContext:
-    """Build a server-side TLS context that serves the protocols `without-http` speaks.
+    """
+    Build a server-side TLS context that serves the protocols `without-http` speaks.
 
     Loads the certificate chain (a combined cert+key PEM if `keyfile` is omitted)
     and advertises `ALPN_PROTOCOLS`, so a client negotiates the wire protocol

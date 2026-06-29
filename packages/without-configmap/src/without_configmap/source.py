@@ -27,7 +27,8 @@ def watch_config[T](
     *,
     changes: Changes = _awatch_changes,
 ) -> Stream[T]:
-    """The parsed config now, and a freshly parsed value on every mount change.
+    """
+    The parsed config now, and a freshly parsed value on every mount change.
 
     `parse` is the boundary: it turns the mount directory into a validated
     value. `changes` is the source of reload signals, injectable so tests can

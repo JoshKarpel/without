@@ -36,7 +36,8 @@ class H2Result:
 
 
 async def h2c_roundtrip(host: str, port: int, method: str, path: str, body: bytes = b"") -> H2Result:
-    """Drive one HTTP/2-over-cleartext request to completion via prior knowledge.
+    """
+    Drive one HTTP/2-over-cleartext request to completion via prior knowledge.
 
     A fresh connection per request keeps the helper small; multiplexing many streams
     over one connection is exercised through the TLS path instead.

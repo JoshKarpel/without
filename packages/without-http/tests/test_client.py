@@ -94,7 +94,7 @@ async def test_wrap_response_side_transforms_the_returned_body() -> None:
     def shout(response: ClientResponse) -> ClientResponse:
         async def upper(
             events: AsyncIterator[bytes | ResponseTrailers],
-        ) -> AsyncGenerator[bytes | ResponseTrailers, None]:
+        ) -> AsyncGenerator[bytes | ResponseTrailers]:
             async for item in events:
                 yield item.upper() if isinstance(item, bytes) else item
 
@@ -241,8 +241,10 @@ async def test_streams_a_response_body_chunk_by_chunk() -> None:
 
 
 async def cookie_app(scope: RawScope, receive: Receive, send: Send) -> None:
-    """`/set` issues a cookie, `/clear` deletes it (`Max-Age=0`), `/echo` returns the
-    `Cookie` header the request carried."""
+    """
+    `/set` issues a cookie, `/clear` deletes it (`Max-Age=0`), `/echo` returns the
+    `Cookie` header the request carried.
+    """
     if scope["type"] != "http":
         raise RuntimeError("this app serves only http")
     head = parse_http_scope(scope)

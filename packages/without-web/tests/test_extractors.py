@@ -116,7 +116,9 @@ def test_body_contributes_its_request_body_fragment() -> None:
 
 def test_path_param_contributes_no_openapi_because_the_router_owns_it() -> None:
     extractor = path_param("id", INT)
-    assert extractor.query == () and extractor.headers == () and extractor.request_body is None
+    assert extractor.query == ()
+    assert extractor.headers == ()
+    assert extractor.request_body is None
 
 
 @dataclass(frozen=True, slots=True)

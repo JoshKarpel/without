@@ -22,7 +22,8 @@ class Found[L]:
 
 @dataclass(frozen=True, slots=True)
 class Node[L]:
-    """One immutable trie node, generic over the leaf payload it terminates in.
+    """
+    One immutable trie node, generic over the leaf payload it terminates in.
 
     `params` is ordered so the walk tries more specific branches first: a typed
     converter (`int`, `uuid`) before the catch-most `str`. That recovers route
@@ -44,7 +45,8 @@ class _Builder[L]:
 
 
 def build[L](routes: Iterable[tuple[tuple[Segment, ...], L]]) -> Node[L]:
-    """Fold a flat route table into one immutable trie.
+    """
+    Fold a flat route table into one immutable trie.
 
     A duplicate route (two leaves at the same path) is a build-time fault, so it
     raises here at construction rather than surfacing per request. Converters
@@ -97,7 +99,8 @@ def _param_precedence[L](item: tuple[tuple[str, Converter[object]], _Builder[L]]
 
 
 def walk[L](node: Node[L], segments: tuple[str, ...]) -> Found[L] | None:
-    """Match a request target against the trie, backtracking on converter rejection.
+    """
+    Match a request target against the trie, backtracking on converter rejection.
 
     Because a typed converter can reject a segment, a literal-then-param descent
     is not a single forward walk: when a branch dead-ends downstream the walk

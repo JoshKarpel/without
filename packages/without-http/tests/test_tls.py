@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import ssl
-from collections.abc import Iterator
 from contextlib import suppress
 from pathlib import Path
 
@@ -61,10 +60,10 @@ def server_context(authority: trustme.CA, tmp_path_factory: pytest.TempPathFacto
 
 
 @pytest.fixture
-def trusting_client_context(authority: trustme.CA) -> Iterator[ssl.SSLContext]:
+def trusting_client_context(authority: trustme.CA) -> ssl.SSLContext:
     context = ssl.create_default_context()
     authority.configure_trust(context)
-    yield context
+    return context
 
 
 async def test_serves_https_with_the_scheme_marked_secure(
@@ -135,11 +134,13 @@ async def test_serves_https_over_h2_when_alpn_negotiates_it(
 async def test_multiplexes_concurrent_requests_over_h2(
     server_context: ssl.SSLContext, trusting_client_context: ssl.SSLContext
 ) -> None:
-    async with serving(echo_app, ssl_context=server_context) as server:
-        async with httpx.AsyncClient(
+    async with (
+        serving(echo_app, ssl_context=server_context) as server,
+        httpx.AsyncClient(
             base_url=f"https://{server.host}:{server.port}", http2=True, verify=trusting_client_context
-        ) as client:
-            responses = await asyncio.gather(*(client.get(f"/n{index}") for index in range(8)))
+        ) as client,
+    ):
+        responses = await asyncio.gather(*(client.get(f"/n{index}") for index in range(8)))
 
     assert {response.http_version for response in responses} == {"HTTP/2"}
     assert [response.text for response in responses] == [f"GET /n{index} " for index in range(8)]

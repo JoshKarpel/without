@@ -24,7 +24,8 @@ from without_web.patterns import PathSpec
 
 @dataclass(frozen=True, slots=True)
 class Request:
-    """The parsed-once context an extractor reads from.
+    """
+    The parsed-once context an extractor reads from.
 
     `params` holds the path parameters the router already parsed during the trie
     walk (typed values, stored as `object`); `body` is the fully-buffered request
@@ -51,8 +52,9 @@ _V_co = TypeVar("_V_co", covariant=True)
 
 
 @dataclass(frozen=True, slots=True)
-class Extractor(Generic[_V_co]):
-    """A typed piece of a request, paired with the OpenAPI it contributes.
+class Extractor(Generic[_V_co]):  # noqa: UP046 - PEP 695 infers a frozen dataclass field as invariant; the covariant TypeVar is deliberate (see above)
+    """
+    A typed piece of a request, paired with the OpenAPI it contributes.
 
     `extract` is a pure `Request -> V` that raises to *reject* a bad request
     (a `catching` middleware's `recover` maps the raised type to a 4xx); it never
@@ -70,7 +72,8 @@ class Extractor(Generic[_V_co]):
 
 
 def path_param[V](name: str, converter: Converter[V]) -> Extractor[V]:
-    """A typed path parameter: one value that is both a pattern segment and a read.
+    """
+    A typed path parameter: one value that is both a pattern segment and a read.
 
     The same `converter` the router matches the segment with also fixes the type
     `V` the handler receives, so there is no second place to keep in sync: drop
@@ -79,7 +82,6 @@ def path_param[V](name: str, converter: Converter[V]) -> Extractor[V]:
     type are all declared exactly once. The read casts the value the router's
     walk already parsed with this very converter, so the cast is sound.
     """
-
     spec = PathSpec(name=name, converter=converter)
 
     def extract(request: Request) -> V:
@@ -89,12 +91,12 @@ def path_param[V](name: str, converter: Converter[V]) -> Extractor[V]:
 
 
 def catch_all(name: str, converter: Converter[str] = PATH) -> Extractor[str]:
-    """A typed catch-all path parameter: the `{name:path}` form as a token.
+    """
+    A typed catch-all path parameter: the `{name:path}` form as a token.
 
     Consumes the rest of the target into one segment (always the final one); the
     sibling of `path_param` for the rest-of-path case.
     """
-
     spec = PathSpec(name=name, converter=converter, catch_all=True)
 
     def extract(request: Request) -> str:
@@ -106,7 +108,8 @@ def catch_all(name: str, converter: Converter[str] = PATH) -> Extractor[str]:
 def query_param[V](
     name: str, parse: Callable[[list[str]], V], *, schema: SchemaRef, required: bool = False
 ) -> Extractor[V]:
-    """Parse a query parameter into `V`, given all of its raw values.
+    """
+    Parse a query parameter into `V`, given all of its raw values.
 
     `parse` receives the (possibly empty, possibly repeated) values for `name`
     and decides what their absence and multiplicity mean, returning `V` or
@@ -123,12 +126,12 @@ def query_param[V](
 def header_param[V](
     name: str, parse: Callable[[list[bytes]], V], *, schema: SchemaRef, required: bool = False
 ) -> Extractor[V]:
-    """Parse a request header into `V`, given all of its raw values.
+    """
+    Parse a request header into `V`, given all of its raw values.
 
     Header names are matched case-insensitively (ASGI lower-cases them); `parse`
     receives every value sent under `name`, in order, and returns `V` or raises.
     """
-
     wanted = name.lower().encode()
 
     def extract(request: Request) -> V:
@@ -139,7 +142,8 @@ def header_param[V](
 
 
 def body[V](parse: Callable[[bytes], V], *, schema: SchemaRef, media_type: str = "application/json") -> Extractor[V]:
-    """Parse the buffered request body into `V`.
+    """
+    Parse the buffered request body into `V`.
 
     `parse` is injected so `without-web` stays serialization-agnostic: an app
     passes a pydantic model's `model_validate_json`, a dataclass loader, or any
@@ -153,7 +157,8 @@ def body[V](parse: Callable[[bytes], V], *, schema: SchemaRef, media_type: str =
 
 
 def http_scope() -> Extractor[HttpScope]:
-    """Hand an HTTP handler the unparsed `HttpScope`.
+    """
+    Hand an HTTP handler the unparsed `HttpScope`.
 
     The escape hatch that keeps "pass the scope down" and "parse parts of it"
     from competing: a handler composes `http_scope()` alongside parsed extractors
@@ -171,7 +176,8 @@ def http_scope() -> Extractor[HttpScope]:
 
 
 def websocket_scope() -> Extractor[WebsocketScope]:
-    """Hand a websocket handler the unparsed `WebsocketScope`.
+    """
+    Hand a websocket handler the unparsed `WebsocketScope`.
 
     The websocket sibling of `http_scope()`; the assert guards against using it on
     an HTTP route.
@@ -311,7 +317,8 @@ def into[M, A, B, C, D, E, F, G, H, J, K](
 ) -> Extractor[M]: ...
 # [[[end]]]
 def into[M](make: Callable[..., M], *extractors: Extractor[object]) -> Extractor[M]:
-    """Combine several extractors into one that builds a typed value.
+    """
+    Combine several extractors into one that builds a typed value.
 
     The escape hatch from a handler's extractor-arity ceiling, and the way to
     parse a group of inputs into one model: `make` is the model's constructor (or

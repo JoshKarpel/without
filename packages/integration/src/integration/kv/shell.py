@@ -62,7 +62,8 @@ type MakeSession[In, Out] = Callable[[Ask[In, Out]], Processor[str, str]]
 
 
 class ServeConfig(BaseSettings):
-    """How the line server binds and shuts down, parsed from the environment.
+    """
+    How the line server binds and shuts down, parsed from the environment.
 
     A `without` `Context` carries this into `serve`: the transport reads its
     knobs from `config.current()` rather than taking a fistful of keyword
@@ -82,7 +83,8 @@ class ServeConfig(BaseSettings):
 
 @dataclass(frozen=True, slots=True)
 class Connected[In, Out]:
-    """An inbound payload paired with the channel to reply on.
+    """
+    An inbound payload paired with the channel to reply on.
 
     `send` is bound to the connection the payload arrived on, so the reply
     target rides *in the value* rather than through a side registry keyed by a
@@ -101,7 +103,8 @@ async def serve[In, Out](
     *,
     config: Context[ServeConfig],
 ) -> AsyncIterator[asyncio.Server]:
-    """Run a TCP line server: a shared serial `consumer` plus a `make_session` per connection.
+    """
+    Run a TCP line server: a shared serial `consumer` plus a `make_session` per connection.
 
     The two arguments are a value and a maker, and that asymmetry is the point:
     `consumer` is the single serial owner of any shared state (the keyspace fold),
@@ -200,7 +203,8 @@ async def serve[In, Out](
 
 
 def make_keyspace(initial: Store = EMPTY_STORE) -> Fold[Connected[Request, Reply], Store]:
-    """The shared serial state owner: fold each request into the keyspace, reply on its channel.
+    """
+    The shared serial state owner: fold each request into the keyspace, reply on its channel.
 
     Every connection funnels here. A `from_fold` consumes the merged request
     stream one event at a time, threading the keyspace as a value and answering
@@ -219,7 +223,8 @@ def make_keyspace(initial: Store = EMPTY_STORE) -> Fold[Connected[Request, Reply
 
 
 def make_session(ask: Ask[Request, Reply]) -> Processor[str, str]:
-    """Build one connection's processor: thread a request counter, funnel to the shared keyspace.
+    """
+    Build one connection's processor: thread a request counter, funnel to the shared keyspace.
 
     The connection-scoped half, dual to `make_keyspace`'s shared half. Called per
     connection with that connection's `ask`, it owns the protocol codec (parse
