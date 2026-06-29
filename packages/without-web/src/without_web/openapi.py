@@ -187,6 +187,8 @@ def _segment_template(segment: Segment) -> str:
             return text
         case Param(name, _) | CatchAll(name, _):
             return "{" + name + "}"
+        case _ as unreachable:
+            assert_never(unreachable)
 
 
 def _path_parameters(segments: tuple[Segment, ...], schema_for: SchemaFor) -> list[dict[str, object]]:

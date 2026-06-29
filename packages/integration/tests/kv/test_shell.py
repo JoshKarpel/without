@@ -195,7 +195,7 @@ async def test_shutdown_cancels_a_session_when_the_consumer_wedges() -> None:
     async def wedged(events: Stream[Connected[Request, Reply]]) -> object:
         async for _event in events:
             await asyncio.Event().wait()  # never reply; block forever on the first request
-        return None
+        return None  # pragma: no cover - the consumer wedges on its first event; this only types the no-events path
 
     baseline = asyncio.all_tasks()
     async with asyncio.timeout(5.0):

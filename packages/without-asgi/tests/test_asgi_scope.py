@@ -156,6 +156,36 @@ def test_parse_scope_rejects_an_unknown_type() -> None:
         parse_scope({"type": "tcp"})
 
 
+_VALID_HTTP_SCOPE: dict[str, object] = {
+    "type": "http",
+    "asgi": {"version": "3.0"},
+    "http_version": "1.1",
+    "method": "GET",
+    "path": "/flags",
+    "query_string": b"",
+    "headers": [],
+}
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("headers", [[b"name-without-a-value"]], "expected a \\(bytes, bytes\\) pair"),
+        ("headers", 17, "expected an iterable of bytes pairs"),
+        ("asgi", "not-a-mapping", "expected an asgi mapping"),
+        ("client", ["host-without-a-port"], "expected a \\[host, port\\] pair"),
+        ("server", ["host", 8080, "surplus"], "expected a \\[host, port\\] pair"),
+        ("extensions", ["not-a-mapping"], "expected an extensions mapping"),
+        ("extensions", {"tls": "not-a-mapping"}, "expected an options mapping for extension"),
+    ],
+)
+def test_parse_http_scope_rejects_a_malformed_field(field: str, value: object, match: str) -> None:
+    scope: dict[str, object] = {**_VALID_HTTP_SCOPE, field: value}
+
+    with pytest.raises(TypeError, match=match):
+        parse_http_scope(scope)
+
+
 def test_parse_tls_reads_the_connection_info() -> None:
     extensions: dict[str, dict[str, object]] = {
         "tls": {

@@ -18,7 +18,7 @@ alias w := watch
 [doc('Run type checking and tests')]
 test *args:
     uv run mypy
-    uv run pytest --failed-first {{ args }}
+    uv run pytest --failed-first --cov {{ args }}
 
 alias t := test
 

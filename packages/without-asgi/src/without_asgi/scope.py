@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import assert_never
 
 from without_asgi.narrow import narrow_to_bytes
 from without_asgi.narrow import narrow_to_int
@@ -393,6 +394,8 @@ def encode_scope(scope: Scope) -> RawScope:
             return encode_websocket_scope(scope)
         case LifespanScope(asgi):
             return {"type": "lifespan", "asgi": _encode_asgi(asgi)}
+        case _ as unreachable:
+            assert_never(unreachable)
 
 
 def parse_tls(extensions: Mapping[str, Mapping[str, object]] | None) -> Tls | None:

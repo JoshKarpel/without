@@ -10,11 +10,38 @@ from pathlib import Path
 
 import pytest
 from integration.transform.app import Settings
+from integration.transform.app import log_connect
 from integration.transform.app import mode_param
+from integration.transform.app import request_digest
 from integration.transform.app import text_transform_app
+from integration.transform.app import transform_socket
+from integration.transform.core import Mode
+from integration.transform.core import TransformConfig
+from without import Stream
+from without import collect
+from without import stream
 from without.testing import tick
 from without_asgi import ASGIApp
+from without_asgi import Disconnect
+from without_asgi import HttpScope
+from without_asgi import Inbound
+from without_asgi import Outbound
 from without_asgi import RawMessage
+from without_asgi import RequestBody
+from without_asgi import ResponseBody
+from without_asgi import ResponseStart
+from without_asgi import ResponseTrailers
+from without_asgi import WebsocketAccept
+from without_asgi import WebsocketBinary
+from without_asgi import WebsocketClose
+from without_asgi import WebsocketConnect
+from without_asgi import WebsocketDisconnect
+from without_asgi import WebsocketReceive
+from without_asgi import WebsocketScope
+from without_asgi import WebsocketSend
+from without_asgi import WebsocketText
+from without_asgi.scope import parse_http_scope
+from without_asgi.scope import parse_websocket_scope
 from without_configmap import read_yaml_file
 from without_configmap import watch_config
 
@@ -49,7 +76,7 @@ def _has_header(message: RawMessage, name: bytes, value: bytes) -> bool:
 
 async def _blocked(mount: Path) -> AsyncIterator[object]:
     await asyncio.Event().wait()
-    yield object()
+    yield object()  # pragma: no cover - the wait never returns; the yield only makes this a never-signalling change source
 
 
 @asynccontextmanager
@@ -318,7 +345,9 @@ async def test_unrouted_websocket_path_is_closed_without_reading(tmp_path: Path)
     sent: list[RawMessage] = []
 
     async def receive() -> RawMessage:
-        raise AssertionError("the fallback closes without reading events")
+        raise AssertionError(
+            "the fallback closes without reading events"
+        )  # pragma: no cover - asserts receive is never called
 
     async def send(message: RawMessage) -> None:
         sent.append(message)
@@ -362,3 +391,88 @@ async def test_websocket_stream_transforms_each_text_frame_with_the_default_mode
 )
 def test_mode_param_reads_the_mode_parameter(query_string: bytes, expected: str | None) -> None:
     assert mode_param(query_string) == expected
+
+
+def _ws_scope(path: str) -> WebsocketScope:
+    return parse_websocket_scope({"type": "websocket", "asgi": {"version": "3.0"}, "path": path, "headers": []})
+
+
+def _http_scope(extensions: dict[str, dict[str, object]] | None = None) -> HttpScope:
+    raw: dict[str, object] = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "path": "/transform",
+        "headers": [],
+        "query_string": b"",
+    }
+    if extensions is not None:
+        raw["extensions"] = extensions
+    return parse_http_scope(raw)
+
+
+async def test_transform_socket_transforms_text_then_closes_on_a_binary_frame() -> None:
+    # Drive the processor directly with a finite stream: a binary frame closes (the
+    # protocol is text-only) and the loop exits when the stream runs dry without a
+    # disconnect, the connection-end path the live socket reaches only via disconnect.
+    settings = Settings(transform=TransformConfig(default_mode=Mode.UPPER))
+    processor = transform_socket(settings, _ws_scope("/stream"))
+
+    outputs = await collect(
+        processor(
+            stream(
+                [
+                    WebsocketConnect(),
+                    WebsocketReceive(WebsocketText(text="quiet")),
+                    WebsocketReceive(WebsocketBinary(data=b"\x00\x01")),
+                ]
+            )
+        )
+    )
+
+    assert outputs == [
+        WebsocketAccept(),
+        WebsocketSend(WebsocketText(text="QUIET")),
+        WebsocketClose(code=1003, reason="text frames only"),
+    ]
+
+
+async def _respond_after_draining(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
+    async for _event in inputs:
+        pass
+    yield ResponseStart(status=200, headers=((b"content-type", b"text/plain"),))
+    yield ResponseBody(body=b"done", more_body=False)
+
+
+def _request_digests(outputs: list[Outbound]) -> list[bytes]:
+    return [
+        value
+        for event in outputs
+        if isinstance(event, (ResponseStart, ResponseTrailers))
+        for name, value in event.headers
+        if name == b"x-request-digest"
+    ]
+
+
+@pytest.mark.parametrize("extensions", [None, {"http.response.trailers": {}}])
+async def test_request_digest_hashes_only_body_chunks_and_passes_a_disconnect_through(
+    extensions: dict[str, dict[str, object]] | None,
+) -> None:
+    # A non-body inbound event (a disconnect) must be forwarded without being hashed,
+    # on both the trailer path (supports the extension) and the header fallback. The
+    # digest therefore reflects only the body chunk.
+    processor = request_digest(_respond_after_draining, object(), _http_scope(extensions))
+
+    outputs = await collect(processor(stream([RequestBody(body=b"hi", more_body=True), Disconnect()])))
+
+    assert _request_digests(outputs) == [b"sha-256=" + hashlib.sha256(b"hi").hexdigest().encode()]
+
+
+async def test_log_connect_prints_the_path_and_forwards_every_frame(capsys: pytest.CaptureFixture[str]) -> None:
+    forwarded = await collect(
+        log_connect(stream([WebsocketConnect(), WebsocketDisconnect(code=1000, reason="bye")]), _ws_scope("/stream"))
+    )
+
+    assert forwarded == [WebsocketConnect(), WebsocketDisconnect(code=1000, reason="bye")]
+    assert "=== WS /stream" in capsys.readouterr().out

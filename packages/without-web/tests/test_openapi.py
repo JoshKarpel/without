@@ -7,6 +7,7 @@ from without_asgi import HttpScope
 from without_asgi import Response
 from without_web import INT
 from without_web import Body
+from without_web import HeaderParam
 from without_web import Match
 from without_web import QueryParam
 from without_web import ResponseSpec
@@ -23,7 +24,7 @@ from without_web import route
 
 @buffered
 def _fallback(state: object, match: Match[HttpScope], body: bytes) -> Response:
-    return json_response(404, {})
+    return json_response(404, {})  # pragma: no cover - openapi reads describe(), never dispatches the handler
 
 
 @describe(
@@ -36,7 +37,7 @@ def _fallback(state: object, match: Match[HttpScope], body: bytes) -> Response:
 )
 @buffered
 def _show(state: object, match: Match[HttpScope], body: bytes) -> Response:
-    return json_response(200, {})
+    return json_response(200, {})  # pragma: no cover - openapi reads describe(), never dispatches the handler
 
 
 @describe(
@@ -48,7 +49,7 @@ def _show(state: object, match: Match[HttpScope], body: bytes) -> Response:
 )
 @buffered
 def _create(state: object, match: Match[HttpScope], body: bytes) -> Response:
-    return json_response(201, {})
+    return json_response(201, {})  # pragma: no cover - openapi reads describe(), never dispatches the handler
 
 
 def _spec() -> dict[str, object]:
@@ -95,7 +96,7 @@ def test_openapi_resolves_a_type_through_the_injected_schema_for() -> None:
     @describe(RouteSpec(request_body=Body("application/json", Single(_Payload))))
     @buffered
     def create(state: object, match: Match[HttpScope], body: bytes) -> Response:
-        return json_response(201, {})
+        return json_response(201, {})  # pragma: no cover - openapi reads describe(), never dispatches the handler
 
     router: Router[object] = Router(routes=(route("/x", post=create),), fallback=_fallback)
     spec = openapi(router, schema_for=lambda annotation: {"type": "object", "title": annotation.__name__})
@@ -116,7 +117,7 @@ def test_openapi_renders_a_sequence_body_as_item_schema() -> None:
     )
     @buffered
     def upload(state: object, match: Match[HttpScope], body: bytes) -> Response:
-        return json_response(200, {})
+        return json_response(200, {})  # pragma: no cover - openapi reads describe(), never dispatches the handler
 
     router: Router[object] = Router(routes=(route("/feed", post=upload),), fallback=_fallback)
     assert _operation(openapi(router), "/feed", "post") == {
@@ -125,6 +126,29 @@ def test_openapi_renders_a_sequence_body_as_item_schema() -> None:
             "200": {"description": "streamed", "content": {"text/event-stream": {"itemSchema": {"type": "string"}}}}
         },
     }
+
+
+def test_openapi_emits_path_params_for_a_non_describable_endpoint() -> None:
+    router: Router[object] = Router(routes=(route(t"/raw/{path_param('id', INT)}", get=_fallback),), fallback=_fallback)
+    assert _operation(openapi(router), "/raw/{id}", "get") == {
+        "parameters": [{"name": "id", "in": "path", "required": True, "schema": {"type": "integer"}}],
+        "responses": {},
+    }
+
+
+def test_openapi_renders_a_header_parameter_from_the_describe_half() -> None:
+    described = describe(RouteSpec(headers=(HeaderParam(name="X-Trace", schema={"type": "string"}),)))(_fallback)
+    router: Router[object] = Router(routes=(route("/trace", get=described),), fallback=_fallback)
+    assert _operation(openapi(router), "/trace", "get") == {
+        "parameters": [{"name": "X-Trace", "in": "header", "required": False, "schema": {"type": "string"}}],
+        "responses": {},
+    }
+
+
+def test_openapi_renders_a_response_without_a_body() -> None:
+    described = describe(RouteSpec(responses={204: ResponseSpec(description="no content")}))(_fallback)
+    router: Router[object] = Router(routes=(route("/empty", get=described),), fallback=_fallback)
+    assert _operation(openapi(router), "/empty", "get") == {"responses": {"204": {"description": "no content"}}}
 
 
 class _Payload:

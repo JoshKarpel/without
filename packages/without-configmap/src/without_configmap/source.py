@@ -17,7 +17,7 @@ type Changes = Callable[[Path], AsyncIterator[object]]
 
 
 async def _awatch_changes(mount: Path) -> AsyncIterator[object]:
-    async for batch in awatch(mount):
+    async for batch in awatch(mount):  # pragma: no cover - default I/O adapter; tests drive the `changes` seam
         yield batch
 
 

@@ -43,7 +43,7 @@ async def scheme_ws_app(scope: RawScope, receive: Receive, send: Send) -> None:
             case "websocket.connect":
                 await send({"type": "websocket.accept"})
                 await send({"type": "websocket.send", "text": scheme})
-            case "websocket.disconnect":
+            case "websocket.disconnect":  # pragma: no branch - the client only connects then disconnects
                 return
 
 

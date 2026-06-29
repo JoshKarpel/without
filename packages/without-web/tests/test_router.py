@@ -90,6 +90,11 @@ def _fallback(state: object, match: Match[HttpScope], body: bytes) -> Response:
     return json_response(404, {"error": f"no route for {match.scope.method} {match.scope.path}"})
 
 
+def test_route_with_no_methods_is_a_build_error() -> None:
+    with pytest.raises(ValueError, match="declares no methods"):
+        route("/empty")
+
+
 async def test_dispatch_selects_the_endpoint_for_the_method() -> None:
     router: Router[object] = Router(routes=(route("/todos", get=_ok, post=_created),), fallback=_fallback)
     start, body = await _run(router.dispatch(object(), _scope("POST", "/todos")))
@@ -169,6 +174,20 @@ async def test_an_exception_before_response_start_is_mapped_to_a_response() -> N
     assert json.loads(body) == {"error": "nope"}
 
 
+async def test_catching_propagates_an_exception_when_recover_declines() -> None:
+    @buffered
+    def boom(state: object, match: Match[HttpScope], body: bytes) -> Response:
+        raise ValueError("unmapped")
+
+    router: Router[object] = Router(
+        routes=(route("/boom", get=boom),),
+        fallback=_fallback,
+        middleware=catching(_to_400),
+    )
+    with pytest.raises(ValueError, match="unmapped"):
+        await _run(router.dispatch(object(), _scope("GET", "/boom")))
+
+
 class Forbidden(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -180,7 +199,7 @@ async def test_recover_narrows_the_exception_type_and_reads_typed_fields() -> No
         match exc:
             case Forbidden():
                 return json_response(403, {"reason": exc.reason})
-            case _:
+            case _:  # pragma: no cover - decline path tested elsewhere
                 return None
 
     @buffered
@@ -264,6 +283,23 @@ async def test_a_mounted_router_keeps_its_own_middleware() -> None:
     outside, _ = await _run(app.dispatch(object(), _scope("GET", "/health")))
     assert (b"x-zone", b"admin") in inside.headers
     assert not any(name == b"x-zone" for name, _ in outside.headers)
+
+
+async def test_subtree_middleware_wraps_an_opaque_mount_within_it() -> None:
+    def opaque(state: object, head: HttpScope) -> HttpHandler:
+        def handler(inputs: Stream[Inbound]) -> Stream[Outbound]:
+            return stream(encode_response(json_response(200, {"who": "opaque"})))
+
+        return handler
+
+    section: Router[object] = Router(
+        routes=(Mount("/legacy", opaque),), fallback=_fallback, middleware=_mark(b"x-zone", b"admin")
+    )
+    app: Router[object] = Router(routes=(Mount("/admin", section),), fallback=_fallback)
+    start, body = await _run(app.dispatch(object(), _scope("GET", "/admin/legacy/ping")))
+    assert start.status == 200
+    assert json.loads(body) == {"who": "opaque"}
+    assert (b"x-zone", b"admin") in start.headers
 
 
 async def test_parent_and_mounted_middleware_both_apply() -> None:

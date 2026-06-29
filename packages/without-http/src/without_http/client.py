@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import ssl
 from collections.abc import AsyncGenerator
 from collections.abc import AsyncIterator
@@ -33,6 +34,8 @@ from without_http.h2_wire import response_status_and_headers
 
 _BUFFER = 65536
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+logger = logging.getLogger(__name__)
 
 
 async def _empty_body() -> AsyncIterator[bytes]:
@@ -361,7 +364,11 @@ class _Http11Connection:
                 continue
             if isinstance(event, h11.Response):
                 return event.status_code, tuple((bytes(name), bytes(value)) for name, value in event.headers)
-            raise ConnectionError("the server closed the connection before sending a response")
+            # Unreachable: while a response is pending, h11 yields NEED_DATA, an
+            # InformationalResponse, or a Response, and raises (rather than returning a
+            # ConnectionClosed event) if the peer closes first. The guard stays as a
+            # defensive backstop against an unexpected h11 event.
+            raise ConnectionError("the server closed the connection before sending a response")  # pragma: no cover
 
     async def iter_body(self) -> AsyncGenerator[bytes | ResponseTrailers]:
         while True:
@@ -376,7 +383,11 @@ class _Http11Connection:
                     yield ResponseTrailers(tuple((bytes(name), bytes(value)) for name, value in event.headers))
                 return
             else:
-                return
+                # Unreachable: the body phase yields only Data, EndOfMessage, or
+                # NEED_DATA; any other state (a truncated length-framed body) makes h11
+                # raise instead. The guard stays as a defensive backstop.
+                logger.warning(f"Truncating response body on an unexpected h11 event: {event!r}")  # pragma: no cover
+                return  # pragma: no cover
 
     def finish(self) -> bool:
         try:
@@ -500,7 +511,11 @@ class _Http2Connection:
                     raise ConnectionError("the HTTP/2 connection closed before the request body was sent")
                 try:
                     window = self._conn.local_flow_control_window(stream_id)
-                except h2.exceptions.StreamClosedError:
+                # Defensive: h2 returns a stale window for a reset stream rather than
+                # raising here, so `send_data` below is what actually rejects a write to
+                # a closed stream. This guard only fires for a fully purged stream.
+                except h2.exceptions.StreamClosedError as exc:  # pragma: no cover
+                    logger.warning(f"Aborting body send for closed HTTP/2 stream {stream_id}: {exc!r}")
                     return
                 sendable = min(len(remaining), window, self._conn.max_outbound_frame_size)
                 if sendable > 0 or len(remaining) == 0:

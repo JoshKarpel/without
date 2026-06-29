@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from collections.abc import AsyncIterator
 from dataclasses import replace
+from urllib.parse import urlsplit
 
 import pytest
 from without_asgi import RawScope
@@ -20,7 +21,9 @@ from without_http import follow_redirects
 from without_http import serving
 from without_http import wrap
 from without_http.client import _REDIRECT_STATUSES
+from without_http.client import _build_request
 from without_http.client import _Http11Connection
+from without_http.client import _origin
 
 
 async def _read_body(receive: Receive) -> bytes:
@@ -28,7 +31,7 @@ async def _read_body(receive: Receive) -> bytes:
     more = True
     while more:
         message = await receive()
-        if message["type"] == "http.disconnect":
+        if message["type"] == "http.disconnect":  # pragma: no cover - clients here never disconnect mid-body
             break
         chunk = message.get("body", b"")
         assert isinstance(chunk, bytes)
@@ -282,3 +285,73 @@ async def test_cookie_jar_drops_a_cookie_deleted_with_max_age_zero() -> None:
             assert head.status == 200
         async with pool.request("GET", f"{base}/echo") as (_head, body):
             assert await body.read() == b"cookie="
+
+
+def test_origin_rejects_a_url_without_a_host() -> None:
+    with pytest.raises(ValueError, match="must be absolute"):
+        _origin(urlsplit("/relative/path"))
+
+
+def test_build_request_keeps_an_explicit_content_length_for_a_buffered_body() -> None:
+    request = _build_request("POST", "http://h/x", ((b"content-length", b"7"),), b"payload")
+
+    assert request.headers == ((b"content-length", b"7"),)
+
+
+async def test_build_request_keeps_explicit_framing_for_a_streaming_body() -> None:
+    stream = _chunks(b"ab", b"cd")
+    request = _build_request("POST", "http://h/x", ((b"transfer-encoding", b"chunked"),), stream)
+
+    assert request.headers == ((b"transfer-encoding", b"chunked"),)
+    assert [chunk async for chunk in request.body] == [b"ab", b"cd"]
+
+
+async def _chunks_with_gaps(*parts: bytes) -> AsyncIterator[bytes]:
+    for part in parts:
+        yield part
+
+
+async def test_streams_an_h11_body_with_an_explicit_host_and_empty_chunks() -> None:
+    async with serving(echo_app) as server, ConnectionPool() as pool:
+        upload = _chunks_with_gaps(b"", b"ab", b"", b"cd")
+        url = f"http://{server.host}:{server.port}/up"
+        async with pool.request("POST", url, headers=((b"host", b"override.test"),), body=upload) as (_head, body):
+            assert await body.read() == b"POST /up test= body=abcd"
+
+
+async def test_reads_a_large_h11_response_body_across_multiple_socket_reads() -> None:
+    payload = b"x" * 200_000
+    async with serving(echo_app) as server, ConnectionPool() as pool:
+        url = f"http://{server.host}:{server.port}/big"
+        async with pool.request("POST", url, body=payload) as (_head, body):
+            assert await body.read() == b"POST /big test= body=" + payload
+
+
+async def no_location_redirect_app(scope: RawScope, receive: Receive, send: Send) -> None:
+    """Answer every request with a `302` that carries no `Location` header."""
+    if scope["type"] != "http":
+        raise RuntimeError("this app serves only http")
+    await _read_body(receive)
+    await send({"type": "http.response.start", "status": 302, "headers": [(b"content-length", b"0")]})
+    await send({"type": "http.response.body", "body": b""})
+
+
+async def test_follow_redirects_stops_when_a_redirect_lacks_a_location() -> None:
+    async with serving(no_location_redirect_app) as server, ConnectionPool(middleware=follow_redirects()) as pool:
+        async with pool.request("GET", f"http://{server.host}:{server.port}/start") as (head, _body):
+            assert head.status == 302
+
+
+async def test_returning_an_h11_connection_to_a_closed_pool_closes_it() -> None:
+    async with serving(sized_echo_app) as server, ConnectionPool() as pool:
+        url = f"http://{server.host}:{server.port}/items"
+        async with pool.request("GET", url) as (_head, body):
+            assert await body.read() == b"GET /items body="
+        (connection,) = _only_idle(pool)
+        pool._idle_h11.clear()
+        pool._closed = True
+
+        pool._return_h11(_origin(urlsplit(url)), connection)
+
+        assert pool._idle_h11 == {}
+        assert connection._writer.is_closing()

@@ -4,6 +4,7 @@ from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import assert_never
 
 from without_asgi.narrow import narrow_to_bytes
 from without_asgi.narrow import narrow_to_str
@@ -44,6 +45,8 @@ def encode_websocket_data(data: WebsocketData) -> dict[str, object]:
             return {"text": text}
         case WebsocketBinary(binary):
             return {"bytes": binary}
+        case _ as unreachable:
+            assert_never(unreachable)
 
 
 def decode_websocket_data(message: RawMessage) -> WebsocketData:

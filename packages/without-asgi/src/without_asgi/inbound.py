@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import assert_never
 
 from without_asgi.narrow import narrow_to_bytes
 from without_asgi.narrow import narrow_to_int
@@ -115,6 +116,8 @@ def encode_inbound(event: Inbound) -> RawMessage:
             return {"type": "http.request", "body": body, "more_body": more_body}
         case Disconnect():
             return {"type": "http.disconnect"}
+        case _ as unreachable:
+            assert_never(unreachable)
 
 
 def encode_websocket_inbound(event: WebsocketInbound) -> RawMessage:
@@ -126,6 +129,8 @@ def encode_websocket_inbound(event: WebsocketInbound) -> RawMessage:
             return {"type": "websocket.receive", **encode_websocket_data(data)}
         case WebsocketDisconnect(code, reason):
             return {"type": "websocket.disconnect", "code": code, "reason": reason}
+        case _ as unreachable:
+            assert_never(unreachable)
 
 
 def encode_lifespan_event(event: LifespanEvent) -> RawMessage:
@@ -135,3 +140,5 @@ def encode_lifespan_event(event: LifespanEvent) -> RawMessage:
             return {"type": "lifespan.startup"}
         case Shutdown():
             return {"type": "lifespan.shutdown"}
+        case _ as unreachable:
+            assert_never(unreachable)

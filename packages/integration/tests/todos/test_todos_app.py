@@ -5,12 +5,24 @@ import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+from integration.todos.app import _recover
+from integration.todos.app import session
 from integration.todos.app import todos_app
 from integration.todos.app import todos_openapi
 from integration.todos.core import Todo
 from integration.todos.core import TodoList
+from without import collect
+from without import stream
 from without_asgi import ASGIApp
 from without_asgi import RawMessage
+from without_asgi import WebsocketAccept
+from without_asgi import WebsocketBinary
+from without_asgi import WebsocketClose
+from without_asgi import WebsocketConnect
+from without_asgi import WebsocketReceive
+from without_asgi import WebsocketText
+from without_asgi.scope import parse_websocket_scope
+from without_web import Match
 
 
 def _todos() -> TodoList:
@@ -80,7 +92,7 @@ async def _request(
     for name, value in raw_headers:
         collected.setdefault(name.decode(), []).append(value)
     payload = b"".join(m["body"] for m in sent if m["type"] == "http.response.body" and isinstance(m["body"], bytes))
-    if not payload:
+    if not payload:  # pragma: no cover - every todos HTTP route returns a body, so the empty-body path is dead here
         return status, collected, None
     try:
         return status, collected, json.loads(payload)
@@ -181,6 +193,30 @@ async def test_import_echoes_each_todo_as_the_ndjson_stream_arrives() -> None:
         {"ok": True, "todo": {"id": 4, "title": "beta", "done": True}},
         {"ok": False, "errors": 1},
     ]
+
+
+async def test_import_skips_blank_lines_and_imports_a_final_unterminated_line() -> None:
+    app = todos_app(_todos())
+    async with _running(app):
+        # A blank line between records exercises the skip-empty branch; the final
+        # chunk has no trailing newline, so it is imported from the leftover buffer
+        # after the stream ends rather than inside the split loop.
+        status, bodies = await _stream_request(
+            app,
+            "POST",
+            "/todos/import",
+            [b'{"title": "alpha"}\n\n', b'{"title": "omega"}'],
+        )
+    assert status == 200
+    records = [json.loads(line) for line in b"".join(bodies).splitlines() if line]
+    assert records == [
+        {"ok": True, "todo": {"id": 3, "title": "alpha", "done": False}},
+        {"ok": True, "todo": {"id": 4, "title": "omega", "done": False}},
+    ]
+
+
+async def test_recover_lets_an_unmapped_exception_propagate() -> None:
+    assert await _recover(RuntimeError("not a todo error")) is None
 
 
 async def test_an_invalid_body_is_a_mapped_422() -> None:
@@ -343,6 +379,32 @@ async def test_the_session_answers_a_malformed_frame_without_closing() -> None:
     assert isinstance(reply, dict)
     assert reply["ok"] is False
     assert reply["errors"] >= 1
+
+
+async def test_session_closes_on_a_binary_frame_and_returns_when_the_stream_ends() -> None:
+    # Drive the endpoint's processor directly with a finite frame stream: a binary
+    # frame closes (text-only protocol) and the loop exits naturally when the stream
+    # runs dry without a disconnect, the connection-end path the live socket reaches
+    # only via a disconnect.
+    scope = parse_websocket_scope(
+        {"type": "websocket", "asgi": {"version": "3.0"}, "path": "/todos/session", "headers": []}
+    )
+    handler = session.endpoint(_todos(), Match(scope, {}))
+
+    outputs = await collect(
+        handler(
+            stream(
+                [
+                    WebsocketConnect(),
+                    WebsocketReceive(WebsocketText(text='{"title": "soon"}')),
+                    WebsocketReceive(WebsocketBinary(data=b"\x00\x01")),
+                ]
+            )
+        )
+    )
+
+    assert outputs[0] == WebsocketAccept()
+    assert outputs[-1] == WebsocketClose(code=1003, reason="text frames only")
 
 
 async def test_an_unrouted_websocket_path_is_closed_by_the_fallback() -> None:
