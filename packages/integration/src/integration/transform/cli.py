@@ -99,5 +99,5 @@ def main() -> None:
     asyncio.run(serve(config, stdin_lines(config.current().prompt), print))
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - module entrypoint, exercised by running the CLI, not by tests
     main()

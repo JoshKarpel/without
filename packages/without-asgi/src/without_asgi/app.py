@@ -4,6 +4,7 @@ from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
+from typing import assert_never
 
 from without import Processor
 from without import Stream
@@ -110,6 +111,8 @@ async def _drive[T](lifespan: Lifespan[T], cell: _Cell[T], receive: Receive, sen
                         await send(encode_lifespan_reply(ShutdownFailed(message=str(exc))))
                         return
                     await send(encode_lifespan_reply(ShutdownComplete()))
+                case _ as unreachable:
+                    assert_never(unreachable)
 
 
 # What the default routers refuse a connection with. An `http` scope gets `501
@@ -182,5 +185,7 @@ def make_asgi_app[T](
                 await http_outbound(send)(http(cell.require(), head)(http_inbound(receive)))
             case WebsocketScope() as head:
                 await websocket_outbound(send)(websocket(cell.require(), head)(websocket_inbound(receive)))
+            case _ as unreachable:
+                assert_never(unreachable)
 
     return app

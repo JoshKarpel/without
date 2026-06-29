@@ -5,6 +5,8 @@ import pytest
 from without_asgi import WebsocketAccept
 from without_asgi import WebsocketBinary
 from without_asgi import WebsocketClose
+from without_asgi import WebsocketResponseBody
+from without_asgi import WebsocketResponseStart
 from without_asgi import WebsocketSend
 from without_asgi import WebsocketText
 from without_http.ws_wire import is_websocket_upgrade
@@ -14,6 +16,7 @@ from wsproto.events import AcceptConnection
 from wsproto.events import BytesMessage
 from wsproto.events import CloseConnection
 from wsproto.events import RejectConnection
+from wsproto.events import RejectData
 from wsproto.events import TextMessage
 
 
@@ -75,3 +78,17 @@ def test_ws_events_from_outbound_rejects_a_connection_closed_before_accept() -> 
     events = ws_events_from_outbound(WebsocketClose(code=1000, reason=""), accepted=False)
 
     assert events == [RejectConnection(status_code=403)]
+
+
+def test_ws_events_from_outbound_renders_a_rejection_response_start() -> None:
+    events = ws_events_from_outbound(
+        WebsocketResponseStart(status=404, headers=((b"x-reason", b"nope"),)), accepted=False
+    )
+
+    assert events == [RejectConnection(status_code=404, headers=[(b"x-reason", b"nope")], has_body=True)]
+
+
+def test_ws_events_from_outbound_renders_a_rejection_response_body() -> None:
+    events = ws_events_from_outbound(WebsocketResponseBody(body=b"denied", more_body=False), accepted=False)
+
+    assert events == [RejectData(data=b"denied", body_finished=True)]

@@ -78,8 +78,10 @@ branch = true
 [tool.coverage.report]
 show_missing = true
 skip_covered = true
+fail_under = 100
 exclude_also = [
     "assert_never\\(",
+    "case _ as unreachable:",
     "if TYPE_CHECKING:",
     "raise NotImplementedError",
     "@(abc\\.)?abstractmethod",

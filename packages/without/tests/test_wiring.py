@@ -61,4 +61,4 @@ async def test_sample_tracks_the_latest_value() -> None:
 async def test_sample_rejects_an_empty_stream() -> None:
     with pytest.raises(ValueError, match="at least one value"):
         async with sample(stream([])):
-            pass
+            pass  # pragma: no cover - sample raises on enter, so the body never runs

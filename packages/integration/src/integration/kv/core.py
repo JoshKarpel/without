@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import assert_never
 
 from without import Processor
 from without import Transition
@@ -118,6 +119,8 @@ def encode_reply(reply: Reply) -> str:
             return "1" if existed else "0"
         case Error(message):
             return f"ERR {message}"
+        case _ as unreachable:
+            assert_never(unreachable)
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +163,8 @@ async def apply(request: Request, store: Store) -> Transition[Store, Reply]:
             return Transition(state=store.without_entry(key), output=Deleted(existed=key in store.entries))
         case Malformed(_, reason):
             return Transition(state=store, output=Error(reason))
+        case _ as unreachable:
+            assert_never(unreachable)
 
 
 def make_store(initial: Store = EMPTY_STORE) -> Processor[Request, Reply]:

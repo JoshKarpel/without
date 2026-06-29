@@ -45,7 +45,7 @@ class _WebSocket:
             data = await self.reader.read(65536)
             self.conn.receive_data(data)
             self.pending.extend(self.conn.events())
-            if data == b"":
+            if data == b"":  # pragma: no cover - defensive EOF guard; no test forces a vanished peer
                 break
         return self.pending.popleft()
 
@@ -98,15 +98,21 @@ async def test_a_missing_todo_maps_to_404() -> None:
         assert head.status == 404
 
 
+async def _admin_status(pool: ConnectionPool, url: str) -> int:
+    async with pool.request("GET", url) as (head, _body):
+        return head.status
+
+
 async def test_client_middleware_supplies_the_admin_authorization_header() -> None:
     async with serving(todos_app(_todos())) as server:
+        url = f"http://{server.host}:{server.port}/admin/stats"
         async with ConnectionPool() as pool:
-            async with pool.request("GET", f"http://{server.host}:{server.port}/admin/stats") as (head, _body):
-                assert head.status == 401
-
+            unauthorized = await _admin_status(pool, url)
         async with ConnectionPool(middleware=add_headers((b"authorization", b"Bearer let-me-in"))) as authorized:
-            async with authorized.request("GET", f"http://{server.host}:{server.port}/admin/stats") as (head, _body):
-                assert head.status == 200
+            authorized_status = await _admin_status(authorized, url)
+
+    assert unauthorized == 401
+    assert authorized_status == 200
 
 
 async def test_websocket_session_route_over_without_http() -> None:

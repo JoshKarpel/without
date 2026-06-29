@@ -112,3 +112,12 @@ def test_response_status_and_headers_split_the_status_from_the_rest() -> None:
 
     assert status == 404
     assert headers == ((b"content-type", b"text/plain"),)
+
+
+def test_response_status_and_headers_drops_other_pseudo_headers() -> None:
+    status, headers = response_status_and_headers(
+        [(b":status", b"204"), (b":unexpected", b"ignored"), (b"x-trace", b"abc")]
+    )
+
+    assert status == 204
+    assert headers == ((b"x-trace", b"abc"),)

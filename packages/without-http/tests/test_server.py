@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from contextlib import suppress
 
 import httpx
+import pytest
 from without_asgi import ASGIApp
 from without_asgi import HttpScope
 from without_asgi import RawMessage
@@ -14,6 +16,7 @@ from without_asgi import Send
 from without_asgi import make_asgi_app
 from without_asgi.routing import buffered
 from without_http import serving
+from without_http.server import _address
 from without_http.server import _LiveConnections
 
 
@@ -25,7 +28,7 @@ async def echo_app(scope: RawMessage, receive: Receive, send: Send) -> None:
     more = True
     while more:
         message = await receive()
-        if message["type"] == "http.disconnect":
+        if message["type"] == "http.disconnect":  # pragma: no cover - clients here never disconnect mid-body
             return
         chunk = message.get("body", b"")
         assert isinstance(chunk, bytes)
@@ -122,6 +125,63 @@ async def test_live_connections_counts_in_flight_connections() -> None:
             assert live.in_flight == 2
         assert live.in_flight == 1
     assert live.in_flight == 0
+
+
+@pytest.mark.parametrize(
+    ("info", "expected"),
+    [
+        (("198.51.100.7", 8000), ("198.51.100.7", 8000)),
+        ("a-unix-socket-path", None),
+        (("only-one-element",), None),
+        (("host", "not-an-int"), None),
+    ],
+)
+def test_address_parses_only_a_host_port_tuple(info: object, expected: tuple[str, int] | None) -> None:
+    assert _address(info) == expected
+
+
+async def test_serves_a_large_post_body_spanning_multiple_socket_reads() -> None:
+    payload = b"q" * 200_000
+    async with _client(echo_app) as client:
+        response = await client.post("/big", content=payload)
+
+    assert response.text == "POST /big " + payload.decode()
+
+
+async def receive_after_done_app(scope: RawMessage, receive: Receive, send: Send) -> None:
+    """Read the body to completion, then call `receive` once more to observe the disconnect."""
+    if scope["type"] != "http":
+        raise RuntimeError("this app serves only http")
+    more = True
+    while more:
+        message = await receive()
+        more = bool(message.get("more_body", False))
+    trailing = await receive()
+    trailing_type = trailing["type"]
+    assert isinstance(trailing_type, str)
+    body = trailing_type.encode()
+    await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
+    await send({"type": "http.response.body", "body": body})
+
+
+async def test_receiving_after_the_request_body_is_done_yields_a_disconnect() -> None:
+    async with _client(receive_after_done_app) as client:
+        response = await client.post("/x", content=b"payload")
+
+    assert response.text == "http.disconnect"
+
+
+async def test_a_malformed_request_gets_a_400() -> None:
+    async with serving(echo_app) as server:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        writer.write(b"!!! not a valid request line !!!\r\n\r\n")
+        await writer.drain()
+        status_line = await reader.readline()
+        writer.close()
+        with suppress(OSError):
+            await writer.wait_closed()
+
+    assert status_line.startswith(b"HTTP/1.1 400")
 
 
 async def test_reports_in_flight_connections_while_a_request_is_served() -> None:

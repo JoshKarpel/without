@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from dataclasses import replace
 from string.templatelib import Template
+from typing import assert_never
 
 from without import Stream
 from without import stream
@@ -231,6 +232,8 @@ def _behind[T](leaf: _HttpLeaf[T], middleware: HttpMiddleware[T]) -> _HttpLeaf[T
                 return middleware(target(state, scope), state, scope)
 
             return _Delegate(prefix, behind_target)
+        case _ as unreachable:
+            assert_never(unreachable)
 
 
 def _flatten[T](routes: tuple[Route[T] | Mount[T], ...]) -> list[tuple[tuple[Segment, ...], _HttpLeaf[T]]]:
@@ -328,6 +331,8 @@ class Router[T]:
                 return endpoint(state, Match(scope, found.params))
             case _Delegate(prefix, target):
                 return target(state, _remount(scope, prefix))
+            case _ as unreachable:
+                assert_never(unreachable)
 
 
 @dataclass(frozen=True, slots=True)

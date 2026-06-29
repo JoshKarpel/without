@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import assert_never
 from urllib.parse import unquote
 
 import h11
@@ -83,6 +84,8 @@ def ws_events_from_outbound(outbound: WebsocketOutbound, *, accepted: bool) -> l
             return [RejectConnection(status_code=status, headers=[(n, v) for n, v in headers], has_body=True)]
         case WebsocketResponseBody(body, more_body):
             return [RejectData(data=body, body_finished=not more_body)]
+        case _ as unreachable:
+            assert_never(unreachable)
 
 
 def _data_message(data: WebsocketText | WebsocketBinary) -> TextMessage | BytesMessage:
@@ -91,3 +94,5 @@ def _data_message(data: WebsocketText | WebsocketBinary) -> TextMessage | BytesM
             return TextMessage(data=text)
         case WebsocketBinary(binary):
             return BytesMessage(data=binary)
+        case _ as unreachable:
+            assert_never(unreachable)

@@ -16,6 +16,7 @@ from without_asgi import RequestBody
 from without_asgi import Response
 from without_asgi import ResponseBody
 from without_asgi import ResponseStart
+from without_asgi import WebsocketHandler
 from without_asgi import WebsocketInbound
 from without_asgi import WebsocketOutbound
 from without_asgi import WebsocketScope
@@ -30,6 +31,7 @@ from without_web import path_param
 from without_web import post
 from without_web import query_param
 from without_web import ws
+from without_web import ws_route
 
 
 def _scope(*, query: bytes = b"") -> HttpScope:
@@ -275,6 +277,28 @@ async def test_handle_awaits_an_async_handler_that_returns_a_response() -> None:
     endpoint = handle(body(json.loads, schema={"type": "object"}), fn=make)
     handler = endpoint("tenant", Match(_scope(), {}))
     assert await _run(handler, b'{"x": 1}') == (200, {"state": "tenant", "got": {"x": 1}})
+
+
+async def test_handle_runs_a_handler_that_only_reads_the_state() -> None:
+    handler = handle(fn=_ok)("tenant", Match(_scope(), {}))
+    assert await _run(handler) == (200, {})
+
+
+async def test_handle_stream_relays_a_handler_that_emits_nothing() -> None:
+    def make(state: str, inputs: Stream[Inbound]) -> Stream[Outbound]:
+        return _empty()
+
+    handler = handle_stream(fn=make)("tenant", Match(_scope(), {}))
+    events = [event async for event in handler(_chunks(b"ignored"))]
+    assert events == []
+
+
+def test_ws_route_wraps_a_pattern_and_endpoint() -> None:
+    def endpoint(state: object, match: Match[WebsocketScope]) -> WebsocketHandler:
+        raise NotImplementedError
+
+    built = ws_route(t"/feed/{path_param('room', INT)}", endpoint)
+    assert built.endpoint is endpoint
 
 
 def _empty() -> Stream[Outbound]:

@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol
+from typing import assert_never
 from typing import runtime_checkable
 
 from without_asgi.narrow import narrow_to_bytes
@@ -209,6 +210,8 @@ def encode_outbound(event: Outbound) -> RawMessage:
             }
         case ResponseDebug(info):
             return {"type": "http.response.debug", "info": info}
+        case _ as unreachable:
+            assert_never(unreachable)
 
 
 def encode_response(response: Response) -> tuple[Outbound, ...]:
@@ -240,6 +243,8 @@ def encode_websocket_outbound(event: WebsocketOutbound) -> RawMessage:
             }
         case WebsocketResponseBody(body, more_body):
             return {"type": "websocket.http.response.body", "body": body, "more_body": more_body}
+        case _ as unreachable:
+            assert_never(unreachable)
 
 
 def encode_lifespan_reply(reply: LifespanReply) -> RawMessage:
@@ -253,6 +258,8 @@ def encode_lifespan_reply(reply: LifespanReply) -> RawMessage:
             return {"type": "lifespan.startup.failed", "message": message}
         case ShutdownFailed(message):
             return {"type": "lifespan.shutdown.failed", "message": message}
+        case _ as unreachable:
+            assert_never(unreachable)
 
 
 def _as_pair(item: object) -> tuple[bytes, bytes]:

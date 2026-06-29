@@ -82,7 +82,9 @@ async def _send_simple(conn: h11.Connection, writer: asyncio.StreamWriter, statu
     with suppress(h11.ProtocolError, OSError):
         for event in (response, h11.Data(data=body), h11.EndOfMessage()):
             chunk = conn.send(event)
-            if chunk is not None:
+            if (
+                chunk is not None
+            ):  # pragma: no branch - h11.send returns None only for ConnectionClosed, never sent here
                 writer.write(chunk)
         await writer.drain()
 
@@ -125,11 +127,15 @@ async def _run_request(
             if event is h11.NEED_DATA:
                 conn.receive_data(await reader.read(_BUFFER))
                 continue
-            if not isinstance(event, h11.Event):
+            # Unreachable defensive guards: after NEED_DATA is handled, h11 yields only
+            # body-phase Events (Data, EndOfMessage, ConnectionClosed), each of which
+            # `inbound_from_event` maps to a non-None Inbound; it never returns PAUSED
+            # here (that needs a completed request, which sets `request_done` above first).
+            if not isinstance(event, h11.Event):  # pragma: no cover
                 request_done = True
                 return encode_inbound(Disconnect())
             inbound = inbound_from_event(event)
-            if inbound is None:
+            if inbound is None:  # pragma: no cover
                 request_done = True
                 return encode_inbound(Disconnect())
             if isinstance(inbound, Disconnect) or (isinstance(inbound, RequestBody) and not inbound.more_body):
@@ -142,7 +148,9 @@ async def _run_request(
             if method == "HEAD" and isinstance(event, h11.Data):
                 continue
             chunk = conn.send(event)
-            if chunk is not None:
+            if (
+                chunk is not None
+            ):  # pragma: no branch - h11.send returns None only for ConnectionClosed, never sent here
                 writer.write(chunk)
             if isinstance(event, h11.EndOfMessage):
                 response_done = True
@@ -221,6 +229,8 @@ async def _serve_websocket(
                     await writer.drain()
                     await inbound.put(encode_websocket_inbound(WebsocketDisconnect(code=code, reason=reason or "")))
                     return False
+                case _:  # pragma: no cover - post-handshake wsproto emits only the events handled above
+                    pass
         return True
 
     async def pump() -> None:
@@ -230,7 +240,10 @@ async def _serve_websocket(
                     data = await reader.read(_BUFFER)
                     if data == b"" or not await _feed(ws, data, drain_events):
                         break
-        except Exception:  # noqa: BLE001 - any read/parse failure becomes a WebSocket disconnect below
+        # wsproto folds malformed frames into a CloseConnection event rather than
+        # raising, so this fires only on a socket failure mid-write (a racy disconnect);
+        # either way the connection becomes a WebSocket disconnect below.
+        except Exception:  # noqa: BLE001  # pragma: no cover
             pass
         await inbound.put(encode_websocket_inbound(WebsocketDisconnect(code=1006, reason="")))
         finished.set()
@@ -335,7 +348,9 @@ async def _serve_h11_connection(
             return
         try:
             conn.start_next_cycle()
-        except h11.LocalProtocolError:
+        # Unreachable: keep_alive is only true when both roles reached DONE, which is
+        # exactly the state start_next_cycle requires; a non-reusable cycle returns above.
+        except h11.LocalProtocolError:  # pragma: no cover
             return
 
 
@@ -388,7 +403,9 @@ async def _serve_h2_connection(
             async with lock:
                 try:
                     window = conn.local_flow_control_window(stream_id)
-                except h2.exceptions.StreamClosedError:
+                # Defensive: h2 returns a stale window for a reset stream rather than
+                # raising here, so `send_data` below is what rejects a closed stream.
+                except h2.exceptions.StreamClosedError:  # pragma: no cover
                     return
                 sendable = min(len(remaining), window, conn.max_outbound_frame_size)
                 if sendable > 0 or len(remaining) == 0:
@@ -407,7 +424,7 @@ async def _serve_h2_connection(
                 await stream.window.wait()
                 continue
             await writer.drain()
-            if last:
+            if len(remaining) == 0:
                 return
 
     async def send_outbound(stream_id: int, stream: _H2Stream, message: RawMessage) -> None:
@@ -482,17 +499,20 @@ async def _serve_h2_connection(
                 tasks.add(task)
                 task.add_done_callback(tasks.discard)
             case h2.events.DataReceived(stream_id=stream_id, data=data, flow_controlled_length=length):
-                if (target := streams.get(stream_id)) is not None:
+                # `is not None` guards are defensive: h2 raises a protocol error rather
+                # than emitting a body/end/reset/window event for a stream it is not
+                # tracking, so the miss branch cannot be reached.
+                if (target := streams.get(stream_id)) is not None:  # pragma: no branch
                     target.inbound.put_nowait(RequestBody(body=bytes(data), more_body=True))
                 async with lock:
                     conn.acknowledge_received_data(length, stream_id)
                     writer.write(conn.data_to_send())
                 await writer.drain()
             case h2.events.StreamEnded(stream_id=stream_id):
-                if (target := streams.get(stream_id)) is not None:
+                if (target := streams.get(stream_id)) is not None:  # pragma: no branch
                     target.inbound.put_nowait(RequestBody(body=b"", more_body=False))
             case h2.events.StreamReset(stream_id=stream_id):
-                if (target := streams.get(stream_id)) is not None:
+                if (target := streams.get(stream_id)) is not None:  # pragma: no branch
                     target.inbound.put_nowait(Disconnect())
                     # Wake a sender blocked on the window so it observes the closed
                     # stream and unwinds, rather than lingering until connection close.
@@ -501,7 +521,7 @@ async def _serve_h2_connection(
                 if stream_id == 0:
                     for target in streams.values():
                         target.window.set()
-                elif (target := streams.get(stream_id)) is not None:
+                elif (target := streams.get(stream_id)) is not None:  # pragma: no branch
                     target.window.set()
             case h2.events.RemoteSettingsChanged():
                 # A changed initial window resizes every stream's window, so wake all

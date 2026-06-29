@@ -36,7 +36,7 @@ from without_asgi import parse_websocket_outbound
 
 class _FileDescriptor:
     def fileno(self) -> int:
-        return 7
+        return 7  # pragma: no cover - only its presence satisfies the SupportsFileno protocol; never called
 
 
 def test_encode_outbound_renders_a_response_start() -> None:
@@ -219,6 +219,33 @@ def test_parse_outbound_classifies_a_response_start() -> None:
 def test_parse_outbound_rejects_an_unknown_event() -> None:
     with pytest.raises(ValueError, match="unexpected http event"):
         parse_outbound({"type": "http.response.surprise"})
+
+
+@pytest.mark.parametrize(
+    ("message", "match"),
+    [
+        (
+            {"type": "http.response.start", "status": 200, "headers": [[b"lonely"]]},
+            "expected a \\(bytes, bytes\\) pair",
+        ),
+        ({"type": "http.response.start", "status": 200, "headers": 17}, "expected an iterable of bytes pairs"),
+        ({"type": "http.response.zerocopysend", "file": "not-a-file"}, "expected a file object with fileno"),
+        ({"type": "http.response.debug", "info": "not-a-mapping"}, "expected a debug info mapping"),
+    ],
+)
+def test_parse_outbound_rejects_a_malformed_field(message: RawMessage, match: str) -> None:
+    with pytest.raises(TypeError, match=match):
+        parse_outbound(message)
+
+
+def test_parse_websocket_outbound_rejects_an_unknown_event() -> None:
+    with pytest.raises(ValueError, match="unexpected websocket event"):
+        parse_websocket_outbound({"type": "websocket.surprise"})
+
+
+def test_parse_lifespan_reply_rejects_an_unknown_reply() -> None:
+    with pytest.raises(ValueError, match="unexpected lifespan reply"):
+        parse_lifespan_reply({"type": "lifespan.surprise"})
 
 
 @pytest.mark.parametrize(

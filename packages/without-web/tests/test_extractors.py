@@ -15,6 +15,7 @@ from without_web import QueryParam
 from without_web import Request
 from without_web import Single
 from without_web import body
+from without_web import catch_all
 from without_web import header_param
 from without_web import http_scope
 from without_web import into
@@ -49,6 +50,11 @@ def _request(
 def test_path_param_reads_the_already_parsed_value_at_its_type() -> None:
     request = _request(params={"id": 7, "slug": "ship"})
     assert path_param("id", INT).extract(request) == 7
+
+
+def test_catch_all_reads_the_rest_of_path_value_already_parsed_by_the_router() -> None:
+    request = _request(params={"rest": "a/b/c", "id": 7})
+    assert catch_all("rest").extract(request) == "a/b/c"
 
 
 def test_query_param_hands_the_parser_every_value_for_its_name() -> None:
@@ -149,6 +155,11 @@ class Span:
     def __post_init__(self) -> None:
         if self.low > self.high:
             raise ValueError("low must not exceed high")
+
+
+def test_into_builds_the_value_when_the_constructor_accepts() -> None:
+    extractor = into(Span, path_param("low", INT), path_param("high", INT))
+    assert extractor.extract(_request(params={"low": 2, "high": 9})) == Span(low=2, high=9)
 
 
 def test_into_propagates_a_constructor_validation_error() -> None:

@@ -53,7 +53,7 @@ def _recording_router(seen: list[str]) -> HttpRouter[str]:
         async def silent(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
             nothing: tuple[Outbound, ...] = ()  # reads no events, emits none: the test only checks threaded state
             for event in nothing:
-                yield event
+                yield event  # pragma: no cover
 
         return silent
 
@@ -83,7 +83,7 @@ async def test_drives_the_handshake_and_enters_then_exits_the_lifespan() -> None
     trace = Trace()
 
     def router(state: str, scope: HttpScope) -> Processor[Inbound, Outbound]:
-        raise AssertionError("no request in this test")
+        raise AssertionError("no request in this test")  # pragma: no cover
 
     wrapped = make_asgi_app(_lifespan(trace, "ready"), router)
     inbox, outbox, task = _start_lifespan(wrapped)
@@ -109,10 +109,10 @@ async def test_requests_are_handed_the_lifespan_state() -> None:
     await outbox.get()
 
     async def receive() -> RawMessage:
-        raise AssertionError("this handler reads no events")
+        raise AssertionError("this handler reads no events")  # pragma: no cover
 
     async def send(message: RawMessage) -> None:
-        raise AssertionError("this handler sends nothing")
+        raise AssertionError("this handler sends nothing")  # pragma: no cover
 
     await wrapped(
         {
@@ -140,10 +140,10 @@ async def test_a_request_before_startup_fails_loud() -> None:
     wrapped = make_asgi_app(_lifespan(Trace(), "unused"), router)
 
     async def receive() -> RawMessage:
-        raise AssertionError("unreached")
+        raise AssertionError("unreached")  # pragma: no cover
 
     async def send(message: RawMessage) -> None:
-        raise AssertionError("unreached")
+        raise AssertionError("unreached")  # pragma: no cover
 
     with pytest.raises(RuntimeError, match="startup has not completed"):
         await wrapped(
@@ -171,7 +171,7 @@ async def test_an_unserved_http_scope_is_refused_with_501() -> None:
     sent: list[RawMessage] = []
 
     async def receive() -> RawMessage:
-        raise AssertionError("the refusal sends without reading the request")
+        raise AssertionError("the refusal sends without reading the request")  # pragma: no cover
 
     async def send(message: RawMessage) -> None:
         sent.append(message)
@@ -213,7 +213,7 @@ async def test_an_unserved_websocket_scope_is_refused_with_a_close() -> None:
     sent: list[RawMessage] = []
 
     async def receive() -> RawMessage:
-        raise AssertionError("the refusal closes without reading events")
+        raise AssertionError("the refusal closes without reading events")  # pragma: no cover
 
     async def send(message: RawMessage) -> None:
         sent.append(message)
@@ -231,7 +231,7 @@ async def test_setup_failure_is_reported_as_startup_failed() -> None:
     trace = Trace()
 
     def router(state: str, scope: HttpScope) -> Processor[Inbound, Outbound]:
-        raise AssertionError("startup failed, so no request should run")
+        raise AssertionError("startup failed, so no request should run")  # pragma: no cover
 
     wrapped = make_asgi_app(_lifespan(trace, "never", fail_enter=True), router)
     inbox, outbox, task = _start_lifespan(wrapped)
@@ -247,7 +247,7 @@ async def test_teardown_failure_is_reported_as_shutdown_failed() -> None:
     trace = Trace()
 
     def router(state: str, scope: HttpScope) -> Processor[Inbound, Outbound]:
-        raise AssertionError("no request in this test")
+        raise AssertionError("no request in this test")  # pragma: no cover
 
     wrapped = make_asgi_app(_lifespan(trace, "ready", fail_exit=True), router)
     inbox, outbox, task = _start_lifespan(wrapped)

@@ -154,7 +154,9 @@ async def test_limit_concurrency_pulls_the_source_lazily_only_below_the_limit() 
             yield wait_blocked()
 
     async def consume() -> None:
-        async for _ in limit_concurrency(source(), limit=4):
+        # The in-flight items block forever, so the loop never yields a value and
+        # never exits normally; consume is cancelled instead.
+        async for _ in limit_concurrency(source(), limit=4):  # pragma: no cover
             pass
 
     task = asyncio.create_task(consume())
@@ -181,7 +183,9 @@ async def test_limit_concurrency_cancels_in_flight_awaitables_on_early_exit() ->
             raise
 
     async def consume() -> None:
-        async for _ in limit_concurrency((work() for _ in range(7)), limit=3):
+        # The in-flight work blocks forever, so the loop never yields a value and
+        # never exits normally; consume is cancelled instead.
+        async for _ in limit_concurrency((work() for _ in range(7)), limit=3):  # pragma: no cover
             pass
 
     task = asyncio.create_task(consume())
@@ -207,4 +211,4 @@ async def test_limit_concurrency_rejects_a_non_positive_limit(limit: int) -> Non
     empty: list[Awaitable[int]] = []
     with pytest.raises(ValueError, match="limit must be at least 1"):
         async for _ in limit_concurrency(empty, limit=limit):
-            pass
+            pass  # pragma: no cover - limit_concurrency raises before the first iteration

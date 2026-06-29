@@ -63,10 +63,10 @@ async def h2c_roundtrip(host: str, port: int, method: str, path: str, body: byte
     done = False
     while not done:
         data = await reader.read(65536)
-        if not data:
+        if not data:  # pragma: no cover - the server always ends the stream before EOF here
             break
         for event in conn.receive_data(data):
-            match event:
+            match event:  # pragma: no branch - the helper drives a single known stream
                 case h2.events.ResponseReceived(stream_id=sid, headers=headers) if sid == stream_id:
                     status = int(next(value for name, value in headers if name == b":status").decode())
                 case h2.events.DataReceived(stream_id=sid, data=chunk, flow_controlled_length=length) if (

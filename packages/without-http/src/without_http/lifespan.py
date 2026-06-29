@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from contextlib import suppress
+from typing import assert_never
 
 from without import cancel_futures
 from without_asgi import Asgi
@@ -61,6 +62,8 @@ async def run_lifespan(app: ASGIApp) -> AsyncIterator[None]:
             case ShutdownFailed(message=reason):
                 failure.append(reason)
                 finished.set()
+            case _ as unreachable:
+                assert_never(unreachable)
 
     async def drive() -> None:
         await app(encode_scope(_LIFESPAN), receive, send)

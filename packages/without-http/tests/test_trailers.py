@@ -74,7 +74,9 @@ async def _raw_http11_server(response: bytes) -> AsyncIterator[tuple[str, int]]:
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            while await reader.readuntil(b"\r\n\r\n"):
+            while await reader.readuntil(
+                b"\r\n\r\n"
+            ):  # pragma: no branch - readuntil raises on EOF, never returns falsy
                 writer.write(response)
                 await writer.drain()
         except asyncio.IncompleteReadError, ConnectionResetError, OSError:
@@ -136,7 +138,7 @@ async def _raw_h2_server(
                         conn.send_headers(event.stream_id, trailers, end_stream=True)
                 writer.write(conn.data_to_send())
                 await writer.drain()
-        except ConnectionResetError, OSError:
+        except ConnectionResetError, OSError:  # pragma: no cover - the client closes cleanly, reaching EOF not a reset
             pass
         finally:
             writer.close()
