@@ -14,8 +14,10 @@ runs:
       with:
         python-version: ${{ inputs.python-version }}
         enable-cache: true
+
     - name: Install Just
       uses: extractions/setup-just@v4.0.0
+
     - name: Sync dependencies
       shell: bash
       run: uv sync --locked
