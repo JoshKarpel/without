@@ -16,7 +16,8 @@ from typing import runtime_checkable
 
 @dataclass(frozen=True, slots=True)
 class Transition[S, Out]:
-    """The result of folding one event into a scan's state.
+    """
+    The result of folding one event into a scan's state.
 
     A value, never a place: a step returns the next `state` and the single
     `output` it emits, and mutates nothing the caller can observe. Splitting
@@ -30,7 +31,8 @@ class Transition[S, Out]:
 
 @runtime_checkable
 class Stream[T](Protocol):
-    """An asynchronous sequence of values.
+    """
+    An asynchronous sequence of values.
 
     A stream is the single shape every connection has. Sources that touch the
     outside world (a socket, a file watcher, a clock) are streams too: a stream
@@ -41,7 +43,8 @@ class Stream[T](Protocol):
 
 
 class Processor[In, Out](Protocol):
-    """A transformation from a stream of inputs to a stream of outputs.
+    """
+    A transformation from a stream of inputs to a stream of outputs.
 
     This is the only thing a user writes, and the only node type: a processor's
     output stream becomes another processor's input stream, all the way down.
@@ -62,7 +65,8 @@ class Processor[In, Out](Protocol):
 
 @runtime_checkable
 class Context[T](Protocol):
-    """A stream viewed as its latest value: the "behavior" half of the model.
+    """
+    A stream viewed as its latest value: the "behavior" half of the model.
 
     Where consuming a stream sees *every* event, `current` samples the *latest*
     and never blocks. This is how long-lived state (config, a connection pool) is
@@ -78,7 +82,8 @@ def from_scan[In, S, Out](
     initial: S,
     step: Callable[[In, S], Awaitable[Transition[S, Out]]],
 ) -> Processor[In, Out]:
-    """Build a processor from a stateful step that emits an output every event.
+    """
+    Build a processor from a stateful step that emits an output every event.
 
     `step` is the kernel: given an event and the current state it returns the
     next state and the output it emits. It is `async` so it MAY `await` contained I/O
@@ -111,7 +116,8 @@ async def _scan[In, S, Out](
 def from_map[In, Out](
     step: Callable[[In], Awaitable[Out]],
 ) -> Processor[In, Out]:
-    """Build a processor from a stateless step: each event maps to one output.
+    """
+    Build a processor from a stateless step: each event maps to one output.
 
     The counterpart to `from_scan` for a processor that holds no state.
     Each event is handled independently of every other, so there is no
@@ -142,7 +148,8 @@ type Fold[In, S] = Callable[[Stream[In]], Awaitable[S]]
 
 
 def from_sink[In](step: Callable[[In], Awaitable[None]]) -> Sink[In]:
-    """Build a leaf that consumes a stream for its effects and emits nothing.
+    """
+    Build a leaf that consumes a stream for its effects and emits nothing.
 
     The stateless terminus, dual to `from_map`: where a map turns each event
     into an output, a sink turns each event into an effect and yields no output
@@ -159,7 +166,8 @@ def from_sink[In](step: Callable[[In], Awaitable[None]]) -> Sink[In]:
 
 
 def from_fold[In, S](initial: S, step: Callable[[In, S], Awaitable[S]]) -> Fold[In, S]:
-    """Build a leaf that folds a stream of events into a single final state.
+    """
+    Build a leaf that folds a stream of events into a single final state.
 
     The stateful terminus, dual to `from_scan`: where `from_scan` threads
     state and emits an output every step (a scan), `from_fold` threads state

@@ -10,7 +10,8 @@ TEXT_HEADERS: RawHeaders = ((b"content-type", b"text/plain; charset=utf-8"),)
 
 
 def json_response(status: int, payload: object) -> Response:
-    """A JSON response with a deterministic (sorted-key) body.
+    """
+    A JSON response with a deterministic (sorted-key) body.
 
     Encoding (the serializer, its options, the content type) is an application
     choice, so it lives here in the app layer rather than in `without-web`: the

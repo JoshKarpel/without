@@ -6,7 +6,8 @@ from without_asgi import Response
 
 
 def json_response(status: int, payload: object) -> Response:
-    """Build a JSON `Response` for tests.
+    """
+    Build a JSON `Response` for tests.
 
     `without-web` no longer ships an encoding helper (encoding is the app's
     choice); the tests carry their own to exercise the router with concrete

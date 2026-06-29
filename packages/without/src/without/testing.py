@@ -8,7 +8,8 @@ import asyncio
 
 
 async def tick() -> None:
-    """Let the event loop run ready tasks one step, e.g. to nudge a `sample` drain.
+    """
+    Let the event loop run ready tasks one step, e.g. to nudge a `sample` drain.
 
     TODO: this advances the loop only a single step, so it relies on the source
     under test draining in one activation. Replace callers with an explicit

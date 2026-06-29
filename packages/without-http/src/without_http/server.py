@@ -154,7 +154,7 @@ async def _run_request(
     crashed = False
     try:
         await app(encode_http_scope(scope), receive, send)
-    except Exception:
+    except Exception:  # noqa: BLE001 - isolate a crashing app from the connection loop; turned into a 500 below
         crashed = True
     if not response_done and conn.our_state is h11.SEND_RESPONSE:
         await _send_simple(conn, writer, 500, b"internal server error\n")
@@ -174,7 +174,8 @@ async def _serve_websocket(
     client: tuple[str, int] | None,
     request: h11.Request,
 ) -> None:
-    """Drive one WebSocket connection over the HTTP/1.1 upgrade, via wsproto.
+    """
+    Drive one WebSocket connection over the HTTP/1.1 upgrade, via wsproto.
 
     WebSockets are full-duplex, so a reader pump feeds inbound frames into a queue
     the app's `receive` drains, while `send` writes the app's frames out. The h11
@@ -229,7 +230,7 @@ async def _serve_websocket(
                     data = await reader.read(_BUFFER)
                     if data == b"" or not await _feed(ws, data, drain_events):
                         break
-        except Exception:
+        except Exception:  # noqa: BLE001 - any read/parse failure becomes a WebSocket disconnect below
             pass
         await inbound.put(encode_websocket_inbound(WebsocketDisconnect(code=1006, reason="")))
         finished.set()
@@ -266,7 +267,8 @@ async def _serve_connection(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
 ) -> None:
-    """Pick the wire protocol for one connection, serve it, then close the socket.
+    """
+    Pick the wire protocol for one connection, serve it, then close the socket.
 
     HTTP/2 is selected two ways: by ALPN (`h2`) when serving over TLS, and by
     *prior knowledge* over cleartext, recognizing the h2 connection preface in the
@@ -358,7 +360,8 @@ async def _serve_h2_connection(
     server: tuple[str, int] | None,
     client: tuple[str, int] | None,
 ) -> None:
-    """Serve concurrent multiplexed HTTP/2 requests on one connection.
+    """
+    Serve concurrent multiplexed HTTP/2 requests on one connection.
 
     Each request stream drives its own ASGI app invocation (the per-request
     processor model), so many run at once over the single connection. The read loop
@@ -462,7 +465,7 @@ async def _serve_h2_connection(
                 await app(encode_http_scope(scope), receive, send)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception:  # noqa: BLE001 - isolate one stream's app failure; finalized as incomplete below
                 pass
             if not stream.response_done:
                 await finalize_incomplete(stream_id, stream)
@@ -542,7 +545,8 @@ async def _serve_h2_connection(
 
 @dataclass(slots=True)
 class _LiveConnections:
-    """A live count of connections currently being served, for observability.
+    """
+    A live count of connections currently being served, for observability.
 
     `tracked` brackets one connection's lifetime, moving the count up while it runs
     and back down when it ends; `in_flight` is always readable, so the server can
@@ -562,7 +566,8 @@ class _LiveConnections:
 
 @dataclass(frozen=True, slots=True)
 class Server:
-    """A handle to a running server, yielded by `serving` for the block's duration.
+    """
+    A handle to a running server, yielded by `serving` for the block's duration.
 
     `host`/`port` are the bound address (`port` is the OS-assigned one when `port=0`
     was requested). `in_flight` reports how many connections are being served right
@@ -590,7 +595,8 @@ async def serving(
     ssl_handshake_timeout: float | None = None,
     ssl_shutdown_timeout: float | None = None,
 ) -> AsyncIterator[Server]:
-    """Serve `app` over HTTP for the duration of the `with` block.
+    """
+    Serve `app` over HTTP for the duration of the `with` block.
 
     Drives the lifespan cycle, binds a socket (`port=0` picks a free one) with
     `asyncio.start_server`, and yields a `Server` (its bound `host`/`port`, plus live

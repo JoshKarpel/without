@@ -53,22 +53,26 @@ from integration.transform.router import ws_route
 
 
 class HttpConfig(BaseModel):
-    """The HTTP shell's own config: the request-body size limit it enforces.
+    """
+    The HTTP shell's own config: the request-body size limit it enforces.
 
     A transport concern, not a domain one, so it lives with the shell and never
     reaches the core (`transform.core` works in decoded text and names no byte
-    count). The other shell, the CLI, has no equivalent."""
+    count). The other shell, the CLI, has no equivalent.
+    """
 
     max_bytes: int = 1024
 
 
 class Settings(BaseModel):
-    """The whole ASGI app's config, validated from the ConfigMap YAML at the boundary.
+    """
+    The whole ASGI app's config, validated from the ConfigMap YAML at the boundary.
 
     Two sub-configs rather than one flat bag: `transform` is the domain config the
     core consumes, `http` is this shell's transport config. Splitting them keeps
     the core's `TransformConfig` free of shell concerns, so a handler hands the
-    core `settings.transform` and reads its own limit from `settings.http`."""
+    core `settings.transform` and reads its own limit from `settings.http`.
+    """
 
     transform: TransformConfig = TransformConfig()
     http: HttpConfig = HttpConfig()
@@ -210,7 +214,8 @@ def access_timing(handler: HttpHandler, _state: object, head: HttpScope) -> Http
 
 
 def request_digest(handler: HttpHandler, _state: object, head: HttpScope) -> HttpHandler:
-    """Middleware reporting a SHA-256 of the request body back on the response.
+    """
+    Middleware reporting a SHA-256 of the request body back on the response.
 
     The genuine both-sides case: data observed on the inbound stream (each body
     chunk, fed into a hasher) is carried into the outbound stream (the finished

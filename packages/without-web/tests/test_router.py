@@ -130,7 +130,8 @@ async def test_an_unknown_path_falls_back() -> None:
 async def test_a_string_pattern_is_a_literal_only_convenience() -> None:
     router: Router[object] = Router(routes=(route("/todos", get=_ok),), fallback=_fallback)
     start, body = await _run(router.dispatch(object(), _scope("GET", "/todos")))
-    assert start.status == 200 and json.loads(body) == {"who": "ok"}
+    assert start.status == 200
+    assert json.loads(body) == {"who": "ok"}
 
 
 async def test_a_mounted_router_is_grafted_at_the_prefix() -> None:

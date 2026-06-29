@@ -13,19 +13,23 @@ class Mode(Enum):
 
 
 class TransformConfig(BaseModel):
-    """The domain config: the one knob the core needs, the default `Mode`.
+    """
+    The domain config: the one knob the core needs, the default `Mode`.
 
     Deliberately free of any shell concern (no byte limit, no wire format): the
     core works in decoded text under this config and nothing else, so the same
     value serves whichever shell drives it (the ASGI app, the CLI). A shell wraps
-    this in its own larger config (see `transform.app`'s `Settings`)."""
+    this in its own larger config (see `transform.app`'s `Settings`).
+    """
 
     default_mode: Mode = Mode.UPPER
 
 
 class TransformError(Exception):
-    """A domain error from the core, for the shell to render. The core works in
-    decoded text and never names a status code, wire format, or byte count."""
+    """
+    A domain error from the core, for the shell to render. The core works in
+    decoded text and never names a status code, wire format, or byte count.
+    """
 
 
 class UnknownMode(TransformError):
@@ -47,7 +51,8 @@ def apply_mode(mode: Mode, text: str) -> str:
 
 
 def resolve_mode(config: TransformConfig, requested: str | None) -> Mode:
-    """The requested mode, or the configured default when none was requested.
+    """
+    The requested mode, or the configured default when none was requested.
 
     Raises `UnknownMode` when `requested` names no known mode.
     """
@@ -60,7 +65,8 @@ def resolve_mode(config: TransformConfig, requested: str | None) -> Mode:
 
 
 def transform(config: TransformConfig, requested_mode: str | None, text: str) -> str:
-    """Transform `text`, applying `config`.
+    """
+    Transform `text`, applying `config`.
 
     The `requested_mode` argument overrides `config.default_mode`; raises
     `UnknownMode` when it names no known mode.

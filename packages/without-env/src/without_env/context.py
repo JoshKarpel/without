@@ -7,7 +7,8 @@ from pydantic_settings import BaseSettings
 
 @dataclass(frozen=True, slots=True)
 class EnvContext[SettingsT: BaseSettings]:
-    """A static `without.Context` whose value is parsed from the environment.
+    """
+    A static `without.Context` whose value is parsed from the environment.
 
     The environment is read once, at the boundary, into a validated settings
     value (parse, don't validate). The value is then immutable: `current` always

@@ -11,7 +11,8 @@ from contextlib import suppress
 
 
 async def sleep_forever() -> None:
-    """Suspend the current task until it is cancelled.
+    """
+    Suspend the current task until it is cancelled.
 
     The idiom for a coroutine whose job is to stay alive until its surrounding
     scope tears it down: a server's run loop holding a bound socket open, a
@@ -22,7 +23,8 @@ async def sleep_forever() -> None:
 
 
 async def cancel_futures[T](futures: Iterable[asyncio.Future[T] | None]) -> None:
-    """Cancel every future, then await them all so their teardown completes.
+    """
+    Cancel every future, then await them all so their teardown completes.
 
     Two phases on purpose: cancelling the whole set *before* awaiting any of them
     lets them tear down concurrently, instead of serially cancelling and waiting
@@ -42,7 +44,8 @@ async def cancel_futures[T](futures: Iterable[asyncio.Future[T] | None]) -> None
 
 @asynccontextmanager
 async def background_task[T](coro: Coroutine[object, object, T]) -> AsyncIterator[asyncio.Task[T]]:
-    """Run `coro` as a task for the duration of the `with` block.
+    """
+    Run `coro` as a task for the duration of the `with` block.
 
     The task is started on entry and cancelled (then awaited) on exit, so it is
     bounded by the block and never leaks. If it finishes on its own with an
@@ -56,7 +59,8 @@ async def background_task[T](coro: Coroutine[object, object, T]) -> AsyncIterato
 
 
 async def as_async_iterator[T](items: AsyncIterable[T] | Iterable[T]) -> AsyncIterator[T]:
-    """Normalize a sync or async iterable into a single async iterator.
+    """
+    Normalize a sync or async iterable into a single async iterator.
 
     Lets code that consumes via `async for`/`anext` accept either kind without
     branching on the iteration protocol at every use.
@@ -73,7 +77,8 @@ async def limit_concurrency[T](
     aws: AsyncIterable[Awaitable[T]] | Iterable[Awaitable[T]],
     limit: int,
 ) -> AsyncIterator[asyncio.Future[T]]:
-    """Run awaitables from `aws` with at most `limit` in flight, yielding each as it finishes.
+    """
+    Run awaitables from `aws` with at most `limit` in flight, yielding each as it finishes.
 
     A bounded-concurrency driver: it pulls the next awaitable from `aws` only
     while fewer than `limit` are already running. So a *lazy* source (an async
