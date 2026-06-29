@@ -8,7 +8,7 @@ from without import from_scan
 from without import sample
 from without import stream
 from without import stream_from_queue
-from without.testing import tick
+from without.testing import yield_once
 
 
 async def test_compose_runs_first_then_second() -> None:
@@ -52,10 +52,36 @@ async def test_sample_starts_at_the_first_value() -> None:
         assert latest.current() == 11
 
 
-async def test_sample_tracks_the_latest_value() -> None:
+async def test_sample_updated_returns_the_next_published_value() -> None:
     async with sample(stream([11, 22, 33])) as latest:
-        await tick()
+        assert await latest.updated() == 22
+
+
+async def test_sample_tracks_the_latest_value() -> None:
+    # The synchronous source drains in one go, so one update lands current on the last value.
+    async with sample(stream([11, 22, 33])) as latest:
+        await latest.updated()
         assert latest.current() == 33
+
+
+async def test_sample_publish_skips_a_waiter_cancelled_before_it_resolves() -> None:
+    # Cancelling a task awaiting `updated` cancels its future in place; the next
+    # publish must skip that dead waiter rather than crash on it, and still
+    # resolve a live one.
+    queue: asyncio.Queue[int] = asyncio.Queue()
+    queue.put_nowait(1)
+    async with sample(stream_from_queue(queue)) as latest:
+        doomed = asyncio.create_task(latest.updated())
+        live = asyncio.create_task(latest.updated())
+        await yield_once()  # one turn so both updated() calls register their waiters
+        doomed.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await doomed
+
+        queue.put_nowait(2)
+
+        assert await live == 2
+        assert latest.current() == 2
 
 
 async def test_sample_rejects_an_empty_stream() -> None:

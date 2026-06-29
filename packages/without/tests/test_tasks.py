@@ -9,6 +9,7 @@ from without import background_task
 from without import cancel_futures
 from without import limit_concurrency
 from without import sleep_forever
+from without.testing import yield_once
 
 
 async def test_background_task_runs_during_the_block_then_cancels_on_exit() -> None:
@@ -16,7 +17,7 @@ async def test_background_task_runs_during_the_block_then_cancels_on_exit() -> N
 
     async def worker() -> None:
         started.set()
-        await asyncio.sleep(3600)
+        await sleep_forever()
 
     async with background_task(worker()) as task:
         await started.wait()
@@ -26,17 +27,20 @@ async def test_background_task_runs_during_the_block_then_cancels_on_exit() -> N
 
 
 async def test_background_task_surfaces_a_worker_exception_on_exit() -> None:
+    failing = asyncio.Event()
+
     async def worker() -> None:
+        failing.set()
         raise ValueError("worker failed")
 
     with pytest.raises(ValueError, match="worker failed"):
         async with background_task(worker()):
-            await asyncio.sleep(0)
+            await failing.wait()  # the worker has run to its failure; exit must surface it
 
 
 async def test_sleep_forever_blocks_until_cancelled() -> None:
     task = asyncio.create_task(sleep_forever())
-    await asyncio.sleep(0)
+    await yield_once()  # one turn so the task reaches its await; sleep_forever can never finish there
 
     assert not task.done()
 
@@ -47,16 +51,19 @@ async def test_sleep_forever_blocks_until_cancelled() -> None:
 
 async def test_cancel_futures_cancels_then_awaits_every_future() -> None:
     torn_down = 0
+    parked = asyncio.Semaphore(0)
 
     async def worker() -> None:
         nonlocal torn_down
         try:
+            parked.release()
             await sleep_forever()
         finally:
             torn_down += 1
 
     tasks = [asyncio.create_task(worker()) for _ in range(4)]
-    await asyncio.sleep(0)
+    for _ in tasks:
+        await parked.acquire()  # every worker is inside its try, parked on sleep_forever
 
     await cancel_futures(tasks)
 
@@ -66,16 +73,18 @@ async def test_cancel_futures_cancels_then_awaits_every_future() -> None:
 
 async def test_cancel_futures_skips_none_entries() -> None:
     torn_down = 0
+    parked = asyncio.Event()
 
     async def worker() -> None:
         nonlocal torn_down
         try:
+            parked.set()
             await sleep_forever()
         finally:
             torn_down += 1
 
     task = asyncio.create_task(worker())
-    await asyncio.sleep(0)
+    await parked.wait()  # the worker is inside its try, parked on sleep_forever
 
     await cancel_futures([None, task, None])
 
@@ -84,14 +93,17 @@ async def test_cancel_futures_skips_none_entries() -> None:
 
 
 async def test_cancel_futures_propagates_a_non_cancellation_teardown_error() -> None:
+    parked = asyncio.Event()
+
     async def worker() -> None:
         try:
+            parked.set()
             await sleep_forever()
         except asyncio.CancelledError:
             raise ValueError("teardown failed") from None
 
     task = asyncio.create_task(worker())
-    await asyncio.sleep(0)
+    await parked.wait()  # the worker is parked on sleep_forever, so cancellation hits there
 
     with pytest.raises(ValueError, match="teardown failed"):
         await cancel_futures([task])
@@ -115,8 +127,9 @@ async def test_as_async_iterator_passes_through_an_async_iterable() -> None:
 
 async def test_limit_concurrency_runs_every_awaitable_and_yields_its_result() -> None:
     async def work(value: int) -> int:
-        await asyncio.sleep(0)
-        return value * 10
+        fetched: asyncio.Future[int] = asyncio.get_running_loop().create_future()
+        fetched.set_result(value)
+        return (await fetched) * 10
 
     results = [future.result() async for future in limit_concurrency((work(n) for n in range(1, 6)), limit=2)]
 

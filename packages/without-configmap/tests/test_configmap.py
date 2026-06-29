@@ -4,7 +4,6 @@ from pathlib import Path
 from pydantic import BaseModel
 from without import collect
 from without import sample
-from without.testing import tick
 from without_configmap import read_yaml_file
 from without_configmap import watch_config
 
@@ -60,5 +59,4 @@ async def test_sampled_config_context_tracks_a_reload(tmp_path: Path) -> None:
 
     async with sample(source) as config:
         assert config.current().host == "before"
-        await tick()
-        assert config.current().host == "after"
+        assert (await config.updated()).host == "after"

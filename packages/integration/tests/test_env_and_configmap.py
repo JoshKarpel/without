@@ -12,7 +12,6 @@ from without import Transition
 from without import collect
 from without import from_scan
 from without import sample
-from without.testing import tick
 from without_configmap import read_yaml_file
 from without_configmap import watch_config
 from without_env import EnvContext
@@ -54,8 +53,7 @@ async def test_static_and_reloading_contexts_coexist(
         assert limits.current().max_connections == 32
         assert routing.current().upstream == "db.before"
 
-        await tick()
-        assert routing.current().upstream == "db.after"
+        assert (await routing.updated()).upstream == "db.after"
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,13 +98,14 @@ async def test_processor_reads_both_contexts_and_tracks_a_reload_mid_stream(
 
     routing_source = watch_config(tmp_path, read_yaml_file(Routing, "routing.yaml"), changes=reloads)
 
-    async def requests() -> AsyncIterator[Request]:
-        yield Request(id=10)
-        yield Request(id=11)
-        await tick()
-        yield Request(id=12)
-
     async with sample(routing_source) as routing:
+
+        async def requests() -> AsyncIterator[Request]:
+            yield Request(id=10)
+            yield Request(id=11)
+            await routing.updated()  # request 12 is held back until the reload has landed
+            yield Request(id=12)
+
         routed = await collect(make_router(limits, routing)(requests()))
 
     assert routed == [

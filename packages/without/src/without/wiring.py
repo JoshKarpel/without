@@ -16,8 +16,8 @@ from collections.abc import Callable
 from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from dataclasses import field
 
-from without.contracts import Context
 from without.contracts import Processor
 from without.contracts import Stream
 from without.tasks import background_task
@@ -113,20 +113,55 @@ async def collect[T](source: Stream[T]) -> list[T]:
 @dataclass(slots=True)
 class Sample[T]:
     _value: T
+    _waiters: set[asyncio.Future[T]] = field(default_factory=set)
 
     def current(self) -> T:
         return self._value
 
+    async def updated(self) -> T:
+        """
+        Wait for the drain to publish the next value, then return it.
+
+        The deterministic counterpart to `current` on the behavior edge: where
+        `current` reads the latest value and never blocks, `updated` blocks until
+        the background drain consumes and publishes the *next* value from the
+        source, then returns it. It is the "await next update" signal a reader
+        waits on (a test asserting on post-reload state, a control loop reacting
+        to a config change) instead of guessing how long the background task
+        needs.
+
+        Each call registers its own one-shot future resolved by the next publish,
+        so concurrent waiters are independent and cancelling one never disturbs
+        another. Like `current`, it inherits latest-wins: a waiter sees only
+        publishes after it starts waiting, and a source that publishes faster
+        than the reader re-arms collapses the values it missed. So `updated` is a
+        "the state has moved on" signal, not a way to observe every value;
+        consume the stream for that.
+        """
+        waiter: asyncio.Future[T] = asyncio.get_running_loop().create_future()
+        self._waiters.add(waiter)
+        return await waiter
+
+    def _publish(self, value: T) -> None:
+        self._value = value
+        while self._waiters:
+            waiter = self._waiters.pop()
+            if not waiter.done():
+                waiter.set_result(value)
+
 
 @asynccontextmanager
-async def sample[T](source: Stream[T]) -> AsyncIterator[Context[T]]:
+async def sample[T](source: Stream[T]) -> AsyncIterator[Sample[T]]:
     """
     Connect to a stream on the behavior edge: read its latest value, not each.
 
     The first value is sampled eagerly, so the context is never "not ready". A
     background task keeps the held value current while the `with` block is open,
-    dropping intermediate values (latest-wins, no backpressure). The held value is
-    mutated only by the drain; readers see it only through `current`.
+    dropping intermediate values (latest-wins, no backpressure). A reader reads
+    the held value through `current` (latest, non-blocking) or waits for the next
+    one through `updated` (the deterministic "await next update" signal); the held
+    value is mutated only by the drain. The yielded `Sample` is a `Context`, so a
+    caller that only reads `current` can treat it as one.
     """
     iterator = source.__aiter__()
     try:
@@ -137,7 +172,7 @@ async def sample[T](source: Stream[T]) -> AsyncIterator[Context[T]]:
 
     async def drain() -> None:
         async for value in iterator:
-            sampled._value = value  # noqa: SLF001 - the drain is the sole writer of the sampled value by design
+            sampled._publish(value)  # noqa: SLF001 - the drain is the sole publisher of the sampled value by design
 
     async with background_task(drain()):
         yield sampled
