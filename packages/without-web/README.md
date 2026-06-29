@@ -60,9 +60,8 @@ its interpolation types, so the token's type is recovered from the handler's
 positional extractor list: the *same* `path_param(...)` value is interpolated
 into the pattern (where it is the segment, matched and schemed through its
 converter) *and* passed alongside (where it is the typed read), so the name,
-converter, schema, and parsed type are declared exactly once. A brace in a
-*plain* string is a build error pointing you to the t-string form rather than a
-route that silently never matches.
+converter, schema, and parsed type are declared exactly once. A plain string is
+taken verbatim as a literal path, so a path parameter requires the t-string form.
 
 ## Layering: each layer owns the schema it parses
 

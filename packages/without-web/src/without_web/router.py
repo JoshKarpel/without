@@ -57,20 +57,18 @@ type HttpEndpoint[T] = Endpoint[T, HttpScope, HttpHandler]
 type WebsocketEndpoint[T] = Endpoint[T, WebsocketScope, WebsocketHandler]
 
 
-# A pattern is either a plain string (a literal-only path, `@get("/todos")`) or a
+# A pattern is either a plain string (a literal path, `@get("/todos")`) or a
 # t-string interpolating path-param tokens (`t"/todos/{todo_id}"`, where
 # `todo_id` is a `path_param(...)`/`catch_all(...)` value). The t-string carries
 # the path *structure* for matching; the token's type is recovered separately
 # from the handler's positional extractor list, since a `Template` erases its
-# interpolation types. A brace in a plain string is a build error steering to the
-# t-string form rather than a route that silently never matches.
+# interpolation types. A plain string is taken verbatim, so parameters require the
+# t-string form.
 type Pattern = str | Template
 
 
 def _segments(pattern: Pattern) -> tuple[Segment, ...]:
     if isinstance(pattern, str):
-        if "{" in pattern or "}" in pattern:
-            raise ValueError(f"a plain string pattern is literal-only; use a t-string for parameters, got {pattern!r}")
         return tuple(Literal(segment) for segment in split_path(pattern))
     return _template_segments(pattern)
 
@@ -128,12 +126,17 @@ class Route[T]:
 
 @dataclass(frozen=True, slots=True)
 class Mount[T]:
-    """A sub-application mounted at a prefix.
+    """A sub-application mounted at a literal-string prefix.
 
     `target` is either a `without-web` `Router` (whose routes are grafted into
     this router's trie, so matching and OpenAPI see straight through with the
     prefix prepended) or an opaque `HttpRouter` (a BYO router or another app),
     which is handed the prefix-trimmed scope and treated as a black box.
+
+    The prefix is a plain `str`, hence a literal path: it cannot carry a path
+    parameter, since that would need a `Template` (as route patterns use) and the
+    type does not allow one here. The opaque-mount trim strips a fixed string
+    (`root_path` semantics), so there is nowhere for a parameter to bind anyway.
     """
 
     prefix: str

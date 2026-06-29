@@ -233,8 +233,8 @@ redirect hop both sends and collects cookies.
 ## Deferred
 
 The server speaks HTTP/1.1, HTTP/2, and WebSockets (over the HTTP/1.1 upgrade).
-Still ahead, building on the shipped per-stream machinery (see
-[`plans/WITHOUT_HTTP.md`](../../plans/WITHOUT_HTTP.md)):
+Still ahead, building on the shipped per-stream machinery (each tracked as a draft
+in the repo's [`issues/`](../../issues)):
 
 - **WebSockets over HTTP/2** (RFC 8441 extended CONNECT), which needs `wsproto`'s
   lower-level frame layer rather than its h11-bound handshake connection.

@@ -1,18 +1,53 @@
 # without
 
 The narrow waist of the project: the contracts every plugin speaks, plus the
-stream connectors and a `with`-scoped background task helper.
+stream connectors and a `with`-scoped background task helper. See
+[`PHILOSOPHY.md`](../../PHILOSOPHY.md) for why the model is shaped this way.
 
-See `without.contracts` for the typed sketch of the core types and the builders
-that lift a step into a processor or a leaf, `without.wiring` for the edge
-connectors that wire processors together (plus the source adapters that feed
-them), and `without.tasks` for the async task helpers: `sleep_forever`, the
-`with`-scoped `background_task`, `limit_concurrency` (a bounded-concurrency driver
-that pulls work from a source only while below the limit, so a lazy source is
-never advanced past it), and its building blocks `cancel_futures` (cancel a set,
-then await them all) and `as_async_iterator` (normalize a sync or async iterable
-into one async iterator).
+## The substrate (`without.contracts`)
 
-Graph/DAG recovery from declared inputs (the `@node` decorator and mermaid
-visualizer) was prototyped and then set aside to focus on the streams core; it
-will return later, likely built on stdlib `graphlib`.
+Three types carry the whole model:
+
+- A `Stream[T]` is an asynchronous sequence of values: the one shape every
+  connection takes, whoever does the I/O (a socket, a file watcher, an in-memory
+  list).
+- A `Processor[In, Out]` transforms a stream of inputs into a stream of outputs.
+  It is the only node type and the only thing a user writes; one processor's
+  output is another's input, all the way down.
+- A `Context[T]` is a stream viewed as its latest sampled value: `current()`
+  reads the *latest* and never blocks, the way long-lived state (config, a pool)
+  is read.
+
+Processors are built, not subclassed. Four builders cover a 2×2 of
+stateful-vs-stateless and emitting-vs-terminal:
+
+| | emits one output per event | collapses to a final value |
+|---|---|---|
+| **stateless** | `from_map(step)` | `from_sink(step)` (effects only) |
+| **stateful** | `from_scan(initial, step)` (a *scan*) | `from_fold(initial, step)` (a reduce) |
+
+A scan emits at every step; a fold yields only the final accumulated value when
+the stream ends. The `step` is always `async`, so it MAY `await` contained I/O
+(reading dependencies from injected `Context` values), but MUST complete the
+effect within the call rather than handing a half-open resource back.
+
+## Wiring (`without.wiring`)
+
+`compose` chains one processor into the next on the event edge: pure composition,
+the only connector that needs nothing running. `sample` is the behavior edge: it
+exposes a stream's latest value as a `Context` (latest-wins, no backpressure),
+driven by a `background_task` for the life of its `with` block. The source and
+terminal adapters sit alongside: `stream` lifts a fixed iterable into a `Stream`,
+`collect` drains one to a list, and `stream_from_queue` turns a push-based queue
+(an accept loop, a callback client) into the pull-based stream the rest of the
+system consumes. `stack` composes middleware (any `(handler, *context) -> handler`)
+into one, serving both server handlers and client exchanges.
+
+## Tasks (`without.tasks`)
+
+The async task helpers: `sleep_forever`; the `with`-scoped `background_task`
+(starts a task on entry, cancels-then-awaits it on exit, so nothing leaks);
+`limit_concurrency`, a bounded-concurrency driver that pulls work from a source
+only while below the limit (so a lazy source is never advanced past it); and its
+building blocks `cancel_futures` (cancel a set, then await them all) and
+`as_async_iterator` (normalize a sync or async iterable into one async iterator).

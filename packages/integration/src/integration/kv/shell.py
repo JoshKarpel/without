@@ -23,11 +23,11 @@
 # connection's own channel), which is contained I/O, the per-event analogue of
 # ASGI's receive/send.
 #
-# Finding worth recording: `without.merge` is a *static* N-to-1 fan-in (a fixed
-# set of sources known up front). A server's set of connections is *dynamic*, so
-# the fan-in here is a shared inbox queue (`stream_from_queue`) any newly accepted
-# connection writes to, not `merge`. A dynamic-merge connector is a candidate
-# addition to the core.
+# Finding worth recording: a server's set of connections is *dynamic* (it grows
+# as clients arrive), so the fan-in here is a shared inbox queue
+# (`stream_from_queue`) any newly accepted connection writes to. A static,
+# fixed-set N-to-1 fan-in connector would not cover the dynamic case; a
+# dynamic-merge connector is a candidate addition to the core.
 
 from __future__ import annotations
 

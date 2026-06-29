@@ -15,17 +15,12 @@ from without.tasks import limit_concurrency
 from without.tasks import sleep_forever
 from without.wiring import Endo
 from without.wiring import Sample
-from without.wiring import broadcast
 from without.wiring import collect
 from without.wiring import compose
-from without.wiring import distribute
-from without.wiring import merge
-from without.wiring import route
 from without.wiring import sample
 from without.wiring import stack
 from without.wiring import stream
 from without.wiring import stream_from_queue
-from without.wiring import tee
 
 __all__ = [
     "Context",
@@ -38,22 +33,17 @@ __all__ = [
     "Transition",
     "as_async_iterator",
     "background_task",
-    "broadcast",
     "cancel_futures",
     "collect",
     "compose",
-    "distribute",
     "from_fold",
     "from_map",
     "from_scan",
     "from_sink",
     "limit_concurrency",
-    "merge",
-    "route",
     "sample",
     "sleep_forever",
     "stack",
     "stream",
     "stream_from_queue",
-    "tee",
 ]

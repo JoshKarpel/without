@@ -2,7 +2,7 @@
 # Processor transforms a stream of inputs into a stream of outputs; a Context is
 # a stream viewed as its latest sampled value (a "behavior"). Normative keywords
 # (MUST, SHOULD, MAY) are per RFC 2119. The design rationale (events vs.
-# behaviors, why there is no privileged executor) lives in plans/REVIEW_BIG_IDEA.md.
+# behaviors, why there is no privileged executor) lives in PHILOSOPHY.md.
 
 from __future__ import annotations
 

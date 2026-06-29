@@ -133,11 +133,6 @@ async def test_a_string_pattern_is_a_literal_only_convenience() -> None:
     assert start.status == 200 and json.loads(body) == {"who": "ok"}
 
 
-def test_a_string_pattern_with_a_brace_is_a_build_error() -> None:
-    with pytest.raises(ValueError, match="literal-only"):
-        Router(routes=(route("/todos/{id:int}", get=_show),), fallback=_fallback)
-
-
 async def test_a_mounted_router_is_grafted_at_the_prefix() -> None:
     inner: Router[object] = Router(routes=(route("/stats", get=_ok),), fallback=_fallback)
     outer: Router[object] = Router(routes=(Mount("/admin", inner),), fallback=_fallback)

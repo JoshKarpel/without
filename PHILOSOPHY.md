@@ -1,11 +1,15 @@
 # The Philosophy of `without`
 
 A synthesis of the ideas the project has actually committed to in code, drawn
-from `BIG_IDEA.md`, `REVIEW_BIG_IDEA.md`, the checkpoints, and the shipped
-packages (`without`, `without-asgi`, `without-web`, `without-env`,
-`without-configmap`, and the `integration` toys). It describes the philosophy
-*as implemented through Checkpoint 18*, not an aspirational manifesto. Where the
-code and an older framing disagree, the code wins.
+from the project's design history and the shipped packages (`without`,
+`without-asgi`, `without-http`, `without-web`, `without-env`, `without-configmap`,
+and the `integration` toys). It describes the philosophy *as implemented*, not an
+aspirational manifesto. Where the code and an older framing disagree, the code
+wins.
+
+The throughline, if you read nothing else: name the smallest substrate that makes
+independent pieces compose, keep the core pure and the shell thin, prefer values
+to places, and push every boundary decision out to the application that owns it.
 
 ## The bet: name the substrate
 
@@ -106,7 +110,7 @@ readers a value through `current()`, never a writable cell. State threads
 *through* a fold as a value rather than living in a mutable location reached by
 reference.
 
-This yields the **state-placement rule** (settled in Checkpoint 6):
+This yields the **state-placement rule**:
 
 - Thread state *down* only when it is scoped to that level: a per-connection
   counter belongs in that connection's own `from_scan`.
@@ -131,7 +135,7 @@ the reply target in the value, and composes structurally. Both serialize
 mutation through one queue, which is why they rhyme; they differ on whether the
 serial owner is a place you address or a value you compose. `without` borrows the
 mailbox, not the supervision/fault model, so calling it an actor framework would
-over-claim. (See `ACTOR_MODEL.md`.)
+over-claim.
 
 ## The builders: one small 2x2
 
@@ -151,32 +155,30 @@ distinction matters: an early framing called the model an "async reducer," but
 the per-event processor is an async *scan*. The fold is the serial owner of
 shared state; the scan is the per-connection processor.
 
-## Two edge types: how processors connect
+## How processors connect
 
-Wiring (`without.wiring`) has exactly two kinds of edge, matching the two halves
-of the model:
+Wiring (`without.wiring`) is deliberately small. The load-bearing event-edge
+connector is `compose`: it chains one processor into the next and is pure
+composition, the only connector that needs nothing running. The other half of the
+model is the **behavior edge**, `sample`, which exposes a stream's latest value as
+a `Context` (latest-wins, no backpressure). Around those sit the source and
+terminal adapters: `stream` lifts a fixed iterable into a `Stream`, `collect`
+drains one to a list, and `stream_from_queue` adapts a push source (an accept
+loop, a callback client) into the pull-based stream the rest of the system
+consumes.
 
-- The **event edge** carries every value onward. `compose` chains one processor
-  into the next and is pure composition (the only connector that needs nothing
-  running). `distribute` spreads events across N competing workers (each handled
-  once, bounded concurrency, end-to-end backpressure). `tee` / `broadcast` fan
-  one stream out to N consumers that each see everything. `route` partitions a
-  stream by the runtime type of each value. `merge` folds N sources into one.
-- The **behavior edge** is `sample`: it exposes a stream's latest value as a
-  `Context`, latest-wins, no backpressure.
+`compose` aside, a connector that needs a running task is scoped by
+`background_task`, a `with`-block helper that starts the task on entry and
+cancels-then-awaits it on exit, so nothing leaks past its block. `sample` is the
+canonical one: it is where a stream becomes readable state. Closability is
+signalled structurally: shutting down a queue (`queue.shutdown()`) ends the
+stream it feeds, which lets a downstream fold return its final value.
 
-`compose` aside, every connector needs something running: a `background_task`
-draining a queue. Those are the thin, visible seams where the imperative shell
-appears in an otherwise pure graph. `sample` is the canonical one: it is where a
-stream becomes readable state. `stream_from_queue` sits at the same boundary from
-the other side, adapting a push source (an accept loop, a callback client) into a
-pull-based stream the rest of the system consumes.
-
-A connector that needs a running task is scoped by `background_task`, a
-`with`-block helper that starts the task on entry and cancels-then-awaits it on
-exit. Nothing leaks past its block. Closability is signalled structurally:
-shutting down a queue (`queue.shutdown()`) ends the stream it feeds, which lets a
-downstream fold return its final value.
+Wiring deliberately stops there. A cluster of fan-out/fan-in connectors
+(`distribute`, `tee`, `broadcast`, `route`, `merge`) is *not* part of the core: no
+shipped package needs them, so they would be speculative surface carrying real
+queue-and-background-task complexity. The design is recorded for when a concrete
+fan-out/fan-in need calls for them (see `issues/`).
 
 ## Lifespan as a variable: a connection's lifecycle is a stream's
 
@@ -233,6 +235,15 @@ carried by the extractor that parses it. OpenAPI is then a *merge* of those
 self-descriptions recovered from structure, not a blob declared in one place. The
 description is recovered from the code, not maintained alongside it.
 
+The same role-not-shape rule governs defaults: a type the parser fills from
+outside input (inbound) carries *no* defaults, so a field the parser forgot fails
+loudly instead of silently defaulting; a type the app constructs (outbound)
+carries defaults for ergonomic construction. Even when two types have identical
+fields, they are modeled separately because they hold opposite invariants:
+`RequestBody` (inbound, no defaults) versus `ResponseBody` (outbound, defaulted),
+and the HTTP client's `ResponseHead` parsed from the wire versus the server's
+`ResponseStart` the app builds.
+
 ## Library, not framework: control flow stays visible
 
 The north star is that user control flow is plain, visible Python. The package
@@ -244,33 +255,23 @@ should read like a library you call, not a framework that calls you.
   code stays plain.
 - Dependencies are injected as arguments (contexts, state), never reached through
   globals or singletons, which is what makes the core testable without mocks.
-- Where a DAG of work could be recovered from declared inputs for parallelism,
-  the resolution is that *visibility wins*: the graph is recovered from what you
-  declared and can be visualized, never hand-assembled in a way that hides the
-  flow. (The `@node`/mermaid prototype was set aside to focus on the streams
-  core; it will likely return on stdlib `graphlib`.)
+
+This is also why the client API is imperative and *should* be. The server
+framework surrounds the user's handler (it calls inward); the client user holds
+the continuation (the code after `await response` is theirs), so the client is a
+script at the rim, not a processor at the center. Forcing both into one shape to
+make the library look symmetric would contort the caller's code; the asymmetry is
+real, so the two sides stay different while sharing the one composition tool that
+genuinely generalizes (`stack`).
 
 ## Known-hard problems, faced deliberately
 
 The project inherits the hard problems of dataflow and FRP and chooses to face
-them rather than discover them. Backpressure is end-to-end by construction: the
-internal queues in `distribute`, `merge`, `tee`, and `route` are bounded, so a
-slow consumer stalls its producers instead of growing an unbounded backlog. The
+them rather than discover them. Backpressure is handled where it arises rather
+than bolted on: a bounded queue makes a slow consumer stall its producer instead
+of growing an unbounded backlog (the HTTP server's per-stream `WINDOW_UPDATE` flow
+control and `stream_from_queue`'s shutdown signal are the live examples). The
 `sample` behavior edge deliberately has *no* backpressure (latest-wins is its
 whole point). Glitches on diamond dependencies, feedback cycles, and teardown
 order remain open and are tracked as such. The `sample`-drain test helper (`tick`)
 is acknowledged as a stopgap pending a deterministic "await next update" signal.
-
-## What is deliberately deferred
-
-- A **dynamic-merge connector**: the single named primitive that would replace
-  the hand-rolled queue funnel and pull the one un-clean, actor-ish spot back
-  inside the stream model. This is seen as *the* resolution of the actor-model
-  question, in code rather than prose.
-- **DAG recovery and visualization** from declared inputs (`graphlib`, mermaid).
-- OpenAPI **`$ref`/shared components** and reverse routing (`url_for`).
-- **Real HTTP/WebSocket transport testing** (currently hand-built scope dicts).
-
-The discipline throughout: name the smallest substrate that makes independent
-pieces compose, keep the core pure and the shell thin, prefer values to places,
-and push every boundary decision out to the application that owns it.
