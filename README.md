@@ -12,9 +12,8 @@ interoperate because none of them names the shared lower layer. `without` names
 that layer as a narrow contract, so the pieces compose. It is meant to feel like
 a library (your control flow stays visible) rather than a framework.
 
-See [`PHILOSOPHY.md`](PHILOSOPHY.md) for the design rationale (the narrow-waist
-bet, functional-core/imperative-shell, values-over-places) and [`issues/`](issues)
-for the outstanding work, each item a draft ready to file.
+See [`PHILOSOPHY.md`](PHILOSOPHY.md) for the design rationale: the narrow-waist
+bet, functional-core/imperative-shell, and values-over-places.
 
 ## Layout
 

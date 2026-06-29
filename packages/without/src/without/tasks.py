@@ -90,6 +90,8 @@ async def limit_concurrency[T](
     Adapted from [Limiting concurrency in
     asyncio](https://death.andgravity.com/limit-concurrency).
     """
+    if limit < 1:
+        raise ValueError(f"limit must be at least 1, but got {limit}")
     source = as_async_iterator(aws)
     ended = False
     pending: set[asyncio.Future[T]] = set()

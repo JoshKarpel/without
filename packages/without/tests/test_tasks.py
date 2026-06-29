@@ -200,3 +200,11 @@ async def test_limit_concurrency_surfaces_an_awaitable_failure_through_the_futur
     async for future in limit_concurrency([boom()], limit=2):
         with pytest.raises(ValueError, match="work failed"):
             future.result()
+
+
+@pytest.mark.parametrize("limit", [0, -3])
+async def test_limit_concurrency_rejects_a_non_positive_limit(limit: int) -> None:
+    empty: list[Awaitable[int]] = []
+    with pytest.raises(ValueError, match="limit must be at least 1"):
+        async for _ in limit_concurrency(empty, limit=limit):
+            pass
