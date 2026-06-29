@@ -325,6 +325,29 @@ async def test_a_connection_aborted_mid_request_raises() -> None:
                 pass  # pragma: no cover
 
 
+async def test_run_loop_swallows_an_oserror_from_the_socket_and_fails_pending_streams() -> None:
+    """
+    A read raising `OSError` (an abrupt reset) ends the loop and fails in-flight streams.
+
+    Reproduced deterministically rather than via a real socket: on Linux/macOS an abrupt
+    close surfaces as `OSError` from the read, but on Windows it arrives as a clean EOF, so
+    a socket-based test leaves the `except OSError` branch uncovered there.
+    """
+    async with _idle_connection() as connection:
+        stream = _stream()
+        connection._streams[5] = stream
+
+        async def _raise(n: int = -1) -> bytes:
+            raise OSError("connection reset")
+
+        connection._reader.read = _raise  # type: ignore[method-assign]
+
+        await connection._run()
+
+        assert connection._closed.is_set()
+        assert isinstance(stream.error, ConnectionError)
+
+
 async def test_concurrent_first_requests_share_one_pooled_h2c_connection() -> None:
     async def fetch(pool: ConnectionPool, host: str, port: int, index: int) -> bytes:
         async with pool.request("POST", f"http://{host}:{port}/", body=f"body{index}".encode()) as (_head, body):

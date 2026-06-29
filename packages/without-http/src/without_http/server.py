@@ -132,10 +132,12 @@ async def _run_request(
             # `inbound_from_event` maps to a non-None Inbound; it never returns PAUSED
             # here (that needs a completed request, which sets `request_done` above first).
             if not isinstance(event, h11.Event):  # pragma: no cover
+                logger.warning(f"Treating unexpected h11 event as a client disconnect: {event!r}")
                 request_done = True
                 return encode_inbound(Disconnect())
             inbound = inbound_from_event(event)
             if inbound is None:  # pragma: no cover
+                logger.warning(f"Treating unmappable h11 event as a client disconnect: {event!r}")
                 request_done = True
                 return encode_inbound(Disconnect())
             if isinstance(inbound, Disconnect) or (isinstance(inbound, RequestBody) and not inbound.more_body):
@@ -230,7 +232,7 @@ async def _serve_websocket(
                     await inbound.put(encode_websocket_inbound(WebsocketDisconnect(code=code, reason=reason or "")))
                     return False
                 case _:  # pragma: no cover - post-handshake wsproto emits only the events handled above
-                    pass
+                    logger.warning(f"Discarding unexpected WebSocket event from wsproto: {event!r}")
         return True
 
     async def pump() -> None:
@@ -243,8 +245,8 @@ async def _serve_websocket(
         # wsproto folds malformed frames into a CloseConnection event rather than
         # raising, so this fires only on a socket failure mid-write (a racy disconnect);
         # either way the connection becomes a WebSocket disconnect below.
-        except Exception:  # noqa: BLE001  # pragma: no cover
-            pass
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover
+            logger.warning(f"WebSocket read pump ended on a connection error: {exc!r}")
         await inbound.put(encode_websocket_inbound(WebsocketDisconnect(code=1006, reason="")))
         finished.set()
 
@@ -350,7 +352,8 @@ async def _serve_h11_connection(
             conn.start_next_cycle()
         # Unreachable: keep_alive is only true when both roles reached DONE, which is
         # exactly the state start_next_cycle requires; a non-reusable cycle returns above.
-        except h11.LocalProtocolError:  # pragma: no cover
+        except h11.LocalProtocolError as exc:  # pragma: no cover
+            logger.warning(f"Closing HTTP/1.1 connection after start_next_cycle failed: {exc!r}")
             return
 
 
@@ -405,7 +408,8 @@ async def _serve_h2_connection(
                     window = conn.local_flow_control_window(stream_id)
                 # Defensive: h2 returns a stale window for a reset stream rather than
                 # raising here, so `send_data` below is what rejects a closed stream.
-                except h2.exceptions.StreamClosedError:  # pragma: no cover
+                except h2.exceptions.StreamClosedError as exc:  # pragma: no cover
+                    logger.warning(f"Aborting body send for closed HTTP/2 stream {stream_id}: {exc!r}")
                     return
                 sendable = min(len(remaining), window, conn.max_outbound_frame_size)
                 if sendable > 0 or len(remaining) == 0:
@@ -502,27 +506,35 @@ async def _serve_h2_connection(
                 # `is not None` guards are defensive: h2 raises a protocol error rather
                 # than emitting a body/end/reset/window event for a stream it is not
                 # tracking, so the miss branch cannot be reached.
-                if (target := streams.get(stream_id)) is not None:  # pragma: no branch
+                if (target := streams.get(stream_id)) is not None:
                     target.inbound.put_nowait(RequestBody(body=bytes(data), more_body=True))
+                else:  # pragma: no cover - h2 rejects DATA for an untracked stream before this point
+                    logger.warning(f"Discarding HTTP/2 DATA for untracked stream {stream_id}")
                 async with lock:
                     conn.acknowledge_received_data(length, stream_id)
                     writer.write(conn.data_to_send())
                 await writer.drain()
             case h2.events.StreamEnded(stream_id=stream_id):
-                if (target := streams.get(stream_id)) is not None:  # pragma: no branch
+                if (target := streams.get(stream_id)) is not None:
                     target.inbound.put_nowait(RequestBody(body=b"", more_body=False))
+                else:  # pragma: no cover - h2 rejects END_STREAM for an untracked stream before this point
+                    logger.warning(f"Discarding HTTP/2 END_STREAM for untracked stream {stream_id}")
             case h2.events.StreamReset(stream_id=stream_id):
-                if (target := streams.get(stream_id)) is not None:  # pragma: no branch
+                if (target := streams.get(stream_id)) is not None:
                     target.inbound.put_nowait(Disconnect())
                     # Wake a sender blocked on the window so it observes the closed
                     # stream and unwinds, rather than lingering until connection close.
                     target.window.set()
+                else:  # pragma: no cover - h2 rejects RST_STREAM for an untracked stream before this point
+                    logger.warning(f"Discarding HTTP/2 RST_STREAM for untracked stream {stream_id}")
             case h2.events.WindowUpdated(stream_id=stream_id):
                 if stream_id == 0:
                     for target in streams.values():
                         target.window.set()
-                elif (target := streams.get(stream_id)) is not None:  # pragma: no branch
+                elif (target := streams.get(stream_id)) is not None:
                     target.window.set()
+                else:  # pragma: no cover - h2 rejects WINDOW_UPDATE for an untracked stream before this point
+                    logger.warning(f"Discarding HTTP/2 WINDOW_UPDATE for untracked stream {stream_id}")
             case h2.events.RemoteSettingsChanged():
                 # A changed initial window resizes every stream's window, so wake all
                 # blocked senders to re-check rather than tracking which grew.

@@ -244,6 +244,36 @@ fields, they are modeled separately because they hold opposite invariants:
 and the HTTP client's `ResponseHead` parsed from the wire versus the server's
 `ResponseStart` the app builds.
 
+## Fail loud for the author, recover for the remote
+
+Strictness belongs at the trust boundary, not only the parse boundary. Two kinds
+of unexpected value reach the code, and they earn opposite treatment.
+
+A value the **application author** generates and hands inward (an outbound
+`Response`, a typed event the app builds, a handler's return, a config value) is
+under their control, so an unexpected one is a bug in code they own. The
+framework fails loud: an exhaustive `match` closes with `assert_never`, an inbound
+parser that forgot a field raises, an unsupported outbound extension raises
+`NotImplementedError`. Crashing surfaces the bug where it can be fixed.
+
+A value **received from a remote client over the network** (a half-framed `h11`
+event, an unexpected `wsproto` frame, a DATA frame for a stream no longer tracked)
+is controlled by neither the framework nor its user. Hard-failing would let any
+peer take a connection down, so the network-receive side recovers instead: it
+logs at `warning` so an operator sees that something off happened, then degrades
+gracefully (treat it as a disconnect, drop the stray frame, close the single
+connection) rather than raising.
+
+This is why the `assert_never` exhaustiveness guards cluster in the `encode_*`
+functions, which match over our own sealed unions built from values we
+constructed, while the recover-and-log paths cluster in `without-http`'s
+`h11`/`h2`/`wsproto` handling, which decodes raw remote bytes. The parse boundary
+decides *where* raw input becomes a typed value; the trust boundary decides *how*
+to react when that input breaks the contract: same defensive guard, opposite
+verdict, settled by who authored the value. It pairs with the rule that a
+valid-but-unhandled event from a peer (a new event kind) is not a fault to crash
+on but something to ignore, with a log only when it is genuinely unexpected.
+
 ## Library, not framework: control flow stays visible
 
 The north star is that user control flow is plain, visible Python. The package

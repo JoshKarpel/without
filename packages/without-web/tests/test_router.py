@@ -174,7 +174,7 @@ async def test_an_exception_before_response_start_is_mapped_to_a_response() -> N
     assert json.loads(body) == {"error": "nope"}
 
 
-async def test_catching_propagates_an_exception_its_recover_declines() -> None:
+async def test_catching_propagates_an_exception_when_recover_declines() -> None:
     @buffered
     def boom(state: object, match: Match[HttpScope], body: bytes) -> Response:
         raise ValueError("unmapped")
