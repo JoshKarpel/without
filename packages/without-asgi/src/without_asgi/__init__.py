@@ -168,7 +168,6 @@ __all__ = [
     "read_body",
     "refuse_http",
     "refuse_websocket",
-    "supports",
     "websocket_inbound",
     "websocket_outbound",
 ]

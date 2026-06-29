@@ -70,6 +70,8 @@ def _insert[L](node: _Builder[L], segments: tuple[Segment, ...], leaf: L) -> Non
         case Param(name, converter):
             child = node.params.setdefault((name, converter), _Builder())
         case CatchAll():
+            if rest:
+                raise ValueError("invalid route: a catch-all must be the last segment")
             if node.catchall is None:
                 node.catchall = (head, _Builder())
             child = node.catchall[1]
@@ -118,5 +120,9 @@ def walk[L](node: Node[L], segments: tuple[str, ...]) -> Found[L] | None:
     if node.catchall is not None:
         catchall, child = node.catchall
         if child.leaf is not None:
-            return Found(child.leaf, {catchall.name: "/".join(segments)})
+            try:
+                value = catchall.converter.parse("/".join(segments))
+            except ValueError:
+                return None
+            return Found(child.leaf, {catchall.name: value})
     return None

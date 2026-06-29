@@ -1,5 +1,6 @@
 import asyncio
 
+import pytest
 from without import Transition
 from without import collect
 from without import compose
@@ -55,3 +56,9 @@ async def test_sample_tracks_the_latest_value() -> None:
     async with sample(stream([11, 22, 33])) as latest:
         await tick()
         assert latest.current() == 33
+
+
+async def test_sample_rejects_an_empty_stream() -> None:
+    with pytest.raises(ValueError, match="at least one value"):
+        async with sample(stream([])):
+            pass

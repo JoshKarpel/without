@@ -61,6 +61,17 @@ def test_a_catch_all_captures_the_remaining_segments_joined() -> None:
     assert found is not None and found.params == {"rest": "a/b/c"}
 
 
+def test_a_catch_all_binds_the_converted_remainder() -> None:
+    tree = _tree(((Literal("ids"), CatchAll("n", INT)), "ids"))
+    found = walk(tree, ("ids", "42"))
+    assert found is not None and found.leaf == "ids" and found.params == {"n": 42}
+
+
+def test_a_catch_all_whose_converter_rejects_the_remainder_returns_none() -> None:
+    tree = _tree(((Literal("ids"), CatchAll("n", INT)), "ids"))
+    assert walk(tree, ("ids", "a", "b", "c")) is None
+
+
 def test_an_unmatched_path_returns_none() -> None:
     tree = _tree(((Literal("todos"),), "todos"))
     assert walk(tree, ("nope",)) is None
@@ -69,3 +80,8 @@ def test_an_unmatched_path_returns_none() -> None:
 def test_a_duplicate_route_is_a_build_error() -> None:
     with pytest.raises(ValueError):
         _tree(((Literal("todos"),), "first"), ((Literal("todos"),), "second"))
+
+
+def test_a_segment_after_a_catch_all_is_a_build_error() -> None:
+    with pytest.raises(ValueError):
+        _tree(((CatchAll("rest", PATH), Literal("more")), "unreachable"))

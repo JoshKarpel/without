@@ -123,7 +123,11 @@ async def sample[T](source: Stream[T]) -> AsyncIterator[Context[T]]:
     mutated only by the drain; readers see it only through `current`.
     """
     iterator = source.__aiter__()
-    sampled = Sample(await anext(iterator))
+    try:
+        first = await anext(iterator)
+    except StopAsyncIteration:
+        raise ValueError("sample requires at least one value, but the source stream was empty") from None
+    sampled = Sample(first)
 
     async def drain() -> None:
         async for value in iterator:
