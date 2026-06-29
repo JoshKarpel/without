@@ -1,0 +1,37 @@
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[project]
+name = "integration"
+version = "0.0.0"
+description = "Cross-package integration tests: depends on without and every plugin to exercise them together."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Josh Karpel", email = "josh.karpel@gmail.com" },
+]
+# Never published: the name sits outside the `without*` family the publish
+# workflow globs, and this classifier makes PyPI reject an upload if it ever
+# slips through.
+classifiers = ["Private :: Do Not Upload"]
+requires-python = ">=3.14"
+dependencies = [
+    "without",
+    "without-env",
+    "without-configmap",
+    "without-asgi",
+    "without-http",
+    "without-web",
+    "pydantic>=2",
+    "pydantic-settings>=2.7",
+    "httpx>=0.28",
+]
+
+[tool.uv.sources]
+without = { workspace = true }
+without-env = { workspace = true }
+without-configmap = { workspace = true }
+without-asgi = { workspace = true }
+without-http = { workspace = true }
+without-web = { workspace = true }

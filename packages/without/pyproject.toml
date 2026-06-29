@@ -1,0 +1,23 @@
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[project]
+name = "without"
+version = "0.0.0"
+description = "Core contracts and executor for without: the sans-IO stream-processor substrate."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Josh Karpel", email = "josh.karpel@gmail.com" },
+]
+requires-python = ">=3.14"
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
+dependencies = []

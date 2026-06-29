@@ -1,0 +1,27 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: saturday
+    open-pull-requests-limit: 1
+    # github-actions doesn't support per-semver-tier cooldown windows.
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+      day: saturday
+    open-pull-requests-limit: 1
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+    groups:
+      python:
+        patterns: ["*"]

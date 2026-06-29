@@ -1,0 +1,28 @@
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[project]
+name = "without-asgi"
+version = "0.0.0"
+description = "without adapters that turn an ASGI app's receive/send into typed event streams and back."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Josh Karpel", email = "josh.karpel@gmail.com" },
+]
+requires-python = ">=3.14"
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
+dependencies = [
+    "without",
+]
+
+[tool.uv.sources]
+without = { workspace = true }

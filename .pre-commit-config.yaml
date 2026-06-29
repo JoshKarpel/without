@@ -1,0 +1,61 @@
+repos:
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+      - id: check-ast
+      - id: check-builtin-literals
+      - id: check-case-conflict
+      - id: check-docstring-first
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-json
+      - id: debug-statements
+      - id: end-of-file-fixer
+        exclude_types: [svg]
+      - id: forbid-new-submodules
+      - id: mixed-line-ending
+      - id: trailing-whitespace
+
+  - repo: https://github.com/pre-commit/pygrep-hooks
+    rev: v1.10.0
+    hooks:
+      - id: python-check-mock-methods
+      - id: python-no-eval
+      - id: python-no-log-warn
+      - id: python-use-type-annotations
+      - id: python-check-blanket-type-ignore
+
+  - repo: https://github.com/python-jsonschema/check-jsonschema
+    rev: 0.37.3
+    hooks:
+      - id: check-github-workflows
+      - id: check-github-actions
+      - id: check-dependabot
+
+  - repo: local
+    hooks:
+      - id: no-plc0415
+        name: no PLC0415 (import-not-at-top) suppression
+        language: pygrep
+        entry: 'PLC0415'
+        types: [python]
+      - id: generate-ladders
+        name: regenerate overload ladders (cog + ruff)
+        language: system
+        entry: packages/without-web/tools/regenerate.sh
+        files: ^packages/without-web/src/without_web/(handlers|extractors)\.py$
+      - id: format-justfile
+        name: format justfile
+        language: system
+        entry: just --fmt --unstable
+        files: justfile
+        pass_filenames: false
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: 'v0.15.17'
+    hooks:
+      - id: ruff-check
+        args: [ --fix, --exit-non-zero-on-fix ]
+      - id: ruff-format
