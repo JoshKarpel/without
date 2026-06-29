@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from contextlib import suppress
 
+from without import cancel_futures
 from without_asgi import Asgi
 from without_asgi import ASGIApp
 from without_asgi import LifespanScope
@@ -94,7 +95,5 @@ async def _wait_for(event: asyncio.Event, task: asyncio.Task[None]) -> bool:
     try:
         await asyncio.wait({waiter, task}, return_when=asyncio.FIRST_COMPLETED)
     finally:
-        waiter.cancel()
-        with suppress(asyncio.CancelledError):
-            await waiter
+        await cancel_futures([waiter])
     return event.is_set()

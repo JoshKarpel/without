@@ -21,19 +21,21 @@ async def sleep_forever() -> None:
     await asyncio.get_running_loop().create_future()
 
 
-async def cancel_futures[T](futures: Iterable[asyncio.Future[T]]) -> None:
+async def cancel_futures[T](futures: Iterable[asyncio.Future[T] | None]) -> None:
     """Cancel every future, then await them all so their teardown completes.
 
     Two phases on purpose: cancelling the whole set *before* awaiting any of them
     lets them tear down concurrently, instead of serially cancelling and waiting
-    for one at a time. The futures are materialized first, so a caller may pass a
-    live set the awaits will mutate. Each future's own `CancelledError` is
-    suppressed; any other exception it raises during teardown propagates.
+    for one at a time. `None` entries are skipped, so a caller holding an optional
+    task (`task: asyncio.Task | None`) can pass it without a guard. The futures are
+    materialized first, so a caller may pass a live set the awaits will mutate. Each
+    future's own `CancelledError` is suppressed; any other exception it raises during
+    teardown propagates.
     """
-    futures = list(futures)
-    for future in futures:
+    present = [future for future in futures if future is not None]
+    for future in present:
         future.cancel()
-    for future in futures:
+    for future in present:
         with suppress(asyncio.CancelledError):
             await future
 

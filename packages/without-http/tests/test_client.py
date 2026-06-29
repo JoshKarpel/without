@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
 from collections.abc import AsyncIterator
+from dataclasses import replace
 
 import pytest
 from without_asgi import RawScope
 from without_asgi import Receive
 from without_asgi import Send
 from without_asgi import parse_http_scope
+from without_http import ClientResponse
 from without_http import ConnectionPool
 from without_http import CookieJar
+from without_http import ResponseBody
+from without_http import ResponseTrailers
 from without_http import add_headers
 from without_http import cookies
 from without_http import follow_redirects
 from without_http import serving
+from without_http import wrap
 from without_http.client import _REDIRECT_STATUSES
 from without_http.client import _Http11Connection
 
@@ -65,15 +71,38 @@ async def redirect_app(scope: RawScope, receive: Receive, send: Send) -> None:
 
 async def test_pool_gets_a_response() -> None:
     async with serving(echo_app) as server, ConnectionPool() as pool:
-        async with pool.request("GET", f"http://{server.host}:{server.port}/items") as response:
-            assert response.status == 200
-            assert await response.read() == b"GET /items test= body="
+        async with pool.request("GET", f"http://{server.host}:{server.port}/items") as (head, body):
+            assert head.status == 200
+            assert await body.read() == b"GET /items test= body="
 
 
 async def test_pool_posts_a_body() -> None:
     async with serving(echo_app) as server, ConnectionPool() as pool:
-        async with pool.request("POST", f"http://{server.host}:{server.port}/submit", content=b"payload") as response:
-            assert await response.read() == b"POST /submit test= body=payload"
+        url = f"http://{server.host}:{server.port}/submit"
+        async with pool.request("POST", url, body=b"payload") as (_head, body):
+            assert await body.read() == b"POST /submit test= body=payload"
+
+
+async def test_wrap_request_side_rewrites_the_outgoing_request() -> None:
+    inject = wrap(request=lambda request: replace(request, headers=(*request.headers, (b"x-test", b"viawrap"))))
+    async with serving(echo_app) as server, ConnectionPool(middleware=inject) as pool:
+        async with pool.request("GET", f"http://{server.host}:{server.port}/items") as (_head, body):
+            assert await body.read() == b"GET /items test=viawrap body="
+
+
+async def test_wrap_response_side_transforms_the_returned_body() -> None:
+    def shout(response: ClientResponse) -> ClientResponse:
+        async def upper(
+            events: AsyncIterator[bytes | ResponseTrailers],
+        ) -> AsyncGenerator[bytes | ResponseTrailers, None]:
+            async for item in events:
+                yield item.upper() if isinstance(item, bytes) else item
+
+        return ClientResponse(response.head, ResponseBody(upper(response.body.events())))
+
+    async with serving(echo_app) as server, ConnectionPool(middleware=wrap(response=shout)) as pool:
+        async with pool.request("GET", f"http://{server.host}:{server.port}/items") as (_head, body):
+            assert await body.read() == b"GET /ITEMS TEST= BODY="
 
 
 async def test_add_headers_middleware_injects_a_header_seen_server_side() -> None:
@@ -81,16 +110,16 @@ async def test_add_headers_middleware_injects_a_header_seen_server_side() -> Non
         serving(echo_app) as server,
         ConnectionPool(middleware=add_headers((b"x-test", b"injected"))) as pool,
     ):
-        async with pool.request("GET", f"http://{server.host}:{server.port}/items") as response:
-            assert await response.read() == b"GET /items test=injected body="
+        async with pool.request("GET", f"http://{server.host}:{server.port}/items") as (_head, body):
+            assert await body.read() == b"GET /items test=injected body="
 
 
 @pytest.mark.parametrize("status", sorted(_REDIRECT_STATUSES))
 async def test_follow_redirects_middleware_follows_each_redirect_status(status: int) -> None:
     async with serving(redirect_app) as server, ConnectionPool(middleware=follow_redirects()) as pool:
-        async with pool.request("GET", f"http://{server.host}:{server.port}/start?status={status}") as response:
-            assert response.status == 200
-            assert await response.read() == b"arrived"
+        async with pool.request("GET", f"http://{server.host}:{server.port}/start?status={status}") as (head, body):
+            assert head.status == 200
+            assert await body.read() == b"arrived"
 
 
 async def chain_app(scope: RawScope, receive: Receive, send: Send) -> None:
@@ -113,17 +142,17 @@ async def chain_app(scope: RawScope, receive: Receive, send: Send) -> None:
 
 async def test_follow_redirects_middleware_follows_a_chain_of_hops() -> None:
     async with serving(chain_app) as server, ConnectionPool(middleware=follow_redirects(max_hops=5)) as pool:
-        async with pool.request("GET", f"http://{server.host}:{server.port}/hop/3") as response:
-            assert response.status == 200
-            assert await response.read() == b"done"
+        async with pool.request("GET", f"http://{server.host}:{server.port}/hop/3") as (head, body):
+            assert head.status == 200
+            assert await body.read() == b"done"
 
 
 async def test_follow_redirects_middleware_stops_at_max_hops() -> None:
     async with serving(chain_app) as server, ConnectionPool(middleware=follow_redirects(max_hops=2)) as pool:
-        async with pool.request("GET", f"http://{server.host}:{server.port}/hop/5") as response:
+        async with pool.request("GET", f"http://{server.host}:{server.port}/hop/5") as (head, body):
             # The chain is longer than max_hops, so it stops still on a redirect.
-            assert response.status == 302
-            assert await response.read() == b""
+            assert head.status == 302
+            assert await body.read() == b""
 
 
 async def sized_echo_app(scope: RawScope, receive: Receive, send: Send) -> None:
@@ -150,33 +179,33 @@ def _only_idle(pool: ConnectionPool) -> list[_Http11Connection]:
 async def test_keep_alive_reuses_one_connection_for_sequential_requests() -> None:
     async with serving(sized_echo_app) as server, ConnectionPool() as pool:
         url = f"http://{server.host}:{server.port}/items"
-        async with pool.request("GET", url) as first:
-            assert await first.read() == b"GET /items body="
+        async with pool.request("GET", url) as (_head, body):
+            assert await body.read() == b"GET /items body="
         kept = _only_idle(pool)
         assert len(kept) == 1
-        async with pool.request("GET", url) as second:
-            assert await second.read() == b"GET /items body="
+        async with pool.request("GET", url) as (_head, body):
+            assert await body.read() == b"GET /items body="
         assert _only_idle(pool) == kept
 
 
 async def test_a_stale_pooled_connection_is_replaced_with_a_fresh_one() -> None:
     async with serving(sized_echo_app) as server, ConnectionPool() as pool:
         url = f"http://{server.host}:{server.port}/items"
-        async with pool.request("GET", url) as first:
-            assert await first.read() == b"GET /items body="
+        async with pool.request("GET", url) as (_head, body):
+            assert await body.read() == b"GET /items body="
         (stale,) = _only_idle(pool)
         await stale.aclose()  # the server-closed-an-idle-keep-alive case, simulated
-        async with pool.request("GET", url) as second:
-            assert await second.read() == b"GET /items body="
+        async with pool.request("GET", url) as (_head, body):
+            assert await body.read() == b"GET /items body="
         (fresh,) = _only_idle(pool)
         assert fresh is not stale
 
 
 async def test_cleartext_h2c_uses_http_2_by_prior_knowledge() -> None:
-    async with serving(echo_app) as server, ConnectionPool(http2_cleartext=True) as pool:
-        async with pool.request("GET", f"http://{server.host}:{server.port}/items") as response:
-            assert response.status == 200
-            assert await response.read() == b"GET /items test= body="
+    async with serving(echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
+        async with pool.request("GET", f"http://{server.host}:{server.port}/items") as (head, body):
+            assert head.status == 200
+            assert await body.read() == b"GET /items test= body="
         assert len(pool._h2) == 1
         assert pool._idle_h11 == {}
 
@@ -199,15 +228,15 @@ async def chunked_response_app(scope: RawScope, receive: Receive, send: Send) ->
 
 async def test_streams_a_request_body_from_an_async_iterator() -> None:
     async with serving(echo_app) as server, ConnectionPool() as pool:
-        body = _chunks(b"ab", b"cd", b"ef")
-        async with pool.request("POST", f"http://{server.host}:{server.port}/up", content=body) as response:
-            assert await response.read() == b"POST /up test= body=abcdef"
+        upload = _chunks(b"ab", b"cd", b"ef")
+        async with pool.request("POST", f"http://{server.host}:{server.port}/up", body=upload) as (_head, body):
+            assert await body.read() == b"POST /up test= body=abcdef"
 
 
 async def test_streams_a_response_body_chunk_by_chunk() -> None:
     async with serving(chunked_response_app) as server, ConnectionPool() as pool:
-        async with pool.request("GET", f"http://{server.host}:{server.port}/down") as response:
-            received = [chunk async for chunk in response]
+        async with pool.request("GET", f"http://{server.host}:{server.port}/down") as (_head, body):
+            received = [chunk async for chunk in body]
     assert b"".join(received) == b"onetwothree"
 
 
@@ -235,19 +264,19 @@ async def test_cookie_jar_carries_a_set_cookie_to_the_next_request() -> None:
     jar = CookieJar()
     async with serving(cookie_app) as server, ConnectionPool() as pool:
         base = f"http://{server.host}:{server.port}"
-        async with pool.request("GET", f"{base}/set", middleware=cookies(jar)) as response:
-            assert response.status == 200
-        async with pool.request("GET", f"{base}/echo", middleware=cookies(jar)) as response:
-            assert await response.read() == b"cookie=sid=xyz789"
+        async with pool.request("GET", f"{base}/set", middleware=cookies(jar)) as (head, _body):
+            assert head.status == 200
+        async with pool.request("GET", f"{base}/echo", middleware=cookies(jar)) as (_head, body):
+            assert await body.read() == b"cookie=sid=xyz789"
 
 
 async def test_cookie_jar_drops_a_cookie_deleted_with_max_age_zero() -> None:
     jar = CookieJar()
     async with serving(cookie_app) as server, ConnectionPool(middleware=cookies(jar)) as pool:
         base = f"http://{server.host}:{server.port}"
-        async with pool.request("GET", f"{base}/set") as response:
-            assert response.status == 200
-        async with pool.request("GET", f"{base}/clear") as response:
-            assert response.status == 200
-        async with pool.request("GET", f"{base}/echo") as response:
-            assert await response.read() == b"cookie="
+        async with pool.request("GET", f"{base}/set") as (head, _body):
+            assert head.status == 200
+        async with pool.request("GET", f"{base}/clear") as (head, _body):
+            assert head.status == 200
+        async with pool.request("GET", f"{base}/echo") as (_head, body):
+            assert await body.read() == b"cookie="

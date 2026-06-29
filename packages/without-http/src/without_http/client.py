@@ -11,6 +11,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from dataclasses import field
 from dataclasses import replace
+from typing import NamedTuple
 from urllib.parse import SplitResult
 from urllib.parse import urljoin
 from urllib.parse import urlsplit
@@ -22,6 +23,7 @@ import h2.exceptions
 import h11
 from without import Endo
 from without import Stream
+from without import cancel_futures
 from without import stack
 from without_asgi import RawHeaders
 
@@ -74,48 +76,141 @@ class ClientRequest:
     body: Stream[bytes] = field(default_factory=_empty_body)
 
 
-@dataclass(slots=True)
-class ClientResponse:
-    """A client response: the head, with the body as a live stream of chunks.
+@dataclass(frozen=True, slots=True)
+class ResponseHead:
+    """A response's head as the client parses it off the wire: status plus headers.
 
-    Stream the body with `async for chunk in response`, the download half of the
-    matrix, or `await response.read()` to buffer the whole body into `bytes`. The
-    connection is released exactly once, when the body is finished: an HTTP/1.1
-    connection returns to the pool only if its body was read to the end (otherwise it
-    is closed, since unread bytes remain on the wire), and an HTTP/2 stream is reset if
-    abandoned early. `ConnectionPool.request` finalizes the response on exit, so a body
-    that is never read still releases its connection rather than stranding it.
+    Without-http's *inbound* counterpart to without-asgi's outbound `ResponseStart`.
+    Same fields, deliberately *not* the same type: an outbound type carries defaults so
+    an app constructs it ergonomically, but a parsed-from-the-wire type must have no
+    defaults, so a field the parser forgot fails loudly instead of silently defaulting
+    (the inbound/outbound rule, mirroring without-asgi's `RequestBody` vs `ResponseBody`).
     """
 
     status: int
     headers: RawHeaders
-    _body: AsyncGenerator[bytes, None]
-    _release: Callable[[bool], Awaitable[None]]
-    _fully_read: bool = False
-    _released: bool = False
 
-    async def stream(self) -> AsyncIterator[bytes]:
-        async for chunk in self._body:
-            yield chunk
-        self._fully_read = True
-        await self._finalize()
+
+@dataclass(frozen=True, slots=True)
+class ResponseTrailers:
+    """A trailing header block, parsed off the wire after the response body.
+
+    The inbound counterpart to without-asgi's outbound `ResponseTrailers`, with no
+    defaults for the same reason as `ResponseHead`. A response is modeled as carrying
+    zero or more such blocks at the tail of its body stream, so consumers see them as a
+    sequence.
+    """
+
+    headers: RawHeaders
+
+
+@dataclass(slots=True)
+class ResponseBody:
+    """A response body: a stream of `bytes` chunks, optionally ended by trailers.
+
+    Consumed exactly once, by one of four methods spanning two axes, stream vs buffer
+    and drop-trailers vs keep-trailers:
+
+    - `async for chunk in body` / `await body.read()` yield `bytes`, dropping any
+      trailers, so the common path pays nothing for a feature it does not use.
+    - `body.events()` / `await body.read_with_trailers()` keep trailers, surfaced as
+      `ResponseTrailers` after the byte chunks. Reach for these only when you know (out
+      of band) the endpoint uses trailers; `read_with_trailers` returns *all* trailer
+      blocks (an empty tuple if none), so a consumer that requires them enforces that.
+
+    Dropping trailers still drains the stream to its end, so the connection releases as
+    fully-read (see `_with_release`): it filters the terminal, it does not stop early.
+    """
+
+    _events: AsyncGenerator[bytes | ResponseTrailers, None]
+
+    async def _chunks(self) -> AsyncIterator[bytes]:
+        async for item in self._events:
+            if isinstance(item, bytes):
+                yield item
 
     def __aiter__(self) -> AsyncIterator[bytes]:
-        return self.stream()
+        return self._chunks()
 
     async def read(self) -> bytes:
-        return b"".join([chunk async for chunk in self.stream()])
+        chunks = [chunk async for chunk in self]
+        return b"".join(chunks)
+
+    def events(self) -> AsyncIterator[bytes | ResponseTrailers]:
+        return self._events
+
+    async def read_with_trailers(self) -> tuple[bytes, tuple[ResponseTrailers, ...]]:
+        chunks: list[bytes] = []
+        trailers: list[ResponseTrailers] = []
+        async for item in self._events:
+            if isinstance(item, ResponseTrailers):
+                trailers.append(item)
+            else:
+                chunks.append(item)
+        return b"".join(chunks), tuple(trailers)
 
     async def aclose(self) -> None:
-        await self._finalize()
+        await self._events.aclose()
 
-    async def _finalize(self) -> None:
-        if self._released:
-            return
-        self._released = True
-        if not self._fully_read:
-            await self._body.aclose()
-        await self._release(self._fully_read)
+
+class ClientResponse(NamedTuple):
+    """A client response as a value: the head paired with the body.
+
+    `head` is the parsed `ResponseHead` (status + headers), available the instant
+    `await exchange(request)` returns. `body` is a `ResponseBody`, a once-consumable
+    stream that releases its connection when it ends or is closed.
+
+    A `NamedTuple` so a caller can take it whole (`response.head`, `response.body`) or
+    unpack it (`head, body = response`) with each field keeping its precise type, which a
+    `__iter__` on a dataclass could not give. The two halves are independent, the
+    consumer split that mirrors how a server consumes a request (a `scope` value plus a
+    body stream): branch on `head` without touching `body`. `ConnectionPool.request`
+    yields this value and closes `body` on exit; it is also what a `ClientExchange`
+    rewrites (by constructing a new one, since a `NamedTuple` has no `dataclasses.replace`).
+    """
+
+    head: ResponseHead
+    body: ResponseBody
+
+
+async def _with_release(
+    body: AsyncGenerator[bytes | ResponseTrailers, None], release: Callable[[bool], Awaitable[None]]
+) -> AsyncGenerator[bytes | ResponseTrailers, None]:
+    """A response body that releases its connection when the body ends.
+
+    Folds the release decision into the stream's own lifecycle, the client mirror of
+    the server's end-of-stream cleanup: draining the body to the end runs `release`
+    with `fully_read=True` (the h11 connection is keep-alive eligible), while closing
+    it early (`GeneratorExit` from an abandoned read) runs the `finally` with `False`,
+    so the same hook closes the socket or resets the stream. The body generator owns
+    *when* cleanup happens; the pool's `release` owns *what* it does.
+
+    The leading `yield b""` is a priming sentinel. `aclose()` on an async generator
+    that was never entered skips its `finally` entirely, so a response whose body is
+    never read (a status-only check, an empty redirect hop) would leak its connection.
+    `_releasing` consumes the sentinel at construction, leaving the generator suspended
+    *inside* the `try`, so `aclose` always runs the `finally`. It costs no I/O: the
+    sentinel is yielded before the body is ever pulled.
+    """
+    fully_read = False
+    try:
+        yield b""
+        async for chunk in body:
+            yield chunk
+        fully_read = True
+    finally:
+        if not fully_read:
+            await body.aclose()
+        await release(fully_read)
+
+
+async def _releasing(
+    body: AsyncGenerator[bytes | ResponseTrailers, None], release: Callable[[bool], Awaitable[None]]
+) -> AsyncGenerator[bytes | ResponseTrailers, None]:
+    """Build a release-on-end body and prime past its sentinel (see `_with_release`)."""
+    armed = _with_release(body, release)
+    await anext(armed)
+    return armed
 
 
 # A client exchange is the dual of a server handler: where a handler maps a request to
@@ -255,7 +350,7 @@ class _Http11Connection:
                 return event.status_code, tuple((bytes(name), bytes(value)) for name, value in event.headers)
             raise ConnectionError("the server closed the connection before sending a response")
 
-    async def iter_body(self) -> AsyncGenerator[bytes, None]:
+    async def iter_body(self) -> AsyncGenerator[bytes | ResponseTrailers, None]:
         while True:
             event = self._conn.next_event()
             if event is h11.NEED_DATA:
@@ -263,6 +358,10 @@ class _Http11Connection:
                 continue
             if isinstance(event, h11.Data):
                 yield bytes(event.data)
+            elif isinstance(event, h11.EndOfMessage):
+                if event.headers:
+                    yield ResponseTrailers(tuple((bytes(name), bytes(value)) for name, value in event.headers))
+                return
             else:
                 return
 
@@ -289,7 +388,8 @@ class _Stream:
     `head` is set when the response start arrives; `chunks` carries the response body
     as `(data, flow_controlled_length)` pairs, ended by `None`, so the consumer
     acknowledges flow control only as it reads, keeping the window (and the buffer)
-    bounded. `window` gates the *request* body sender on `WINDOW_UPDATE`.
+    bounded. `window` gates the *request* body sender on `WINDOW_UPDATE`. `trailers`
+    accumulates any trailing header blocks, delivered after the body's last chunk.
     """
 
     window: asyncio.Event
@@ -297,6 +397,7 @@ class _Stream:
     chunks: asyncio.Queue[tuple[bytes, int] | None]
     status: int = 0
     headers: RawHeaders = ()
+    trailers: list[ResponseTrailers] = field(default_factory=list)
     error: BaseException | None = None
 
 
@@ -349,7 +450,7 @@ class _Http2Connection:
         authority: bytes,
         headers: RawHeaders,
         body: Stream[bytes],
-    ) -> tuple[int, RawHeaders, int, AsyncGenerator[bytes, None]]:
+    ) -> tuple[int, RawHeaders, int, AsyncGenerator[bytes | ResponseTrailers, None]]:
         first, rest = await _peek(body)
         stream = _Stream(window=asyncio.Event(), head=asyncio.Event(), chunks=asyncio.Queue())
         async with self._lock:
@@ -406,7 +507,7 @@ class _Http2Connection:
             if len(remaining) == 0:
                 return
 
-    async def _iter_body(self, stream_id: int, stream: _Stream) -> AsyncGenerator[bytes, None]:
+    async def _iter_body(self, stream_id: int, stream: _Stream) -> AsyncGenerator[bytes | ResponseTrailers, None]:
         while True:
             item = await stream.chunks.get()
             if item is None:
@@ -420,6 +521,8 @@ class _Http2Connection:
             await self._writer.drain()
         if stream.error is not None:
             raise stream.error
+        for trailer in stream.trailers:
+            yield trailer
 
     async def abort(self, stream_id: int) -> None:
         """Reset a stream abandoned before its response ended, so the server stops sending."""
@@ -475,6 +578,11 @@ class _Http2Connection:
             case h2.events.DataReceived(stream_id=stream_id, data=data, flow_controlled_length=length):
                 if (stream := self._streams.get(stream_id)) is not None:
                     stream.chunks.put_nowait((bytes(data), length))
+            case h2.events.TrailersReceived(stream_id=stream_id, headers=headers):
+                if (stream := self._streams.get(stream_id)) is not None:
+                    stream.trailers.append(
+                        ResponseTrailers(tuple((bytes(name), bytes(value)) for name, value in headers))
+                    )
             case h2.events.StreamEnded(stream_id=stream_id):
                 if (stream := self._streams.pop(stream_id, None)) is not None:
                     stream.chunks.put_nowait(None)
@@ -500,10 +608,7 @@ class _Http2Connection:
 
     async def aclose(self) -> None:
         self._closed.set()
-        if self._task is not None:
-            self._task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._task
+        await cancel_futures([self._task])  # `_task` may be None before `start`; skipped
         with suppress(h2.exceptions.ProtocolError, OSError):
             async with self._lock:
                 self._conn.close_connection()
@@ -526,10 +631,11 @@ class ConnectionPool:
     multiplex over a single connection, which is the point of h2. HTTP/1.1
     connections are kept too but used serially: an idle one is checked out for a
     request and returned once its response body is read (keep-alive), so a fresh one
-    is opened only when none is idle. An h2 connection is negotiated over TLS by ALPN,
-    or over cleartext by *prior knowledge* when `http2_cleartext` is set (the caller
-    asserting the server speaks h2c, since cleartext cannot negotiate); otherwise the
-    origin speaks HTTP/1.1.
+    is opened only when none is idle. An h2 connection is negotiated over TLS by ALPN
+    when `allow_http2` is set (the default; it is *allowed*, falling back to HTTP/1.1 if
+    the server does not offer it), or over cleartext by *prior knowledge* when
+    `force_http2_cleartext` is set (the caller asserting the server speaks h2c, since
+    cleartext cannot negotiate); otherwise the origin speaks HTTP/1.1.
 
     `middleware` decorates every request through the pool; per-request `middleware` on
     `request` composes inside it. Keep pool-level middleware to *pure* decoration
@@ -540,8 +646,8 @@ class ConnectionPool:
     hiding in the pool.
     """
 
-    http2: bool = True
-    http2_cleartext: bool = False
+    allow_http2: bool = True
+    force_http2_cleartext: bool = False
     ssl_context: ssl.SSLContext | None = None
     middleware: ClientMiddleware = _PASSTHROUGH
     _h2: dict[Origin, _Http2Connection] = field(default_factory=dict)
@@ -563,34 +669,39 @@ class ConnectionPool:
         url: str,
         *,
         headers: RawHeaders = (),
-        content: bytes | Stream[bytes] = b"",
+        body: bytes | Stream[bytes] = b"",
         middleware: ClientMiddleware = _PASSTHROUGH,
     ) -> AsyncIterator[ClientResponse]:
-        """Send a request and yield its response for the block, then release the connection.
+        """Send a request and yield its `ClientResponse` for the block, then release the connection.
 
-        `content` is the request body: `bytes` to buffer it, or a `Stream[bytes]` to
-        stream it. Read the response with `await response.read()` or by iterating
-        `response` chunk by chunk; on exit any unread body is drained or aborted so the
-        connection is never stranded.
+        `body` is the request body: `bytes` to buffer it, or a `Stream[bytes]` to stream
+        it. The yielded `ClientResponse` can be taken whole (`response.head`,
+        `response.body`) or unpacked (`head, body = ...`); read the response body with
+        `async for chunk in body` / `await body.read()`, or `body.read_with_trailers()`
+        when the endpoint carries trailers. On exit any unread body is drained or aborted
+        so the connection is never stranded.
 
         `middleware` is composed inside the pool's own `middleware`, so a single request
         can add decoration (a `CookieJar` via `cookies`, an extra header) on top of the
         pool-wide stack for this call alone.
         """
-        outgoing = _build_request(method, url, headers, content)
-        exchange = stack(self.middleware, middleware)(self.exchange)
+        outgoing = _build_request(method, url, headers, body)
+        exchange = stack(self.middleware, middleware)(self._exchange)
         response = await exchange(outgoing)
         try:
             yield response
         finally:
-            await response.aclose()
+            await response.body.aclose()
 
-    async def exchange(self, request: ClientRequest) -> ClientResponse:
+    async def _exchange(self, request: ClientRequest) -> ClientResponse:
+        # The bare transport exchange: the inner `ClientExchange` that `request` wraps
+        # with `stack(self.middleware, ...)`. Private so callers go through `request`
+        # and never accidentally bypass the pool's configured middleware.
         parts = urlsplit(request.url)
         origin = _origin(parts)
-        if origin.secure and self.http2:
+        if origin.secure and self.allow_http2:
             return await self._request_secure(origin, request, parts)
-        if not origin.secure and self.http2_cleartext:
+        if not origin.secure and self.force_http2_cleartext:
             return await self._h2_response(await self._acquire_h2c(origin), request, parts)
         return await self._request_h11(origin, request, parts)
 
@@ -644,7 +755,7 @@ class ConnectionPool:
             if not fully_read:
                 await connection.abort(stream_id)
 
-        return ClientResponse(status, headers, body, release)
+        return ClientResponse(ResponseHead(status, headers), ResponseBody(await _releasing(body, release)))
 
     async def _request_h11(self, origin: Origin, request: ClientRequest, parts: SplitResult) -> ClientResponse:
         connection = self._checkout_h11(origin)
@@ -662,7 +773,9 @@ class ConnectionPool:
             else:
                 await connection.aclose()
 
-        return ClientResponse(status, headers, connection.iter_body(), release)
+        return ClientResponse(
+            ResponseHead(status, headers), ResponseBody(await _releasing(connection.iter_body(), release))
+        )
 
     def _checkout_h11(self, origin: Origin) -> _Http11Connection | None:
         idle = self._idle_h11.get(origin)
@@ -705,6 +818,39 @@ class ConnectionPool:
             await idle_connection.aclose()
 
 
+def wrap(
+    *,
+    request: Endo[ClientRequest] | None = None,
+    response: Endo[ClientResponse] | None = None,
+) -> ClientMiddleware:
+    """Build a `ClientMiddleware` from a request and/or response transform.
+
+    The client counterpart to without-asgi's `wrap`: where the server wraps a handler's
+    inbound/outbound *streams*, the client wraps an exchange's *request* (before it is
+    sent) and *response* (after it returns). `request` rewrites the outgoing
+    `ClientRequest` (headers, URL, body); `response` transforms the returned
+    `ClientResponse` (e.g. wrapping its body). Either omitted leaves that side untouched.
+
+    This is the easy path for the *independent* before/after case (the dual of why
+    `add_headers`, below, is a one-liner over it). A middleware whose two sides share
+    state, like `cookies` needing the request URL when it stores the response, or that
+    loops, like `follow_redirects`, is written directly as a `ClientExchange` wrapper.
+    """
+
+    def middleware(inner: ClientExchange) -> ClientExchange:
+        async def exchange(outgoing: ClientRequest) -> ClientResponse:
+            if request is not None:
+                outgoing = request(outgoing)
+            incoming = await inner(outgoing)
+            if response is not None:
+                incoming = response(incoming)
+            return incoming
+
+        return exchange
+
+    return middleware
+
+
 def add_headers(*headers: tuple[bytes, bytes]) -> ClientMiddleware:
     """Client middleware that adds headers to every request.
 
@@ -713,16 +859,8 @@ def add_headers(*headers: tuple[bytes, bytes]) -> ClientMiddleware:
     pool sends default headers (auth tokens, a user agent) on every request, or a
     single request adds its own.
     """
-
     extra: RawHeaders = tuple(headers)
-
-    def middleware(inner: ClientExchange) -> ClientExchange:
-        async def exchange(request: ClientRequest) -> ClientResponse:
-            return await inner(replace(request, headers=extra + request.headers))
-
-        return exchange
-
-    return middleware
+    return wrap(request=lambda request: replace(request, headers=extra + request.headers))
 
 
 def follow_redirects(max_hops: int = 5) -> ClientMiddleware:
@@ -738,12 +876,12 @@ def follow_redirects(max_hops: int = 5) -> ClientMiddleware:
         async def exchange(request: ClientRequest) -> ClientResponse:
             response = await inner(request)
             for _ in range(max_hops):
-                if response.status not in _REDIRECT_STATUSES:
+                if response.head.status not in _REDIRECT_STATUSES:
                     return response
-                location = next((value for name, value in response.headers if name.lower() == b"location"), None)
+                location = next((value for name, value in response.head.headers if name.lower() == b"location"), None)
                 if location is None:
                     return response
-                await response.aclose()
+                await response.body.aclose()
                 request = replace(request, url=urljoin(request.url, location.decode("ascii")))
                 response = await inner(request)
             return response
@@ -909,7 +1047,7 @@ def cookies(jar: CookieJar) -> ClientMiddleware:
             if header is not None:
                 request = replace(request, headers=_with_cookie(request.headers, header))
             response = await inner(request)
-            jar.store(request.url, response.headers)
+            jar.store(request.url, response.head.headers)
             return response
 
         return exchange

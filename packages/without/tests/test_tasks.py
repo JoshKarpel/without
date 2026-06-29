@@ -64,6 +64,25 @@ async def test_cancel_futures_cancels_then_awaits_every_future() -> None:
     assert torn_down == 4
 
 
+async def test_cancel_futures_skips_none_entries() -> None:
+    torn_down = 0
+
+    async def worker() -> None:
+        nonlocal torn_down
+        try:
+            await sleep_forever()
+        finally:
+            torn_down += 1
+
+    task = asyncio.create_task(worker())
+    await asyncio.sleep(0)
+
+    await cancel_futures([None, task, None])
+
+    assert task.cancelled()
+    assert torn_down == 1
+
+
 async def test_cancel_futures_propagates_a_non_cancellation_teardown_error() -> None:
     async def worker() -> None:
         try:

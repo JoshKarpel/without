@@ -93,34 +93,75 @@ The client is a `ConnectionPool` you open once and make requests through, not fr
 from without_http import ConnectionPool
 
 async with ConnectionPool() as pool:
-    async with pool.request("GET", "http://127.0.0.1:8000/items") as response:
-        assert response.status == 200
-        body = await response.read()
+    async with pool.request("GET", "http://127.0.0.1:8000/items") as (head, body):
+        assert head.status == 200
+        data = await body.read()
 ```
+
+### The response: a `(head, body)` split
+
+`pool.request` yields a `ClientResponse`, which is a `NamedTuple`, so take it whole or
+unpack it as you like:
+
+```python
+async with pool.request("GET", url) as response:   # response.head, response.body
+    ...
+async with pool.request("GET", url) as (head, body):   # unpacked, types preserved
+    ...
+```
+
+`head` is a `ResponseHead` (status + headers), a value you branch on immediately;
+`body` is a `ResponseBody`, a live stream you consume separately. This mirrors how the
+server *consumes* a request (a `scope` value plus a body stream): the structured head
+is pulled out as a value so you can decide what to do before touching the body.
+
+`head` is without-http's own inbound type, deliberately *not* without-asgi's outbound
+`ResponseStart` even though the fields match: a type the parser fills from the wire
+has no defaults (so a missing field fails loudly), while an outbound type an app
+builds carries them for ergonomics. Same split as without-asgi's `RequestBody`
+(inbound) versus `ResponseBody` (outbound).
 
 ### Buffered and streaming, both directions
 
 Request and response bodies each cover the full buffered/streaming matrix, the
-client mirror of `without-web`'s server handlers. The request body is `content=`
+client mirror of `without-web`'s server handlers. The request body is `body=`
 on `pool.request`: pass `bytes` to buffer it, or a `Stream[bytes]` (any async
-iterable of chunks) to stream it. The response body is a live stream: iterate it
-chunk by chunk, or `await response.read()` to buffer the whole thing.
+iterable of chunks) to stream it. The response `body` is a live stream: iterate it
+chunk by chunk, or `await body.read()` to buffer the whole thing.
 
 ```python
 async def upload() -> AsyncIterator[bytes]:
     for path in paths:
         yield path.read_bytes()
 
-async with pool.request("POST", url, content=upload()) as response:
-    async for chunk in response:          # stream the response as it arrives
+async with pool.request("POST", url, body=upload()) as (head, body):
+    async for chunk in body:          # stream the response as it arrives
         sink.write(chunk)
 ```
 
 The connection is released when the body is finished: an HTTP/1.1 connection is
 returned to the pool only if its body was read to the end (a partial read closes
 it, since unread bytes remain on the wire), and an HTTP/2 stream is reset if
-abandoned early. `pool.request` finalizes the response on block exit, so a body
-you never read still releases its connection rather than stranding it.
+abandoned early. `pool.request` closes the body on block exit, so a body you never
+read still releases its connection rather than stranding it.
+
+### Trailers
+
+A response can carry trailing headers after its body (gRPC's `grpc-status` is the
+common case). The default path drops them: `async for chunk in body` and
+`await body.read()` yield only `bytes`. When you know (out of band, by the
+endpoint's contract) that trailers matter, opt in:
+
+```python
+data, trailers = await body.read_with_trailers()   # trailers: tuple[ResponseTrailers, ...]
+# or, while streaming: async for item in body.events():  # bytes | ResponseTrailers
+```
+
+`read_with_trailers` returns *all* trailer blocks (an empty tuple if none), so a
+consumer that requires them enforces that itself rather than the framework imposing
+a failure on every response. Dropping trailers on the default path is a deliberate,
+valid choice, not a swallowed error, so a server adding a trailer never breaks a
+client that does not ask for it.
 
 ### Connection pooling
 
@@ -128,13 +169,13 @@ you never read still releases its connection rather than stranding it.
 multiplex over a single pooled connection; HTTP/1.1 connections are kept alive and
 reused serially (an idle one is checked out per request and returned once its
 response body is read). h2 is negotiated by ALPN over TLS
-(`ConnectionPool(http2=True)`, the default; pass a custom `ssl_context` for a private
-CA), or over cleartext by *prior knowledge* with `ConnectionPool(http2_cleartext=True)`
+(`ConnectionPool(allow_http2=True)`, the default; pass a custom `ssl_context` for a private
+CA), or over cleartext by *prior knowledge* with `ConnectionPool(force_http2_cleartext=True)`
 (no negotiation, so the caller is asserting the server speaks h2c); otherwise the
 origin speaks HTTP/1.1.
 
 ```python
-async with ConnectionPool(http2=True, ssl_context=ctx) as pool:
+async with ConnectionPool(allow_http2=True, ssl_context=ctx) as pool:
     # eight concurrent requests, multiplexed over one h2 connection
     bodies = await asyncio.gather(*(fetch(pool, n) for n in range(8)))
 ```
@@ -159,13 +200,26 @@ from without_http import ConnectionPool, add_headers, follow_redirects, cookies,
 
 jar = CookieJar()
 async with ConnectionPool(middleware=add_headers((b"authorization", b"Bearer ..."))) as pool:
-    async with pool.request("GET", url, middleware=stack(follow_redirects(), cookies(jar))) as response:
+    async with pool.request("GET", url, middleware=stack(follow_redirects(), cookies(jar))) as (head, body):
         ...
 ```
 
 Because the whole request is the value the exchange transforms (not a fixed scope),
 middleware can rewrite it on the way out (inject headers, change the URL on redirect,
 attach cookies) and wrap the response on the way back.
+
+For the simple independent case, `wrap(request=, response=)` builds a middleware from a
+request transform and/or a response transform, the client counterpart to
+without-asgi's `wrap` (which wraps a handler's inbound/outbound streams). `add_headers`
+is a one-liner over it: `wrap(request=lambda r: replace(r, headers=...))`. Reach for it
+when the two sides are independent; a middleware whose sides share state (`cookies`) or
+that loops (`follow_redirects`) is written directly as a `ClientExchange` wrapper.
+
+```python
+from without_http import ClientResponse, wrap
+
+byte_counter = wrap(response=lambda r: ClientResponse(r.head, counting(r.body)))
+```
 
 Keep the pool's own middleware to *pure* decoration (default headers, redirect
 following, retry): things that are values, not state. Anything carrying mutable,

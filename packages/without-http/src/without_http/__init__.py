@@ -4,10 +4,14 @@ from without_http.client import ClientRequest
 from without_http.client import ClientResponse
 from without_http.client import ConnectionPool
 from without_http.client import CookieJar
+from without_http.client import ResponseBody
+from without_http.client import ResponseHead
+from without_http.client import ResponseTrailers
 from without_http.client import add_headers
 from without_http.client import cookies
 from without_http.client import follow_redirects
 from without_http.client import stack
+from without_http.client import wrap
 from without_http.h2_wire import early_hint_headers
 from without_http.h2_wire import request_headers
 from without_http.h2_wire import response_headers
@@ -35,6 +39,9 @@ __all__ = [
     "ConnectionPool",
     "CookieJar",
     "LifespanError",
+    "ResponseBody",
+    "ResponseHead",
+    "ResponseTrailers",
     "Server",
     "add_headers",
     "cookies",
@@ -53,5 +60,6 @@ __all__ = [
     "serving",
     "stack",
     "websocket_scope_from_request",
+    "wrap",
     "ws_events_from_outbound",
 ]

@@ -41,9 +41,9 @@ async def test_client_round_trips_a_get_over_h2(
 ) -> None:
     async with serving(echo_app, ssl_context=server_context) as server:
         async with ConnectionPool(ssl_context=trusting_client_context) as pool:
-            async with pool.request("GET", f"https://{_HOST}:{server.port}/items") as response:
-                assert response.status == 200
-                assert await response.read() == b"GET /items test= body="
+            async with pool.request("GET", f"https://{_HOST}:{server.port}/items") as (head, body):
+                assert head.status == 200
+                assert await body.read() == b"GET /items test= body="
             assert len(pool._h2) == 1
 
 
@@ -52,16 +52,17 @@ async def test_client_posts_a_body_over_h2(
 ) -> None:
     async with serving(echo_app, ssl_context=server_context) as server:
         async with ConnectionPool(ssl_context=trusting_client_context) as pool:
-            async with pool.request("POST", f"https://{_HOST}:{server.port}/submit", content=b"payload") as response:
-                assert await response.read() == b"POST /submit test= body=payload"
+            url = f"https://{_HOST}:{server.port}/submit"
+            async with pool.request("POST", url, body=b"payload") as (_head, body):
+                assert await body.read() == b"POST /submit test= body=payload"
 
 
 async def test_client_multiplexes_concurrent_requests_over_one_h2_connection(
     server_context: ssl.SSLContext, trusting_client_context: ssl.SSLContext
 ) -> None:
     async def fetch(pool: ConnectionPool, port: int, index: int) -> bytes:
-        async with pool.request("GET", f"https://{_HOST}:{port}/n{index}") as response:
-            return await response.read()
+        async with pool.request("GET", f"https://{_HOST}:{port}/n{index}") as (_head, body):
+            return await body.read()
 
     async with serving(echo_app, ssl_context=server_context) as server:
         async with ConnectionPool(ssl_context=trusting_client_context) as pool:
@@ -81,9 +82,9 @@ async def test_client_streams_a_request_body_over_h2(
 ) -> None:
     async with serving(echo_app, ssl_context=server_context) as server:
         async with ConnectionPool(ssl_context=trusting_client_context) as pool:
-            body = _chunks(b"ab", b"cd", b"ef")
-            async with pool.request("POST", f"https://{_HOST}:{server.port}/up", content=body) as response:
-                assert await response.read() == b"POST /up test= body=abcdef"
+            upload = _chunks(b"ab", b"cd", b"ef")
+            async with pool.request("POST", f"https://{_HOST}:{server.port}/up", body=upload) as (_head, body):
+                assert await body.read() == b"POST /up test= body=abcdef"
 
 
 async def test_client_round_trips_a_body_larger_than_the_flow_control_window(
@@ -92,8 +93,8 @@ async def test_client_round_trips_a_body_larger_than_the_flow_control_window(
     payload = b"z" * 200_000
     async with serving(echo_app, ssl_context=server_context) as server:
         async with ConnectionPool(ssl_context=trusting_client_context) as pool:
-            async with pool.request("POST", f"https://{_HOST}:{server.port}/big", content=payload) as response:
-                assert await response.read() == b"POST /big test= body=" + payload
+            async with pool.request("POST", f"https://{_HOST}:{server.port}/big", body=payload) as (_head, body):
+                assert await body.read() == b"POST /big test= body=" + payload
 
 
 async def test_client_add_headers_middleware_reaches_the_server_over_h2(
@@ -103,13 +104,13 @@ async def test_client_add_headers_middleware_reaches_the_server_over_h2(
         async with ConnectionPool(
             ssl_context=trusting_client_context, middleware=add_headers((b"x-test", b"injected"))
         ) as pool:
-            async with pool.request("GET", f"https://{_HOST}:{server.port}/items") as response:
-                assert await response.read() == b"GET /items test=injected body="
+            async with pool.request("GET", f"https://{_HOST}:{server.port}/items") as (_head, body):
+                assert await body.read() == b"GET /items test=injected body="
 
 
 async def test_cleartext_stays_http_1_1_even_with_http2_enabled() -> None:
     async with serving(echo_app) as server:
-        async with ConnectionPool(http2=True) as pool:
-            async with pool.request("GET", f"http://{_HOST}:{server.port}/items") as response:
-                assert await response.read() == b"GET /items test= body="
+        async with ConnectionPool(allow_http2=True) as pool:
+            async with pool.request("GET", f"http://{_HOST}:{server.port}/items") as (_head, body):
+                assert await body.read() == b"GET /items test= body="
             assert pool._h2 == {}

@@ -83,30 +83,30 @@ async def test_without_http_client_gets_one_todo() -> None:
     async with (
         serving(todos_app(_todos())) as server,
         ConnectionPool() as pool,
-        pool.request("GET", f"http://{server.host}:{server.port}/todos/1") as response,
+        pool.request("GET", f"http://{server.host}:{server.port}/todos/1") as (head, body),
     ):
-        assert response.status == 200
-        assert json.loads(await response.read()) == {"id": 1, "title": "write", "done": False}
+        assert head.status == 200
+        assert json.loads(await body.read()) == {"id": 1, "title": "write", "done": False}
 
 
 async def test_a_missing_todo_maps_to_404() -> None:
     async with (
         serving(todos_app(_todos())) as server,
         ConnectionPool() as pool,
-        pool.request("GET", f"http://{server.host}:{server.port}/todos/999") as response,
+        pool.request("GET", f"http://{server.host}:{server.port}/todos/999") as (head, _body),
     ):
-        assert response.status == 404
+        assert head.status == 404
 
 
 async def test_client_middleware_supplies_the_admin_authorization_header() -> None:
     async with serving(todos_app(_todos())) as server:
         async with ConnectionPool() as pool:
-            async with pool.request("GET", f"http://{server.host}:{server.port}/admin/stats") as anonymous:
-                assert anonymous.status == 401
+            async with pool.request("GET", f"http://{server.host}:{server.port}/admin/stats") as (head, _body):
+                assert head.status == 401
 
         async with ConnectionPool(middleware=add_headers((b"authorization", b"Bearer let-me-in"))) as authorized:
-            async with authorized.request("GET", f"http://{server.host}:{server.port}/admin/stats") as response:
-                assert response.status == 200
+            async with authorized.request("GET", f"http://{server.host}:{server.port}/admin/stats") as (head, _body):
+                assert head.status == 200
 
 
 async def test_websocket_session_route_over_without_http() -> None:
