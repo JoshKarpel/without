@@ -99,14 +99,14 @@ async def _drive[T](lifespan: Lifespan[T], cell: _Cell[T], receive: Receive, sen
                 case Startup():
                     try:
                         cell.value = await stack.enter_async_context(lifespan())
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001 - ASGI lifespan reports any startup failure as StartupFailed
                         await send(encode_lifespan_reply(StartupFailed(message=str(exc))))
                         return
                     await send(encode_lifespan_reply(StartupComplete()))
                 case Shutdown():
                     try:
                         await stack.aclose()
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001 - ASGI lifespan reports any shutdown failure as ShutdownFailed
                         await send(encode_lifespan_reply(ShutdownFailed(message=str(exc))))
                         return
                     await send(encode_lifespan_reply(ShutdownComplete()))
@@ -151,7 +151,8 @@ def make_asgi_app[T](
     http: HttpRouter[T] = refuse_http,
     websocket: WebsocketRouter[T] = refuse_websocket,
 ) -> ASGIApp:
-    """Build the ASGI app that drives `lifespan` and runs a per-connection
+    """
+    Build the ASGI app that drives `lifespan` and runs a per-connection
     `Processor` over each connection's event stream.
 
     This is the ASGI entrypoint: it parses each raw scope into its typed value

@@ -24,7 +24,8 @@ class Asgi:
 
 @dataclass(frozen=True, slots=True)
 class HttpScope:
-    """The per-request connection facts, known once when the request opens.
+    """
+    The per-request connection facts, known once when the request opens.
 
     Field descriptions are taken from the ASGI HTTP connection scope:
     https://asgi.readthedocs.io/en/latest/specs/www.html#http-connection-scope
@@ -79,7 +80,8 @@ class HttpScope:
 
 @dataclass(frozen=True, slots=True)
 class WebsocketScope:
-    """The handshake facts of a websocket connection, known when it opens.
+    """
+    The handshake facts of a websocket connection, known when it opens.
 
     Field descriptions are taken from the ASGI WebSocket connection scope:
     https://asgi.readthedocs.io/en/latest/specs/www.html#websocket-connection-scope
@@ -134,7 +136,8 @@ class WebsocketScope:
 
 @dataclass(frozen=True, slots=True)
 class LifespanScope:
-    """The server lifecycle scope, shared across the whole event loop.
+    """
+    The server lifecycle scope, shared across the whole event loop.
 
     Field descriptions are taken from the ASGI lifespan scope:
     https://asgi.readthedocs.io/en/latest/specs/lifespan.html#scope
@@ -150,7 +153,8 @@ class LifespanScope:
 
 @dataclass(frozen=True, slots=True)
 class Tls:
-    """The `tls` extension's connection info, present only on TLS connections.
+    """
+    The `tls` extension's connection info, present only on TLS connections.
 
     Field descriptions are taken from the ASGI TLS extension:
     https://asgi.readthedocs.io/en/latest/specs/tls.html
@@ -309,7 +313,8 @@ def parse_scope(scope: RawScope) -> Scope:
 
 
 def extension(extensions: Mapping[str, Mapping[str, object]] | None, name: str) -> Mapping[str, object] | None:
-    """The named extension's advertised options, or `None` when it is absent.
+    """
+    The named extension's advertised options, or `None` when it is absent.
 
     Parse, don't validate: this returns the options mapping itself (often empty,
     as for `http.response.trailers`) rather than a bool, so a caller needing the
@@ -336,7 +341,8 @@ def _encode_headers(headers: RawHeaders) -> list[list[bytes]]:
 
 
 def encode_http_scope(scope: HttpScope) -> RawScope:
-    """Render a typed `HttpScope` as the raw `http` scope dict an ASGI app expects.
+    """
+    Render a typed `HttpScope` as the raw `http` scope dict an ASGI app expects.
 
     The server-direction dual of `parse_http_scope`: a transport that owns the
     wire (without-http) builds the typed scope from the request line and renders
@@ -390,7 +396,8 @@ def encode_scope(scope: Scope) -> RawScope:
 
 
 def parse_tls(extensions: Mapping[str, Mapping[str, object]] | None) -> Tls | None:
-    """Read the `tls` extension's connection info from a scope's `extensions`.
+    """
+    Read the `tls` extension's connection info from a scope's `extensions`.
 
     Returns `None` when the connection is not over TLS (the extension is absent),
     which is how an application distinguishes TLS from plaintext connections.

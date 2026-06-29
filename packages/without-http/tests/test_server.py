@@ -62,9 +62,8 @@ def crash_app() -> ASGIApp:
 
 @asynccontextmanager
 async def _client(app: ASGIApp) -> AsyncIterator[httpx.AsyncClient]:
-    async with serving(app) as server:
-        async with httpx.AsyncClient(base_url=f"http://{server.host}:{server.port}") as client:
-            yield client
+    async with serving(app) as server, httpx.AsyncClient(base_url=f"http://{server.host}:{server.port}") as client:
+        yield client
 
 
 async def test_serves_a_get_response() -> None:

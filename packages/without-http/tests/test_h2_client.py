@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import ssl
 from collections.abc import AsyncIterator
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -30,10 +29,10 @@ def server_context(authority: trustme.CA, tmp_path_factory: pytest.TempPathFacto
 
 
 @pytest.fixture
-def trusting_client_context(authority: trustme.CA) -> Iterator[ssl.SSLContext]:
+def trusting_client_context(authority: trustme.CA) -> ssl.SSLContext:
     context = ssl.create_default_context()
     authority.configure_trust(context)
-    yield context
+    return context
 
 
 async def test_client_round_trips_a_get_over_h2(
@@ -100,17 +99,16 @@ async def test_client_round_trips_a_body_larger_than_the_flow_control_window(
 async def test_client_add_headers_middleware_reaches_the_server_over_h2(
     server_context: ssl.SSLContext, trusting_client_context: ssl.SSLContext
 ) -> None:
-    async with serving(echo_app, ssl_context=server_context) as server:
-        async with ConnectionPool(
-            ssl_context=trusting_client_context, middleware=add_headers((b"x-test", b"injected"))
-        ) as pool:
-            async with pool.request("GET", f"https://{_HOST}:{server.port}/items") as (_head, body):
-                assert await body.read() == b"GET /items test=injected body="
+    async with (
+        serving(echo_app, ssl_context=server_context) as server,
+        ConnectionPool(ssl_context=trusting_client_context, middleware=add_headers((b"x-test", b"injected"))) as pool,
+        pool.request("GET", f"https://{_HOST}:{server.port}/items") as (_head, body),
+    ):
+        assert await body.read() == b"GET /items test=injected body="
 
 
 async def test_cleartext_stays_http_1_1_even_with_http2_enabled() -> None:
-    async with serving(echo_app) as server:
-        async with ConnectionPool(allow_http2=True) as pool:
-            async with pool.request("GET", f"http://{_HOST}:{server.port}/items") as (_head, body):
-                assert await body.read() == b"GET /items test= body="
-            assert pool._h2 == {}
+    async with serving(echo_app) as server, ConnectionPool(allow_http2=True) as pool:
+        async with pool.request("GET", f"http://{_HOST}:{server.port}/items") as (_head, body):
+            assert await body.read() == b"GET /items test= body="
+        assert pool._h2 == {}

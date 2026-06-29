@@ -47,7 +47,8 @@ def encode_websocket_data(data: WebsocketData) -> dict[str, object]:
 
 
 def decode_websocket_data(message: RawMessage) -> WebsocketData:
-    """Read the `text`/`bytes` key off an ASGI websocket message into a `WebsocketData`.
+    """
+    Read the `text`/`bytes` key off an ASGI websocket message into a `WebsocketData`.
 
     The spec requires exactly one of the two; both or neither is a protocol fault.
     """

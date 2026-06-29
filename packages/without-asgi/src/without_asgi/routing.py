@@ -56,7 +56,8 @@ def wrap[In, Out, S](
     inbound: Callable[[Stream[In], S], Stream[In]] | None = None,
     outbound: Callable[[Stream[Out], S], Stream[Out]] | None = None,
 ) -> Middleware[object, Processor[In, Out], S]:
-    """Build a (type-preserving) `Middleware` from scope-aware stream
+    """
+    Build a (type-preserving) `Middleware` from scope-aware stream
     transformers. Each is given the parsed scope, so a no-config middleware is
     just `wrap(inbound=..., outbound=...)`; either omitted leaves that side
     untouched.
@@ -122,7 +123,8 @@ _OVERLOADED = Response(
 
 
 def limit_concurrent_requests(limit: int, *, overloaded: Response = _OVERLOADED) -> HttpMiddleware[object]:
-    """An `HttpMiddleware` that sheds load past `limit` concurrent in-flight requests.
+    """
+    An `HttpMiddleware` that sheds load past `limit` concurrent in-flight requests.
 
     While `limit` requests are already running, further requests are answered
     immediately with the `overloaded` response (a `503 Service Unavailable` carrying
@@ -176,7 +178,8 @@ def limit_concurrent_requests(limit: int, *, overloaded: Response = _OVERLOADED)
 
 
 def buffered[T](make: Callable[[T, HttpScope, bytes], Response]) -> HttpRouter[T]:
-    """Build an `HttpRouter` that reads the whole request body and emits one
+    """
+    Build an `HttpRouter` that reads the whole request body and emits one
     `Response`, for handlers that don't stream. Usable as a decorator on a
     `(state, scope, body) -> Response` function.
 

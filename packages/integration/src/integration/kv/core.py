@@ -32,7 +32,8 @@ class Delete:
 
 @dataclass(frozen=True, slots=True)
 class Malformed:
-    """A line the boundary could not read as a command.
+    """
+    A line the boundary could not read as a command.
 
     Garbage from a client is a real protocol event, not an illegal internal
     state, so the parser names it as a closed variant rather than raising. The
@@ -48,7 +49,8 @@ type Request = Command | Malformed
 
 
 def parse_request(line: str) -> Request:
-    """Classify one protocol line into the closed set of things a client can send.
+    """
+    Classify one protocol line into the closed set of things a client can send.
 
     A total function at the boundary (parse, don't validate): every line maps to
     a `Request`, and an unreadable one becomes `Malformed` rather than raising,
@@ -120,7 +122,8 @@ def encode_reply(reply: Reply) -> str:
 
 @dataclass(frozen=True, slots=True)
 class Store:
-    """An immutable snapshot of the keyspace.
+    """
+    An immutable snapshot of the keyspace.
 
     Mutating operations return a *new* `Store`: the keyspace is a value the
     step threads from one request to the next, not a place callers share and
@@ -140,7 +143,8 @@ EMPTY_STORE = Store(entries={})
 
 
 async def apply(request: Request, store: Store) -> Transition[Store, Reply]:
-    """Fold one request into the keyspace, emitting its reply.
+    """
+    Fold one request into the keyspace, emitting its reply.
 
     The step kernel. It does no I/O, so it is an `async def` that never
     awaits: a step that happens to be pure is just the degenerate case of one

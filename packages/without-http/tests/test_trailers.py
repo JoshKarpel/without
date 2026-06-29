@@ -13,7 +13,7 @@ from without_http import ResponseBody
 from without_http import ResponseTrailers
 
 
-async def _events(*items: bytes | ResponseTrailers) -> AsyncGenerator[bytes | ResponseTrailers, None]:
+async def _events(*items: bytes | ResponseTrailers) -> AsyncGenerator[bytes | ResponseTrailers]:
     for item in items:
         yield item
 
@@ -151,9 +151,9 @@ async def test_h2_client_surfaces_trailers() -> None:
     async with (
         _raw_h2_server(200, b"hello", [(b"grpc-status", b"0")]) as (host, port),
         ConnectionPool(force_http2_cleartext=True) as pool,
+        pool.request("GET", f"http://{host}:{port}/") as (head, body),
     ):
-        async with pool.request("GET", f"http://{host}:{port}/") as (head, body):
-            assert head.status == 200
-            data, trailers = await body.read_with_trailers()
+        assert head.status == 200
+        data, trailers = await body.read_with_trailers()
     assert data == b"hello"
     assert trailers == (ResponseTrailers(((b"grpc-status", b"0"),)),)

@@ -30,7 +30,8 @@ class LifespanError(Exception):
 
 @asynccontextmanager
 async def run_lifespan(app: ASGIApp) -> AsyncIterator[None]:
-    """Drive the ASGI lifespan protocol around an app for the server's lifetime.
+    """
+    Drive the ASGI lifespan protocol around an app for the server's lifetime.
 
     Runs the app once with a `lifespan` scope as a background task: sends
     `lifespan.startup` on entry and waits for the app to ack, then `lifespan.shutdown`

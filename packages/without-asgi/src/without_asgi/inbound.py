@@ -103,7 +103,8 @@ def parse_lifespan_event(message: RawMessage) -> LifespanEvent:
 
 
 def encode_inbound(event: Inbound) -> RawMessage:
-    """Render one inbound `http` event as the raw dict an ASGI `receive` returns.
+    """
+    Render one inbound `http` event as the raw dict an ASGI `receive` returns.
 
     The server-direction dual of `parse_inbound`: a transport that owns the wire
     (without-http) builds typed `Inbound` events and hands them to the app as the

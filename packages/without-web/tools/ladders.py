@@ -1,4 +1,5 @@
-"""Generate the typed `@overload` ladders for `without-web`.
+"""
+Generate the typed `@overload` ladders for `without-web`.
 
 These ladders tie a variadic list of `Extractor` tokens to a handler's
 parameters at each arity (0-10), so a mismatch is a mypy error rather than a
@@ -21,7 +22,8 @@ LETTERS = ("A", "B", "C", "D", "E", "F", "G", "H", "J", "K")
 
 
 def _keywords(stream: bool) -> list[str]:
-    """The keyword-only tail for the handler ladders (the websocket ladder has none).
+    """
+    The keyword-only tail for the handler ladders (the websocket ladder has none).
 
     A streaming route gets a `request_body` describing its inbound sequence: it
     has no `body` extractor (that would buffer the input it streams), so the
@@ -34,7 +36,8 @@ def _keywords(stream: bool) -> list[str]:
 
 
 def _overload(name: str, typeparams: list[str], params: list[str], return_type: str) -> str:
-    """One `@overload` stub, fully expanded with a magic trailing comma.
+    """
+    One `@overload` stub, fully expanded with a magic trailing comma.
 
     The trailing comma on the last parameter keeps `ruff format` from collapsing
     short signatures back onto one line, so this generated form is a fixed point
@@ -50,7 +53,8 @@ def _extractor_params(letters: list[str]) -> list[str]:
 
 
 def _handler_ladder(name: str, *, stream: bool) -> str:
-    """`handle` / `handle_stream`: extractors, then a keyword-only `fn`.
+    """
+    `handle` / `handle_stream`: extractors, then a keyword-only `fn`.
 
     The streaming form appends a trailing `Stream[Inbound]` to `fn`'s parameters,
     which the handler reads live instead of a buffered body.
@@ -70,7 +74,8 @@ def _handler_ladder(name: str, *, stream: bool) -> str:
 
 
 def _method_ladder(*, stream: bool) -> str:
-    """`_Method.__call__` / `_StreamMethod.__call__`: a leading `pattern`, then extractors.
+    """
+    `_Method.__call__` / `_StreamMethod.__call__`: a leading `pattern`, then extractors.
 
     `fn` rides in the returned decorator's type, so the per-arity variation is in
     the return type rather than a parameter.
@@ -86,7 +91,8 @@ def _method_ladder(*, stream: bool) -> str:
 
 
 def _ws_ladder() -> str:
-    """`ws`: a leading `pattern`, then extractors, no keyword tail (a handshake has no body).
+    """
+    `ws`: a leading `pattern`, then extractors, no keyword tail (a handshake has no body).
 
     The handler *is* the frame processor (as in `@post.stream`): a trailing
     `Stream[WebsocketInbound]` carries the live inbound frames and the handler
@@ -123,7 +129,8 @@ _LADDERS: dict[str, Callable[[], str]] = {
 
 
 def emit(name: str) -> str:
-    """The generated ladder text for `name`, for a `cog.outl(emit("..."))` block.
+    """
+    The generated ladder text for `name`, for a `cog.outl(emit("..."))` block.
 
     Blank-line spacing is left to `ruff format`, which runs immediately after
     `cog` in the same pre-commit hook (see `tools/regenerate.sh`): this emits the

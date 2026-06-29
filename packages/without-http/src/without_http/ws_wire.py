@@ -25,10 +25,7 @@ from without_http.h11_wire import ASGI
 
 def is_websocket_upgrade(request: h11.Request) -> bool:
     """Whether an `h11.Request` is a WebSocket handshake (`Upgrade: websocket`)."""
-    for name, value in request.headers:
-        if name.lower() == b"upgrade" and b"websocket" in value.lower():
-            return True
-    return False
+    return any(name.lower() == b"upgrade" and b"websocket" in value.lower() for name, value in request.headers)
 
 
 def _subprotocols(request: h11.Request) -> tuple[str, ...]:
@@ -65,7 +62,8 @@ def websocket_scope_from_request(
 
 
 def ws_events_from_outbound(outbound: WebsocketOutbound, *, accepted: bool) -> list[Event]:
-    """Render one typed `WebsocketOutbound` as the `wsproto` events that put it on the wire.
+    """
+    Render one typed `WebsocketOutbound` as the `wsproto` events that put it on the wire.
 
     `accepted` distinguishes the two meanings of a `WebsocketClose`: before the
     handshake is accepted it is a *rejection* (an HTTP response, here a `403`);

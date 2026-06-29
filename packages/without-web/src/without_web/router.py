@@ -37,7 +37,8 @@ from without_web.trie import walk
 
 @dataclass(frozen=True, slots=True)
 class Match[S]:
-    """What the router hands a handler: the scope plus already-parsed path params.
+    """
+    What the router hands a handler: the scope plus already-parsed path params.
 
     `make_asgi_app`'s `HttpRouter` type is unchanged: `Router.dispatch` still
     presents as `(T, HttpScope) -> HttpHandler`. The richer `Match` is the
@@ -113,7 +114,8 @@ def _token_segment(value: object) -> Segment:
 
 @dataclass(frozen=True, slots=True)
 class Route[T]:
-    """A path pattern bound to one endpoint per HTTP method.
+    """
+    A path pattern bound to one endpoint per HTTP method.
 
     The method-decorator form (`@get(...)`) produces a single-method `Route`; the
     `Router` merges `Route`s that share a pattern into one method map, so the
@@ -126,7 +128,8 @@ class Route[T]:
 
 @dataclass(frozen=True, slots=True)
 class Mount[T]:
-    """A sub-application mounted at a literal-string prefix.
+    """
+    A sub-application mounted at a literal-string prefix.
 
     `target` is either a `without-web` `Router` (whose routes are grafted into
     this router's trie, so matching and OpenAPI see straight through with the
@@ -174,7 +177,8 @@ def route[T](
 
 
 def with_middleware[T, S, H](endpoint: Endpoint[T, S, H], *middleware: Middleware[T, H, S]) -> Endpoint[T, S, H]:
-    """Scope middleware to one endpoint instead of the whole router.
+    """
+    Scope middleware to one endpoint instead of the whole router.
 
     The router-wide `middleware` runs on every dispatch; this applies the same
     `Middleware` vocabulary to a single route (or an opaque mount target). An
@@ -291,7 +295,8 @@ def _remount(scope: HttpScope, prefix: str) -> HttpScope:
 
 @dataclass(frozen=True, slots=True)
 class Router[T]:
-    """An opinionated HTTP router whose `dispatch` is an `HttpRouter[T]`.
+    """
+    An opinionated HTTP router whose `dispatch` is an `HttpRouter[T]`.
 
     The whole integration surface with `without-asgi` is that one type: pass
     `router.dispatch` as `make_asgi_app(http=...)` and bring-your-own (or no
@@ -340,7 +345,8 @@ def ws_route[T](pattern: Pattern, endpoint: WebsocketEndpoint[T]) -> WebsocketRo
 
 @dataclass(frozen=True, slots=True)
 class WebsocketRouter[T]:
-    """The WebSocket sibling of `Router`, reusing the same trie machinery.
+    """
+    The WebSocket sibling of `Router`, reusing the same trie machinery.
 
     There is no method layer, so no 405: a connection either matches a path or
     falls to the `fallback`. `dispatch` is a `WebsocketRouter[T]` for

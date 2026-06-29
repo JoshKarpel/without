@@ -72,7 +72,8 @@ async def test_handle_calls_the_function_with_the_typed_extracted_values() -> No
     handler = endpoint("tenant", Match(_scope(), {"id": 7}))
     status, response = await _run(handler, b'{"title": "ship"}')
 
-    assert status == 201 and response == {"ok": True}
+    assert status == 201
+    assert response == {"ok": True}
     assert seen == {"state": "tenant", "requested_id": 7, "payload": {"title": "ship"}}
 
 
@@ -88,7 +89,8 @@ async def test_handle_relays_a_streamed_response_without_buffering_the_output() 
     handler = handle(path_param("id", INT), fn=make)("tenant", Match(_scope(), {"id": 5}))
     events = [event async for event in handler(_inbound(b""))]
     start = events[0]
-    assert isinstance(start, ResponseStart) and start.status == 206
+    assert isinstance(start, ResponseStart)
+    assert start.status == 206
     assert b"".join(e.body for e in events if isinstance(e, ResponseBody)) == b"part-5"
 
 
@@ -111,7 +113,8 @@ def test_handle_recovers_its_openapi_from_the_extractors() -> None:
     spec = endpoint.describe()
     assert spec.summary == "make a thing"
     assert [param.name for param in spec.query] == ["done"]
-    assert spec.request_body is not None and spec.request_body.shape == Single(schema={"type": "object"})
+    assert spec.request_body is not None
+    assert spec.request_body.shape == Single(schema={"type": "object"})
 
 
 def test_handle_rejects_more_than_one_body_extractor() -> None:
@@ -207,7 +210,8 @@ async def test_handle_stream_does_not_pre_consume_the_body() -> None:
     handler = handle_stream(fn=make)("tenant", Match(_scope(), {}))
     events = [event async for event in handler(tracked())]
 
-    assert isinstance(events[0], ResponseStart) and events[0].status == 202
+    assert isinstance(events[0], ResponseStart)
+    assert events[0].status == 202
     assert pulled == [b"one", b"two"]
 
 
@@ -258,7 +262,8 @@ async def test_post_stream_decorator_builds_a_streaming_route() -> None:
     events = [event async for event in handler(_chunks(b"ab", b"cde"))]
 
     start = events[0]
-    assert isinstance(start, ResponseStart) and start.status == 200
+    assert isinstance(start, ResponseStart)
+    assert start.status == 200
     raw = b"".join(event.body for event in events if isinstance(event, ResponseBody))
     assert json.loads(raw) == {"id": 3, "bytes": 5}
 
