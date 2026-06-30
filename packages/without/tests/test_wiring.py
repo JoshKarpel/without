@@ -119,6 +119,23 @@ async def test_updated_raises_the_source_error_to_a_pending_waiter() -> None:
         await await_next_update()
 
 
+async def test_updated_fails_fast_after_the_source_has_already_failed() -> None:
+    class SourceFailed(Exception):
+        pass
+
+    async def source() -> AsyncIterator[int]:
+        yield 1
+        raise SourceFailed("source failed")
+
+    async def update_after_failure() -> int:
+        async with sample(source()) as latest:
+            await yield_once()  # let the drain pull again and fail, storing the error
+            return await latest.updated()  # raises the stored error at once, never registering a doomed waiter
+
+    with pytest.raises(SourceFailed, match="source failed"):
+        await update_after_failure()
+
+
 async def test_sample_rejects_an_empty_stream() -> None:
     with pytest.raises(ValueError, match="at least one value"):
         async with sample(stream([])):

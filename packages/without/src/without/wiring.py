@@ -114,6 +114,7 @@ async def collect[T](source: Stream[T]) -> list[T]:
 class Sample[T]:
     _value: T
     _waiters: set[asyncio.Future[T]] = field(default_factory=set, init=False, repr=False, compare=False)
+    _error: BaseException | None = field(default=None, init=False, repr=False, compare=False)
 
     def current(self) -> T:
         return self._value
@@ -129,7 +130,9 @@ class Sample[T]:
         waits on (a test asserting on post-reload state, a control loop reacting
         to a config change) instead of guessing how long the background task
         needs. If the source raises instead of yielding, the wait raises that
-        error rather than hanging; if the context closes first, the wait is
+        error rather than hanging, and the failure is terminal: once the source
+        has failed, every later call re-raises it rather than registering a
+        waiter that can never resolve. If the context closes first, the wait is
         cancelled.
 
         Each call registers its own one-shot future resolved by the next publish,
@@ -140,6 +143,8 @@ class Sample[T]:
         "the state has moved on" signal, not a way to observe every value;
         consume the stream for that.
         """
+        if self._error is not None:  # the source already failed; fail fast rather than wait forever
+            raise self._error
         waiter: asyncio.Future[T] = asyncio.get_running_loop().create_future()
         self._waiters.add(waiter)
         try:
@@ -152,6 +157,7 @@ class Sample[T]:
         self._settle(lambda waiter: waiter.set_result(value))
 
     def _fail(self, error: BaseException) -> None:
+        self._error = error
         self._settle(lambda waiter: waiter.set_exception(error))
 
     def _settle(self, outcome: Callable[[asyncio.Future[T]], None]) -> None:
