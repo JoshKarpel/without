@@ -20,7 +20,6 @@ from integration.transform.core import TransformConfig
 from without import Stream
 from without import collect
 from without import stream
-from without.testing import tick
 from without_asgi import ASGIApp
 from without_asgi import Disconnect
 from without_asgi import HttpScope
@@ -300,11 +299,15 @@ async def test_unknown_route_is_a_404(tmp_path: Path) -> None:
 async def test_handlers_pick_up_a_config_reload_mid_lifetime(tmp_path: Path) -> None:
     _write_settings(tmp_path, default_mode="upper", max_bytes=1024)
     reload_now = asyncio.Event()
+    reload_landed = asyncio.Event()
 
     async def reloads(mount: Path) -> AsyncIterator[object]:
         await reload_now.wait()
         _write_settings(mount, default_mode="lower", max_bytes=1024)
         yield object()
+        # The app's internal sample drain only pulls the next change after it has
+        # published this one, so resuming here means the reload is live.
+        reload_landed.set()
 
     source = watch_config(tmp_path, read_yaml_file(Settings, "settings.yaml"), changes=reloads)
     app = text_transform_app(source)
@@ -314,8 +317,7 @@ async def test_handlers_pick_up_a_config_reload_mid_lifetime(tmp_path: Path) -> 
         assert _body(before) == b"ECHO"
 
         reload_now.set()
-        for _ in range(10):
-            await tick()
+        await reload_landed.wait()
 
         _start, after = await _request(app, "POST", "/transform", body=b"Echo")
         assert _body(after) == b"echo"

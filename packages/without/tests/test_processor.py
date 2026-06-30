@@ -1,5 +1,3 @@
-import asyncio
-
 from without import Transition
 from without import collect
 from without import from_fold
@@ -7,6 +5,7 @@ from without import from_map
 from without import from_scan
 from without import from_sink
 from without import stream
+from without.testing import resolved_next_turn
 
 
 async def test_from_scan_threads_state_and_emits_each_output() -> None:
@@ -23,8 +22,7 @@ async def test_from_scan_threads_state_and_emits_each_output() -> None:
 
 async def test_from_scan_awaits_contained_io_in_each_step() -> None:
     async def fetch_then_accumulate(event: int, total: int) -> Transition[int, str]:
-        await asyncio.sleep(0)
-        updated = total + event
+        updated = total + await resolved_next_turn(event)
         return Transition(state=updated, output=f"total={updated}")
 
     running_total = from_scan(1000, fetch_then_accumulate)
@@ -47,8 +45,7 @@ async def test_from_map_transforms_each_event_independently() -> None:
 
 async def test_from_map_awaits_contained_io_per_event() -> None:
     async def fetch_then_double(event: int) -> int:
-        await asyncio.sleep(0)
-        return event * 2
+        return await resolved_next_turn(event) * 2
 
     doubler = from_map(fetch_then_double)
 

@@ -31,11 +31,15 @@ class MyConfig(BaseModel):
 
 source = watch_config(Path("/etc/config"), read_yaml_file(MyConfig, "config.yaml"))
 async with sample(source) as config:
-    config.current()   # always the latest reloaded value, never blocks
+    config.current()       # always the latest reloaded value, never blocks
+    await config.updated() # block until the next reload lands, then return it
 ```
 
 `sample` reads the first value eagerly, so the context is never "not ready"; a
-background task keeps it current for the life of the `with` block. A reload whose
+background task keeps it current for the life of the `with` block. `current`
+reads the latest value without blocking; `updated` is the deterministic
+counterpart that waits for the next reload to land (it inherits latest-wins, so
+it signals "the config moved on" rather than replaying every intermediate value). A reload whose
 YAML fails validation raises from the watch loop rather than silently serving a
 stale or partial value. Snapshot `config.current()` once per request or connection
 so a mid-flight reload does not change a value an in-progress handler already read.

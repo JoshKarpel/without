@@ -303,5 +303,7 @@ of growing an unbounded backlog (the HTTP server's per-stream `WINDOW_UPDATE` fl
 control and `stream_from_queue`'s shutdown signal are the live examples). The
 `sample` behavior edge deliberately has *no* backpressure (latest-wins is its
 whole point). Glitches on diamond dependencies, feedback cycles, and teardown
-order remain open and are tracked as such. The `sample`-drain test helper (`tick`)
-is acknowledged as a stopgap pending a deterministic "await next update" signal.
+order remain open and are tracked as such. The `sample` behavior edge pairs
+`current` (read the latest value, non-blocking) with `updated` (await the next
+published value): a deterministic "await next update" signal that lets a reader
+wait on a known event rather than racing the background drain.
