@@ -53,5 +53,10 @@ async def resolved_next_turn[T](value: T) -> T:
     """
     loop = asyncio.get_running_loop()
     result: asyncio.Future[T] = loop.create_future()
-    loop.call_soon(result.set_result, value)
+
+    def resolve() -> None:
+        if not result.done():  # the awaiting task may have cancelled `result` before this turn
+            result.set_result(value)
+
+    loop.call_soon(resolve)
     return await result

@@ -224,3 +224,13 @@ async def test_limit_concurrency_rejects_a_non_positive_limit(limit: int) -> Non
     with pytest.raises(ValueError, match="limit must be at least 1"):
         async for _ in limit_concurrency(empty, limit=limit):
             pass  # pragma: no cover - limit_concurrency raises before the first iteration
+
+
+async def test_resolved_next_turn_drops_its_result_when_cancelled_first() -> None:
+    # Cancelling before the scheduled turn cancels the future, so the call_soon
+    # callback must skip set_result rather than raise InvalidStateError.
+    task = asyncio.create_task(resolved_next_turn(42))
+    await yield_once()  # let the task schedule its resolver and park on the future
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

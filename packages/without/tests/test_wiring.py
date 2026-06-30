@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import AsyncIterator
 
 import pytest
 from without import Transition
@@ -94,6 +95,28 @@ async def test_sample_cancels_a_pending_updated_waiter_on_exit() -> None:
 
     with pytest.raises(asyncio.CancelledError):
         await waiting
+
+
+async def test_updated_raises_the_source_error_to_a_pending_waiter() -> None:
+    proceed = asyncio.Event()
+
+    class SourceFailed(Exception):
+        pass
+
+    async def source() -> AsyncIterator[int]:
+        yield 1
+        await proceed.wait()
+        raise SourceFailed("source failed")
+
+    async def await_next_update() -> int:
+        async with sample(source()) as latest:
+            waiting = asyncio.create_task(latest.updated())
+            await yield_once()  # the waiter registers; the drain is parked on `proceed`
+            proceed.set()  # the source now raises on the next drain pull
+            return await waiting  # the pending wait sees the source error, not a hang
+
+    with pytest.raises(SourceFailed, match="source failed"):
+        await await_next_update()
 
 
 async def test_sample_rejects_an_empty_stream() -> None:

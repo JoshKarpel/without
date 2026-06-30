@@ -113,7 +113,7 @@ async def collect[T](source: Stream[T]) -> list[T]:
 @dataclass(slots=True)
 class Sample[T]:
     _value: T
-    _waiters: set[asyncio.Future[T]] = field(default_factory=set)
+    _waiters: set[asyncio.Future[T]] = field(default_factory=set, init=False, repr=False, compare=False)
 
     def current(self) -> T:
         return self._value
@@ -128,7 +128,9 @@ class Sample[T]:
         source, then returns it. It is the "await next update" signal a reader
         waits on (a test asserting on post-reload state, a control loop reacting
         to a config change) instead of guessing how long the background task
-        needs.
+        needs. If the source raises instead of yielding, the wait raises that
+        error rather than hanging; if the context closes first, the wait is
+        cancelled.
 
         Each call registers its own one-shot future resolved by the next publish,
         so concurrent waiters are independent: cancelling one deregisters it at
@@ -147,10 +149,16 @@ class Sample[T]:
 
     def _publish(self, value: T) -> None:
         self._value = value
+        self._settle(lambda waiter: waiter.set_result(value))
+
+    def _fail(self, error: BaseException) -> None:
+        self._settle(lambda waiter: waiter.set_exception(error))
+
+    def _settle(self, outcome: Callable[[asyncio.Future[T]], None]) -> None:
         while self._waiters:
             waiter = self._waiters.pop()
-            if not waiter.done():
-                waiter.set_result(value)
+            if not waiter.done():  # skip a waiter cancelled in the window before its own cleanup ran
+                outcome(waiter)
 
     def _close(self) -> None:
         while self._waiters:
@@ -180,8 +188,12 @@ async def sample[T](source: Stream[T]) -> AsyncIterator[Sample[T]]:
     sampled = Sample(first)
 
     async def drain() -> None:
-        async for value in iterator:
-            sampled._publish(value)  # noqa: SLF001 - the drain is the sole publisher of the sampled value by design
+        try:
+            async for value in iterator:
+                sampled._publish(value)  # noqa: SLF001 - the drain is the sole publisher of the sampled value by design
+        except Exception as error:
+            sampled._fail(error)  # noqa: SLF001 - the drain hands a source failure to anyone awaiting `updated`
+            raise
 
     async with background_task(drain()):
         try:
