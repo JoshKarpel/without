@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from contextlib import suppress
+from typing import cast
 
 import httpx
 import pytest
@@ -18,6 +19,7 @@ from without_asgi.routing import buffered
 from without_http import serving
 from without_http.server import _address
 from without_http.server import _LiveConnections
+from without_http.server import _serve_connection
 
 
 async def echo_app(scope: RawMessage, receive: Receive, send: Send) -> None:
@@ -182,6 +184,46 @@ async def test_a_malformed_request_gets_a_400() -> None:
             await writer.wait_closed()
 
     assert status_line.startswith(b"HTTP/1.1 400")
+
+
+class _ResettingReader:
+    """A reader that raises a peer reset, as a socket does when the client aborts."""
+
+    async def read(self, _size: int) -> bytes:
+        raise ConnectionResetError(104, "connection reset by peer")
+
+
+class _RecordingWriter:
+    """A writer that records only what `_serve_connection` needs: extra info and close."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def get_extra_info(self, _name: str) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+async def test_a_peer_reset_while_awaiting_a_request_ends_the_connection_without_raising() -> None:
+    async def unused_app(scope: RawMessage, receive: Receive, send: Send) -> None:  # pragma: no cover
+        raise AssertionError("the app is never reached when the peer resets first")
+
+    writer = _RecordingWriter()
+
+    # A peer reset is a normal end-of-connection, so serving one must complete
+    # quietly rather than letting the error escape the connection task.
+    await _serve_connection(
+        unused_app,
+        cast(asyncio.StreamReader, _ResettingReader()),
+        cast(asyncio.StreamWriter, writer),
+    )
+
+    assert writer.closed
 
 
 async def test_reports_in_flight_connections_while_a_request_is_served() -> None:

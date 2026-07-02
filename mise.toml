@@ -1,0 +1,9 @@
+# Benchmark tooling that isn't a Python package: the austin sampling profiler
+# and the vegeta load generator, both installed from their GitHub releases via
+# mise's `ubi` backend. The `austin2speedscope` converter is *not* here; it ships
+# in the `austin-python` PyPI package, pulled in by the benchmarks package's uv
+# dependencies. Pin these to exact tags (mise writes them to `mise.lock`) once
+# resolved, rather than floating on `latest`, to keep runs reproducible.
+[tools]
+"ubi:P403n1x87/austin" = "latest"
+"ubi:tsenart/vegeta" = "latest"

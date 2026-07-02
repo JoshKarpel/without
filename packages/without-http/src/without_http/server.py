@@ -308,6 +308,12 @@ async def _serve_connection(
                 )
                 return
         await _serve_h11_connection(app, reader, writer, initial=initial, secure=secure, server=server, client=client)
+    except ConnectionError:
+        # The peer reset or dropped the connection (e.g. an abortive close while we
+        # waited for the next keep-alive request). That is a normal way for a
+        # connection to end, not a server error, so end quietly rather than letting
+        # it surface as an unhandled exception in the connection task.
+        pass
     finally:
         with suppress(OSError):
             writer.close()
