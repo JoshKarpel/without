@@ -2,8 +2,15 @@
 # and the vegeta load generator, both installed from their GitHub releases via
 # mise's `ubi` backend. The `austin2speedscope` converter is *not* here; it ships
 # in the `austin-python` PyPI package, pulled in by the benchmarks package's uv
-# dependencies. Pin these to exact tags (mise writes them to `mise.lock`) once
-# resolved, rather than floating on `latest`, to keep runs reproducible.
+# dependencies. Versions are pinned for reproducibility (a pin bypasses the
+# cooldown below); bump them deliberately. austin 4.0 is required for Python 3.14
+# and emits the MOJO binary format; the harness converts it with `austin-python`'s
+# `mojo2austin` then `austin2speedscope` (3.7's text format looked simpler but 3.7
+# predates 3.14 and cannot sample it).
 [tools]
-"ubi:P403n1x87/austin" = "latest"
-"ubi:tsenart/vegeta" = "latest"
+"ubi:P403n1x87/austin" = "4.0.0"
+"ubi:tsenart/vegeta" = "12.13.0"
+
+[settings]
+# Skip brand-new releases when resolving any fuzzy version, as supply-chain defense.
+minimum_release_age = "7d"

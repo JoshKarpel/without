@@ -82,6 +82,7 @@ omit = [
     # subprocesses), not by unit tests, per functional-core/imperative-shell.
     "*/benchmarks/todos/servers.py",
     "*/benchmarks/harness.py",
+    "*/benchmarks/plot.py",
 ]
 
 [tool.coverage.report]

@@ -7,15 +7,16 @@ import sys
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from contextlib import nullcontext
 from pathlib import Path
 
+import psutil
 from without_http import ConnectionPool
 
-# The async supervisor: it boots one server process, optionally attaches the
-# austin sampler to its PID, and drives a vegeta *rate sweep* against it, writing
-# each run's raw results and text report into `results/`. Load generation and
-# sampling both happen in separate processes (vegeta, austin), never in this
+# The async supervisor: for each rate it boots a fresh server process (optionally
+# under the austin sampler, so each rate gets its own profile), drives a vegeta run
+# against it, and writes that run's raw results and text report into `results/`.
+# Load generation and sampling both happen in separate processes (vegeta, austin),
+# never in this
 # interpreter, so nothing here competes with the code under test for CPU. vegeta
 # drives a constant arrival rate (open loop), so its latency distribution is
 # corrected for coordinated omission. This is pure orchestration, run by hand, so
@@ -79,29 +80,32 @@ async def _await_ready(url: str, timeout_seconds: float = 10.0) -> None:
 
 
 @asynccontextmanager
-async def _server(framework: str, host: str, port: int) -> AsyncIterator[asyncio.subprocess.Process]:
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "benchmarks.todos.servers", framework, "--host", host, "--port", str(port)
-    )
+async def _server(
+    framework: str, host: str, port: int, *, profile: tuple[Path, int] | None = None
+) -> AsyncIterator[asyncio.subprocess.Process]:
+    server = [sys.executable, "-m", "benchmarks.todos.servers", framework, "--host", host, "--port", str(port)]
+    # austin's launch mode runs the server as austin's own child, so sampling works
+    # under Yama `ptrace_scope=1` (which forbids tracing a non-descendant) with no
+    # sudo, and it brackets the whole run. Attach mode (`-p PID`) would need ptrace
+    # relaxation. `-c` is CPU mode: sample only on-CPU stacks, so the profile shows
+    # where the core actually goes rather than counting idle waits. When not
+    # profiling, the server is launched directly.
+    austin = ["austin", "-c", "-i", str(profile[1]), "-o", str(profile[0])] if profile is not None else []
+    command = [*austin, *server]
+    proc = await asyncio.create_subprocess_exec(*command)
     try:
         await _await_ready(f"http://{host}:{port}{_READINESS_PATH}")
         yield proc
     finally:
         proc.terminate()
         await proc.wait()
-
-
-@asynccontextmanager
-async def _profiling(pid: int, out: Path, interval_us: int) -> AsyncIterator[None]:
-    # austin attaches to the running server and samples until we stop it; the
-    # native stream is converted to speedscope for a flamegraph afterward.
-    sampler = await asyncio.create_subprocess_exec("austin", "-p", str(pid), "-i", str(interval_us), "-o", str(out))
-    try:
-        yield
-    finally:
-        sampler.terminate()
-        await sampler.wait()
-    await _run(["austin2speedscope", str(out), str(out.with_suffix(".speedscope.json"))])
+        if profile is not None:
+            # austin 4.0 writes the MOJO binary format; convert it to austin's text
+            # format and then to speedscope, both via `austin-python`'s converters.
+            mojo = profile[0]
+            text = mojo.with_suffix(".austin")
+            await _run(["mojo2austin", str(mojo), str(text)])
+            await _run(["austin2speedscope", str(text), str(mojo.with_suffix(".speedscope.json"))])
 
 
 async def _attack(base: str, endpoint: str, rate: int, duration: int, connections: int, out: Path) -> str:
@@ -121,10 +125,31 @@ async def _attack(base: str, endpoint: str, rate: int, duration: int, connection
     return await _capture(["vegeta", "report", "-type=text", str(out)])
 
 
+def _server_process(proc: asyncio.subprocess.Process, profiling: bool) -> psutil.Process:
+    # When profiling, `proc` is austin and the server it launched is austin's child;
+    # measure that, not the sampler. Otherwise `proc` is the server itself.
+    parent = psutil.Process(proc.pid)
+    children = parent.children()
+    return children[0] if profiling and children else parent
+
+
 async def _record(base: str, args: argparse.Namespace, rate: int, label: str, stem: Path) -> None:
-    report = await _attack(base, args.endpoint, rate, args.duration, args.connections, stem.with_suffix(".bin"))
+    # A fresh server per rate, so each rate gets its own profile (the hot path can
+    # look different under light load versus past the knee) instead of one sample
+    # stream smeared across every rate.
+    profile = (stem.with_suffix(".mojo"), args.interval) if args.profile else None
+    async with _server(args.framework, args.host, args.port, profile=profile) as proc:
+        server = _server_process(proc, profile is not None)
+        before = server.cpu_times()
+        started = time.monotonic()
+        report = await _attack(base, args.endpoint, rate, args.duration, args.connections, stem.with_suffix(".bin"))
+        # Server-process CPU seconds over the attack window, as a fraction of wall
+        # time: 1.0 == one core fully saturated (both stacks are single-process).
+        after = server.cpu_times()
+        cores = ((after.user - before.user) + (after.system - before.system)) / (time.monotonic() - started)
     stem.with_suffix(".txt").write_text(report)
-    print(f"[{label}] {args.framework} {args.endpoint} @ {rate} rps -> {stem}.txt")
+    stem.with_suffix(".cpu").write_text(f"{cores:.3f}\n")
+    print(f"[{label}] {args.framework} {args.endpoint} @ {rate} rps -> {stem}.txt  ({cores:.2f} CPU cores)")
     print(report)
 
 
@@ -153,7 +178,9 @@ async def main() -> None:
     )
     parser.add_argument("--duration", type=int, default=30, help="seconds per rate step")
     parser.add_argument("--connections", type=int, default=100, help="vegeta -max-workers (concurrent connections cap)")
-    parser.add_argument("--profile", action="store_true", help="attach austin to the server PID for the whole sweep")
+    parser.add_argument(
+        "--profile", action="store_true", help="run each rate's server under austin for a per-rate profile"
+    )
     parser.add_argument("--interval", type=int, default=100, help="austin sampling interval in microseconds")
     parser.add_argument("--results", type=Path, default=Path(__file__).parent.parent.parent / "results")
     args = parser.parse_args()
@@ -161,17 +188,17 @@ async def main() -> None:
     rates = args.rates or [1000, 2000, 5000, 10000]
     args.results.mkdir(parents=True, exist_ok=True)
     base = f"http://{args.host}:{args.port}"
+    # The duration and profiling state are in every filename, so a profiled run and
+    # a clean one (or two different durations) at the same rate coexist instead of
+    # overwriting each other. Profiling inflates latency, so the `-prof` tag also
+    # lets the plot pick only clean runs.
     prefix = f"{args.framework}-{args.endpoint}"
+    tag = f"d{args.duration}s" + ("-prof" if args.profile else "")
 
-    async with _server(args.framework, args.host, args.port) as proc:
-        sampling = (
-            _profiling(proc.pid, args.results / f"{prefix}.austin", args.interval) if args.profile else nullcontext()
-        )
-        async with sampling:
-            for rate in rates:
-                await _record(base, args, rate, "sweep", args.results / f"{prefix}-r{rate}")
-            if args.saturate is not None:
-                await _record(base, args, args.saturate, "saturate", args.results / f"{prefix}-saturate")
+    for rate in rates:
+        await _record(base, args, rate, "sweep", args.results / f"{prefix}-r{rate}-{tag}")
+    if args.saturate is not None:
+        await _record(base, args, args.saturate, "saturate", args.results / f"{prefix}-saturate-{tag}")
 
 
 if __name__ == "__main__":

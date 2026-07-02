@@ -40,19 +40,23 @@ def fastapi_todos() -> FastAPI:
     todos = seed()
     app = FastAPI()
 
+    # `async def` handlers, to match without-web: FastAPI runs these on the event
+    # loop, whereas a sync `def` handler is dispatched to an anyio worker thread, so
+    # a sync version would measure threadpool hop + GIL contention, not the
+    # framework. The bodies stay pure (no await); the point is the execution model.
     @app.get("/todos")
-    def list_todos(done: bool | None = None) -> dict[str, object]:
+    async def list_todos(done: bool | None = None) -> dict[str, object]:
         return {"todos": [render(todo) for todo in todos.matching(done)]}
 
     @app.get("/todos/{todo_id}")
-    def show_todo(todo_id: int) -> dict[str, object]:
+    async def show_todo(todo_id: int) -> dict[str, object]:
         try:
             return render(todos.get(todo_id))
         except TodoNotFound as exc:
             raise HTTPException(status_code=404, detail={"error": str(exc), "id": exc.todo_id}) from exc
 
     @app.post("/todos", status_code=201)
-    def create_todo(new: NewTodo) -> dict[str, object]:
+    async def create_todo(new: NewTodo) -> dict[str, object]:
         _updated, created = todos.added(new)
         return render(created)
 

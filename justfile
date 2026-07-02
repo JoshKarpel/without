@@ -22,6 +22,16 @@ test *args:
 
 alias t := test
 
+[doc('Benchmark one stack (without|fastapi) with vegeta+austin on PATH; extra args pass to the harness')]
+bench framework *args:
+    mise exec -- uv run python -m benchmarks.harness {{ framework }} {{ args }}
+
+alias b := bench
+
+[doc('Plot latency + throughput vs rate from the vegeta results in results/')]
+plot *args:
+    mise exec -- uv run python -m benchmarks.plot {{ args }}
+
 [doc('Upgrade all dependencies')]
 upgrade:
     uv lock --upgrade

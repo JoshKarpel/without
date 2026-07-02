@@ -28,6 +28,10 @@ dependencies = [
     # Converts austin's native sample stream to speedscope for a flamegraph. The
     # austin sampler binary itself is a system install (C), not a Python package.
     "austin-python>=1.7",
+    # Plots the vegeta latency/throughput sweep results.
+    "matplotlib>=3.9",
+    # Reads the server process's CPU time to report utilization per rate.
+    "psutil>=5.9",
 ]
 
 [tool.uv.sources]

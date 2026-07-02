@@ -44,13 +44,17 @@ stacks under test share the same functional core and differ only at the edges:
   knees over. A single point can't show that. The optional `--saturate` run is a
   deliberately over-capacity step; read it as a *throughput ceiling*, not as a
   latency figure.
-- **Sampling profiler on the server.** With `--profile`, the
-  [`austin`](https://github.com/P403n1x87/austin) statistical sampler attaches to
-  the server PID for the sweep (no instrumentation of the hot path) and its
-  output is converted to a speedscope flamegraph. This is the stand-in for
-  CPython 3.15's stdlib `profiling.sampling`, which the project can adopt once it
-  moves off 3.14. Profile and headline-throughput runs are best taken
-  separately, since sampling adds a little overhead.
+- **Sampling profiler on the server, per rate.** With `--profile`, each rate's
+  server is launched *under* the
+  [`austin`](https://github.com/P403n1x87/austin) statistical sampler (no
+  instrumentation of the hot path). Launch mode, rather than attaching to a PID,
+  means austin is the server's parent, so it works under the common Yama
+  `ptrace_scope=1` with no sudo. Each rate gets its *own* profile, since the hot
+  path can look different under light load versus past the knee. austin 4.0 emits
+  the MOJO binary format, which the harness converts to a speedscope flamegraph
+  via `austin-python`'s `mojo2austin` then `austin2speedscope`. This is the
+  stand-in for CPython 3.15's stdlib `profiling.sampling`, which the project can
+  adopt once it moves off 3.14.
 
 ## Prerequisites
 
@@ -58,13 +62,14 @@ The Python side comes from `uv` (including `austin2speedscope`, via the
 `austin-python` dependency). The two *binaries* are managed by
 [`mise`](https://mise.jdx.dev/) from the repo-root `mise.toml`:
 
-```
+```bash
 mise install        # austin (sampler) + vegeta (load generator)
 ```
 
-`austin` samples another process, so it needs `ptrace` (run under `sudo`, grant
-`CAP_SYS_PTRACE`, or set `kernel.yama.ptrace_scope=0`); otherwise the `--profile`
-runs will fail to attach.
+Because the harness launches the server *under* austin (rather than attaching to
+a running PID), `--profile` needs no `ptrace` relaxation. austin is pinned to 4.0
+for Python 3.14 support; the run leaves a `.mojo` (raw samples), an intermediate
+`.austin`, and the `.speedscope.json` flamegraph per rate.
 
 ## Running
 
@@ -78,6 +83,12 @@ uv run python -m benchmarks.harness fastapi --endpoint create \
     --rate 2000 --rate 8000 --saturate 40000 --profile
 ```
 
-Reports and raw vegeta results (and any `.austin` / `.speedscope.json`) land in a
-git-ignored `results/`. Endpoints: `list` (`GET /todos`), `show`
+Results land in a git-ignored `results/`, named
+`{stack}-{endpoint}-r{rate}-d{duration}s[-prof]`, so a profiled run and a clean
+one (or two durations) at the same rate coexist rather than overwrite. Each run
+leaves a `.bin` (raw vegeta) and `.txt` (report); `--profile` adds the `-prof`
+tag and a `.speedscope.json` flamegraph. Endpoints: `list` (`GET /todos`), `show`
 (`GET /todos/2`), `create` (`POST /todos`).
+
+`just plot` reads the *clean* (non-`-prof`) runs and draws latency and throughput
+versus target rate to `results/{endpoint}-latency-throughput.png`.
