@@ -77,12 +77,16 @@ asyncio_mode = "auto"
 [tool.coverage.run]
 branch = true
 omit = [
-    # Imperative process-launch and orchestration shells: exercised by actually
-    # running a benchmark (they only spawn the server, vegeta, and austin as
-    # subprocesses), not by unit tests, per functional-core/imperative-shell.
+    # Imperative benchmark shells, exercised by actually running a benchmark rather
+    # than unit-tested, per functional-core/imperative-shell: the process-launch and
+    # orchestration modules (they spawn the server, vegeta, and austin as
+    # subprocesses) and the run-by-hand result-analysis CLIs (plot, hotspots), which
+    # read `results/` and render/print. Their pure cores (e.g. hotspots' frame
+    # classifier) are still unit-tested directly; only the CLI shell is uncovered.
     "*/benchmarks/todos/servers.py",
     "*/benchmarks/harness.py",
     "*/benchmarks/plot.py",
+    "*/benchmarks/hotspots.py",
 ]
 
 [tool.coverage.report]

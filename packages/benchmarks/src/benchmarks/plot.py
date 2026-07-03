@@ -146,7 +146,7 @@ def main() -> None:
     cpu.set_ylabel("server CPU (cores)", color=_INK_2)
     cpu.set_ylim(bottom=0)
     figure.suptitle(
-        f"todos  GET /{args.endpoint}  —  same core, server x framework matrix",
+        f"todos  {args.endpoint}  —  same core, server x framework matrix",
         color=_INK,
         weight="bold",
         x=0.02,
