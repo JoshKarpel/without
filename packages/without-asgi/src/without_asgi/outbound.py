@@ -7,14 +7,13 @@ from typing import Protocol
 from typing import assert_never
 from typing import runtime_checkable
 
-from without_asgi.narrow import narrow_to_bytes
-from without_asgi.narrow import narrow_to_int
-from without_asgi.narrow import narrow_to_str
+from without_asgi.narrow import narrow
 from without_asgi.types import RawHeaders
 from without_asgi.types import RawMessage
 from without_asgi.types import WebsocketData
 from without_asgi.types import decode_websocket_data
 from without_asgi.types import encode_websocket_data
+from without_asgi.types import narrow_headers
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,22 +261,10 @@ def encode_lifespan_reply(reply: LifespanReply) -> RawMessage:
             assert_never(unreachable)
 
 
-def _as_pair(item: object) -> tuple[bytes, bytes]:
-    if isinstance(item, (list, tuple)) and len(item) == 2:
-        return narrow_to_bytes(item[0]), narrow_to_bytes(item[1])
-    raise TypeError(f"expected a (bytes, bytes) pair, got {item!r}")
-
-
-def _as_headers(value: object) -> RawHeaders:
-    if not isinstance(value, Iterable):
-        raise TypeError(f"expected an iterable of bytes pairs, got {type(value).__name__}")
-    return tuple(_as_pair(item) for item in value)
-
-
 def _as_links(value: object) -> tuple[bytes, ...]:
     if not isinstance(value, Iterable):
         raise TypeError(f"expected an iterable of link bytes, got {type(value).__name__}")
-    return tuple(narrow_to_bytes(link) for link in value)
+    return tuple(narrow(link, bytes) for link in value)
 
 
 def _as_fileno(value: object) -> SupportsFileno:
@@ -304,31 +291,31 @@ def parse_outbound(message: RawMessage) -> Outbound:
     match message.get("type"):
         case "http.response.start":
             return ResponseStart(
-                status=narrow_to_int(message["status"]),
-                headers=_as_headers(message.get("headers", ())),
+                status=narrow(message["status"], int),
+                headers=narrow_headers(message.get("headers", ())),
                 trailers=bool(message.get("trailers", False)),
             )
         case "http.response.body":
             return ResponseBody(
-                body=narrow_to_bytes(message.get("body", b"")),
+                body=narrow(message.get("body", b""), bytes),
                 more_body=bool(message.get("more_body", False)),
             )
         case "http.response.push":
-            return ServerPush(path=narrow_to_str(message["path"]), headers=_as_headers(message.get("headers", ())))
+            return ServerPush(path=narrow(message["path"], str), headers=narrow_headers(message.get("headers", ())))
         case "http.response.zerocopysend":
             return ZeroCopySend(
                 file=_as_fileno(message["file"]),
-                offset=None if message.get("offset") is None else narrow_to_int(message["offset"]),
-                count=None if message.get("count") is None else narrow_to_int(message["count"]),
+                offset=None if message.get("offset") is None else narrow(message["offset"], int),
+                count=None if message.get("count") is None else narrow(message["count"], int),
                 more_body=bool(message.get("more_body", False)),
             )
         case "http.response.pathsend":
-            return PathSend(path=narrow_to_str(message["path"]))
+            return PathSend(path=narrow(message["path"], str))
         case "http.response.early_hint":
             return EarlyHint(links=_as_links(message.get("links", ())))
         case "http.response.trailers":
             return ResponseTrailers(
-                headers=_as_headers(message.get("headers", ())),
+                headers=narrow_headers(message.get("headers", ())),
                 more_trailers=bool(message.get("more_trailers", False)),
             )
         case "http.response.debug":
@@ -343,24 +330,24 @@ def parse_websocket_outbound(message: RawMessage) -> WebsocketOutbound:
         case "websocket.accept":
             subprotocol = message.get("subprotocol")
             return WebsocketAccept(
-                subprotocol=None if subprotocol is None else narrow_to_str(subprotocol),
-                headers=_as_headers(message.get("headers", ())),
+                subprotocol=None if subprotocol is None else narrow(subprotocol, str),
+                headers=narrow_headers(message.get("headers", ())),
             )
         case "websocket.send":
             return WebsocketSend(data=decode_websocket_data(message))
         case "websocket.close":
             return WebsocketClose(
-                code=narrow_to_int(message.get("code", 1000)),
-                reason=narrow_to_str(message.get("reason", "")),
+                code=narrow(message.get("code", 1000), int),
+                reason=narrow(message.get("reason", ""), str),
             )
         case "websocket.http.response.start":
             return WebsocketResponseStart(
-                status=narrow_to_int(message["status"]),
-                headers=_as_headers(message.get("headers", ())),
+                status=narrow(message["status"], int),
+                headers=narrow_headers(message.get("headers", ())),
             )
         case "websocket.http.response.body":
             return WebsocketResponseBody(
-                body=narrow_to_bytes(message.get("body", b"")),
+                body=narrow(message.get("body", b""), bytes),
                 more_body=bool(message.get("more_body", False)),
             )
         case other:
@@ -375,8 +362,10 @@ def parse_lifespan_reply(message: RawMessage) -> LifespanReply:
         case "lifespan.shutdown.complete":
             return ShutdownComplete()
         case "lifespan.startup.failed":
-            return StartupFailed(message=narrow_to_str(message.get("message", "")))
+            value = message.get("message", "")
+            return StartupFailed(message=narrow(value, str))
         case "lifespan.shutdown.failed":
-            return ShutdownFailed(message=narrow_to_str(message.get("message", "")))
+            value1 = message.get("message", "")
+            return ShutdownFailed(message=narrow(value1, str))
         case other:
             raise ValueError(f"unexpected lifespan reply type: {other!r}")

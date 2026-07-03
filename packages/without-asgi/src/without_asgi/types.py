@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from collections.abc import Awaitable
 from collections.abc import Callable
+from collections.abc import Iterable
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import assert_never
 
-from without_asgi.narrow import narrow_to_bytes
-from without_asgi.narrow import narrow_to_str
+from without_asgi.narrow import narrow
 
 # The raw ASGI surface, hand-rolled to keep this package's only runtime
 # dependency `without`. These mirror the shapes an ASGI server passes to an
@@ -20,6 +20,18 @@ type RawHeaders = tuple[tuple[bytes, bytes], ...]
 type Receive = Callable[[], Awaitable[RawMessage]]
 type Send = Callable[[RawMessage], Awaitable[None]]
 type ASGIApp = Callable[[RawScope, Receive, Send], Awaitable[None]]
+
+
+def narrow_pair(item: object) -> tuple[bytes, bytes]:
+    if isinstance(item, (list, tuple)) and len(item) == 2:
+        return narrow(item[0], bytes), narrow(item[1], bytes)
+    raise TypeError(f"expected a (bytes, bytes) pair, got {item!r}")
+
+
+def narrow_headers(value: object) -> RawHeaders:
+    if not isinstance(value, Iterable):
+        raise TypeError(f"expected an iterable of bytes pairs, got {type(value).__name__}")
+    return tuple(narrow_pair(item) for item in value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,7 +72,7 @@ def decode_websocket_data(message: RawMessage) -> WebsocketData:
     if text is not None and binary is not None:
         raise ValueError("websocket message has both text and bytes")
     if text is not None:
-        return WebsocketText(text=narrow_to_str(text))
+        return WebsocketText(text=narrow(text, str))
     if binary is not None:
-        return WebsocketBinary(data=narrow_to_bytes(binary))
+        return WebsocketBinary(data=narrow(binary, bytes))
     raise ValueError("websocket message has neither text nor bytes")
