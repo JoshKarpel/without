@@ -12,6 +12,10 @@ from pathlib import Path
 import psutil
 from without_http import ConnectionPool
 
+from benchmarks.todos.servers import DEFAULT_SERVER
+from benchmarks.todos.servers import FRAMEWORKS
+from benchmarks.todos.servers import SERVERS
+
 # The async supervisor: for each rate it boots a fresh server process (optionally
 # under the austin sampler, so each rate gets its own profile), drives a vegeta run
 # against it, and writes that run's raw results and text report into `results/`.
@@ -81,9 +85,20 @@ async def _await_ready(url: str, timeout_seconds: float = 10.0) -> None:
 
 @asynccontextmanager
 async def _server(
-    framework: str, host: str, port: int, *, profile: tuple[Path, int] | None = None
+    framework: str, server_kind: str, host: str, port: int, *, profile: tuple[Path, int] | None = None
 ) -> AsyncIterator[asyncio.subprocess.Process]:
-    server = [sys.executable, "-m", "benchmarks.todos.servers", framework, "--host", host, "--port", str(port)]
+    server = [
+        sys.executable,
+        "-m",
+        "benchmarks.todos.servers",
+        framework,
+        "--server",
+        server_kind,
+        "--host",
+        host,
+        "--port",
+        str(port),
+    ]
     # austin's launch mode runs the server as austin's own child, so sampling works
     # under Yama `ptrace_scope=1` (which forbids tracing a non-descendant) with no
     # sudo, and it brackets the whole run. Attach mode (`-p PID`) would need ptrace
@@ -108,7 +123,7 @@ async def _server(
             await _run(["austin2speedscope", str(text), str(mojo.with_suffix(".speedscope.json"))])
 
 
-async def _attack(base: str, endpoint: str, rate: int, duration: int, connections: int, out: Path) -> str:
+async def _attack(base: str, endpoint: str, rate: int, duration: int, connections: int, out: Path, *, h2c: bool) -> str:
     method, path, has_body = _ENDPOINTS[endpoint]
     target = f"{method} {base}{path}"
     attack = [
@@ -119,6 +134,10 @@ async def _attack(base: str, endpoint: str, rate: int, duration: int, connection
         f"-max-workers={connections}",
         f"-output={out}",
     ]
+    if h2c:
+        # HTTP/2 cleartext (prior knowledge). without-http negotiates it by sniffing
+        # the h2 preface; a server that only speaks HTTP/1.1 (uvicorn) will refuse.
+        attack.append("-h2c")
     if has_body:
         attack += ["-body", str(_BODY), "-header", "Content-Type: application/json"]
     await _run(attack, stdin=target)
@@ -138,18 +157,23 @@ async def _record(base: str, args: argparse.Namespace, rate: int, label: str, st
     # look different under light load versus past the knee) instead of one sample
     # stream smeared across every rate.
     profile = (stem.with_suffix(".mojo"), args.interval) if args.profile else None
-    async with _server(args.framework, args.host, args.port, profile=profile) as proc:
+    async with _server(args.framework, args.server, args.host, args.port, profile=profile) as proc:
         server = _server_process(proc, profile is not None)
         before = server.cpu_times()
         started = time.monotonic()
-        report = await _attack(base, args.endpoint, rate, args.duration, args.connections, stem.with_suffix(".bin"))
+        report = await _attack(
+            base, args.endpoint, rate, args.duration, args.connections, stem.with_suffix(".bin"), h2c=args.h2c
+        )
         # Server-process CPU seconds over the attack window, as a fraction of wall
-        # time: 1.0 == one core fully saturated (both stacks are single-process).
+        # time: 1.0 == one core fully saturated (every cell is single-process).
         after = server.cpu_times()
         cores = ((after.user - before.user) + (after.system - before.system)) / (time.monotonic() - started)
     stem.with_suffix(".txt").write_text(report)
     stem.with_suffix(".cpu").write_text(f"{cores:.3f}\n")
-    print(f"[{label}] {args.framework} {args.endpoint} @ {rate} rps -> {stem}.txt  ({cores:.2f} CPU cores)")
+    print(
+        f"[{label}] {args.framework} on {args.server} {args.endpoint} @ {rate} rps"
+        f" -> {stem}.txt  ({cores:.2f} CPU cores)"
+    )
     print(report)
 
 
@@ -157,7 +181,13 @@ async def main() -> None:
     parser = argparse.ArgumentParser(
         description="Drive a vegeta rate sweep against one todo stack, optionally profiling the server with austin.",
     )
-    parser.add_argument("framework", choices=("without", "fastapi"))
+    parser.add_argument("framework", choices=tuple(FRAMEWORKS))
+    parser.add_argument(
+        "--server",
+        choices=tuple(SERVERS),
+        default=None,
+        help="server to run the framework under (default: the server the framework normally deploys under)",
+    )
     parser.add_argument("--endpoint", choices=tuple(_ENDPOINTS), default="list")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -179,21 +209,28 @@ async def main() -> None:
     parser.add_argument("--duration", type=int, default=30, help="seconds per rate step")
     parser.add_argument("--connections", type=int, default=100, help="vegeta -max-workers (concurrent connections cap)")
     parser.add_argument(
+        "--h2c",
+        action="store_true",
+        help="drive HTTP/2 cleartext instead of HTTP/1.1 (only without-http negotiates it; uvicorn will refuse)",
+    )
+    parser.add_argument(
         "--profile", action="store_true", help="run each rate's server under austin for a per-rate profile"
     )
     parser.add_argument("--interval", type=int, default=100, help="austin sampling interval in microseconds")
     parser.add_argument("--results", type=Path, default=Path(__file__).parent.parent.parent / "results")
     args = parser.parse_args()
 
+    args.server = args.server or DEFAULT_SERVER[args.framework]
     rates = args.rates or [1000, 2000, 5000, 10000]
     args.results.mkdir(parents=True, exist_ok=True)
     base = f"http://{args.host}:{args.port}"
-    # The duration and profiling state are in every filename, so a profiled run and
-    # a clean one (or two different durations) at the same rate coexist instead of
-    # overwriting each other. Profiling inflates latency, so the `-prof` tag also
-    # lets the plot pick only clean runs.
-    prefix = f"{args.framework}-{args.endpoint}"
-    tag = f"d{args.duration}s" + ("-prof" if args.profile else "")
+    # The (framework, server) cell, transport, duration, and profiling state are in
+    # every filename, so every combination (a profiled run beside a clean one, an
+    # h2c run beside an h1 one, or two durations) at the same rate coexists instead
+    # of overwriting. Profiling inflates latency, so the `-prof` tag also lets the
+    # plot pick only clean runs. `+` joins the pair; `-` stays the field separator.
+    prefix = f"{args.framework}+{args.server}-{args.endpoint}"
+    tag = ("h2c-" if args.h2c else "") + f"d{args.duration}s" + ("-prof" if args.profile else "")
 
     for rate in rates:
         await _record(base, args, rate, "sweep", args.results / f"{prefix}-r{rate}-{tag}")

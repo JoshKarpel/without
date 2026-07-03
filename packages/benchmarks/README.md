@@ -8,8 +8,11 @@ framework.
 
 ## What it measures, and why the shape
 
-The bet is that a benchmark should isolate *one* variable at a time. So the two
-stacks under test share the same functional core and differ only at the edges:
+The bet is that a benchmark should isolate *one* variable at a time. In ASGI's
+own vocabulary the two edges are the **application framework** and the **server**,
+and they are independent: a framework produces a plain ASGI app, a server drives
+any ASGI app. So the deliverable is a `framework × server` matrix over one shared
+core:
 
 - **Same core.** Both shells import the pure `integration.todos.core`
   (`TodoList`, `NewTodo`, `Todo`). The domain logic (parse a body, fold the
@@ -19,12 +22,21 @@ stacks under test share the same functional core and differ only at the edges:
   `fastapi_todos()` is the idiomatic FastAPI equivalent. Neither persists past a
   request (create echoes the would-be todo), matching `integration`'s stance so
   both do the same work per request.
-- **Whole stack, real socket.** `servers.py` runs each shell as a long-lived
-  server process, *as it would actually be deployed*: the without app on
-  `without-http` over stdlib `asyncio`; the FastAPI app on `uvicorn` with
-  `uvloop` + `httptools`. The load crosses a real TCP socket, not an in-process
-  shortcut. (The event-loop difference is deliberately *not* controlled away:
-  this compares the stacks people actually ship.)
+- **Every framework under every server.** `servers.py` is a registry of two
+  frameworks (`without-web`, `fastapi`) and three servers (`without-http` over
+  stdlib `asyncio`; `without-http-uvloop`, the same server on uvloop; `uvicorn`
+  with `uvloop` + `httptools`), run as a long-lived server process crossing a real
+  TCP socket. Because both apps are plain ASGI and every server speaks plain ASGI,
+  any combination runs. That is what lets the numbers be *decomposed*: hold the
+  framework fixed and the difference is the server layer (h11 + asyncio writes vs
+  uvloop + httptools); hold the server fixed and the difference is the framework.
+  The `without-http-uvloop` server goes one finer, splitting the event loop out
+  from the HTTP server: because without-http (unlike uvicorn) leaves loop startup
+  to the caller, running it on uvloop is a one-line entrypoint change, so its delta
+  against the plain `without-http` cell is *only* the loop. Each framework has a
+  **default server** it normally deploys under (without-web on without-http,
+  FastAPI on uvicorn), so the two as-deployed baselines are the default and the
+  cross cells are one `--server` flag away.
 
 ## Methodology
 
@@ -74,21 +86,40 @@ for Python 3.14 support; the run leaves a `.mojo` (raw samples), an intermediate
 ## Running
 
 ```bash
-# Sweep the without stack's list endpoint across the default rates.
+# Sweep without-web's list endpoint on its default server (without-http).
 uv run python -m benchmarks.harness without --endpoint list
+
+# The same framework on the *other* server: one cross cell of the matrix.
+uv run python -m benchmarks.harness without --endpoint list --server uvicorn
 
 # The FastAPI peer, the write path, custom rates, and a saturation ceiling,
 # with a flamegraph of the server.
 uv run python -m benchmarks.harness fastapi --endpoint create \
     --rate 2000 --rate 8000 --saturate 40000 --profile
+
+# The same list endpoint over HTTP/2 cleartext instead of HTTP/1.1.
+uv run python -m benchmarks.harness without --server without-http --endpoint list --h2c
 ```
 
+The positional is the framework (`without`, `fastapi`); `--server`
+(`without-http`, `without-http-uvloop`, `uvicorn`) defaults to that framework's
+default server, so a cell is `without`/`fastapi` × a `--server` value. `--h2c`
+drives HTTP/2 cleartext (prior knowledge) rather than HTTP/1.1; without-http
+negotiates it by sniffing the h2 preface, so only its cells answer h2c (uvicorn
+speaks HTTP/1.1 only and refuses).
+
 Results land in a git-ignored `results/`, named
-`{stack}-{endpoint}-r{rate}-d{duration}s[-prof]`, so a profiled run and a clean
-one (or two durations) at the same rate coexist rather than overwrite. Each run
-leaves a `.bin` (raw vegeta) and `.txt` (report); `--profile` adds the `-prof`
-tag and a `.speedscope.json` flamegraph. Endpoints: `list` (`GET /todos`), `show`
-(`GET /todos/2`), `create` (`POST /todos`).
+`{framework}+{server}-{endpoint}-r{rate}-[h2c-]d{duration}s[-prof]` (the `+`
+joins the cell, `-` separates fields), so every combination (a profiled run
+beside a clean one, an h2c run beside an h1 one, or two durations) at the same
+rate coexists rather than overwrites. Each run leaves a `.bin` (raw vegeta) and
+`.txt` (report); `--profile` adds the `-prof` tag and a `.speedscope.json`
+flamegraph. Endpoints: `list` (`GET /todos`), `show` (`GET /todos/2`), `create`
+(`POST /todos`).
 
 `just plot` reads the *clean* (non-`-prof`) runs and draws latency and throughput
-versus target rate to `results/{endpoint}-latency-throughput.png`.
+versus target rate to `results/{endpoint}-latency-throughput.png`, one series per
+cell that has results. `just hotspots` reads the `--profile` runs and prints each
+saturated server's self-time by package and by frame, so a flamegraph is not the
+only way to read a profile. (For the uvloop-backed servers the loop is C, so its
+socket I/O surfaces as `asyncio.Runner.run` rather than as a pure-Python hotspot.)

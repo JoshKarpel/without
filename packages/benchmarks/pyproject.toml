@@ -25,6 +25,10 @@ dependencies = [
     # (uvloop + httptools), so the delta is framework + server, not domain logic.
     "fastapi>=0.115",
     "uvicorn[standard]>=0.34",
+    # uvloop is pulled in transitively by uvicorn[standard], but `servers.py`
+    # imports it directly to run the without-http server on uvloop, so it is a
+    # direct dependency in its own right.
+    "uvloop>=0.21",
     # Converts austin's native sample stream to speedscope for a flamegraph. The
     # austin sampler binary itself is a system install (C), not a Python package.
     "austin-python>=1.7",

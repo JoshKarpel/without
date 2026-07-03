@@ -9,12 +9,13 @@ from integration.todos.core import TodoList
 from integration.todos.core import TodoNotFound
 from without_asgi import ASGIApp
 
-# Two shells over the *same* todo core, so a benchmark measures framework + server
-# overhead, not domain logic: `without_todos` is the without-web app (via
-# `integration`), `fastapi_todos` is the idiomatic FastAPI equivalent. Both parse
-# the same `NewTodo`, fold the same immutable `TodoList`, and render the same
-# shape; neither persists past the request (the create path echoes the would-be
-# todo), matching `integration`'s echo stance so the two stacks do identical work.
+# The two application frameworks under test, each a shell over the *same* todo
+# core, so a benchmark measures framework + server overhead, not domain logic:
+# `without_todos` is the without-web app (via `integration`), `fastapi_todos` is
+# the idiomatic FastAPI equivalent. Both parse the same `NewTodo`, fold the same
+# immutable `TodoList`, and render the same shape; neither persists past the
+# request (the create path echoes the would-be todo), matching `integration`'s
+# echo stance so both frameworks do identical work per request.
 
 
 def seed() -> TodoList:

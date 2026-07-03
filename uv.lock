@@ -118,6 +118,7 @@ dependencies = [
     { name = "matplotlib" },
     { name = "psutil" },
     { name = "uvicorn", extra = ["standard"] },
+    { name = "uvloop" },
     { name = "without-asgi" },
     { name = "without-http" },
 ]
@@ -130,6 +131,7 @@ requires-dist = [
     { name = "matplotlib", specifier = ">=3.9" },
     { name = "psutil", specifier = ">=5.9" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34" },
+    { name = "uvloop", specifier = ">=0.21" },
     { name = "without-asgi", editable = "packages/without-asgi" },
     { name = "without-http", editable = "packages/without-http" },
 ]
