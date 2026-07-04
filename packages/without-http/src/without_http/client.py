@@ -639,12 +639,12 @@ class _Http2Connection:
     async def aclose(self) -> None:
         self._closed.set()
         await cancel_futures([self._task])  # `_task` may be None before `start`; skipped
-        with suppress(h2.exceptions.ProtocolError, OSError):
+        # The GOAWAY is best-effort: a closed transport rejects the write with `RuntimeError` under
+        # uvloop (stdlib drops it silently), so tolerate that alongside the h2/OS errors.
+        with suppress(h2.exceptions.ProtocolError, OSError, RuntimeError):
             async with self._lock:
                 self._conn.close_connection()
-                # A closed transport rejects the write under uvloop (stdlib drops it silently); the GOAWAY is best-effort.
-                if not self._writer.is_closing():
-                    self._writer.write(self._conn.data_to_send())
+                self._writer.write(self._conn.data_to_send())
         self._writer.close()
         with suppress(OSError):
             await self._writer.wait_closed()
