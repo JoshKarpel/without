@@ -205,7 +205,8 @@ async def test_resetting_a_stream_mid_response_is_contained() -> None:
         conn.reset_stream(stream_id, error_code=h2.errors.ErrorCodes.CANCEL)
         writer.write(conn.data_to_send())
         await writer.drain()
-        await second_sent.wait()  # the app attempted its post-reset send and the server contained it
+        async with asyncio.timeout(5):
+            await second_sent.wait()  # the app attempted its post-reset send and the server contained it
         writer.close()
         with suppress(OSError):
             await writer.wait_closed()
@@ -304,7 +305,8 @@ async def test_resetting_an_in_flight_stream_disconnects_it() -> None:
         conn.send_headers(stream_id, _headers(server.host, server.port, "GET", "/r"), end_stream=True)
         writer.write(conn.data_to_send())
         await writer.drain()
-        await entered.wait()  # the server has dispatched the request; the stream is in-flight
+        async with asyncio.timeout(5):
+            await entered.wait()  # the server has dispatched the request; the stream is in-flight
         conn.reset_stream(stream_id, error_code=h2.errors.ErrorCodes.CANCEL)
         writer.write(conn.data_to_send())
         await writer.drain()
@@ -324,7 +326,8 @@ async def test_an_in_flight_stream_is_cancelled_on_server_shutdown() -> None:
         conn.send_headers(stream_id, _headers(server.host, server.port, "GET", "/slow"), end_stream=True)
         writer.write(conn.data_to_send())
         await writer.drain()
-        await entered.wait()  # the never-finishing stream is in-flight
+        async with asyncio.timeout(5):
+            await entered.wait()  # the never-finishing stream is in-flight
     # leaving the serving block cancels the in-flight stream task
     writer.close()
     with suppress(OSError):
