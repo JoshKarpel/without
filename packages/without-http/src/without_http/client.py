@@ -642,7 +642,9 @@ class _Http2Connection:
         with suppress(h2.exceptions.ProtocolError, OSError):
             async with self._lock:
                 self._conn.close_connection()
-                self._writer.write(self._conn.data_to_send())
+                # A closed transport rejects the write under uvloop (stdlib drops it silently); the GOAWAY is best-effort.
+                if not self._writer.is_closing():
+                    self._writer.write(self._conn.data_to_send())
         self._writer.close()
         with suppress(OSError):
             await self._writer.wait_closed()
