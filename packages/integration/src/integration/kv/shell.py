@@ -136,9 +136,11 @@ async def serve[In, Out](
     graceful phase overruns the one budget, the server hard-stops: cancel the
     consumer, and cancel any session still parked (e.g. awaiting a reply a stopped
     consumer will never send), which runs each session's cleanup and force-closes
-    its client. Either way it then waits for the transports to close. The budget is global (one timeout
-    around the graceful phase, not one per step), so shutdown always terminates in
-    roughly `drain_timeout` without leaking a task.
+    its client. Either way it then waits for the server's listening sockets to
+    close (the connection transports are already closed by the sessions above).
+    The budget is global (one timeout around the graceful phase, not one per
+    step), so shutdown always terminates in roughly `drain_timeout` without
+    leaking a task.
     """
     settings = config.current()
     inbox: asyncio.Queue[Connected[In, Out]] = asyncio.Queue(maxsize=settings.max_pending)
