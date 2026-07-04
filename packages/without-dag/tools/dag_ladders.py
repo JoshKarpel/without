@@ -39,13 +39,15 @@ def _overload(name: str, typeparams: list[str], params: list[str], return_type: 
 
 
 def _of_ladder() -> str:
-    """`of`: open a graph over N entry types, returning it plus a tuple of one `Handle` each (arity 1-10)."""
+    """`of`: open a graph over N entry types, returning it plus a tuple of one `Handle` each (arity 0-10)."""
     blocks = []
-    for arity in range(1, 11):
+    for arity in range(11):
         letters = list(LETTERS[:arity])
-        params = [*(f"{letter.lower()}: type[{letter}]," for letter in letters), "/,"]
-        graph_type = f"Graph[{', '.join(letters)}]"
-        handles = ", ".join(f"Handle[{letter}]" for letter in letters)
+        # `Graph[()]`/`tuple[()]` are the empty-pack spellings; a bare `/` with no
+        # preceding parameter is a syntax error, so arity 0 takes no parameters.
+        params = [*(f"{letter.lower()}: type[{letter}]," for letter in letters), "/,"] if letters else []
+        graph_type = f"Graph[{', '.join(letters)}]" if letters else "Graph[()]"
+        handles = ", ".join(f"Handle[{letter}]" for letter in letters) if letters else "()"
         # Trailing comma inside the outer tuple: it keeps the return type off a
         # single line (so `ruff format` owns the layout) and, crucially, breaks
         # the `]]]` run that `tuple[..., tuple[...]]` would otherwise end on,

@@ -105,6 +105,13 @@ class Graph[*Ins]:
     # [[[cog import cog; from dag_ladders import emit; cog.outl(emit("of")) ]]]
     @overload
     @staticmethod
+    def of() -> tuple[
+        Graph[()],
+        tuple[()],
+    ]: ...
+
+    @overload
+    @staticmethod
     def of[A](
         a: type[A],
         /,

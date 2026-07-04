@@ -44,6 +44,11 @@ async def test_evaluate_returns_an_input_target_without_running_anything() -> No
     assert result == 7
 
 
+async def test_evaluate_raises_for_a_target_that_is_neither_node_nor_input() -> None:
+    with pytest.raises(KeyError, match="ghost"):
+        await evaluate(Plan.of([Node("out", ("in",), returning(1))]), "ghost", inputs={"in": None}, limit=1)
+
+
 async def test_evaluate_runs_every_node_even_those_the_output_ignores() -> None:
     ran: list[str] = []
 

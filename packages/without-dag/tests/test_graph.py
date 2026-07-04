@@ -3,6 +3,18 @@ from __future__ import annotations
 from without_dag import Graph
 
 
+async def test_of_opens_a_graph_with_zero_inputs() -> None:
+    graph, () = Graph.of()
+
+    async def constant() -> str:
+        return "k"
+
+    made = graph.node(constant)
+    run = graph.build(output=made)
+
+    assert await run() == "k"
+
+
 async def test_build_produces_a_callable_from_inputs_to_output() -> None:
     graph, (text,) = Graph.of(str)
 

@@ -132,7 +132,12 @@ async def evaluate(plan: Plan, target: NodeKey, inputs: Mapping[NodeKey, object]
     the value, or a supplied input returned directly (an identity plan). There is
     deliberately no early return on `target`: the graph is run to completion, so
     the result reflects the whole graph and every node's effects have happened.
+
+    A `target` that is neither a defined node nor a supplied input raises
+    `KeyError`, matching `drive`, rather than silently reading back as `None`.
     """
+    if target not in plan.by_key and target not in inputs:
+        raise KeyError(f"{target!r} is neither a supplied input nor a defined node")
     # `target` is either a node, whose completion `drive` yields (and overwrites
     # this), or a supplied input, which `drive` never yields: default to its value
     # so an identity graph (the output is an input) returns it.
