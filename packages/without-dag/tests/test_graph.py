@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from without_dag import Graph
 
 
@@ -112,3 +113,10 @@ async def test_build_with_output_equal_to_an_input_returns_that_input() -> None:
     run = graph.build(output=number, limit=1)
 
     assert await run(42) == 42
+
+
+async def test_build_rejects_a_limit_below_one() -> None:
+    graph, (number,) = Graph.of(int)
+
+    with pytest.raises(ValueError, match="limit must be at least 1 or None"):
+        graph.build(output=number, limit=0)
