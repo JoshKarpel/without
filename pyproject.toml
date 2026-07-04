@@ -55,6 +55,13 @@ dev = [
     "types-pyyaml>=6",
     "uvloop>=0.22.1 ; sys_platform != 'win32'",  # uvloop has no Windows support; the suite runs asyncio-only there
 ]
+docs = [
+    # MkDocs 2.0 is a backward-incompatible rewrite that drops the plugin system
+    # this site relies on (mkdocstrings, the hook), so cap below it deliberately.
+    "mkdocs>=1.6,<2",
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.27",
+]
 
 [tool.pytest.ini_options]
 addopts = [

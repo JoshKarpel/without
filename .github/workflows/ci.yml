@@ -48,3 +48,19 @@ jobs:
 
       - name: Run type checking and tests
         run: just test --durations 20 -vvv
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.0
+
+      - name: Set up toolchain
+        uses: ./.github/actions/setup
+        with:
+          python-version: "3.14"
+
+      - name: Build the documentation site
+        run: just docs-build

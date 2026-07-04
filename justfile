@@ -26,7 +26,17 @@ alias t := test
 durations *args:
     uv run pytest --pytest-durations=30 --pytest-durations-group-by=function {{ args }}
 
-alias d := durations
+alias td := durations
+
+[doc('Serve the documentation site with live reload')]
+docs *args:
+    uv run --group docs mkdocs serve {{ args }}
+
+alias d := docs
+
+[doc('Build the documentation site into ./site')]
+docs-build *args:
+    uv run --group docs mkdocs build --strict {{ args }}
 
 [doc('Upgrade all dependencies')]
 upgrade:

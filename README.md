@@ -13,7 +13,10 @@ that layer as a narrow contract, so the pieces compose. It is meant to feel like
 a library (your control flow stays visible) rather than a framework.
 
 See [`PHILOSOPHY.md`](PHILOSOPHY.md) for the design rationale: the narrow-waist
-bet, functional-core/imperative-shell, and values-over-places.
+bet, functional-core/imperative-shell, and values-over-places. The full
+documentation, narrative guides, an API reference recovered from the source
+docstrings, and the derived package dependency graph, lives at
+<https://without.help/>.
 
 ## Layout
 
@@ -48,25 +51,9 @@ packages). Each package is its own top-level import.
   on `without` and every plugin so they can be exercised together in
   cross-package tests. Imported as `integration`.
 
-The package dependency graph (each arrow is "depends on"):
-
-```mermaid
-graph TD
-    without_env[without-env] --> without
-    without_configmap[without-configmap] --> without
-    without_asgi[without-asgi] --> without
-    without_web[without-web] --> without
-    without_web --> without_asgi
-    without_http[without-http] --> without
-    without_http --> without_asgi
-    without_dag[without-dag] --> without
-    integration --> without
-    integration --> without_env
-    integration --> without_configmap
-    integration --> without_asgi
-    integration --> without_web
-    integration --> without_http
-```
+The [package dependency graph](https://without.help/architecture/package-graph/)
+(each arrow is "depends on") is derived from the declared dependencies and
+rendered on the documentation site.
 
 Planned plugins, in the order they should be attempted:
 
@@ -86,4 +73,5 @@ Planned plugins, in the order they should be attempted:
 uv sync
 just test        # mypy + pytest
 just durations   # profile the suite (slowest fixtures, setup, calls, teardown)
+just docs        # serve the documentation site with live reload
 ```
