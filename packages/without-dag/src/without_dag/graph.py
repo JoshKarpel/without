@@ -425,6 +425,9 @@ class Graph[*Ins]:
         node runs at once). Pass an integer to cap it when the steps contend for
         a scarce resource.
         """
+        if limit is not None and limit < 1:
+            raise ValueError(f"limit must be at least 1 or None, but got {limit}")
+
         nodes = tuple(self._nodes)
         return CompiledGraph(
             nodes=nodes,
