@@ -3,22 +3,17 @@ from __future__ import annotations
 import asyncio
 import ssl
 from contextlib import suppress
-from pathlib import Path
 
 import httpx
-import pytest
-import trustme
-from test_server import echo_app
-from test_websocket import WebSocketClient
 from without_asgi import RawScope
 from without_asgi import Receive
 from without_asgi import Send
-from without_http import server_ssl_context
 from without_http import serving
 from wsproto.events import AcceptConnection
 from wsproto.events import TextMessage
 
-_HOST = "127.0.0.1"
+from .test_server import echo_app
+from .test_websocket import WebSocketClient
 
 
 async def scheme_app(scope: RawScope, receive: Receive, send: Send) -> None:
@@ -45,25 +40,6 @@ async def scheme_ws_app(scope: RawScope, receive: Receive, send: Send) -> None:
                 await send({"type": "websocket.send", "text": scheme})
             case "websocket.disconnect":  # pragma: no branch - the client only connects then disconnects
                 return
-
-
-@pytest.fixture(scope="module")
-def authority() -> trustme.CA:
-    return trustme.CA()
-
-
-@pytest.fixture(scope="module")
-def server_context(authority: trustme.CA, tmp_path_factory: pytest.TempPathFactory) -> ssl.SSLContext:
-    pem: Path = tmp_path_factory.mktemp("tls") / "server.pem"
-    authority.issue_cert(_HOST).private_key_and_cert_chain_pem.write_to_path(pem)
-    return server_ssl_context(pem)
-
-
-@pytest.fixture
-def trusting_client_context(authority: trustme.CA) -> ssl.SSLContext:
-    context = ssl.create_default_context()
-    authority.configure_trust(context)
-    return context
 
 
 async def test_serves_https_with_the_scheme_marked_secure(

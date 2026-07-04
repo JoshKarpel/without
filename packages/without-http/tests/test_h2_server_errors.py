@@ -8,12 +8,14 @@ import h2.connection
 import h2.errors
 import h2.events
 import h2.settings
-from test_server import echo_app
-from test_server import receive_after_done_app
+from without_asgi import ASGIApp
 from without_asgi import RawScope
 from without_asgi import Receive
 from without_asgi import Send
 from without_http import serving
+
+from .test_server import echo_app
+from .test_server import receive_after_done_app
 
 _ILLEGAL_FRAME = b"\x00\x00\x00\x00\x00\x00\x00\x00\x00"  # DATA frame on stream 0
 
@@ -57,21 +59,37 @@ async def start_only_app(scope: RawScope, receive: Receive, send: Send) -> None:
     await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
 
 
-async def slow_chunked_app(scope: RawScope, receive: Receive, send: Send) -> None:
-    """Send a first chunk, pause for the client to reset, then send again so the write fails."""
-    if scope["type"] != "http":
-        raise RuntimeError("this app serves only http")
-    await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
-    await send({"type": "http.response.body", "body": b"first", "more_body": True})
-    await asyncio.sleep(0.15)  # let the client's reset reach the server before the next chunk
-    await send({"type": "http.response.body", "body": b"second", "more_body": True})
+def slow_chunked_app(second_sent: asyncio.Event) -> ASGIApp:
+    """
+    Send a first chunk, pause for the client to reset, then send again (a write the
+    server contains), setting `second_sent` once that second send has been attempted.
+    """
+
+    async def app(scope: RawScope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            raise RuntimeError("this app serves only http")
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
+        await send({"type": "http.response.body", "body": b"first", "more_body": True})
+        await asyncio.sleep(0.15)  # let the client's reset reach the server before the next chunk
+        await send({"type": "http.response.body", "body": b"second", "more_body": True})
+        second_sent.set()
+
+    return app
 
 
-async def never_responds_app(scope: RawScope, receive: Receive, send: Send) -> None:
-    """Never send a response, so an in-flight request stays open until cancelled."""
-    if scope["type"] != "http":
-        raise RuntimeError("this app serves only http")
-    await asyncio.Event().wait()
+def never_responds_app(entered: asyncio.Event) -> ASGIApp:
+    """
+    Never send a response, so an in-flight request stays open until cancelled, setting
+    `entered` once the server has dispatched the request to this app.
+    """
+
+    async def app(scope: RawScope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            raise RuntimeError("this app serves only http")
+        entered.set()
+        await asyncio.Event().wait()
+
+    return app
 
 
 async def server_push_app(scope: RawScope, receive: Receive, send: Send) -> None:
@@ -165,7 +183,8 @@ async def test_receiving_after_the_request_body_yields_a_disconnect_over_h2() ->
 
 
 async def test_resetting_a_stream_mid_response_is_contained() -> None:
-    async with serving(slow_chunked_app) as server:
+    second_sent = asyncio.Event()
+    async with serving(slow_chunked_app(second_sent)) as server:
         reader, writer = await asyncio.open_connection(server.host, server.port)
         conn = _client()
         conn.initiate_connection()
@@ -186,7 +205,8 @@ async def test_resetting_a_stream_mid_response_is_contained() -> None:
         conn.reset_stream(stream_id, error_code=h2.errors.ErrorCodes.CANCEL)
         writer.write(conn.data_to_send())
         await writer.drain()
-        await asyncio.sleep(0.3)
+        async with asyncio.timeout(5):
+            await second_sent.wait()  # the app attempted its post-reset send and the server contained it
         writer.close()
         with suppress(OSError):
             await writer.wait_closed()
@@ -276,7 +296,8 @@ async def test_an_unsupported_extension_over_h2_becomes_a_500() -> None:
 
 
 async def test_resetting_an_in_flight_stream_disconnects_it() -> None:
-    async with serving(never_responds_app) as server:
+    entered = asyncio.Event()
+    async with serving(never_responds_app(entered)) as server:
         _reader, writer = await asyncio.open_connection(server.host, server.port)
         conn = _client()
         conn.initiate_connection()
@@ -284,7 +305,8 @@ async def test_resetting_an_in_flight_stream_disconnects_it() -> None:
         conn.send_headers(stream_id, _headers(server.host, server.port, "GET", "/r"), end_stream=True)
         writer.write(conn.data_to_send())
         await writer.drain()
-        await asyncio.sleep(0.1)  # let the server open the stream
+        async with asyncio.timeout(5):
+            await entered.wait()  # the server has dispatched the request; the stream is in-flight
         conn.reset_stream(stream_id, error_code=h2.errors.ErrorCodes.CANCEL)
         writer.write(conn.data_to_send())
         await writer.drain()
@@ -295,7 +317,8 @@ async def test_resetting_an_in_flight_stream_disconnects_it() -> None:
 
 
 async def test_an_in_flight_stream_is_cancelled_on_server_shutdown() -> None:
-    async with serving(never_responds_app) as server:
+    entered = asyncio.Event()
+    async with serving(never_responds_app(entered)) as server:
         _reader, writer = await asyncio.open_connection(server.host, server.port)
         conn = _client()
         conn.initiate_connection()
@@ -303,7 +326,8 @@ async def test_an_in_flight_stream_is_cancelled_on_server_shutdown() -> None:
         conn.send_headers(stream_id, _headers(server.host, server.port, "GET", "/slow"), end_stream=True)
         writer.write(conn.data_to_send())
         await writer.drain()
-        await asyncio.sleep(0.1)  # let the server start the never-finishing stream
+        async with asyncio.timeout(5):
+            await entered.wait()  # the never-finishing stream is in-flight
     # leaving the serving block cancels the in-flight stream task
     writer.close()
     with suppress(OSError):

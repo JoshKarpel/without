@@ -84,5 +84,6 @@ Planned plugins, in the order they should be attempted:
 
 ```bash
 uv sync
-just test    # mypy + pytest
+just test        # mypy + pytest
+just durations   # profile the suite (slowest fixtures, setup, calls, teardown)
 ```

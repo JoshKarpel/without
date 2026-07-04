@@ -22,6 +22,12 @@ test *args:
 
 alias t := test
 
+[doc('Profile the suite: show the slowest fixtures, setup, calls, and teardown')]
+durations *args:
+    uv run pytest --pytest-durations=30 --pytest-durations-group-by=function {{ args }}
+
+alias d := durations
+
 [doc('Upgrade all dependencies')]
 upgrade:
     uv lock --upgrade
