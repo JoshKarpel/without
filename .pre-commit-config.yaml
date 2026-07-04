@@ -46,6 +46,11 @@ repos:
         language: system
         entry: packages/without-web/tools/regenerate.sh
         files: ^packages/without-web/src/without_web/(handlers|extractors)\.py$
+      - id: generate-dag-ladders
+        name: regenerate without-dag overload ladder (cog + ruff)
+        language: system
+        entry: packages/without-dag/tools/regenerate.sh
+        files: ^packages/without-dag/src/without_dag/graph\.py$
       - id: format-justfile
         name: format justfile
         language: system

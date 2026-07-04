@@ -16,6 +16,7 @@ members = [
     "without",
     "without-asgi",
     "without-configmap",
+    "without-dag",
     "without-env",
     "without-http",
     "without-web",
@@ -940,6 +941,17 @@ requires-dist = [
 ]
 
 [[package]]
+name = "without-dag"
+version = "0.0.0"
+source = { editable = "packages/without-dag" }
+dependencies = [
+    { name = "without" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "without", editable = "packages/without" }]
+
+[[package]]
 name = "without-env"
 version = "0.0.0"
 source = { editable = "packages/without-env" }
@@ -998,6 +1010,7 @@ dependencies = [
     { name = "without" },
     { name = "without-asgi" },
     { name = "without-configmap" },
+    { name = "without-dag" },
     { name = "without-env" },
     { name = "without-http" },
     { name = "without-web" },
@@ -1027,6 +1040,7 @@ requires-dist = [
     { name = "without", editable = "packages/without" },
     { name = "without-asgi", editable = "packages/without-asgi" },
     { name = "without-configmap", editable = "packages/without-configmap" },
+    { name = "without-dag", editable = "packages/without-dag" },
     { name = "without-env", editable = "packages/without-env" },
     { name = "without-http", editable = "packages/without-http" },
     { name = "without-web", editable = "packages/without-web" },

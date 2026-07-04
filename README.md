@@ -39,6 +39,10 @@ packages). Each package is its own top-level import.
   on the sans-IO `h11`/`h2`/`wsproto` state machines: `serving(app)` owns the socket
   and the wire protocol (HTTP/1.1, HTTP/2, and WebSockets) and drives any ASGI app.
   Imported as `without_http`.
+- `packages/without-dag` — bounded-concurrency execution of DAG-shaped async
+  workflows: a `Graph` builder threads value types through the wiring, and a
+  single-input graph is an async callable that `from_map` lifts straight into a
+  `Processor`. Imported as `without_dag`.
 - `packages/integration` — not a real package (and never published: its name
   sits outside the `without*` family, so the publish workflow skips it): depends
   on `without` and every plugin so they can be exercised together in
@@ -55,6 +59,7 @@ graph TD
     without_web --> without_asgi
     without_http[without-http] --> without
     without_http --> without_asgi
+    without_dag[without-dag] --> without
     integration --> without
     integration --> without_env
     integration --> without_configmap
