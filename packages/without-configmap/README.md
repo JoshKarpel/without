@@ -9,11 +9,8 @@ once, this one re-parses on every mount change.
 freshly parsed value every time the mount changes. It watches the mount
 *directory*, not the file, so it catches the atomic `..data` symlink swap that
 [projected ConfigMaps](https://kubernetes.io/docs/concepts/configuration/configmap/#mounted-configmaps-are-updated-automatically)
-use (a naive watch on the file alone misses those updates). `read_yaml_file(Model,
-"config.yaml")` is the usual `parse`: it reads one YAML file from the mount and
-validates it into a pydantic model.
-
-Feed the stream through `without.sample` to read the latest value as a `Context`:
+use. Feed the stream through `without.sample` to read the latest value as a
+`Context`:
 
 ```python
 from pathlib import Path
@@ -35,11 +32,7 @@ async with sample(source) as config:
     await config.updated() # block until the next reload lands, then return it
 ```
 
-`sample` reads the first value eagerly, so the context is never "not ready"; a
-background task keeps it current for the life of the `with` block. `current`
-reads the latest value without blocking; `updated` is the deterministic
-counterpart that waits for the next reload to land (it inherits latest-wins, so
-it signals "the config moved on" rather than replaying every intermediate value). A reload whose
-YAML fails validation raises from the watch loop rather than silently serving a
-stale or partial value. Snapshot `config.current()` once per request or connection
-so a mid-flight reload does not change a value an in-progress handler already read.
+See the
+[`without-configmap` guide](https://without.help/guides/without-configmap/)
+(with the [API reference](https://without.help/reference/without_configmap/))
+for the full surface.

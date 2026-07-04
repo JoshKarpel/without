@@ -5,7 +5,7 @@ build-backend = "uv_build"
 [project]
 name = "without-http"
 version = "0.0.0"
-description = "A sans-IO-backed ASGI server (and HTTP client) for without: h11/h2/wsproto over asyncio sockets."
+description = "A sans-IO-backed ASGI server and HTTP client for without: h11/h2/wsproto over asyncio sockets."
 readme = "README.md"
 license = "MIT"
 authors = [

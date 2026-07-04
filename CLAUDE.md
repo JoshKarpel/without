@@ -8,9 +8,15 @@ functional-core/imperative-shell, and values-over-places. It is the durable
 rationale for why the code is shaped the way it is, and the right frame for any
 new work.
 
-Then skim the per-package `README.md` files for the area you are touching: the
-core (`packages/without`), the ASGI boundary (`packages/without-asgi`), the HTTP
-server and client (`packages/without-http`), the opinionated router
-(`packages/without-web`), the config sources (`packages/without-env`,
-`packages/without-configmap`), the DAG executor (`packages/without-dag`), and the
-`integration` toys that exercise the whole stack.
+Then read the per-package guide in [`docs/guides/`](docs/guides) for the area you
+are touching: the core (`without.md`), the ASGI boundary (`without-asgi.md`), the
+HTTP server and client (`without-http.md`), the opinionated router
+(`without-web.md`), the config sources (`without-env.md`, `without-configmap.md`),
+and the DAG executor (`without-dag.md`). Those guides carry the design narrative;
+each package's `README.md` is now a short orientation that links to them, and the
+`integration` toys that exercise the whole stack live under `packages/integration`.
+
+The guides, an API reference recovered from the source docstrings, and the
+derived package dependency graph are published as a documentation site (see
+[`mkdocs.yml`](mkdocs.yml) and the hand-written [`docs/hooks.py`](docs/hooks.py));
+build it locally with `just docs` (serve) or `just docs-build` (strict build).

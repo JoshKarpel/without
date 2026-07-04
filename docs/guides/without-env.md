@@ -1,14 +1,15 @@
 # without-env
 
 A `without` `Context` backed by environment variables: the simplest possible
-context, a static one loaded at startup and never changed.
+context, a static one loaded at startup and never changed. See the
+[`without_env` API reference](../reference/without_env.md) for the full surface.
 
 `EnvContext.load(MySettings)` reads the environment once, at the boundary, into a
 validated [`pydantic-settings`](https://docs.pydantic.dev/latest/concepts/pydantic_settings/)
 model (parse, don't validate), then hands that immutable value to processors via
 `current()`. Because it never changes, a reloading source (a watched file, a
 ConfigMap mount) is a separate plugin; see
-[`without-configmap`](../without-configmap) for the context-updated-by-a-stream
+[`without-configmap`](without-configmap.md) for the context-updated-by-a-stream
 case.
 
 ```python
@@ -25,7 +26,6 @@ config = EnvContext.load(Settings)   # reads os.environ once, validates
 config.current().default_mode        # the parsed value, same every call
 ```
 
-See the
-[`without-env` guide](https://without.help/guides/without-env/)
-(with the [API reference](https://without.help/reference/without_env/))
-for the full surface.
+A missing required field or a value that fails validation raises from
+`pydantic-settings` at `load` time, so misconfiguration fails loudly at startup
+rather than at first use.
