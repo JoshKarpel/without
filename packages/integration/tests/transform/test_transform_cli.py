@@ -12,14 +12,14 @@ from integration.transform.cli import transform_lines
 from integration.transform.core import Mode
 from integration.transform.core import TransformConfig
 from without import collect
-from without import stream
+from without import stream_from_iterable
 from without_env import EnvContext
 
 
 async def test_transform_lines_transforms_each_line_with_the_config_mode() -> None:
     process = transform_lines(TransformConfig(default_mode=Mode.TITLE))
 
-    transformed = await collect(process(stream(["the quiet part", "out loud"])))
+    transformed = await collect(process(stream_from_iterable(["the quiet part", "out loud"])))
 
     assert transformed == ["The Quiet Part", "Out Loud"]
 
@@ -28,7 +28,7 @@ async def test_serve_emits_each_line_transformed_with_the_sampled_config() -> No
     config = EnvContext(settings=CliSettings(transform=TransformConfig(default_mode=Mode.UPPER)))
     emitted: list[str] = []
 
-    await serve(config, stream(["hello", "world"]), emitted.append)
+    await serve(config, stream_from_iterable(["hello", "world"]), emitted.append)
 
     assert emitted == ["HELLO", "WORLD"]
 

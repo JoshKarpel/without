@@ -51,6 +51,31 @@ Three properties fall out of the model:
 A node that raises fails the whole run: the exception surfaces and any in-flight
 siblings are cancelled via `without.cancel_futures`.
 
+`execute` returns one value: the *behavior* read, sampling the final result. Its
+dual is `executed`, the *events* read, an async iterator that yields each
+`(key, result)` the instant it completes (in whatever order nodes finish, a node
+always after the dependencies it consumed):
+
+```python
+async def executed(
+    nodes: Iterable[Node],
+    inputs: Mapping[NodeKey, object],
+    limit: int | None,
+) -> AsyncGenerator[tuple[NodeKey, object]]: ...
+```
+
+Same scheduler, two consumption shapes, mirroring the substrate's own
+events-vs-behaviors split: `executed` runs the whole graph and reports every
+completion (useful to react as results land, or to want several outputs), while
+`execute` is a thin consumer of it that prunes to `target`'s closure and returns
+that one value. Closing the iterator early tears the run down (in-flight nodes
+cancelled), so `execute` drives it under `contextlib.aclosing`.
+
+`executed` is pull-driven: the DAG advances only as the consumer iterates. To
+drive it in the background instead (so the graph makes progress while a slower
+consumer catches up), wrap it with `without.buffer`, which pumps any stream into
+a bounded queue on a background task.
+
 ## The typed frontend
 
 `Graph` is a builder that threads value types through the wiring. `Graph.of`
@@ -88,6 +113,11 @@ general DAG may take several: `graph, a, b = Graph.of(A, B)` opens two entries,
 and the compiled graph is called `run(a_value, b_value)` with the count and types
 checked. Wrong arity or a mismatched value type is a static error.
 
+The behavior/events duality is typed here too: `run(*inputs)` samples the single
+`output`, while `run.stream(*inputs)` is the typed door onto `executed`, yielding
+each node's `(key, result)` as it completes (match a yielded key against a
+`Handle`'s `key` to pick one out). Both check the inputs against `*Ins`.
+
 ## Lifting into a Processor
 
 A `Stream` carries one value per event, so only a *single-input* graph lifts into
@@ -96,13 +126,13 @@ which is exactly what `from_map` wants: this package adds no wrapper of its own,
 because there is nothing to add.
 
 ```python
-from without import collect, from_map, stream
+from without import collect, from_map, stream_from_iterable
 
 processor = from_map(run)                      # Processor[Request, Report]
-reports = await collect(processor(stream([request_a, request_b])))
+reports = await collect(processor(stream_from_iterable([request_a, request_b])))
 ```
 
 Each event drives one bounded-concurrency DAG execution and yields its output, so
-the graph composes with `compose`, `stream`, `collect`, and the rest of the
+the graph composes with `compose`, `stream_from_iterable`, `collect`, and the rest of the
 substrate unchanged. When a step needs several values, group them into one input
 object (a dataclass or tuple) so the graph keeps a single entry and still lifts.

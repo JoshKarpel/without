@@ -63,6 +63,25 @@ async def test_a_node_with_no_dependencies_runs_as_a_source() -> None:
     assert await run(7) == "k7"
 
 
+async def test_stream_yields_each_node_result_from_typed_inputs() -> None:
+    graph, number = Graph.of(int)
+
+    async def double(value: int) -> int:
+        return value * 2
+
+    async def negate(value: int) -> int:
+        return -value
+
+    doubled = graph.node(double, number)
+    negated = graph.node(negate, number)
+    run = graph.build(output=doubled, limit=4)
+
+    collected = {key: value async for key, value in run.stream(5)}
+
+    assert collected[doubled.key] == 10
+    assert collected[negated.key] == -5
+
+
 async def test_build_defaults_to_unbounded_concurrency() -> None:
     graph, number = Graph.of(int)
 

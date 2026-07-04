@@ -97,7 +97,7 @@ contained inside a step. The one discipline an effect must keep: it MUST complet
 within the step and MUST NOT escape the entrypoint. A processor awaits its I/O to
 completion and never hands a half-open resource (an open socket, a task it does
 not own) back to the runtime. Testing then needs no mocks: inject fake `Context`
-values and feed a `stream(...)` of inputs.
+values and feed a `stream_from_iterable(...)` of inputs.
 
 ## Values over places, and where state goes
 
@@ -162,7 +162,7 @@ connector is `compose`: it chains one processor into the next and is pure
 composition, the only connector that needs nothing running. The other half of the
 model is the **behavior edge**, `sample`, which exposes a stream's latest value as
 a `Context` (latest-wins, no backpressure). Around those sit the source and
-terminal adapters: `stream` lifts a fixed iterable into a `Stream`, `collect`
+terminal adapters: `stream_from_iterable` lifts a fixed iterable into a `Stream`, `collect`
 drains one to a list, and `stream_from_queue` adapts a push source (an accept
 loop, a callback client) into the pull-based stream the rest of the system
 consumes.

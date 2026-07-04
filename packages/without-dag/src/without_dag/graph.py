@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
 from collections.abc import Awaitable
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from typing import overload
 from without_dag.execution import Node
 from without_dag.execution import NodeKey
 from without_dag.execution import execute
+from without_dag.execution import executed
 
 # Covariant: `T` names the node's result but is a phantom (no field holds it), so
 # a `Handle[int]` is a `Handle[object]`. That is what lets the `node` runtime
@@ -57,10 +59,24 @@ class CompiledGraph[*Ins, Out]:
     limit: int | None
 
     async def __call__(self, *values: *Ins) -> Out:
-        supplied: tuple[object, ...] = values
-        seeded = dict(zip(self.inputs, supplied, strict=True))
-        result = await execute(self.nodes, target=self.output, inputs=seeded, limit=self.limit)
+        result = await execute(self.nodes, target=self.output, inputs=self._seed(values), limit=self.limit)
         return cast(Out, result)
+
+    def stream(self, *values: *Ins) -> AsyncGenerator[tuple[NodeKey, object]]:
+        """
+        Run the whole graph, yielding each node's `(key, result)` as it completes.
+
+        The streaming counterpart to calling the graph: `__call__` samples the
+        single `output` value (a behavior), `stream` reports every completion as
+        it happens (the events), letting the caller react as results land or read
+        several outputs. The positional arguments seed the graph's inputs,
+        checked against `*Ins` exactly as the call is; match a yielded key against
+        a `Handle`'s `key` to pick out a node's result.
+        """
+        return executed(self.nodes, self._seed(values), self.limit)
+
+    def _seed(self, values: tuple[object, ...]) -> dict[NodeKey, object]:
+        return dict(zip(self.inputs, values, strict=True))
 
 
 @dataclass(frozen=True, slots=True)

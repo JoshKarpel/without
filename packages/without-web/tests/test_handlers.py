@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 import pytest
 from helpers import json_response
 from without import Stream
-from without import stream
+from without import stream_from_iterable
 from without_asgi import Asgi
 from without_asgi import HttpHandler
 from without_asgi import HttpScope
@@ -146,7 +146,7 @@ def _ws_scope(*, query: bytes = b"") -> WebsocketScope:
 
 
 def _noop_ws(inputs: Stream[WebsocketInbound]) -> Stream[WebsocketOutbound]:
-    return stream(())
+    return stream_from_iterable(())
 
 
 def test_ws_ties_path_and_query_to_the_handler() -> None:
@@ -162,7 +162,7 @@ def test_ws_ties_path_and_query_to_the_handler() -> None:
 
     route = ws(t"/feed/{room}", room, since)(make)
     processor = route.endpoint("tenant", Match(_ws_scope(query=b"since=5&since=9"), {"room": 7}))
-    processor(stream(()))
+    processor(stream_from_iterable(()))
     assert seen == {"state": "tenant", "room_id": 7, "since": ["5", "9"]}
 
 
@@ -302,7 +302,7 @@ def test_ws_route_wraps_a_pattern_and_endpoint() -> None:
 
 
 def _empty() -> Stream[Outbound]:
-    return stream(())
+    return stream_from_iterable(())
 
 
 async def _ok(*args: object) -> Response:

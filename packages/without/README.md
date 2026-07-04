@@ -37,11 +37,13 @@ effect within the call rather than handing a half-open resource back.
 the only connector that needs nothing running. `sample` is the behavior edge: it
 exposes a stream's latest value as a `Context` (latest-wins, no backpressure),
 driven by a `background_task` for the life of its `with` block. The source and
-terminal adapters sit alongside: `stream` lifts a fixed iterable into a `Stream`,
-`collect` drains one to a list, and `stream_from_queue` turns a push-based queue
-(an accept loop, a callback client) into the pull-based stream the rest of the
-system consumes. `stack` composes middleware (any `(handler, *context) -> handler`)
-into one, serving both server handlers and client exchanges.
+terminal adapters sit alongside: `stream_from_iterable` lifts a fixed iterable
+into a `Stream`, `collect` drains one to a list, `stream_from_queue` turns a
+push-based queue (an accept loop, a callback client) into the pull-based stream
+the rest of the system consumes, and `buffer` decouples a source's pace from its
+consumer's by pumping it into a bounded queue on a background task. `stack`
+composes middleware (any `(handler, *context) -> handler`) into one, serving both
+server handlers and client exchanges.
 
 ## Tasks (`without.tasks`)
 

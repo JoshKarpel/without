@@ -10,6 +10,7 @@ from graphlib import CycleError
 import pytest
 from without_dag import Node
 from without_dag import execute
+from without_dag import executed
 
 
 class Sentinel:
@@ -208,6 +209,58 @@ async def test_execute_propagates_a_node_error_and_cancels_in_flight_siblings() 
 
     with pytest.raises(RuntimeError, match="boom"):
         await execute(nodes, target="join", inputs={}, limit=4)
+
+    assert cancelled.is_set()
+
+
+async def test_executed_yields_every_node_result() -> None:
+    nodes = [
+        Node("left", ("in",), returning("left-value")),
+        Node("right", ("in",), returning("right-value")),
+        Node("tip", ("left",), returning("tip-value")),
+    ]
+
+    collected = {key: value async for key, value in executed(nodes, inputs={"in": None}, limit=4)}
+
+    assert collected == {"left": "left-value", "right": "right-value", "tip": "tip-value"}
+
+
+async def test_executed_yields_a_dependency_before_its_consumer() -> None:
+    nodes = [
+        Node("root", ("in",), returning("root-value")),
+        Node("leaf", ("root",), returning("leaf-value")),
+    ]
+
+    order = [key async for key, _ in executed(nodes, inputs={"in": None}, limit=1)]
+
+    assert order.index("root") < order.index("leaf")
+
+
+async def test_executed_raises_on_a_dangling_dependency() -> None:
+    orphan = Node("out", ("ghost",), returning(1))
+
+    with pytest.raises(KeyError, match="ghost"):
+        [pair async for pair in executed([orphan], inputs={}, limit=2)]
+
+
+async def test_execute_cancels_in_flight_nodes_when_cancelled() -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def slow(args: tuple[object, ...]) -> object:
+        started.set()
+        try:
+            return await asyncio.get_running_loop().create_future()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    task = asyncio.create_task(execute([Node("slow", (), slow)], target="slow", inputs={}, limit=1))
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
     assert cancelled.is_set()
 

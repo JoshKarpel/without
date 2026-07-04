@@ -3,11 +3,12 @@ from collections.abc import AsyncIterator
 
 import pytest
 from without import Transition
+from without import buffer
 from without import collect
 from without import compose
 from without import from_scan
 from without import sample
-from without import stream
+from without import stream_from_iterable
 from without import stream_from_queue
 from without.testing import yield_once
 
@@ -21,7 +22,7 @@ async def test_compose_runs_first_then_second() -> None:
 
     chained = compose(from_scan(None, double), from_scan(None, increment))
 
-    assert await collect(chained(stream([6, 7, 8]))) == [13, 15, 17]
+    assert await collect(chained(stream_from_iterable([6, 7, 8]))) == [13, 15, 17]
 
 
 async def test_compose_adapts_the_join_type() -> None:
@@ -33,7 +34,7 @@ async def test_compose_adapts_the_join_type() -> None:
 
     chained = compose(from_scan(None, measure), from_scan(None, label))
 
-    assert await collect(chained(stream(["ab", "cdef"]))) == ["len=2", "len=4"]
+    assert await collect(chained(stream_from_iterable(["ab", "cdef"]))) == ["len=2", "len=4"]
 
 
 async def test_stream_from_queue_yields_pushed_values_in_order() -> None:
@@ -48,19 +49,56 @@ async def test_stream_from_queue_yields_pushed_values_in_order() -> None:
     assert received == [5, 6, 7]
 
 
+async def test_buffer_yields_every_item_from_the_source() -> None:
+    assert await collect(buffer(stream_from_iterable([1, 2, 3]), maxsize=2)) == [1, 2, 3]
+
+
+async def test_buffer_rejects_a_nonpositive_maxsize() -> None:
+    with pytest.raises(ValueError, match="at least 1"):
+        await anext(buffer(stream_from_iterable(["x"]), maxsize=0))
+
+
+async def test_buffer_lets_the_producer_run_ahead_of_the_consumer() -> None:
+    all_produced = asyncio.Event()
+
+    async def source() -> AsyncIterator[str]:
+        for value in ("a", "b", "c"):
+            yield value
+        all_produced.set()
+
+    buffered = buffer(source(), maxsize=5)
+
+    assert await anext(buffered) == "a"
+    await all_produced.wait()
+
+    assert [item async for item in buffered] == ["b", "c"]
+
+
+async def test_buffer_surfaces_a_source_error_after_draining_buffered_items() -> None:
+    async def source() -> AsyncIterator[str]:
+        yield "ok"
+        raise RuntimeError("boom")
+
+    buffered = buffer(source(), maxsize=5)
+
+    assert await anext(buffered) == "ok"
+    with pytest.raises(RuntimeError, match="boom"):
+        await anext(buffered)
+
+
 async def test_sample_starts_at_the_first_value() -> None:
-    async with sample(stream([11, 22, 33])) as latest:
+    async with sample(stream_from_iterable([11, 22, 33])) as latest:
         assert latest.current() == 11
 
 
 async def test_sample_updated_returns_the_next_published_value() -> None:
-    async with sample(stream([11, 22, 33])) as latest:
+    async with sample(stream_from_iterable([11, 22, 33])) as latest:
         assert await latest.updated() == 22
 
 
 async def test_sample_tracks_the_latest_value() -> None:
     # The synchronous source drains in one go, so one update lands current on the last value.
-    async with sample(stream([11, 22, 33])) as latest:
+    async with sample(stream_from_iterable([11, 22, 33])) as latest:
         await latest.updated()
         assert latest.current() == 33
 
@@ -138,5 +176,5 @@ async def test_updated_fails_fast_after_the_source_has_already_failed() -> None:
 
 async def test_sample_rejects_an_empty_stream() -> None:
     with pytest.raises(ValueError, match="at least one value"):
-        async with sample(stream([])):
+        async with sample(stream_from_iterable([])):
             pass  # pragma: no cover - sample raises on enter, so the body never runs

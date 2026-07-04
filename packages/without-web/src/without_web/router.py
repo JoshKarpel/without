@@ -9,7 +9,7 @@ from string.templatelib import Template
 from typing import assert_never
 
 from without import Stream
-from without import stream
+from without import stream_from_iterable
 from without_asgi import HttpHandler
 from without_asgi import HttpRouter
 from without_asgi import HttpScope
@@ -284,7 +284,7 @@ def _method_not_allowed[T](methods: Mapping[str, HttpEndpoint[T]]) -> HttpHandle
     )
 
     def handler(inputs: Stream[Inbound]) -> Stream[Outbound]:
-        return stream(encode_response(response))
+        return stream_from_iterable(encode_response(response))
 
     return handler
 

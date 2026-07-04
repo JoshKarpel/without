@@ -19,7 +19,7 @@ from integration.transform.core import Mode
 from integration.transform.core import TransformConfig
 from without import Stream
 from without import collect
-from without import stream
+from without import stream_from_iterable
 from without_asgi import ASGIApp
 from without_asgi import Disconnect
 from without_asgi import HttpScope
@@ -423,7 +423,7 @@ async def test_transform_socket_transforms_text_then_closes_on_a_binary_frame() 
 
     outputs = await collect(
         processor(
-            stream(
+            stream_from_iterable(
                 [
                     WebsocketConnect(),
                     WebsocketReceive(WebsocketText(text="quiet")),
@@ -466,14 +466,17 @@ async def test_request_digest_hashes_only_body_chunks_and_passes_a_disconnect_th
     # digest therefore reflects only the body chunk.
     processor = request_digest(_respond_after_draining, object(), _http_scope(extensions))
 
-    outputs = await collect(processor(stream([RequestBody(body=b"hi", more_body=True), Disconnect()])))
+    outputs = await collect(processor(stream_from_iterable([RequestBody(body=b"hi", more_body=True), Disconnect()])))
 
     assert _request_digests(outputs) == [b"sha-256=" + hashlib.sha256(b"hi").hexdigest().encode()]
 
 
 async def test_log_connect_prints_the_path_and_forwards_every_frame(capsys: pytest.CaptureFixture[str]) -> None:
     forwarded = await collect(
-        log_connect(stream([WebsocketConnect(), WebsocketDisconnect(code=1000, reason="bye")]), _ws_scope("/stream"))
+        log_connect(
+            stream_from_iterable([WebsocketConnect(), WebsocketDisconnect(code=1000, reason="bye")]),
+            _ws_scope("/stream"),
+        )
     )
 
     assert forwarded == [WebsocketConnect(), WebsocketDisconnect(code=1000, reason="bye")]

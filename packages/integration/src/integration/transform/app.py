@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from without import Stream
 from without import compose
 from without import sample
-from without import stream
+from without import stream_from_iterable
 from without_asgi import ASGIApp
 from without_asgi import HttpHandler
 from without_asgi import HttpScope
@@ -146,7 +146,7 @@ def refuse_socket(settings: Settings, head: WebsocketScope) -> WebsocketHandler:
     """The websocket fallback: close an unrouted path without reading any frames."""
 
     def handler(inputs: Stream[WebsocketInbound]) -> Stream[WebsocketOutbound]:
-        return stream((WebsocketClose(),))
+        return stream_from_iterable((WebsocketClose(),))
 
     return handler
 

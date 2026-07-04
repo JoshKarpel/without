@@ -14,7 +14,7 @@ from integration.kv import encode_reply
 from integration.kv import make_store
 from integration.kv import parse_request
 from without import collect
-from without import stream
+from without import stream_from_iterable
 
 
 @pytest.mark.parametrize(
@@ -62,7 +62,7 @@ async def test_store_threads_the_keyspace_across_a_request_stream() -> None:
         Delete(key="color"),
     ]
 
-    replies = await collect(make_store()(stream(requests)))
+    replies = await collect(make_store()(stream_from_iterable(requests)))
 
     assert replies == [
         Stored(),
@@ -81,6 +81,6 @@ async def test_store_turns_a_malformed_request_into_an_error_without_touching_st
         Get(key="color"),
     ]
 
-    replies = await collect(make_store()(stream(requests)))
+    replies = await collect(make_store()(stream_from_iterable(requests)))
 
     assert replies == [Stored(), Error(message="unknown command 'PING'"), Value(value="blue")]

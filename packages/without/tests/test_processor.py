@@ -4,7 +4,7 @@ from without import from_fold
 from without import from_map
 from without import from_scan
 from without import from_sink
-from without import stream
+from without import stream_from_iterable
 from without.testing import resolved_next_turn
 
 
@@ -15,7 +15,7 @@ async def test_from_scan_threads_state_and_emits_each_output() -> None:
 
     running_total = from_scan(100, add_to_running_total)
 
-    outputs = await collect(running_total(stream([3, 4, 5])))
+    outputs = await collect(running_total(stream_from_iterable([3, 4, 5])))
 
     assert outputs == ["total=103", "total=107", "total=112"]
 
@@ -27,7 +27,7 @@ async def test_from_scan_awaits_contained_io_in_each_step() -> None:
 
     running_total = from_scan(1000, fetch_then_accumulate)
 
-    outputs = await collect(running_total(stream([3, 4, 5])))
+    outputs = await collect(running_total(stream_from_iterable([3, 4, 5])))
 
     assert outputs == ["total=1003", "total=1007", "total=1012"]
 
@@ -38,7 +38,7 @@ async def test_from_map_transforms_each_event_independently() -> None:
 
     labeller = from_map(label)
 
-    outputs = await collect(labeller(stream([7, 8, 9])))
+    outputs = await collect(labeller(stream_from_iterable([7, 8, 9])))
 
     assert outputs == ["value=7", "value=8", "value=9"]
 
@@ -49,7 +49,7 @@ async def test_from_map_awaits_contained_io_per_event() -> None:
 
     doubler = from_map(fetch_then_double)
 
-    outputs = await collect(doubler(stream([3, 4, 5])))
+    outputs = await collect(doubler(stream_from_iterable([3, 4, 5])))
 
     assert outputs == [6, 8, 10]
 
@@ -60,7 +60,7 @@ async def test_from_fold_reduces_the_stream_to_a_final_state() -> None:
 
     sum_into = from_fold(100, accumulate)
 
-    assert await sum_into(stream([3, 4, 5])) == 112
+    assert await sum_into(stream_from_iterable([3, 4, 5])) == 112
 
 
 async def test_from_sink_runs_each_event_for_its_effect() -> None:
@@ -71,6 +71,6 @@ async def test_from_sink_runs_each_event_for_its_effect() -> None:
 
     drain = from_sink(record)
 
-    await drain(stream([7, 8, 9]))
+    await drain(stream_from_iterable([7, 8, 9]))
 
     assert seen == [7, 8, 9]

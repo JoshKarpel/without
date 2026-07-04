@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from dataclasses import field
 
 from without import Stream
-from without import stream
+from without import stream_from_iterable
 from without_asgi import Asgi
 from without_asgi import HttpHandler
 from without_asgi import HttpScope
@@ -55,7 +55,7 @@ def _scope() -> HttpScope:
 
 
 async def _collect(handler: HttpHandler) -> list[Outbound]:
-    return [event async for event in handler(stream(()))]
+    return [event async for event in handler(stream_from_iterable(()))]
 
 
 def _status(events: list[Outbound]) -> int:

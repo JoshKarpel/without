@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 import pytest
 from helpers import json_response
 from without import Stream
-from without import stream
+from without import stream_from_iterable
 from without_asgi import Asgi
 from without_asgi import HttpHandler
 from without_asgi import HttpScope
@@ -150,7 +150,9 @@ async def test_a_mounted_router_is_grafted_at_the_prefix() -> None:
 async def test_an_opaque_mount_receives_the_prefix_trimmed_scope() -> None:
     def echo(state: object, head: HttpScope) -> HttpHandler:
         def handler(inputs: Stream[Inbound]) -> Stream[Outbound]:
-            return stream(encode_response(json_response(200, {"path": head.path, "root_path": head.root_path})))
+            return stream_from_iterable(
+                encode_response(json_response(200, {"path": head.path, "root_path": head.root_path}))
+            )
 
         return handler
 
@@ -288,7 +290,7 @@ async def test_a_mounted_router_keeps_its_own_middleware() -> None:
 async def test_subtree_middleware_wraps_an_opaque_mount_within_it() -> None:
     def opaque(state: object, head: HttpScope) -> HttpHandler:
         def handler(inputs: Stream[Inbound]) -> Stream[Outbound]:
-            return stream(encode_response(json_response(200, {"who": "opaque"})))
+            return stream_from_iterable(encode_response(json_response(200, {"who": "opaque"})))
 
         return handler
 

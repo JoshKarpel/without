@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 
 import pytest
 from without import Stream
-from without import stream
+from without import stream_from_iterable
 from without_asgi import Asgi
 from without_asgi import WebsocketAccept
 from without_asgi import WebsocketClose
@@ -51,7 +51,7 @@ async def test_catching_websocket_maps_an_exception_before_accept_to_a_close() -
 
     built = ws("/feed")(handler).endpoint(object(), Match(_ws_scope(), {}))
     wrapped = catching_websocket(_reject)(built, object(), _ws_scope())
-    events = [event async for event in wrapped(stream(()))]
+    events = [event async for event in wrapped(stream_from_iterable(()))]
 
     assert events == [WebsocketClose(code=4403, reason="denied")]
 
@@ -65,4 +65,4 @@ async def test_catching_websocket_propagates_an_exception_raised_after_accept() 
     wrapped = catching_websocket(_reject)(built, object(), _ws_scope())
 
     with pytest.raises(HandshakeDenied, match="too late"):
-        [event async for event in wrapped(stream(()))]
+        [event async for event in wrapped(stream_from_iterable(()))]
