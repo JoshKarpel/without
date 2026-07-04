@@ -4,7 +4,7 @@ from without_dag import Graph
 
 
 async def test_build_produces_a_callable_from_inputs_to_output() -> None:
-    graph, text = Graph.of(str)
+    graph, (text,) = Graph.of(str)
 
     async def shout(value: str) -> str:
         return value.upper()
@@ -16,7 +16,7 @@ async def test_build_produces_a_callable_from_inputs_to_output() -> None:
 
 
 async def test_node_threads_dependency_results_in_handle_order() -> None:
-    graph, number = Graph.of(int)
+    graph, (number,) = Graph.of(int)
 
     async def increment(value: int) -> int:
         return value + 1
@@ -36,7 +36,7 @@ async def test_node_threads_dependency_results_in_handle_order() -> None:
 
 
 async def test_build_seeds_each_input_for_a_multi_input_graph() -> None:
-    graph, text, count = Graph.of(str, int)
+    graph, (text, count) = Graph.of(str, int)
 
     async def repeat(value: str, times: int) -> str:
         return value * times
@@ -48,7 +48,7 @@ async def test_build_seeds_each_input_for_a_multi_input_graph() -> None:
 
 
 async def test_a_node_with_no_dependencies_runs_as_a_source() -> None:
-    graph, ignored = Graph.of(int)
+    graph, (ignored,) = Graph.of(int)
 
     async def constant() -> str:
         return "k"
@@ -64,7 +64,7 @@ async def test_a_node_with_no_dependencies_runs_as_a_source() -> None:
 
 
 async def test_stream_yields_each_node_result_from_typed_inputs() -> None:
-    graph, number = Graph.of(int)
+    graph, (number,) = Graph.of(int)
 
     async def double(value: int) -> int:
         return value * 2
@@ -83,7 +83,7 @@ async def test_stream_yields_each_node_result_from_typed_inputs() -> None:
 
 
 async def test_build_defaults_to_unbounded_concurrency() -> None:
-    graph, number = Graph.of(int)
+    graph, (number,) = Graph.of(int)
 
     async def double(value: int) -> int:
         return value * 2
@@ -96,7 +96,7 @@ async def test_build_defaults_to_unbounded_concurrency() -> None:
 
 
 async def test_build_with_output_equal_to_an_input_returns_that_input() -> None:
-    graph, number = Graph.of(int)
+    graph, (number,) = Graph.of(int)
     run = graph.build(output=number, limit=1)
 
     assert await run(42) == 42

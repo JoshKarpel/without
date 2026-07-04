@@ -16,15 +16,19 @@ importing the other's opinions.
 
 ## The execution core
 
-`execute` runs a set of `Node` values with at most `limit` in flight and returns
-one designated result:
+A set of `Node` values is compiled once into a `Plan`, then run with at most
+`limit` nodes in flight. `Plan.of` does the compiling; `drive` and `evaluate`
+run it:
 
 ```python
-async def execute(
-    nodes: Iterable[Node],
-    target: NodeKey,
-    inputs: Mapping[NodeKey, object],
-    limit: int | None,
+class Plan:
+    @classmethod
+    def of(cls, nodes: Iterable[Node]) -> Plan: ...
+
+async def drive(plan: Plan, inputs: Mapping[NodeKey, object], limit: int | None
+) -> AsyncGenerator[tuple[NodeKey, object]]: ...
+
+async def evaluate(plan: Plan, target: NodeKey, inputs: Mapping[NodeKey, object], limit: int | None
 ) -> object: ...
 ```
 
@@ -32,12 +36,14 @@ A `Node` is the seam: a value carrying its `key`, its ordered `dependencies`, an
 an async `run` that takes its dependencies' results as a tuple and returns its
 own. Results cross the seam as `object`, the same honest move `without-web` makes
 when it collects a heterogeneous mix of `Extractor[object]`; the typed frontend
-restores precision above it.
+restores precision above it. There is only the compiled form: a caller runs a
+graph by compiling a `Plan` and reusing it, the way an HTTP client owns one
+pooled session rather than a fresh connection per request. The input-independent
+work (nodes by key, dependency edges, consumer counts) is done once in `Plan.of`,
+so a graph driven per event never repeats it.
 
-Three properties fall out of the model:
+Two properties fall out of the model:
 
-- **Only what the output demands runs.** `execute` walks the transitive
-  dependencies of `target`, so a branch nothing needs is never started.
 - **Each node runs once.** Its result is memoized and fed to every dependent, so
   a diamond's shared ancestor executes a single time with no glitch.
 - **Acyclicity is proven at the boundary.** The scheduler sits on stdlib
@@ -51,36 +57,26 @@ Three properties fall out of the model:
 A node that raises fails the whole run: the exception surfaces and any in-flight
 siblings are cancelled via `without.cancel_futures`.
 
-`execute` returns one value: the *behavior* read, sampling the final result. Its
-dual is `executed`, the *events* read, an async iterator that yields each
-`(key, result)` the instant it completes (in whatever order nodes finish, a node
-always after the dependencies it consumed):
+`drive` and `evaluate` are the *events* and *behavior* reads of one scheduler,
+mirroring the substrate's own split. `drive` yields each `(key, result)` the
+instant it completes (in whatever order nodes finish, a node always after the
+dependencies it consumed), useful to react as results land or to read several
+outputs. `evaluate` is a consumer of it that keeps the one value `target`
+produces and drops the rest. Both run the whole graph: there is no target-based
+pruning, since fixing the target up front is not a real early return and the
+graph is small (its size is bounded by the per-event work, not the stream). A
+node with no path to the output still runs.
 
-```python
-async def executed(
-    nodes: Iterable[Node],
-    inputs: Mapping[NodeKey, object],
-    limit: int | None,
-) -> AsyncGenerator[tuple[NodeKey, object]]: ...
-```
-
-Same scheduler, two consumption shapes, mirroring the substrate's own
-events-vs-behaviors split: `executed` runs the whole graph and reports every
-completion (useful to react as results land, or to want several outputs), while
-`execute` is a thin consumer of it that prunes to `target`'s closure and returns
-that one value. Closing the iterator early tears the run down (in-flight nodes
-cancelled), so `execute` drives it under `contextlib.aclosing`.
-
-`executed` is pull-driven: the DAG advances only as the consumer iterates. To
-drive it in the background instead (so the graph makes progress while a slower
-consumer catches up), wrap it with `without.buffer`, which pumps any stream into
-a bounded queue on a background task.
+`drive` is pull-driven: the DAG advances only as the consumer iterates. To drive
+it in the background instead (so the graph makes progress while a slower consumer
+catches up), wrap it with `without.buffer`, which pumps any stream into a bounded
+queue on a background task.
 
 ## The typed frontend
 
 `Graph` is a builder that threads value types through the wiring. `Graph.of`
-opens a graph over its entry types and hands back the graph plus one `Handle` per
-type, `node` adds a step wired to the handles it depends on (an arity-overload
+opens a graph over its entry types and hands back the graph plus a tuple of one
+`Handle` per type, `node` adds a step wired to the handles it depends on (an arity-overload
 ladder ties each `Handle[X]` to the matching parameter of the step's function),
 and `build` freezes the result into a `CompiledGraph[*Ins, Out]` so its call is
 checked for argument count and types:
@@ -92,7 +88,7 @@ async def fetch(request: Request) -> Fetched: ...
 async def parse(fetched: Fetched) -> Parsed: ...
 async def render(fetched: Fetched, parsed: Parsed) -> Report: ...
 
-graph, request = Graph.of(Request)
+graph, (request,) = Graph.of(Request)
 fetched = graph.node(fetch, request)
 parsed = graph.node(parse, fetched)          # parse must take a Fetched
 report = graph.node(render, fetched, parsed)  # render must take (Fetched, Parsed)
@@ -109,12 +105,17 @@ backstop for the object seam.
 The graph carries its entry types in its own type (`Graph[*Ins]`), so `build`
 takes only the output handle: it recovers the inputs the graph already knows,
 rather than making you list them a second time and keep the two in sync. A
-general DAG may take several: `graph, a, b = Graph.of(A, B)` opens two entries,
+general DAG may take several: `graph, (a, b) = Graph.of(A, B)` opens two entries,
 and the compiled graph is called `run(a_value, b_value)` with the count and types
 checked. Wrong arity or a mismatched value type is a static error.
 
+`build` compiles the scheduling structure once, into the same object-seam `Plan`:
+the nodes by key, the dependency edges, and the consumer counts are all
+input-independent, so a `CompiledGraph` driven per event runs the nodes without
+re-analyzing the graph each time. `build` *is* the typed graph's `Plan.of`.
+
 The behavior/events duality is typed here too: `run(*inputs)` samples the single
-`output`, while `run.stream(*inputs)` is the typed door onto `executed`, yielding
+`output`, while `run.stream(*inputs)` drives the precompiled `Plan` to yield
 each node's `(key, result)` as it completes (match a yielded key against a
 `Handle`'s `key` to pick one out). Both check the inputs against `*Ins`.
 

@@ -9,7 +9,6 @@ from collections.abc import Callable
 from collections.abc import Hashable
 from collections.abc import Iterable
 from collections.abc import Mapping
-from contextlib import aclosing
 from dataclasses import dataclass
 from graphlib import TopologicalSorter
 
@@ -36,47 +35,62 @@ class Node:
     run: Callable[[tuple[object, ...]], Awaitable[object]]
 
 
-async def executed(
-    nodes: Iterable[Node],
+@dataclass(frozen=True, slots=True)
+class Plan:
+    """
+    A node set compiled into its input-independent scheduling structure.
+
+    Everything a run needs that does *not* depend on the input values: the nodes
+    by key, the dependency edges (as the graph `graphlib` wants), and the number
+    of consumers per key (so a result can be freed once its last dependent has
+    read it). Computed once and reused across runs as a value, so a fixed graph
+    driven per event never rebuilds any of it.
+    """
+
+    by_key: Mapping[NodeKey, Node]
+    dependencies: Mapping[NodeKey, tuple[NodeKey, ...]]
+    consumers: Mapping[NodeKey, int]
+
+    @classmethod
+    def of(cls, nodes: Iterable[Node]) -> Plan:
+        """Compile a node set into a reusable `Plan`."""
+        by_key = {node.key: node for node in nodes}
+        dependencies = {key: node.dependencies for key, node in by_key.items()}
+        consumers: Counter[NodeKey] = Counter()
+        for node in by_key.values():
+            consumers.update(node.dependencies)
+        return cls(by_key=by_key, dependencies=dependencies, consumers=consumers)
+
+
+async def drive(
+    plan: Plan,
     inputs: Mapping[NodeKey, object],
     limit: int | None,
 ) -> AsyncGenerator[tuple[NodeKey, object]]:
     """
-    Run every node, yielding each `(key, result)` the instant it completes.
+    Run a compiled `Plan`, yielding each `(key, result)` the instant it completes.
 
-    The streaming core, and the *events* half of the model: where `execute`
-    samples one final value (a behavior), `executed` reports every completion as
-    it happens, in whatever order nodes finish. The only ordering guarantee is
-    the causal one: a node is always yielded after the dependencies it consumed.
-    `inputs` pre-supplies the values of source keys, which are marked done
-    without running and never yielded.
+    The streaming core, and the *events* half of the model. Yields completions in
+    whatever order nodes finish; the only ordering guarantee is the causal one, a
+    node after the dependencies it consumed. `inputs` pre-supplies the values of
+    source keys, marked done without running and never yielded. `limit` caps how
+    many nodes run concurrently (`None` is unbounded).
 
-    `limit` caps how many nodes run concurrently; `None` leaves it unbounded.
     Scheduling replicates the shape of `without.limit_concurrency`
-    (`asyncio.wait(..., return_when=FIRST_COMPLETED)`) rather than calling it:
-    the scheduler needs the completed task's `NodeKey` to unlock successors, and
-    that per-completion identity is exactly what `limit_concurrency`'s lazy
-    source hides. Acyclicity is proven at the boundary by
-    `graphlib.TopologicalSorter.prepare`, which raises `graphlib.CycleError`.
-
-    Each node runs once; its result is memoized and fed to every dependent, so a
-    diamond's shared ancestor executes a single time with no glitch, and a
-    result is dropped as soon as its last dependent has captured it. A node that
-    raises fails the whole run: the exception surfaces and any in-flight siblings
-    are cancelled on the way out, which is also how closing the iterator early
-    tears the run down.
+    (`asyncio.wait(..., return_when=FIRST_COMPLETED)`) rather than calling it: the
+    scheduler needs the completed task's `NodeKey` to unlock successors, which
+    that lazy source hides. Acyclicity is proven by `TopologicalSorter.prepare`,
+    which raises `graphlib.CycleError`. Each node runs once; a result is dropped
+    as soon as its last dependent has captured it. A node that raises fails the
+    whole run, cancelling in-flight siblings, which is also how closing the
+    iterator early tears the run down.
     """
     if limit is not None and limit < 1:
         raise ValueError(f"limit must be at least 1 or None, but got {limit}")
 
-    by_key = {node.key: node for node in nodes}
-    sorter: TopologicalSorter[NodeKey] = TopologicalSorter()
-    pending_consumers: Counter[NodeKey] = Counter()
-    for node in by_key.values():
-        sorter.add(node.key, *node.dependencies)
-        pending_consumers.update(node.dependencies)
+    sorter: TopologicalSorter[NodeKey] = TopologicalSorter(plan.dependencies)
     sorter.prepare()
-
+    consumers: Counter[NodeKey] = Counter(plan.consumers)
     results: dict[NodeKey, object] = dict(inputs)
     running: dict[asyncio.Future[object], NodeKey] = {}
     ready: deque[NodeKey] = deque(sorter.get_ready())
@@ -88,13 +102,13 @@ async def executed(
                     sorter.done(key)
                     ready.extend(sorter.get_ready())
                     continue
-                if key not in by_key:
+                if key not in plan.by_key:
                     raise KeyError(f"{key!r} is neither a supplied input nor a defined node")
-                node = by_key[key]
+                node = plan.by_key[key]
                 args = tuple(results[dependency] for dependency in node.dependencies)
                 for dependency in node.dependencies:
-                    pending_consumers[dependency] -= 1
-                    if pending_consumers[dependency] == 0:
+                    consumers[dependency] -= 1
+                    if consumers[dependency] == 0:
                         del results[dependency]
                 running[asyncio.ensure_future(node.run(args))] = key
             done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
@@ -109,40 +123,21 @@ async def executed(
         await cancel_futures(running)
 
 
-async def execute(
-    nodes: Iterable[Node],
-    target: NodeKey,
-    inputs: Mapping[NodeKey, object],
-    limit: int | None,
-) -> object:
+async def evaluate(plan: Plan, target: NodeKey, inputs: Mapping[NodeKey, object], limit: int | None) -> object:
     """
-    Run the graph needed to produce `target` and return its value.
+    Run every node in `plan` and return `target`'s value: the *behavior* read.
 
-    The *behavior* half of the model, layered on `executed`: only the transitive
-    dependencies of `target` run, so a branch the output does not demand is never
-    started, and since `target` is the sole terminal of that pruned graph it
-    completes last. `inputs` pre-supplies the values of source keys. `limit` caps
-    concurrency (`None` is unbounded). A failing node propagates and cancels its
-    in-flight siblings; a wide graph holds only the values still in play.
+    A consumer of `drive` that runs the whole graph and keeps the one value the
+    caller wants, dropping the rest. `target` is a node whose completion supplies
+    the value, or a supplied input returned directly (an identity plan). There is
+    deliberately no early return on `target`: the graph is run to completion, so
+    the result reflects the whole graph and every node's effects have happened.
     """
-    by_key = {node.key: node for node in nodes}
-    needed = _needed(by_key, target, inputs)
-    async with aclosing(executed([by_key[key] for key in needed], inputs, limit)) as completions:
-        async for key, value in completions:
-            if key == target:
-                return value
-    return inputs[target]
-
-
-def _needed(by_key: Mapping[NodeKey, Node], target: NodeKey, inputs: Mapping[NodeKey, object]) -> set[NodeKey]:
-    needed: set[NodeKey] = set()
-    frontier = [target]
-    while frontier:
-        key = frontier.pop()
-        if key in inputs or key in needed:
-            continue
-        if key not in by_key:
-            raise KeyError(f"{key!r} is neither a supplied input nor a defined node")
-        needed.add(key)
-        frontier.extend(by_key[key].dependencies)
-    return needed
+    # `target` is either a node, whose completion `drive` yields (and overwrites
+    # this), or a supplied input, which `drive` never yields: default to its value
+    # so an identity graph (the output is an input) returns it.
+    result: object = inputs.get(target)
+    async for key, value in drive(plan, inputs, limit):
+        if key == target:
+            result = value
+    return result

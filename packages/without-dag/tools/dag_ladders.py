@@ -39,14 +39,18 @@ def _overload(name: str, typeparams: list[str], params: list[str], return_type: 
 
 
 def _of_ladder() -> str:
-    """`of`: open a graph over N entry types, returning it plus one `Handle` each (arity 1-10)."""
+    """`of`: open a graph over N entry types, returning it plus a tuple of one `Handle` each (arity 1-10)."""
     blocks = []
     for arity in range(1, 11):
         letters = list(LETTERS[:arity])
         params = [*(f"{letter.lower()}: type[{letter}]," for letter in letters), "/,"]
         graph_type = f"Graph[{', '.join(letters)}]"
         handles = ", ".join(f"Handle[{letter}]" for letter in letters)
-        return_type = f"tuple[{graph_type}, {handles}]"
+        # Trailing comma inside the outer tuple: it keeps the return type off a
+        # single line (so `ruff format` owns the layout) and, crucially, breaks
+        # the `]]]` run that `tuple[..., tuple[...]]` would otherwise end on,
+        # which `cog` would read as its own `]]]` end-marker.
+        return_type = f"tuple[{graph_type}, tuple[{handles}],]"
         blocks.append(_overload("of", letters, params, return_type, static=True))
     return "\n\n".join(blocks)
 

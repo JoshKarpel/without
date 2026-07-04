@@ -9,8 +9,9 @@ from graphlib import CycleError
 
 import pytest
 from without_dag import Node
-from without_dag import execute
-from without_dag import executed
+from without_dag import Plan
+from without_dag import drive
+from without_dag import evaluate
 
 
 class Sentinel:
@@ -24,7 +25,7 @@ def returning(value: object) -> Callable[[tuple[object, ...]], Awaitable[object]
     return run
 
 
-async def test_execute_returns_the_targets_result() -> None:
+async def test_evaluate_returns_the_targets_result() -> None:
     async def double(args: tuple[object, ...]) -> object:
         value = args[0]
         assert isinstance(value, int)
@@ -32,18 +33,36 @@ async def test_execute_returns_the_targets_result() -> None:
 
     doubled = Node(key="out", dependencies=("in",), run=double)
 
-    result = await execute([doubled], target="out", inputs={"in": 21}, limit=4)
+    result = await evaluate(Plan.of([doubled]), "out", inputs={"in": 21}, limit=4)
 
     assert result == 42
 
 
-async def test_execute_returns_an_input_target_without_running_anything() -> None:
-    result = await execute([], target="entry", inputs={"entry": 7}, limit=1)
+async def test_evaluate_returns_an_input_target_without_running_anything() -> None:
+    result = await evaluate(Plan.of([]), "entry", inputs={"entry": 7}, limit=1)
 
     assert result == 7
 
 
-async def test_execute_runs_a_shared_ancestor_exactly_once() -> None:
+async def test_evaluate_runs_every_node_even_those_the_output_ignores() -> None:
+    ran: list[str] = []
+
+    async def side(args: tuple[object, ...]) -> object:
+        ran.append("side")
+        return "side-value"
+
+    nodes = [
+        Node("side", ("in",), side),
+        Node("out", ("in",), returning("out-value")),
+    ]
+
+    result = await evaluate(Plan.of(nodes), "out", inputs={"in": None}, limit=4)
+
+    assert result == "out-value"
+    assert ran == ["side"]
+
+
+async def test_evaluate_runs_a_shared_ancestor_exactly_once() -> None:
     calls = 0
 
     async def root(args: tuple[object, ...]) -> object:
@@ -59,44 +78,23 @@ async def test_execute_runs_a_shared_ancestor_exactly_once() -> None:
 
         return run
 
+    async def join(args: tuple[object, ...]) -> object:
+        return (args[0], args[1])
+
     nodes = [
         Node("root", ("in",), root),
         Node("left", ("root",), await plus(1)),
         Node("right", ("root",), await plus(2)),
-        Node("join", ("left", "right"), returning(None)),
+        Node("join", ("left", "right"), join),
     ]
 
-    async def join(args: tuple[object, ...]) -> object:
-        return (args[0], args[1])
-
-    nodes[-1] = Node("join", ("left", "right"), join)
-
-    result = await execute(nodes, target="join", inputs={"in": None}, limit=4)
+    result = await evaluate(Plan.of(nodes), "join", inputs={"in": None}, limit=4)
 
     assert calls == 1
     assert result == (11, 12)
 
 
-async def test_execute_skips_a_branch_the_output_does_not_need() -> None:
-    ran: list[str] = []
-
-    async def unused(args: tuple[object, ...]) -> object:
-        ran.append("unused")
-        return "unused"
-
-    nodes = [
-        Node("used", ("in",), returning("used")),
-        Node("unused", ("in",), unused),
-        Node("out", ("used",), returning("out-value")),
-    ]
-
-    result = await execute(nodes, target="out", inputs={"in": None}, limit=4)
-
-    assert result == "out-value"
-    assert ran == []
-
-
-async def test_execute_releases_an_intermediate_result_after_its_consumer_runs() -> None:
+async def test_evaluate_releases_an_intermediate_result_after_its_consumer_runs() -> None:
     witness: list[weakref.ref[Sentinel]] = []
 
     async def produce(args: tuple[object, ...]) -> object:
@@ -113,14 +111,14 @@ async def test_execute_releases_an_intermediate_result_after_its_consumer_runs()
         Node("out", ("middle",), consume),
     ]
 
-    result = await execute(nodes, target="out", inputs={"in": None}, limit=2)
+    result = await evaluate(Plan.of(nodes), "out", inputs={"in": None}, limit=2)
     gc.collect()
 
     assert result == "final"
     assert witness[0]() is None
 
 
-async def test_execute_never_exceeds_the_concurrency_limit() -> None:
+async def test_evaluate_never_exceeds_the_concurrency_limit() -> None:
     limit = 2
     active = 0
     peak = 0
@@ -142,7 +140,7 @@ async def test_execute_never_exceeds_the_concurrency_limit() -> None:
     middles = [Node(f"m{index}", ("in",), worker(index + 1)) for index in range(5)]
     sink = Node("sink", tuple(f"m{index}" for index in range(5)), returning("done"))
 
-    task = asyncio.create_task(execute([*middles, sink], target="sink", inputs={"in": None}, limit=limit))
+    task = asyncio.create_task(evaluate(Plan.of([*middles, sink]), "sink", inputs={"in": None}, limit=limit))
     for _ in range(limit):
         await started.acquire()
 
@@ -156,7 +154,7 @@ async def test_execute_never_exceeds_the_concurrency_limit() -> None:
     assert peak == limit
 
 
-async def test_execute_runs_every_ready_node_at_once_when_limit_is_none() -> None:
+async def test_evaluate_runs_every_ready_node_at_once_when_limit_is_none() -> None:
     width = 4
     active = 0
     peak = 0
@@ -178,7 +176,7 @@ async def test_execute_runs_every_ready_node_at_once_when_limit_is_none() -> Non
     middles = [Node(f"m{index}", ("in",), worker(index + 1)) for index in range(width)]
     sink = Node("sink", tuple(f"m{index}" for index in range(width)), returning("done"))
 
-    task = asyncio.create_task(execute([*middles, sink], target="sink", inputs={"in": None}, limit=None))
+    task = asyncio.create_task(evaluate(Plan.of([*middles, sink]), "sink", inputs={"in": None}, limit=None))
     for _ in range(width):
         await started.acquire()
 
@@ -188,7 +186,7 @@ async def test_execute_runs_every_ready_node_at_once_when_limit_is_none() -> Non
     assert await task == "done"
 
 
-async def test_execute_propagates_a_node_error_and_cancels_in_flight_siblings() -> None:
+async def test_evaluate_propagates_a_node_error_and_cancels_in_flight_siblings() -> None:
     cancelled = asyncio.Event()
 
     async def slow(args: tuple[object, ...]) -> object:
@@ -208,42 +206,12 @@ async def test_execute_propagates_a_node_error_and_cancels_in_flight_siblings() 
     ]
 
     with pytest.raises(RuntimeError, match="boom"):
-        await execute(nodes, target="join", inputs={}, limit=4)
+        await evaluate(Plan.of(nodes), "join", inputs={}, limit=4)
 
     assert cancelled.is_set()
 
 
-async def test_executed_yields_every_node_result() -> None:
-    nodes = [
-        Node("left", ("in",), returning("left-value")),
-        Node("right", ("in",), returning("right-value")),
-        Node("tip", ("left",), returning("tip-value")),
-    ]
-
-    collected = {key: value async for key, value in executed(nodes, inputs={"in": None}, limit=4)}
-
-    assert collected == {"left": "left-value", "right": "right-value", "tip": "tip-value"}
-
-
-async def test_executed_yields_a_dependency_before_its_consumer() -> None:
-    nodes = [
-        Node("root", ("in",), returning("root-value")),
-        Node("leaf", ("root",), returning("leaf-value")),
-    ]
-
-    order = [key async for key, _ in executed(nodes, inputs={"in": None}, limit=1)]
-
-    assert order.index("root") < order.index("leaf")
-
-
-async def test_executed_raises_on_a_dangling_dependency() -> None:
-    orphan = Node("out", ("ghost",), returning(1))
-
-    with pytest.raises(KeyError, match="ghost"):
-        [pair async for pair in executed([orphan], inputs={}, limit=2)]
-
-
-async def test_execute_cancels_in_flight_nodes_when_cancelled() -> None:
+async def test_evaluate_cancels_in_flight_nodes_when_cancelled() -> None:
     started = asyncio.Event()
     cancelled = asyncio.Event()
 
@@ -255,7 +223,7 @@ async def test_execute_cancels_in_flight_nodes_when_cancelled() -> None:
             cancelled.set()
             raise
 
-    task = asyncio.create_task(execute([Node("slow", (), slow)], target="slow", inputs={}, limit=1))
+    task = asyncio.create_task(evaluate(Plan.of([Node("slow", (), slow)]), "slow", inputs={}, limit=1))
     await started.wait()
     task.cancel()
 
@@ -265,23 +233,58 @@ async def test_execute_cancels_in_flight_nodes_when_cancelled() -> None:
     assert cancelled.is_set()
 
 
-async def test_execute_raises_cycle_error_on_a_cyclic_graph() -> None:
+async def test_evaluate_raises_cycle_error_on_a_cyclic_graph() -> None:
     nodes = [
         Node("a", ("b",), returning(1)),
         Node("b", ("a",), returning(2)),
     ]
 
     with pytest.raises(CycleError):
-        await execute(nodes, target="a", inputs={}, limit=2)
+        await evaluate(Plan.of(nodes), "a", inputs={}, limit=2)
 
 
-async def test_execute_raises_on_a_dangling_dependency() -> None:
+async def test_evaluate_rejects_a_nonpositive_limit() -> None:
+    with pytest.raises(ValueError, match="at least 1"):
+        await evaluate(Plan.of([]), "entry", inputs={"entry": 1}, limit=0)
+
+
+async def test_drive_yields_every_node_result() -> None:
+    nodes = [
+        Node("left", ("in",), returning("left-value")),
+        Node("right", ("in",), returning("right-value")),
+        Node("tip", ("left",), returning("tip-value")),
+    ]
+
+    collected = {key: value async for key, value in drive(Plan.of(nodes), inputs={"in": None}, limit=4)}
+
+    assert collected == {"left": "left-value", "right": "right-value", "tip": "tip-value"}
+
+
+async def test_drive_yields_a_dependency_before_its_consumer() -> None:
+    nodes = [
+        Node("root", ("in",), returning("root-value")),
+        Node("leaf", ("root",), returning("leaf-value")),
+    ]
+
+    order = [key async for key, _ in drive(Plan.of(nodes), inputs={"in": None}, limit=1)]
+
+    assert order.index("root") < order.index("leaf")
+
+
+async def test_drive_raises_on_a_dangling_dependency() -> None:
     orphan = Node("out", ("ghost",), returning(1))
 
     with pytest.raises(KeyError, match="ghost"):
-        await execute([orphan], target="out", inputs={}, limit=2)
+        [pair async for pair in drive(Plan.of([orphan]), inputs={}, limit=2)]
 
 
-async def test_execute_rejects_a_nonpositive_limit() -> None:
-    with pytest.raises(ValueError, match="at least 1"):
-        await execute([], target="entry", inputs={"entry": 1}, limit=0)
+async def test_a_plan_is_reused_across_runs_with_different_inputs() -> None:
+    async def double(args: tuple[object, ...]) -> object:
+        value = args[0]
+        assert isinstance(value, int)
+        return value * 2
+
+    compiled = Plan.of([Node("out", ("in",), double)])
+
+    assert await evaluate(compiled, "out", inputs={"in": 3}, limit=1) == 6
+    assert await evaluate(compiled, "out", inputs={"in": 10}, limit=1) == 20

@@ -12,8 +12,9 @@ from typing import overload
 
 from without_dag.execution import Node
 from without_dag.execution import NodeKey
-from without_dag.execution import execute
-from without_dag.execution import executed
+from without_dag.execution import Plan
+from without_dag.execution import drive
+from without_dag.execution import evaluate
 
 # Covariant: `T` names the node's result but is a phantom (no field holds it), so
 # a `Handle[int]` is a `Handle[object]`. That is what lets the `node` runtime
@@ -48,18 +49,21 @@ class CompiledGraph[*Ins, Out]:
     call, seeding each entry the graph was opened over with the matching
     positional argument and returning the value of its `output`. A single-input
     graph is a plain `Callable[[In], Awaitable[Out]]`, so it lifts into a
-    `Processor` with `from_map`. `nodes` is kept so the structure is *recoverable*
-    (a future diagram is derived from this one declaration, not maintained beside
-    it).
+    `Processor` with `from_map`. The scheduling structure is compiled once at
+    `build` into `_plan` and reused by every call and `stream`, so a graph driven
+    per event never recomputes it. `nodes` is kept so the structure is
+    *recoverable* (a future diagram is derived from this one declaration, not
+    maintained beside it).
     """
 
     nodes: tuple[Node, ...]
     inputs: tuple[NodeKey, ...]
     output: NodeKey
     limit: int | None
+    _plan: Plan
 
     async def __call__(self, *values: *Ins) -> Out:
-        result = await execute(self.nodes, target=self.output, inputs=self._seed(values), limit=self.limit)
+        result = await evaluate(self._plan, self.output, self._seed(values), self.limit)
         return cast(Out, result)
 
     def stream(self, *values: *Ins) -> AsyncGenerator[tuple[NodeKey, object]]:
@@ -73,7 +77,7 @@ class CompiledGraph[*Ins, Out]:
         checked against `*Ins` exactly as the call is; match a yielded key against
         a `Handle`'s `key` to pick out a node's result.
         """
-        return executed(self.nodes, self._seed(values), self.limit)
+        return drive(self._plan, self._seed(values), self.limit)
 
     def _seed(self, values: tuple[object, ...]) -> dict[NodeKey, object]:
         return dict(zip(self.inputs, values, strict=True))
@@ -84,8 +88,8 @@ class Graph[*Ins]:
     """
     A builder that records async steps and returns typed `Handle`s.
 
-    `of` opens a graph over its entry types and hands back one `Handle` per type,
-    `node` adds a step wired to the handles it depends on, and `build` freezes the
+    `of` opens a graph over its entry types and hands back a tuple of one `Handle`
+    per type, `node` adds a step wired to the handles it depends on, and `build` freezes the
     result into a `CompiledGraph`. Because the graph carries its entry pack in
     its type (`Graph[*Ins]`), `build` needs only the output handle: it recovers
     the inputs the graph already knows, so there is no second place to keep in
@@ -104,7 +108,10 @@ class Graph[*Ins]:
     def of[A](
         a: type[A],
         /,
-    ) -> tuple[Graph[A], Handle[A]]: ...
+    ) -> tuple[
+        Graph[A],
+        tuple[Handle[A]],
+    ]: ...
 
     @overload
     @staticmethod
@@ -112,7 +119,10 @@ class Graph[*Ins]:
         a: type[A],
         b: type[B],
         /,
-    ) -> tuple[Graph[A, B], Handle[A], Handle[B]]: ...
+    ) -> tuple[
+        Graph[A, B],
+        tuple[Handle[A], Handle[B]],
+    ]: ...
 
     @overload
     @staticmethod
@@ -121,7 +131,10 @@ class Graph[*Ins]:
         b: type[B],
         c: type[C],
         /,
-    ) -> tuple[Graph[A, B, C], Handle[A], Handle[B], Handle[C]]: ...
+    ) -> tuple[
+        Graph[A, B, C],
+        tuple[Handle[A], Handle[B], Handle[C]],
+    ]: ...
 
     @overload
     @staticmethod
@@ -131,7 +144,10 @@ class Graph[*Ins]:
         c: type[C],
         d: type[D],
         /,
-    ) -> tuple[Graph[A, B, C, D], Handle[A], Handle[B], Handle[C], Handle[D]]: ...
+    ) -> tuple[
+        Graph[A, B, C, D],
+        tuple[Handle[A], Handle[B], Handle[C], Handle[D]],
+    ]: ...
 
     @overload
     @staticmethod
@@ -142,7 +158,10 @@ class Graph[*Ins]:
         d: type[D],
         e: type[E],
         /,
-    ) -> tuple[Graph[A, B, C, D, E], Handle[A], Handle[B], Handle[C], Handle[D], Handle[E]]: ...
+    ) -> tuple[
+        Graph[A, B, C, D, E],
+        tuple[Handle[A], Handle[B], Handle[C], Handle[D], Handle[E]],
+    ]: ...
 
     @overload
     @staticmethod
@@ -154,7 +173,10 @@ class Graph[*Ins]:
         e: type[E],
         f: type[F],
         /,
-    ) -> tuple[Graph[A, B, C, D, E, F], Handle[A], Handle[B], Handle[C], Handle[D], Handle[E], Handle[F]]: ...
+    ) -> tuple[
+        Graph[A, B, C, D, E, F],
+        tuple[Handle[A], Handle[B], Handle[C], Handle[D], Handle[E], Handle[F]],
+    ]: ...
 
     @overload
     @staticmethod
@@ -168,7 +190,8 @@ class Graph[*Ins]:
         g: type[G],
         /,
     ) -> tuple[
-        Graph[A, B, C, D, E, F, G], Handle[A], Handle[B], Handle[C], Handle[D], Handle[E], Handle[F], Handle[G]
+        Graph[A, B, C, D, E, F, G],
+        tuple[Handle[A], Handle[B], Handle[C], Handle[D], Handle[E], Handle[F], Handle[G]],
     ]: ...
 
     @overload
@@ -185,14 +208,7 @@ class Graph[*Ins]:
         /,
     ) -> tuple[
         Graph[A, B, C, D, E, F, G, H],
-        Handle[A],
-        Handle[B],
-        Handle[C],
-        Handle[D],
-        Handle[E],
-        Handle[F],
-        Handle[G],
-        Handle[H],
+        tuple[Handle[A], Handle[B], Handle[C], Handle[D], Handle[E], Handle[F], Handle[G], Handle[H]],
     ]: ...
 
     @overload
@@ -210,15 +226,7 @@ class Graph[*Ins]:
         /,
     ) -> tuple[
         Graph[A, B, C, D, E, F, G, H, J],
-        Handle[A],
-        Handle[B],
-        Handle[C],
-        Handle[D],
-        Handle[E],
-        Handle[F],
-        Handle[G],
-        Handle[H],
-        Handle[J],
+        tuple[Handle[A], Handle[B], Handle[C], Handle[D], Handle[E], Handle[F], Handle[G], Handle[H], Handle[J]],
     ]: ...
 
     @overload
@@ -237,24 +245,17 @@ class Graph[*Ins]:
         /,
     ) -> tuple[
         Graph[A, B, C, D, E, F, G, H, J, K],
-        Handle[A],
-        Handle[B],
-        Handle[C],
-        Handle[D],
-        Handle[E],
-        Handle[F],
-        Handle[G],
-        Handle[H],
-        Handle[J],
-        Handle[K],
+        tuple[
+            Handle[A], Handle[B], Handle[C], Handle[D], Handle[E], Handle[F], Handle[G], Handle[H], Handle[J], Handle[K]
+        ],
     ]: ...
     # [[[end]]]
     @staticmethod
     def of(*inputs: type[object]) -> tuple[object, ...]:
-        """Open a graph over `inputs`, returning it and one `Handle` per entry type."""
+        """Open a graph over `inputs`, returning it and a tuple of one `Handle` per entry type."""
         handles: tuple[Handle[object], ...] = tuple(Handle(object()) for _ in inputs)
         graph: Graph[*tuple[object, ...]] = Graph(_input_keys=tuple(handle.key for handle in handles))
-        return (graph, *handles)
+        return (graph, handles)
 
     # [[[cog cog.outl(emit("node")) ]]]
     @overload
@@ -411,8 +412,17 @@ class Graph[*Ins]:
         """
         Freeze the recorded steps into a callable graph over the graph's inputs.
 
-        `limit` caps how many nodes run concurrently; it defaults to `None`,
-        which leaves concurrency unbounded (every ready node runs at once). Pass
-        an integer to cap it when the steps contend for a scarce resource.
+        The scheduling structure is compiled once here, so running the graph
+        repeats no graph analysis. `limit` caps how many nodes run concurrently;
+        it defaults to `None`, which leaves concurrency unbounded (every ready
+        node runs at once). Pass an integer to cap it when the steps contend for
+        a scarce resource.
         """
-        return CompiledGraph(nodes=tuple(self._nodes), inputs=self._input_keys, output=output.key, limit=limit)
+        nodes = tuple(self._nodes)
+        return CompiledGraph(
+            nodes=nodes,
+            inputs=self._input_keys,
+            output=output.key,
+            limit=limit,
+            _plan=Plan.of(nodes),
+        )
