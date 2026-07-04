@@ -26,7 +26,7 @@ def load_members() -> dict[str, dict[str, object]]:
     """Map each workspace member's distribution name to its parsed `[project]`."""
     members = {}
     for pyproject in sorted(PACKAGES_DIR.glob("*/pyproject.toml")):
-        project = tomllib.loads(pyproject.read_text())["project"]
+        project = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]
         members[project["name"]] = project
     return members
 
@@ -94,6 +94,6 @@ def on_files(files: Files, config: MkDocsConfig) -> Files:
 
     for source_name, dest_uri in (("PHILOSOPHY.md", "philosophy.md"), ("CHANGELOG.md", "changelog.md")):
         source = REPO_ROOT / source_name
-        files.append(File.generated(config, dest_uri, content=source.read_text()))
+        files.append(File.generated(config, dest_uri, content=source.read_text(encoding="utf-8")))
 
     return files

@@ -1,0 +1,50 @@
+name: Publish Docs
+
+# Build and deploy the documentation site to GitHub Pages from the default
+# branch only. Pull-request builds are validated separately in docs.yml.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialize deploys so a newer publish never races a queued one; never cancel one mid-flight.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish Docs to GitHub Pages
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read # check out the repository
+      pages: write # publish to GitHub Pages
+      id-token: write # verify the deployment originates from this workflow
+    environment: github-pages
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.0
+
+      - name: Set up toolchain
+        uses: ./.github/actions/setup
+        with:
+          python-version: "3.14"
+
+      - name: Build the documentation site
+        run: just docs-build
+
+      - name: Upload the site artifact
+        uses: actions/upload-pages-artifact@v5.0.0
+        with:
+          path: site
+
+      # Push only ever runs on main; this also guards a manual dispatch from another branch.
+      - name: Deploy to GitHub Pages
+        id: deployment
+        if: github.ref_name == github.event.repository.default_branch
+        uses: actions/deploy-pages@v5.0.0

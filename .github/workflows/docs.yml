@@ -1,9 +1,8 @@
 name: Docs
 
+# Build the documentation site on pull requests to catch breakage before merge.
+# Publishing to GitHub Pages lives in publish-docs.yml, which runs on main.
 on:
-  push:
-    branches:
-      - main
   pull_request:
   workflow_dispatch:
 
@@ -12,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    name: Build
+    name: Build Docs
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -26,32 +25,3 @@ jobs:
 
       - name: Build the documentation site
         run: just docs-build
-
-      # Only a default-branch run goes on to deploy, so only it needs the artifact.
-      - name: Upload the site artifact
-        if: github.ref_name == github.event.repository.default_branch
-        uses: actions/upload-pages-artifact@v3.0.1
-        with:
-          path: site
-
-  deploy:
-    name: Deploy to GitHub Pages
-    # Publish only from the default branch; pull requests build to validate but never deploy.
-    if: github.ref_name == github.event.repository.default_branch
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      pages: write # publish to GitHub Pages
-      id-token: write # verify the deployment originates from this workflow
-    # Serialize deploys so a newer publish never races a queued one; never cancel one mid-flight.
-    concurrency:
-      group: pages
-      cancel-in-progress: false
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4.0.5
