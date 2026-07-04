@@ -169,13 +169,13 @@ client that does not ask for it.
 multiplex over a single pooled connection; HTTP/1.1 connections are kept alive and
 reused serially (an idle one is checked out per request and returned once its
 response body is read). h2 is negotiated by ALPN over TLS
-(`ConnectionPool(allow_http2=True)`, the default; pass a custom `ssl_context` for a private
-CA), or over cleartext by *prior knowledge* with `ConnectionPool(force_http2_cleartext=True)`
+(`ConnectionPool(allow_http2=True)`, the default; pass a custom `ssl_context_factory` for a
+private CA), or over cleartext by *prior knowledge* with `ConnectionPool(force_http2_cleartext=True)`
 (no negotiation, so the caller is asserting the server speaks h2c); otherwise the
 origin speaks HTTP/1.1.
 
 ```python
-async with ConnectionPool(allow_http2=True, ssl_context=ctx) as pool:
+async with ConnectionPool(allow_http2=True, ssl_context_factory=make_ctx) as pool:
     # eight concurrent requests, multiplexed over one h2 connection
     bodies = await asyncio.gather(*(fetch(pool, n) for n in range(8)))
 ```

@@ -133,12 +133,14 @@ async def serve[In, Out](
     accepting new connections, then, inside one `asyncio.timeout`, waits for
     accepted sessions to finish on their own (clients hanging up, the consumer
     answering their asks) and for the consumer to drain the `inbox`. If that whole
-    graceful phase overruns the one budget, the server hard-stops: force-close
-    every remaining client, cancel the consumer, and cancel any session still
-    parked (e.g. awaiting a reply a stopped consumer will never send). Either way
-    it then waits for the transports to close. The budget is global (one timeout
-    around the graceful phase, not one per step), so shutdown always terminates in
-    roughly `drain_timeout` without leaking a task.
+    graceful phase overruns the one budget, the server hard-stops: cancel the
+    consumer, and cancel any session still parked (e.g. awaiting a reply a stopped
+    consumer will never send), which runs each session's cleanup and force-closes
+    its client. Either way it then waits for the server's listening sockets to
+    close (the connection transports are already closed by the sessions above).
+    The budget is global (one timeout around the graceful phase, not one per
+    step), so shutdown always terminates in roughly `drain_timeout` without
+    leaking a task.
     """
     settings = config.current()
     inbox: asyncio.Queue[Connected[In, Out]] = asyncio.Queue(maxsize=settings.max_pending)
@@ -193,13 +195,12 @@ async def serve[In, Out](
                 await asyncio.wait([consumer_task])
         except TimeoutError:
             pass  # budget spent; hard-stop whatever is still running below
-        server.close_clients()  # force-close any client still connected
         consumer_task.cancel()  # no-op if the consumer already returned
         stragglers = list(connections)  # any session still parked (e.g. awaiting a reply the consumer will not send)
         for connection in stragglers:
-            connection.cancel()
+            connection.cancel()  # cancelling runs each session's `finally`, force-closing its client writer
         await asyncio.gather(consumer_task, *stragglers, return_exceptions=True)  # let the cancellations settle
-        await server.wait_closed()  # blocks until the listening sockets and every client connection (writer) close
+        await server.wait_closed()  # blocks until the listening sockets close
 
 
 def make_keyspace(initial: Store = EMPTY_STORE) -> Fold[Connected[Request, Reply], Store]:

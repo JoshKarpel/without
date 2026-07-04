@@ -6,14 +6,15 @@ from contextlib import suppress
 import h2.config
 import h2.connection
 import h2.events
-from test_server import configured_app
-from test_server import crash_app
-from test_server import echo_app
 from without_asgi import ASGIApp
 from without_asgi import RawMessage
 from without_asgi import Receive
 from without_asgi import Send
 from without_http import serving
+
+from .test_server import configured_app
+from .test_server import crash_app
+from .test_server import echo_app
 
 
 async def big_app(scope: RawMessage, receive: Receive, send: Send) -> None:
