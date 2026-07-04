@@ -8,7 +8,7 @@ from typing import assert_never
 
 from without import Processor
 from without import Stream
-from without import stream
+from without import stream_from_iterable
 
 from without_asgi.inbound import Inbound
 from without_asgi.inbound import Shutdown
@@ -135,7 +135,7 @@ def refuse_http(state: object, head: HttpScope) -> HttpHandler:
     """An `HttpRouter` that refuses every request with `501 Not Implemented`."""
 
     def handler(inputs: Stream[Inbound]) -> Stream[Outbound]:
-        return stream(encode_response(_HTTP_UNSUPPORTED))
+        return stream_from_iterable(encode_response(_HTTP_UNSUPPORTED))
 
     return handler
 
@@ -144,7 +144,7 @@ def refuse_websocket(state: object, head: WebsocketScope) -> WebsocketHandler:
     """A `WebsocketRouter` that refuses every connection by closing before `accept` (a `403`)."""
 
     def handler(inputs: Stream[WebsocketInbound]) -> Stream[WebsocketOutbound]:
-        return stream((_WEBSOCKET_UNSUPPORTED,))
+        return stream_from_iterable((_WEBSOCKET_UNSUPPORTED,))
 
     return handler
 

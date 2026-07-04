@@ -5,8 +5,10 @@
 # running, the thin boundary where the imperative shell shows up.
 # `stream_from_queue` sits at that same boundary from the other side: not a
 # connector between processors but a source adapter that turns a push-based queue
-# into a pull-based stream to feed the rest. `stream` (from a fixed iterable) and
-# `collect` (drain to a list) are the in-memory source and terminal at that edge.
+# into a pull-based stream to feed the rest. `buffer` uses that same queue to
+# decouple a pull source's pace from its consumer's, driving the source in a
+# background task. `stream_from_iterable` (from a fixed iterable) and `collect`
+# (drain to a list) are the in-memory source and terminal at that edge.
 
 from __future__ import annotations
 
@@ -21,6 +23,85 @@ from dataclasses import field
 from without.contracts import Processor
 from without.contracts import Stream
 from without.tasks import background_task
+
+
+async def stream_from_iterable[T](values: Iterable[T]) -> AsyncIterator[T]:
+    """
+    Expose a fixed iterable as a `Stream`: the simplest source.
+
+    Turns already-in-hand values into the pull-based `Stream` the rest of
+    `without` consumes, e.g. to emit a fixed reply or to feed a processor under
+    test. `stream_from_queue` is the push-source counterpart.
+    """
+    for value in values:
+        yield value
+
+
+async def stream_from_queue[T](queue: asyncio.Queue[T]) -> AsyncIterator[T]:
+    """
+    Expose a queue as a Stream: the bridge from a push source to a pull stream.
+
+    A source that *pushes* (a server's accept loop, a callback-based client, a
+    pub/sub subscriber) drops values into a queue; this turns that queue into the
+    pull-based `Stream` the rest of `without` consumes. It ends gracefully when
+    the queue is shut down (`queue.shutdown()`): remaining items still drain, then
+    `get` raises `QueueShutDown` and the stream ends, letting a downstream fold
+    return its final value. Shutting the queue down is thus the closable-stream
+    signal; without it the stream never ends on its own and must be driven inside
+    a `background_task` or otherwise cancelled by its consumer.
+    """
+    while True:
+        try:
+            yield await queue.get()
+        except asyncio.QueueShutDown:
+            return
+
+
+async def buffer[T](source: Stream[T], maxsize: int) -> AsyncIterator[T]:
+    """
+    Decouple a stream's producer from its consumer through a bounded queue.
+
+    A background task pulls from `source` as fast as backpressure allows and
+    drops each value into a queue of at most `maxsize` items; the returned stream
+    yields from that queue. So the source is *driven* independently of how fast
+    the consumer pulls: a pull-based producer (an accept loop, a DAG's `executed`
+    iterator) keeps making progress while a slower consumer catches up, up to
+    `maxsize` items of slack before `put` blocks and backpressure reaches the
+    producer.
+
+    `maxsize` must be at least 1: the bound *is* the backpressure, so an unbounded
+    buffer (which could let a fast producer grow memory without limit) is a
+    `ValueError` rather than a silent default. When `source` ends the queue is
+    shut down and the stream ends once drained; if `source` raises, the buffered
+    items still drain and then the error surfaces. Closing the stream early
+    cancels the background task, so the producer never outlives its consumer.
+    """
+    if maxsize < 1:
+        raise ValueError(f"maxsize must be at least 1, but got {maxsize}")
+
+    queue: asyncio.Queue[T] = asyncio.Queue(maxsize)
+
+    async def pump() -> None:
+        try:
+            async for item in source:
+                await queue.put(item)
+        finally:
+            queue.shutdown()
+
+    async with background_task(pump()):
+        async for item in stream_from_queue(queue):
+            yield item
+
+
+async def collect[T](source: Stream[T]) -> list[T]:
+    """
+    Drain a `Stream` into a list: the terminal that materializes every value.
+
+    The dual of `stream_from_iterable`. It runs until the source ends, so it suits bounded
+    streams (a finished request, a shut-down queue); an endless source never
+    returns.
+    """
+    return [value async for value in source]
 
 
 def compose[A, B, C](first: Processor[A, B], second: Processor[B, C]) -> Processor[A, C]:
@@ -65,49 +146,6 @@ def stack[H, *Ctx](*middleware: Callable[[H, *Ctx], H]) -> Callable[[H, *Ctx], H
         return handler
 
     return composed
-
-
-async def stream_from_queue[T](queue: asyncio.Queue[T]) -> AsyncIterator[T]:
-    """
-    Expose a queue as a Stream: the bridge from a push source to a pull stream.
-
-    A source that *pushes* (a server's accept loop, a callback-based client, a
-    pub/sub subscriber) drops values into a queue; this turns that queue into the
-    pull-based `Stream` the rest of `without` consumes. It ends gracefully when
-    the queue is shut down (`queue.shutdown()`): remaining items still drain, then
-    `get` raises `QueueShutDown` and the stream ends, letting a downstream fold
-    return its final value. Shutting the queue down is thus the closable-stream
-    signal; without it the stream never ends on its own and must be driven inside
-    a `background_task` or otherwise cancelled by its consumer.
-    """
-    while True:
-        try:
-            yield await queue.get()
-        except asyncio.QueueShutDown:
-            return
-
-
-async def stream[T](values: Iterable[T]) -> AsyncIterator[T]:
-    """
-    Expose a fixed iterable as a `Stream`: the simplest source.
-
-    Turns already-in-hand values into the pull-based `Stream` the rest of
-    `without` consumes, e.g. to emit a fixed reply or to feed a processor under
-    test. `stream_from_queue` is the push-source counterpart.
-    """
-    for value in values:
-        yield value
-
-
-async def collect[T](source: Stream[T]) -> list[T]:
-    """
-    Drain a `Stream` into a list: the terminal that materializes every value.
-
-    The dual of `stream`. It runs until the source ends, so it suits bounded
-    streams (a finished request, a shut-down queue); an endless source never
-    returns.
-    """
-    return [value async for value in source]
 
 
 @dataclass(slots=True)

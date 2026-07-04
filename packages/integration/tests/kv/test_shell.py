@@ -22,7 +22,7 @@ from integration.kv import serve
 from without import Fold
 from without import Stream
 from without import from_fold
-from without import stream
+from without import stream_from_iterable
 from without_env import EnvContext
 
 
@@ -48,7 +48,7 @@ async def test_keyspace_sends_each_reply_on_the_events_own_channel() -> None:
         Connected(send=send, payload=Get(key="missing")),
     ]
 
-    final = await make_keyspace()(stream(events))
+    final = await make_keyspace()(stream_from_iterable(events))
 
     assert sent == [Stored(), Value(value="blue"), Nil()]
     assert final.entries == {"color": "blue"}

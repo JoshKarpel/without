@@ -9,7 +9,7 @@ from typing import assert_never
 from pydantic import BaseModel
 from pydantic import ValidationError
 from without import Stream
-from without import stream
+from without import stream_from_iterable
 from without_asgi import ASGIApp
 from without_asgi import HttpHandler
 from without_asgi import HttpScope
@@ -225,7 +225,9 @@ def legacy(todos: TodoList, head: HttpScope) -> HttpHandler:
     """
 
     def handler(inputs: Stream[Inbound]) -> Stream[Outbound]:
-        return stream(encode_response(json_response(200, {"path": head.path, "root_path": head.root_path})))
+        return stream_from_iterable(
+            encode_response(json_response(200, {"path": head.path, "root_path": head.root_path}))
+        )
 
     return handler
 
@@ -270,7 +272,7 @@ def require_authorization(handler: HttpHandler, _state: object, scope: HttpScope
         return handler
 
     def reject(inputs: Stream[Inbound]) -> Stream[Outbound]:
-        return stream(encode_response(json_response(401, {"error": "admin requires authorization"})))
+        return stream_from_iterable(encode_response(json_response(401, {"error": "admin requires authorization"})))
 
     return reject
 
@@ -347,7 +349,7 @@ def refuse(todos: TodoList, match: Match[WebsocketScope]) -> WebsocketHandler:
     """The websocket fallback: close an unrouted path without reading any frames."""
 
     def handler(inputs: Stream[WebsocketInbound]) -> Stream[WebsocketOutbound]:
-        return stream((WebsocketClose(),))
+        return stream_from_iterable((WebsocketClose(),))
 
     return handler
 

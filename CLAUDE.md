@@ -12,5 +12,5 @@ Then skim the per-package `README.md` files for the area you are touching: the
 core (`packages/without`), the ASGI boundary (`packages/without-asgi`), the HTTP
 server and client (`packages/without-http`), the opinionated router
 (`packages/without-web`), the config sources (`packages/without-env`,
-`packages/without-configmap`), and the `integration` toys that exercise the whole
-stack.
+`packages/without-configmap`), the DAG executor (`packages/without-dag`), and the
+`integration` toys that exercise the whole stack.

@@ -15,11 +15,12 @@ from without.tasks import limit_concurrency
 from without.tasks import sleep_forever
 from without.wiring import Endo
 from without.wiring import Sample
+from without.wiring import buffer
 from without.wiring import collect
 from without.wiring import compose
 from without.wiring import sample
 from without.wiring import stack
-from without.wiring import stream
+from without.wiring import stream_from_iterable
 from without.wiring import stream_from_queue
 
 __all__ = [
@@ -33,6 +34,7 @@ __all__ = [
     "Transition",
     "as_async_iterator",
     "background_task",
+    "buffer",
     "cancel_futures",
     "collect",
     "compose",
@@ -44,6 +46,6 @@ __all__ = [
     "sample",
     "sleep_forever",
     "stack",
-    "stream",
+    "stream_from_iterable",
     "stream_from_queue",
 ]

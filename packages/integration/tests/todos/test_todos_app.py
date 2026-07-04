@@ -12,7 +12,7 @@ from integration.todos.app import todos_openapi
 from integration.todos.core import Todo
 from integration.todos.core import TodoList
 from without import collect
-from without import stream
+from without import stream_from_iterable
 from without_asgi import ASGIApp
 from without_asgi import RawMessage
 from without_asgi import WebsocketAccept
@@ -393,7 +393,7 @@ async def test_session_closes_on_a_binary_frame_and_returns_when_the_stream_ends
 
     outputs = await collect(
         handler(
-            stream(
+            stream_from_iterable(
                 [
                     WebsocketConnect(),
                     WebsocketReceive(WebsocketText(text='{"title": "soon"}')),
