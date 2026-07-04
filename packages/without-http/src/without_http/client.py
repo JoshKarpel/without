@@ -290,23 +290,25 @@ def _build_request(method: str, url: str, headers: RawHeaders, content: bytes | 
     return ClientRequest(method, url, headers, content)
 
 
+_ALPN_H2 = ("h2", "http/1.1")
+_ALPN_HTTP11 = ("http/1.1",)
+
+
 async def _open(
-    host: str, port: int, *, secure: bool, http2: bool, ssl_context: ssl.SSLContext | None
+    host: str, port: int, *, ssl_context: ssl.SSLContext | None
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, str]:
     """
     Open a connection and report the negotiated wire protocol.
 
-    Over TLS the protocol is settled by ALPN (`h2` when offered and the server
-    selects it, else `http/1.1`). Cleartext has no negotiation, so it is always
-    `http/1.1`; prior-knowledge h2c is opened directly by the pool instead.
+    `ssl_context` is `None` for cleartext, which has no negotiation and is always
+    `http/1.1` (prior-knowledge h2c is opened directly by the pool instead), or a ready
+    context whose ALPN offer the pool has already settled. Over TLS the protocol is
+    whatever ALPN selected: `h2` when the server takes the offer, else `http/1.1`.
     """
-    if not secure:
+    if ssl_context is None:
         reader, writer = await asyncio.open_connection(host, port)
         return reader, writer, "http/1.1"
-    context = ssl_context if ssl_context is not None else ssl.create_default_context()
-    if http2:
-        context.set_alpn_protocols(["h2", "http/1.1"])
-    reader, writer = await asyncio.open_connection(host, port, ssl=context)
+    reader, writer = await asyncio.open_connection(host, port, ssl=ssl_context)
     ssl_object = writer.get_extra_info("ssl_object")
     negotiated = ssl_object.selected_alpn_protocol() if ssl_object is not None else None
     return reader, writer, "h2" if negotiated == "h2" else "http/1.1"
@@ -670,6 +672,13 @@ class ConnectionPool:
     `force_http2_cleartext` is set (the caller asserting the server speaks h2c, since
     cleartext cannot negotiate); otherwise the origin speaks HTTP/1.1.
 
+    `ssl_context_factory` produces the TLS client context (default
+    `ssl.create_default_context`). The pool *calls* it to build the contexts it opens
+    with and sets ALPN on them itself, holding one per distinct offer, so it never
+    mutates (nor shares the ALPN of) a context the caller holds. Pass a factory, not a
+    live context, precisely because ALPN can only be set context-wide: a shared context
+    would be mutated out from under other pools or libraries using it.
+
     `middleware` decorates every request through the pool; per-request `middleware` on
     `request` composes inside it. Keep pool-level middleware to *pure* decoration
     (default headers, redirect following, retry): things that are values, not state.
@@ -681,11 +690,12 @@ class ConnectionPool:
 
     allow_http2: bool = True
     force_http2_cleartext: bool = False
-    ssl_context: ssl.SSLContext | None = None
+    ssl_context_factory: Callable[[], ssl.SSLContext] = ssl.create_default_context
     middleware: ClientMiddleware = _PASSTHROUGH
     _h2: dict[Origin, _Http2Connection] = field(default_factory=dict)
     _idle_h11: dict[Origin, list[_Http11Connection]] = field(default_factory=dict)
     _h11_only: set[Origin] = field(default_factory=set)
+    _contexts: dict[tuple[str, ...], ssl.SSLContext] = field(default_factory=dict)
     _origin_locks: dict[Origin, asyncio.Lock] = field(default_factory=dict)
     _closed: bool = False
 
@@ -739,6 +749,23 @@ class ConnectionPool:
             return await self._h2_response(await self._acquire_h2c(origin), request, parts)
         return await self._request_h11(origin, request, parts)
 
+    def _context_for_connection(self, *, http2: bool) -> ssl.SSLContext:
+        """
+        The TLS context to open a secure connection with, advertising `h2` via ALPN only when `http2`.
+
+        Produces one context per distinct ALPN offer from `ssl_context_factory` and caches it, so
+        connections wanting the same offer share a pool-owned context while those wanting different
+        offers never mutate a shared one. Construction is synchronous (no `await`), so concurrent
+        opens can't race on the cache.
+        """
+        protocols = _ALPN_H2 if http2 else _ALPN_HTTP11
+        context = self._contexts.get(protocols)
+        if context is None:
+            context = self.ssl_context_factory()
+            context.set_alpn_protocols(list(protocols))
+            self._contexts[protocols] = context
+        return context
+
     async def _request_secure(self, origin: Origin, request: ClientRequest, parts: SplitResult) -> ClientResponse:
         connection = self._reusable_h2(origin)
         if connection is None and origin not in self._h11_only:
@@ -746,7 +773,7 @@ class ConnectionPool:
                 connection = self._reusable_h2(origin)
                 if connection is None and origin not in self._h11_only:
                     reader, writer, protocol = await _open(
-                        origin.host, origin.port, secure=True, http2=True, ssl_context=self.ssl_context
+                        origin.host, origin.port, ssl_context=self._context_for_connection(http2=True)
                     )
                     if protocol == "h2":
                         connection = _Http2Connection.start(reader, writer)
@@ -766,9 +793,7 @@ class ConnectionPool:
             async with self._lock_for(origin):
                 connection = self._reusable_h2(origin)
                 if connection is None:
-                    reader, writer, _ = await _open(
-                        origin.host, origin.port, secure=False, http2=False, ssl_context=self.ssl_context
-                    )
+                    reader, writer, _ = await _open(origin.host, origin.port, ssl_context=None)
                     connection = _Http2Connection.start(reader, writer)
                     self._h2[origin] = connection
         return connection
@@ -794,9 +819,8 @@ class ConnectionPool:
     async def _request_h11(self, origin: Origin, request: ClientRequest, parts: SplitResult) -> ClientResponse:
         connection = self._checkout_h11(origin)
         if connection is None:
-            reader, writer, _ = await _open(
-                origin.host, origin.port, secure=origin.secure, http2=False, ssl_context=self.ssl_context
-            )
+            ssl_context = self._context_for_connection(http2=False) if origin.secure else None
+            reader, writer, _ = await _open(origin.host, origin.port, ssl_context=ssl_context)
             connection = _Http11Connection.new(reader, writer)
         await connection.send_request(request, parts)
         status, headers = await connection.read_head()
