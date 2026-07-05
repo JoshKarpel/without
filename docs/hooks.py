@@ -1,8 +1,9 @@
 # A mkdocs hook (https://www.mkdocs.org/user-guide/configuration/#hooks) that
 # recovers pages from the workspace's own declarations rather than maintaining
 # them by hand, so none can drift from the source it describes: the package
-# dependency graph (from each member's pyproject.toml deps, as Mermaid), one
-# mkdocstrings API-reference page per publishable package, and the root prose
+# dependency graph (from the published `without*` packages' pyproject.toml deps,
+# as Mermaid), one mkdocstrings API-reference page per publishable package, and
+# the root prose
 # (PHILOSOPHY.md, CHANGELOG.md) copied into the site tree. The nav lists these
 # pages by hand in mkdocs.yml; this hook supplies only their content.
 
@@ -58,15 +59,19 @@ def workspace_edges(members: dict[str, dict[str, object]]) -> list[tuple[str, st
 
 
 def render_graph_page(members: dict[str, dict[str, object]]) -> str:
+    published = {name: members[name] for name in publishable(members)}
     lines = ["graph TD"]
-    lines.extend(f"    {import_name(name)}[{name}]" for name in members)
-    lines.extend(f"    {import_name(source)} --> {import_name(target)}" for source, target in workspace_edges(members))
+    lines.extend(f"    {import_name(name)}[{name}]" for name in published)
+    lines.extend(
+        f"    {import_name(source)} --> {import_name(target)}" for source, target in workspace_edges(published)
+    )
     mermaid = "\n".join(lines)
     return (
         "# Package dependency graph\n\n"
         "Each arrow reads *depends on*. This diagram is generated from the\n"
-        "`dependencies` declared in each package's `pyproject.toml`, so it cannot\n"
-        "drift out of sync with the actual workspace edges.\n\n"
+        "`dependencies` declared in each published `without*` package's\n"
+        "`pyproject.toml`, so it cannot drift out of sync with the actual\n"
+        "workspace edges.\n\n"
         f"```mermaid\n{mermaid}\n```\n"
     )
 
