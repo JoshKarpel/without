@@ -20,3 +20,7 @@ The guides, an API reference recovered from the source docstrings, and the
 derived package dependency graph are published as a documentation site (see
 [`mkdocs.yml`](mkdocs.yml) and the hand-written [`docs/hooks.py`](docs/hooks.py));
 build it locally with `just docs` (serve) or `just docs-build` (strict build).
+
+For how the packages are versioned and shipped (lockstep versioning, the
+`without-core` distribution name, build-time dependency pinning, and the trusted-
+publishing setup), see [`RELEASING.md`](RELEASING.md).

@@ -9,7 +9,7 @@ authors = [
 ]
 requires-python = ">=3.14"
 dependencies = [
-    "without",
+    "without-core",
     "without-env",
     "without-configmap",
     "without-asgi",
@@ -26,7 +26,7 @@ exclude-newer = "7 days"
 members = ["packages/*"]
 
 [tool.uv.sources]
-without = { workspace = true }
+without-core = { workspace = true }
 without-env = { workspace = true }
 without-configmap = { workspace = true }
 without-asgi = { workspace = true }

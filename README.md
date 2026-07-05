@@ -25,7 +25,9 @@ packages). Each package is its own top-level import.
 
 - `packages/without` — the core: the contracts every plugin speaks
   (`without.contracts`), the stream edge connectors (`without.wiring`), and a
-  `with`-scoped background task helper (`without.tasks`). Imported as `without`.
+  `with`-scoped background task helper (`without.tasks`). Distributed on PyPI as
+  `without-core` (the bare `without` name is unavailable there); imported as
+  `without`.
 - `packages/without-env` — first plugin: a static `Context` parsed from
   environment variables (`pydantic-settings`). Imported as `without_env`.
 - `packages/without-configmap` — config from a Kubernetes mount (`watchfiles` +

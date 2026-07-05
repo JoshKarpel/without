@@ -13,9 +13,9 @@ exclude-newer-span = "P7D"
 [manifest]
 members = [
     "integration",
-    "without",
     "without-asgi",
     "without-configmap",
+    "without-core",
     "without-dag",
     "without-env",
     "without-http",
@@ -480,9 +480,9 @@ dependencies = [
     { name = "httpx" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
-    { name = "without" },
     { name = "without-asgi" },
     { name = "without-configmap" },
+    { name = "without-core" },
     { name = "without-env" },
     { name = "without-http" },
     { name = "without-web" },
@@ -493,9 +493,9 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
     { name = "pydantic", specifier = ">=2" },
     { name = "pydantic-settings", specifier = ">=2.7" },
-    { name = "without", editable = "packages/without" },
     { name = "without-asgi", editable = "packages/without-asgi" },
     { name = "without-configmap", editable = "packages/without-configmap" },
+    { name = "without-core", editable = "packages/without" },
     { name = "without-env", editable = "packages/without-env" },
     { name = "without-http", editable = "packages/without-http" },
     { name = "without-web", editable = "packages/without-web" },
@@ -1310,20 +1310,15 @@ wheels = [
 ]
 
 [[package]]
-name = "without"
-version = "0.0.0"
-source = { editable = "packages/without" }
-
-[[package]]
 name = "without-asgi"
 version = "0.0.0"
 source = { editable = "packages/without-asgi" }
 dependencies = [
-    { name = "without" },
+    { name = "without-core" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "without", editable = "packages/without" }]
+requires-dist = [{ name = "without-core", editable = "packages/without" }]
 
 [[package]]
 name = "without-configmap"
@@ -1333,7 +1328,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pyyaml" },
     { name = "watchfiles" },
-    { name = "without" },
+    { name = "without-core" },
 ]
 
 [package.metadata]
@@ -1341,19 +1336,24 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "watchfiles", specifier = ">=0.21" },
-    { name = "without", editable = "packages/without" },
+    { name = "without-core", editable = "packages/without" },
 ]
+
+[[package]]
+name = "without-core"
+version = "0.0.0"
+source = { editable = "packages/without" }
 
 [[package]]
 name = "without-dag"
 version = "0.0.0"
 source = { editable = "packages/without-dag" }
 dependencies = [
-    { name = "without" },
+    { name = "without-core" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "without", editable = "packages/without" }]
+requires-dist = [{ name = "without-core", editable = "packages/without" }]
 
 [[package]]
 name = "without-env"
@@ -1361,13 +1361,13 @@ version = "0.0.0"
 source = { editable = "packages/without-env" }
 dependencies = [
     { name = "pydantic-settings" },
-    { name = "without" },
+    { name = "without-core" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.7" },
-    { name = "without", editable = "packages/without" },
+    { name = "without-core", editable = "packages/without" },
 ]
 
 [[package]]
@@ -1377,8 +1377,8 @@ source = { editable = "packages/without-http" }
 dependencies = [
     { name = "h11" },
     { name = "h2" },
-    { name = "without" },
     { name = "without-asgi" },
+    { name = "without-core" },
     { name = "wsproto" },
 ]
 
@@ -1386,8 +1386,8 @@ dependencies = [
 requires-dist = [
     { name = "h11", specifier = ">=0.16" },
     { name = "h2", specifier = ">=4.1" },
-    { name = "without", editable = "packages/without" },
     { name = "without-asgi", editable = "packages/without-asgi" },
+    { name = "without-core", editable = "packages/without" },
     { name = "wsproto", specifier = ">=1.2" },
 ]
 
@@ -1396,14 +1396,14 @@ name = "without-web"
 version = "0.0.0"
 source = { editable = "packages/without-web" }
 dependencies = [
-    { name = "without" },
     { name = "without-asgi" },
+    { name = "without-core" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "without", editable = "packages/without" },
     { name = "without-asgi", editable = "packages/without-asgi" },
+    { name = "without-core", editable = "packages/without" },
 ]
 
 [[package]]
@@ -1411,9 +1411,9 @@ name = "without-workspace"
 version = "0.0.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "without" },
     { name = "without-asgi" },
     { name = "without-configmap" },
+    { name = "without-core" },
     { name = "without-dag" },
     { name = "without-env" },
     { name = "without-http" },
@@ -1448,9 +1448,9 @@ docs = [
 
 [package.metadata]
 requires-dist = [
-    { name = "without", editable = "packages/without" },
     { name = "without-asgi", editable = "packages/without-asgi" },
     { name = "without-configmap", editable = "packages/without-configmap" },
+    { name = "without-core", editable = "packages/without" },
     { name = "without-dag", editable = "packages/without-dag" },
     { name = "without-env", editable = "packages/without-env" },
     { name = "without-http", editable = "packages/without-http" },

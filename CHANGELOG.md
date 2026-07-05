@@ -4,7 +4,8 @@
 
 ### Added
 
-- **`without`**: the narrow-waist core. The `Stream` / `Processor` / `Context`
+- **`without-core`** (imported as `without`): the narrow-waist core. The
+  `Stream` / `Processor` / `Context`
   contracts, the four builders (`from_map`, `from_scan`, `from_sink`,
   `from_fold`), the wiring connectors (`compose`, `sample`, `stream_from_iterable`,
   `stream_from_queue`, `collect`, `buffer`, `stack`), and the `with`-scoped task

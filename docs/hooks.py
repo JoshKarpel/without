@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -22,20 +23,60 @@ REPO_ROOT = Path(__file__).parent.parent
 PACKAGES_DIR = REPO_ROOT / "packages"
 
 
-def load_members() -> dict[str, dict[str, object]]:
-    """Map each workspace member's distribution name to its parsed `[project]`."""
-    members = {}
-    for pyproject in sorted(PACKAGES_DIR.glob("*/pyproject.toml")):
-        project = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]
-        members[project["name"]] = project
-    return members
+@dataclass(frozen=True, slots=True)
+class Member:
+    """
+    A workspace member, parsed from its `pyproject.toml`.
+
+    `name` is the published distribution name; `module` is the importable
+    package, which can differ: the core distributes as `without-core` but
+    imports as `without` via a `[tool.uv.build-backend] module-name` override.
+    """
+
+    name: str
+    module: str
+    description: str
+    dependencies: tuple[str, ...]
 
 
 def import_name(distribution_name: str) -> str:
     return distribution_name.replace("-", "_")
 
 
-def workspace_edges(members: dict[str, dict[str, object]]) -> list[tuple[str, str]]:
+def module_override(document: dict[str, object]) -> str | None:
+    """The `[tool.uv.build-backend] module-name`, when a member renames its import away from its distribution."""
+    tool = document.get("tool")
+    uv = tool.get("uv") if isinstance(tool, dict) else None
+    backend = uv.get("build-backend") if isinstance(uv, dict) else None
+    override = backend.get("module-name") if isinstance(backend, dict) else None
+    return override if isinstance(override, str) else None
+
+
+def parse_member(document: dict[str, object]) -> Member:
+    project = document["project"]
+    if not isinstance(project, dict):
+        raise TypeError(f"expected a [project] table, got {type(project)}")
+    name = str(project["name"])
+    raw_dependencies = project.get("dependencies", [])
+    dependencies = tuple(str(dep) for dep in raw_dependencies) if isinstance(raw_dependencies, list) else ()
+    return Member(
+        name=name,
+        module=module_override(document) or import_name(name),
+        description=str(project.get("description", "")),
+        dependencies=dependencies,
+    )
+
+
+def load_members() -> dict[str, Member]:
+    """Map each workspace member's distribution name to its parsed `pyproject.toml`."""
+    members = {}
+    for pyproject in sorted(PACKAGES_DIR.glob("*/pyproject.toml")):
+        member = parse_member(tomllib.loads(pyproject.read_text(encoding="utf-8")))
+        members[member.name] = member
+    return members
+
+
+def workspace_edges(members: dict[str, Member]) -> list[tuple[str, str]]:
     """
     Every "member depends on member" edge, from the declared dependencies.
 
@@ -44,12 +85,9 @@ def workspace_edges(members: dict[str, dict[str, object]]) -> list[tuple[str, st
     """
     member_names = set(members)
     edges = []
-    for name, project in members.items():
-        dependencies = project.get("dependencies", [])
-        if not isinstance(dependencies, list):
-            continue
-        for dependency in dependencies:
-            depended = str(dependency).split(";")[0].strip()
+    for name, member in members.items():
+        for dependency in member.dependencies:
+            depended = dependency.split(";")[0].strip()
             for separator in ("<", ">", "=", "~", "!", "[", " "):
                 depended = depended.split(separator)[0]
             if depended.strip() in member_names:
@@ -57,7 +95,7 @@ def workspace_edges(members: dict[str, dict[str, object]]) -> list[tuple[str, st
     return sorted(edges)
 
 
-def render_graph_page(members: dict[str, dict[str, object]]) -> str:
+def render_graph_page(members: dict[str, Member]) -> str:
     lines = ["graph TD"]
     lines.extend(f"    {import_name(name)}[{name}]" for name in members)
     lines.extend(f"    {import_name(source)} --> {import_name(target)}" for source, target in workspace_edges(members))
@@ -71,16 +109,15 @@ def render_graph_page(members: dict[str, dict[str, object]]) -> str:
     )
 
 
-def publishable(members: dict[str, dict[str, object]]) -> list[str]:
+def publishable(members: dict[str, Member]) -> list[str]:
     """The `without*` family, ordered with the core first: exactly what publishes."""
-    others = sorted(name for name in members if name.startswith("without") and name != "without")
-    return ["without", *others]
+    others = sorted(name for name in members if name.startswith("without") and name != "without-core")
+    return ["without-core", *others]
 
 
-def render_reference_page(distribution_name: str, description: object) -> str:
-    module = import_name(distribution_name)
-    summary = f"{description}\n\n" if description else ""
-    return f"# `{module}`\n\n{summary}::: {module}\n"
+def render_reference_page(member: Member) -> str:
+    summary = f"{member.description}\n\n" if member.description else ""
+    return f"# `{member.module}`\n\n{summary}::: {member.module}\n"
 
 
 def on_files(files: Files, config: MkDocsConfig) -> Files:
@@ -89,8 +126,9 @@ def on_files(files: Files, config: MkDocsConfig) -> Files:
     files.append(File.generated(config, "architecture/package-graph.md", content=render_graph_page(members)))
 
     for name in publishable(members):
-        content = render_reference_page(name, members[name].get("description"))
-        files.append(File.generated(config, f"reference/{import_name(name)}.md", content=content))
+        files.append(
+            File.generated(config, f"reference/{members[name].module}.md", content=render_reference_page(members[name]))
+        )
 
     for source_name, dest_uri in (("PHILOSOPHY.md", "philosophy.md"), ("CHANGELOG.md", "changelog.md")):
         source = REPO_ROOT / source_name

@@ -21,7 +21,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "without",
+    "without-core",
     "without-asgi",
     "h11>=0.16",
     "h2>=4.1",
@@ -29,5 +29,5 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-without = { workspace = true }
+without-core = { workspace = true }
 without-asgi = { workspace = true }

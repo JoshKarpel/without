@@ -38,6 +38,11 @@ alias d := docs
 docs-build *args:
     uv run --group docs mkdocs build --strict {{ args }}
 
+[confirm('This uploads a real 0.0.0 placeholder and reserves the given name(s) on PyPI. Continue?')]
+[doc('Reserve PyPI project name(s) with an empty 0.0.0 placeholder release (needs UV_PUBLISH_TOKEN)')]
+bootstrap-pypi +names:
+    uv run --script scripts/bootstrap_pypi.py {{ names }}
+
 [doc('Upgrade all dependencies')]
 upgrade:
     uv lock --upgrade

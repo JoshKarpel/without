@@ -21,9 +21,9 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "without",
+    "without-core",
     "pydantic-settings>=2.7",
 ]
 
 [tool.uv.sources]
-without = { workspace = true }
+without-core = { workspace = true }

@@ -21,11 +21,11 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "without",
+    "without-core",
     "watchfiles>=0.21",
     "pydantic>=2",
     "pyyaml>=6",
 ]
 
 [tool.uv.sources]
-without = { workspace = true }
+without-core = { workspace = true }
