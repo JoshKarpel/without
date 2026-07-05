@@ -12,6 +12,8 @@ record is a value, each stage is a `Processor`, and the sink is whatever you
 compose.
 
 ```python
+import logging
+
 from without import compose, from_selector, from_sink
 from without_logging import Level, at_least, capture
 
