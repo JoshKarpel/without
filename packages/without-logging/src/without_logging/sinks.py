@@ -134,9 +134,10 @@ def to_rotating_file(
     `schedule` (the next *absolute* wall-clock boundary, e.g. midnight, via a
     next-boundary function such as `at_times`), and any combination (rotate on
     whichever trips first) all work here, which the stdlib's separate size and time
-    handlers cannot do at once. With no limit at all the file never rotates, but
-    that is a footgun (an unbounded file), so it is not the affordance the name
-    suggests.
+    handlers cannot do at once. At least one policy is required: with no limit the
+    file would never rotate (an unbounded file), which is not the affordance the
+    name suggests, so that case raises `ValueError` rather than being silently
+    allowed.
 
     `schedule(t)` returns the next rotation boundary strictly after `t`; the writer
     samples it at each open and rotates once `now()` reaches it (missed boundaries
@@ -156,6 +157,8 @@ def to_rotating_file(
     `max_bytes`), and it is inlined and short-circuiting: `now()` is read only when a
     size check has not already forced the rotation and an age limit is set.
     """
+    if max_bytes is None and max_age is None and schedule is None:
+        raise ValueError("to_rotating_file needs at least one rotation policy: max_bytes, max_age, or schedule")
 
     def next_boundary(opened: datetime) -> datetime | None:
         return schedule(opened) if schedule is not None else None

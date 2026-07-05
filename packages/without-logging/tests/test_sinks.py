@@ -145,6 +145,12 @@ def test_to_rotating_file_rotates_when_a_scheduled_boundary_is_crossed(tmp_path:
     assert (tmp_path / "app.1.log").read_text(encoding="utf-8") == "c\n"
 
 
+def test_to_rotating_file_requires_at_least_one_rotation_policy() -> None:
+    # `name` is never called: the guard rejects the all-None policy before opening any file.
+    with pytest.raises(ValueError, match="at least one rotation policy"):
+        to_rotating_file(lambda index, when: Path(f"app.{index}.log"))
+
+
 def test_at_times_returns_the_next_time_later_today() -> None:
     schedule = at_times(time(0, 0), time(12, 0))
 

@@ -298,7 +298,9 @@ needs no flush-frequency knob; it falls out of the queue's own backlog.
 The writers are named by *destination*: `to_rotating_file` writes to a file,
 `to_stream` writes to a text stream the caller owns (`sys.stderr`, a socket).
 There is deliberately no plain single-file writer, because an unbounded log file is
-a footgun; you write to a rotating file and choose how it rotates. Both write
+a footgun; you write to a rotating file and choose how it rotates (at least one of
+`max_bytes`, `max_age`, or `schedule` is required, else `to_rotating_file` raises).
+Both write
 *strings*, not records (rendering a `Record` to text is the app's encoding boundary,
 so it is a `from_map(Record -> str)` composed in front), own the `\n` framing, and
 flush per burst; the difference is lifecycle: `to_rotating_file` opens, rotates, and
