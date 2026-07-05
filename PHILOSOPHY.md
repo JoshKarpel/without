@@ -155,6 +155,20 @@ distinction matters: an early framing called the model an "async reducer," but
 the per-event processor is an async *scan*. The fold is the serial owner of
 shared state; the scan is the per-connection processor.
 
+The 2x2 fixes output cardinality at one-per-event (or a terminal collapse), but
+the `Processor` protocol itself imposes no such bound: a step is free to emit
+zero or many. Two builders take up the zero-or-one case, added when a shipped
+package (`without-logging`) needed to filter a stream: `from_selector(keep)`
+re-emits the events matching a predicate and `from_filter(reject)` drops them,
+polarity-duals of each other. They carry no new machinery (no queue, no
+background task), which is why they are builders and not wiring; dropping an event
+needs neither. Their predicate is `async` like every other builder step, keeping
+one color of function throughout: a decision that must `await` I/O composes with a
+pure one that never does. Emitting *several* outputs per event is the other
+direction, and it stays deliberately a wiring concern (the fan-out family, issue
+#13), because splitting one input across many outputs is where the
+queue-and-background-task complexity lives.
+
 ## How processors connect
 
 Wiring (`without.wiring`) is deliberately small. The load-bearing event-edge

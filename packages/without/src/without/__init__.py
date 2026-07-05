@@ -4,9 +4,11 @@ from without.contracts import Processor
 from without.contracts import Sink
 from without.contracts import Stream
 from without.contracts import Transition
+from without.contracts import from_filter
 from without.contracts import from_fold
 from without.contracts import from_map
 from without.contracts import from_scan
+from without.contracts import from_selector
 from without.contracts import from_sink
 from without.tasks import as_async_iterator
 from without.tasks import background_task
@@ -38,9 +40,11 @@ __all__ = [
     "cancel_futures",
     "collect",
     "compose",
+    "from_filter",
     "from_fold",
     "from_map",
     "from_scan",
+    "from_selector",
     "from_sink",
     "limit_concurrency",
     "sample",

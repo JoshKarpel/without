@@ -1,5 +1,6 @@
 # How processors connect. `compose` chains one processor into the next on the
-# event edge (pure composition, nothing running). `stack` composes middleware
+# event edge (pure composition, nothing running), or a processor onto a terminal
+# `Sink` to yield a `Sink`. `stack` composes middleware
 # (handler-wrapping functions) into one. `sample` is the behavior edge: it
 # exposes a stream's latest value as a Context, which needs a `background_task`
 # running, the thin boundary where the imperative shell shows up.
@@ -14,13 +15,17 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from dataclasses import field
+from typing import cast
+from typing import overload
 
 from without.contracts import Processor
+from without.contracts import Sink
 from without.contracts import Stream
 from without.tasks import background_task
 
@@ -104,19 +109,30 @@ async def collect[T](source: Stream[T]) -> list[T]:
     return [value async for value in source]
 
 
-def compose[A, B, C](first: Processor[A, B], second: Processor[B, C]) -> Processor[A, C]:
+@overload
+def compose[A, B, C](first: Processor[A, B], second: Processor[B, C]) -> Processor[A, C]: ...
+
+
+@overload
+def compose[A, B](first: Processor[A, B], second: Sink[B]) -> Sink[A]: ...
+
+
+def compose[A, B, C](first: Processor[A, B], second: Processor[B, C] | Sink[B]) -> Processor[A, C] | Sink[A]:
     """
     Compose two processors on the event edge: `first` then `second`.
 
     The join type `B` may differ from `A` and `C`, so this adapts as well as
     chains. Pure composition (the only event-edge connector that needs nothing
-    running); nest for three or more stages.
+    running); nest for three or more stages. When `second` is a `Sink` rather than
+    a `Processor` the result is a `Sink` too: the same wiring, terminated, which is
+    how a middleware chain (a filter, an enrichment) is prefixed onto a terminal
+    consumer such as a writer.
     """
 
-    def composed(inputs: Stream[A]) -> Stream[C]:
+    def composed(inputs: Stream[A]) -> Stream[C] | Awaitable[None]:
         return second(first(inputs))
 
-    return composed
+    return cast("Processor[A, C] | Sink[A]", composed)
 
 
 type Endo[T] = Callable[[T], T]

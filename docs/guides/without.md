@@ -32,10 +32,23 @@ the stream ends. The `step` is always `async`, so it MAY `await` contained I/O
 (reading dependencies from injected `Context` values), but MUST complete the
 effect within the call rather than handing a half-open resource back.
 
+Two more builders subset a stream by a predicate without transforming it:
+`from_selector(keep)` re-emits the events matching `keep` and drops the rest (the
+keep-the-matches sense of Python's built-in `filter`), and `from_filter(reject)`
+is its polarity-dual, dropping the matches. They are the zero-or-one case the
+`Processor` protocol always allowed, so no new machinery. Their predicate is
+`async` like every other builder step (one color of function throughout, so a
+decision that needs to `await` I/O composes without ceremony; a pure one just
+never awaits). Emitting *several* outputs per event, by contrast, stays a wiring
+concern (issue #13), not a builder.
+
 ## Wiring (`without.wiring`)
 
 `compose` chains one processor into the next on the event edge: pure composition,
-the only connector that needs nothing running. `sample` is the behavior edge: it
+the only connector that needs nothing running. When its second argument is a
+`Sink` rather than a `Processor`, the result is a `Sink` too, which is how a
+middleware chain (a filter, an enrichment) is prefixed onto a terminal consumer.
+`sample` is the behavior edge: it
 exposes a stream's latest value as a `Context` (latest-wins, no backpressure),
 driven by a `background_task` for the life of its `with` block. The source and
 terminal adapters sit alongside: `stream_from_iterable` lifts a fixed iterable

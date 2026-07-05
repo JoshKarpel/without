@@ -7,6 +7,7 @@ from without import buffer
 from without import collect
 from without import compose
 from without import from_scan
+from without import from_sink
 from without import sample
 from without import stream_from_iterable
 from without import stream_from_queue
@@ -35,6 +36,22 @@ async def test_compose_adapts_the_join_type() -> None:
     chained = compose(from_scan(None, measure), from_scan(None, label))
 
     assert await collect(chained(stream_from_iterable(["ab", "cdef"]))) == ["len=2", "len=4"]
+
+
+async def test_compose_prefixes_a_processor_onto_a_sink() -> None:
+    async def measure(event: str, _: None) -> Transition[None, int]:
+        return Transition(state=None, output=len(event))
+
+    drained: list[int] = []
+
+    async def collect_length(length: int) -> None:
+        drained.append(length)
+
+    lengths_into = compose(from_scan(None, measure), from_sink(collect_length))
+
+    await lengths_into(stream_from_iterable(["ab", "cdef", "x"]))
+
+    assert drained == [2, 4, 1]
 
 
 async def test_stream_from_queue_yields_pushed_values_in_order() -> None:
