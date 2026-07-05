@@ -1,8 +1,16 @@
+import io
 import logging
 from collections.abc import Iterator
+from datetime import UTC
+from datetime import datetime
+from datetime import time
+from datetime import timedelta
+from datetime import timezone
 from pathlib import Path
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 from without import compose
 from without import from_map
 from without import from_selector
@@ -10,9 +18,13 @@ from without import stream_from_iterable
 from without_logging import Level
 from without_logging import Record
 from without_logging import at_least
+from without_logging import at_times
 from without_logging import capture
 from without_logging import offload
-from without_logging import write_lines
+from without_logging import to_rotating_file
+from without_logging import to_stream
+
+EPOCH = datetime(2026, 1, 1, tzinfo=UTC)
 
 
 async def render(record: Record) -> str:
@@ -22,8 +34,9 @@ async def render(record: Record) -> str:
 async def test_offload_delivers_every_item_to_the_worker_in_order() -> None:
     received: list[int] = []
 
-    def work(items: Iterator[int]) -> None:
-        received.extend(items)
+    def work(batches: Iterator[list[int]]) -> None:
+        for batch in batches:
+            received.extend(batch)
 
     async with offload(work) as sink:
         await sink(stream_from_iterable([7, 3, 9, 5]))
@@ -31,8 +44,22 @@ async def test_offload_delivers_every_item_to_the_worker_in_order() -> None:
     assert received == [7, 3, 9, 5]
 
 
+async def test_offload_delivers_a_lone_item_as_a_single_element_burst() -> None:
+    # One item means the worker's `get()` empties the queue, so the burst-drain's `range(qsize())`
+    # is `range(0)`: the deterministic "nothing more queued" path.
+    received: list[list[int]] = []
+
+    def work(batches: Iterator[list[int]]) -> None:
+        received.extend(batches)
+
+    async with offload(work) as sink:
+        await sink(stream_from_iterable([42]))
+
+    assert received == [[42]]
+
+
 async def test_offload_surfaces_a_worker_failure_when_the_block_exits() -> None:
-    def work(items: Iterator[int]) -> None:
+    def work(batches: Iterator[list[int]]) -> None:
         raise RuntimeError("worker could not open its resource")
 
     with pytest.raises(RuntimeError, match="worker could not open its resource"):
@@ -40,25 +67,158 @@ async def test_offload_surfaces_a_worker_failure_when_the_block_exits() -> None:
             await sink(stream_from_iterable([1]))
 
 
-async def test_write_lines_appends_each_string_as_a_newline_delimited_line(tmp_path: Path) -> None:
-    path = tmp_path / "app.log"
+def test_to_stream_writes_each_line_to_the_stream_and_leaves_it_open() -> None:
+    buffer = io.StringIO()
 
-    async with offload(write_lines(path)) as sink:
-        await sink(stream_from_iterable(["first line", "second line"]))
+    to_stream(buffer)(iter([["first", "second"], ["third"]]))
 
-    assert path.read_text(encoding="utf-8") == "first line\nsecond line\n"
+    assert buffer.getvalue() == "first\nsecond\nthird\n"
+    assert not buffer.closed  # the caller owns the stream; the worker does not close it
 
 
-async def test_capture_renders_and_writes_filtered_records_to_a_file_off_thread(tmp_path: Path) -> None:
-    path = tmp_path / "warnings.log"
+def test_to_rotating_file_passes_the_index_and_open_time_to_name(tmp_path: Path) -> None:
+    calls: list[tuple[int, datetime]] = []
+
+    def name(index: int, when: datetime) -> Path:
+        calls.append((index, when))
+        return tmp_path / f"app.{index}.log"
+
+    to_rotating_file(name, max_bytes=1_000_000, now=lambda: EPOCH)(iter([["first", "second"]]))
+
+    assert calls == [(0, EPOCH)]
+    assert (tmp_path / "app.0.log").read_text(encoding="utf-8") == "first\nsecond\n"
+
+
+def test_to_rotating_file_rotates_to_the_next_file_when_the_size_limit_would_be_exceeded(tmp_path: Path) -> None:
+    def name(index: int, when: datetime) -> Path:
+        return tmp_path / f"app.{index}.log"
+
+    # Each line is 6 bytes ("aaaaa\n"); with a 12-byte cap two fit per file, the third rotates.
+    to_rotating_file(name, max_bytes=12)(iter([["aaaaa", "bbbbb", "ccccc"]]))
+
+    assert (tmp_path / "app.0.log").read_text(encoding="utf-8") == "aaaaa\nbbbbb\n"
+    assert (tmp_path / "app.1.log").read_text(encoding="utf-8") == "ccccc\n"
+
+
+def test_to_rotating_file_rotates_when_the_current_file_is_older_than_the_age_limit(tmp_path: Path) -> None:
+    def name(index: int, when: datetime) -> Path:
+        return tmp_path / f"app.{index}.log"
+
+    clock = EPOCH
+
+    def now() -> datetime:
+        return clock
+
+    def batches() -> Iterator[list[str]]:
+        nonlocal clock
+        yield ["fresh"]
+        clock = EPOCH + timedelta(seconds=11)  # older than the 10s limit before the next burst
+        yield ["stale"]
+
+    to_rotating_file(name, max_age=timedelta(seconds=10), now=now)(batches())
+
+    assert (tmp_path / "app.0.log").read_text(encoding="utf-8") == "fresh\n"
+    assert (tmp_path / "app.1.log").read_text(encoding="utf-8") == "stale\n"
+
+
+def test_to_rotating_file_rotates_when_a_scheduled_boundary_is_crossed(tmp_path: Path) -> None:
+    def name(index: int, when: datetime) -> Path:
+        return tmp_path / f"app.{index}.log"
+
+    clock = EPOCH
+
+    def now() -> datetime:
+        return clock
+
+    def schedule(after: datetime) -> datetime:
+        return after + timedelta(seconds=10)  # next boundary is 10s after each file opens
+
+    def batches() -> Iterator[list[str]]:
+        nonlocal clock
+        yield ["a", "b"]  # both before the boundary -> same file
+        clock = EPOCH + timedelta(seconds=15)  # past the boundary before the next burst
+        yield ["c"]
+
+    to_rotating_file(name, schedule=schedule, now=now)(batches())
+
+    assert (tmp_path / "app.0.log").read_text(encoding="utf-8") == "a\nb\n"
+    assert (tmp_path / "app.1.log").read_text(encoding="utf-8") == "c\n"
+
+
+def test_at_times_returns_the_next_time_later_today() -> None:
+    schedule = at_times(time(0, 0), time(12, 0))
+
+    assert schedule(datetime(2026, 1, 1, 9, 0, tzinfo=UTC)) == datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+
+def test_at_times_wraps_to_tomorrow_once_all_of_todays_times_have_passed() -> None:
+    schedule = at_times(time(0, 0), time(12, 0))
+
+    assert schedule(datetime(2026, 1, 1, 18, 0, tzinfo=UTC)) == datetime(2026, 1, 2, 0, 0, tzinfo=UTC)
+
+
+def test_at_times_is_strictly_after_so_a_boundary_just_hit_advances() -> None:
+    schedule = at_times(time(12, 0))
+
+    assert schedule(datetime(2026, 1, 1, 12, 0, tzinfo=UTC)) == datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+
+
+def test_at_times_requires_at_least_one_time() -> None:
+    with pytest.raises(ValueError, match="at least one time-of-day"):
+        at_times()
+
+
+# Fixed offsets, not zoneinfo: they exercise the `tz` parameter and the `astimezone` conversion
+# across the full offset range without DST's nonexistent/ambiguous wall times (a separate concern
+# for a rotation schedule). The moment stays in UTC so the conversion into `tz` actually does work.
+fixed_offset_timezones = st.integers(min_value=-14 * 60, max_value=14 * 60).map(
+    lambda minutes: timezone(timedelta(minutes=minutes))
+)
+
+
+@given(
+    times=st.lists(st.times(), min_size=1, max_size=4, unique=True),
+    tz=fixed_offset_timezones,
+    # hypothesis requires naive min/max bounds when a `timezones` strategy is given; bounded to a
+    # realistic range so `+ timedelta(days=1)` cannot overflow near `datetime.max`.
+    moment=st.datetimes(
+        min_value=datetime(2000, 1, 1),  # noqa: DTZ001
+        max_value=datetime(2100, 1, 1),  # noqa: DTZ001
+        timezones=st.just(UTC),
+    ),
+)
+def test_at_times_yields_the_soonest_scheduled_boundary_strictly_after(
+    times: list[time],
+    tz: timezone,
+    moment: datetime,
+) -> None:
+    boundary = at_times(*times, tz=tz)(moment)
+    local = moment.astimezone(tz)
+
+    # Strictly after, and within a day, since the times recur daily.
+    assert moment < boundary <= moment + timedelta(days=1)
+    # The boundary lands on one of the scheduled wall-clock times, read in `tz`.
+    assert boundary.astimezone(tz).time() in set(times)
+    # Nothing scheduled is skipped: no boundary falls strictly between `moment` and the result.
+    for scheduled in times:
+        for day in (local.date(), local.date() + timedelta(days=1)):
+            candidate = datetime.combine(day, scheduled, tzinfo=tz)
+            assert not (moment < candidate < boundary)
+
+
+async def test_capture_renders_and_writes_records_to_a_file_off_thread(tmp_path: Path) -> None:
     logger = logging.getLogger("test.sinks.file")
 
-    async with offload(write_lines(path)) as writer:
-        lines = compose(from_map(render), writer)  # Record -> str -> file
-        pipeline = compose(from_selector(at_least(Level.WARNING)), lines)
-        async with capture(pipeline, logger=logger):
-            logger.info("informational, dropped")
-            logger.warning("first warning")
-            logger.error("an error")
+    def name(index: int, when: datetime) -> Path:
+        return tmp_path / f"app.{index}.log"
 
-    assert path.read_text(encoding="utf-8") == "first warning\nan error\n"
+    writer = to_rotating_file(name, max_bytes=1_000_000)
+    async with (
+        offload(writer) as sink,
+        capture(compose(from_selector(at_least(Level.WARNING)), compose(from_map(render), sink)), logger=logger),
+    ):
+        logger.info("informational, dropped")
+        logger.warning("first warning")
+        logger.error("an error")
+
+    assert (tmp_path / "app.0.log").read_text(encoding="utf-8") == "first warning\nan error\n"

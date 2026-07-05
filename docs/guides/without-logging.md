@@ -151,44 +151,104 @@ log stream pays a thread-pool round-trip on every write. The cheaper shape is a
 *single* long-lived thread that owns the file and does all the I/O, fed by a
 queue: the async side just enqueues, with no per-write hop.
 
-`offload` is that bridge. It is a context manager that yields a `Sink`, running a
+`offload` is that bridge: a context manager that yields a `Sink`, running a
 blocking `work` function on a dedicated thread. `work` is ordinary synchronous
-Python that consumes an `Iterator` (open, loop, close); the yielded sink drops
-each item onto a thread-safe queue the worker drains. `write_lines` is the file
-worker for the common case. It writes *strings*, not records: rendering a
-`Record` to text is the app's encoding boundary, so it is a `from_map(Record ->
-str)` composed in front, which keeps the writer itself encoding-agnostic (it only
-knows strings and file mechanics):
+Python that consumes the items; the yielded sink drops each onto a thread-safe
+queue the worker drains. Items arrive in *bursts* (everything queued at that
+instant), so the worker batches writes and flushes at each burst boundary, which
+is exactly the moment it has caught up: under load bursts are large and flushes
+few, and when idle each burst is a single line flushed at once. So durability
+needs no flush-frequency knob; it falls out of the queue's own backlog.
+
+The writers are named by *destination*: `to_rotating_file` writes to a file,
+`to_stream` writes to a text stream the caller owns (`sys.stderr`, a socket).
+There is deliberately no plain single-file writer, because an unbounded log file is
+a footgun; you write to a rotating file and choose how it rotates. Both write
+*strings*, not records (rendering a `Record` to text is the app's encoding boundary,
+so it is a `from_map(Record -> str)` composed in front), own the `\n` framing, and
+flush per burst; the difference is lifecycle: `to_rotating_file` opens, rotates, and
+closes files it owns, while `to_stream` never closes the caller's stream:
 
 ```python
+from datetime import timedelta
+
 from without import compose, from_map, from_selector
-from without_logging import Level, at_least, capture, offload, write_lines
+from without_logging import Level, at_least, capture, offload, to_rotating_file
 
 
 async def render(record):
     return f"{record.timestamp:%H:%M:%S} {record.level_name} {record.message}"
 
 
-async with offload(write_lines(path)) as writer:
-    lines = compose(from_map(render), writer)                     # Record -> str -> file
-    async with capture(compose(from_selector(at_least(Level.WARNING)), lines)):
-        ...  # WARNING+ records are rendered and written on the worker thread
+writer = to_rotating_file(
+    lambda i, when: directory / f"app.{i}.log",   # (index, open time) -> path; 0 is the current file
+    max_bytes=64 * 1024 * 1024,                   # rotate at 64 MiB, and/or ...
+    max_age=timedelta(hours=1),                   # ... rotate hourly, whichever comes first
+)
+async with (
+    offload(writer) as sink,
+    capture(compose(from_selector(at_least(Level.WARNING)), compose(from_map(render), sink))),
+):
+    ...  # WARNING+ records are rendered and written on the worker thread
 ```
 
 The `compose(processor, sink)` there is the core builder's terminal form: a
 processor chain (the filter, the `Record -> str` render) prefixed onto a sink
-yields a sink. Two things to hold onto:
+yields a sink. Points to hold onto:
 
 - **Nesting order.** `offload` goes *outside* `capture`, so the worker thread
-  outlives the draining. The lifecycle is bounded by the `with` block: the thread
-  starts on entry, and on exit a sentinel ends the worker's iterator so it flushes
-  and closes the file, then the thread is joined before the block returns.
-- **This is a terminal sink, not a general threaded `Processor`.** Bridging a full
-  `Processor` onto a thread (an output queue as well as an input one) is much more
-  stateful, and writing does not need it, so it is deliberately out of scope. The
-  queue is also unbounded in this first cut (the async side never blocks or drops,
-  at the cost of memory if a stalled disk lets a burst accumulate); a bounded,
+  outlives the draining. On exit the queue is shut down so the worker drains what
+  remains, flushes, and closes the file, then the thread is joined before the
+  block returns.
+- **Sink-only, first cut.** Bridging a full `Processor` onto a thread (an output
+  queue as well) is much more stateful and writing does not need it, so it is out
+  of scope. The queue is unbounded (the async side never blocks or drops, at the
+  cost of memory if a stalled disk lets a burst accumulate); a bounded,
   drop-counting variant is a follow-up.
+
+### Rotation lives in the worker
+
+It is tempting to make rotation decoupled: rotate the writer on a stream of
+external triggers. That works for *time* (a clock is independent of the writes)
+but breaks for *size*, and the reason is the same one the stdlib's rotating
+handlers bundle this. A size threshold is a function of the bytes written, so an
+accurate size limit has to live in the write path; and once size is there, joint
+size-and-time has to be too (a time rotation changes which file is current, so a
+separate size trigger would be measuring a file no longer being written). That one
+coupling is essential, not incidental.
+
+So rotation lives in the worker, the one place with all the information:
+`to_rotating_file` keeps an exact byte count (writing UTF-8 bytes directly rather
+than polling a lagging on-disk size) and reads an injected clock, rotating on any
+combination of `max_bytes` (size), `max_age` (a *relative* interval since the file
+opened), and `schedule` (the next *absolute* wall-clock boundary), whichever trips
+first. Everything *else* the stdlib handler fuses (formatting, filtering, flush
+timing, transport) still composes out; only the genuinely-coupled size-and-time
+decision is bundled, and unlike the stdlib's separate size and time handlers, one
+writer does the joint case. The decision is made *before* each write, so a size
+limit is not overshot (bar a single line larger than `max_bytes`), and it is
+inlined and short-circuiting: the clock is read only when a size check has not
+already forced the rotation and a time condition is set. `now` is injectable, so
+time-based rotation is deterministic under test.
+
+`schedule(t)` returns the next rotation boundary strictly after `t`, and the
+writer rotates once `now()` reaches it. It is the pure, thread-synchronous form of
+"a stream of rotation datetimes": the worker already owns the clock, so it
+generates the stream itself rather than sampling an async one, which also means a
+boundary missed while idle collapses to a single rotation and nothing goes stale.
+`at_times` builds one from wall-clock times, so daily-at-midnight is a value:
+
+```python
+from datetime import time
+
+from without_logging import at_times, to_rotating_file
+
+writer = to_rotating_file(
+    lambda i, when: directory / f"app.{when:%Y%m%d}.{i}.log",
+    max_bytes=64 * 1024 * 1024,               # rotate at 64 MiB, or ...
+    schedule=at_times(time(0, 0)),            # ... at midnight UTC, whichever comes first
+)
+```
 
 ## Where fan-out slots in (issue #13)
 
