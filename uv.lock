@@ -1397,11 +1397,11 @@ name = "without-logging"
 version = "0.0.0"
 source = { editable = "packages/without-logging" }
 dependencies = [
-    { name = "without" },
+    { name = "without-core" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "without", editable = "packages/without" }]
+requires-dist = [{ name = "without-core", editable = "packages/without" }]
 
 [[package]]
 name = "without-web"
