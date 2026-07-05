@@ -9,6 +9,32 @@ This guide doubles as the design narrative for the package, because the
 interesting part is not the code (it is small) but *why the shape fits*, and
 where it deliberately stops.
 
+## The pipeline at a glance
+
+Every setup is the same run of slots from a logger call to a sink, split in two
+by a queue: an **emit phase** that runs synchronously on the caller's task (parse
+the `LogRecord` to a value, fold in call-site context), and a **sink phase** that
+drains the queue as a `Stream` and runs the composed processors (filter, enrich,
+render) before the terminal sink. The queue is where the timeline splits and where
+overflow is decided.
+
+```mermaid
+flowchart TD
+    logger(["logger call"])
+    subgraph emit["emit phase · caller's task · sync"]
+        parse["parse · bind"]
+    end
+    queue[["queue"]]
+    subgraph sinkp["sink phase · sink task · async"]
+        proc["processors<br/>filter · enrich · render"]
+        term(["sink"])
+    end
+    logger --> parse --> queue --> proc --> term
+```
+
+The sections below fill each slot in turn, and [fan-out](#fan-out-to-several-sinks)
+splits the sink phase across several sinks at once.
+
 ## The bet: a log record is a value
 
 `structlog` and stdlib `logging` are hard to reason about for a few related
@@ -510,6 +536,31 @@ async with (
     ...
 ```
 
+The same slots as the abstract diagram, instantiated: the shared prefix runs once,
+then `tee` splits the sink phase into a console branch and a file branch, each with
+its own filtering, rendering, and offloaded terminal:
+
+```mermaid
+flowchart TD
+    log(["log.info(...)<br/>logger at DEBUG"])
+    subgraph emit["emit phase"]
+        parse["parse_record · merge_context"]
+    end
+    queue[["queue"]]
+    subgraph sinkp["sink phase"]
+        shared["add_fields(service='api')"]
+        tee{{tee}}
+        rc["render_console"]
+        console(["offload → to_stream(sys.stderr)"])
+        sel["from_selector(at_least(WARNING))"]
+        rj["render_json"]
+        file(["offload → to_rotating_file"])
+    end
+    log --> parse --> queue --> shared --> tee
+    tee --> rc --> console
+    tee --> sel --> rj --> file
+```
+
 `parse_record` runs once and `add_fields` runs once; then the stream splits. The
 console branch renders every record with the shipped `render_console`, the file
 branch keeps `WARNING`+ and renders `render_json` (each branch owns its encoding;
@@ -536,13 +587,15 @@ day. Neither is needed to drive several sinks today.
   common choices, `render_json` and `render_console`, ship as *optional* opt-in
   renderers you compose yourself; logfmt, msgpack, or a bespoke schema stay a
   `from_map` you write.
-- **No rotation, batching, or network sinks yet.** Each is an ordinary processor
-  or sink you compose; the package ships the substrate (the value, the edge, the
-  filter), not a batteries-included handler zoo.
-- **No formatted-exception convenience, and no `stack_info` yet.** `parse_record`
-  captures the `exc_info` traceback as a structured `TracebackException` on
-  `Record.exception`, so formatting it (text or JSON) is your downstream
-  `from_map`, mirroring the no-formatter stance above. The separate call-stack
+- **No batching or network sinks yet.** Each is an ordinary processor or sink you
+  compose; the package ships the substrate (the value, the edge, the filter,
+  rotating and stream writers), not a batteries-included handler zoo. Batching
+  beyond `offload`'s per-burst flush (grouping by count or time before a network
+  send) and a dedicated network sink are still yours to write.
+- **No `stack_info` capture yet.** `parse_record` captures the `exc_info`
+  traceback as a structured `TracebackException` on `Record.exception`, which
+  `render_json`/`render_console` format (or your own `from_map`, reusing the
+  exported `exception_to_dict`/`exception_to_text`). The separate call-stack
   capture from `stack_info=True` is still dropped; folding it in is the same move
   on a rarer field.
 - **No thread-side rendering.** A renderer runs on the loop (see above), which is
