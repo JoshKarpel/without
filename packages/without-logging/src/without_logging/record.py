@@ -79,8 +79,11 @@ class Record:
     place, a `Record` is a value: it always means the same thing, so it can be
     filtered, enriched, fanned out, and sunk without any stage disturbing
     another's copy. Enrichment returns a *new* record (`with_fields`) rather than
-    mutating this one. `fields` holds the structured data logged via `extra=`,
-    exposed read-only. `exception` is a `TracebackException` captured at the
+    mutating this one. `fields` is the record's structured data, exposed read-only:
+    *seeded* from the log call's `extra=` at the parse edge, then *grown* by
+    enrichment (`add_fields`, a `bind` merged by `merge_context`, any `with_fields`).
+    It is named for what it holds, not for `extra=` alone, because those later
+    sources write here too. `exception` is a `TracebackException` captured at the
     ingestion edge (`None` when the event carried none): a *structured* value,
     not a rendered string, so how the traceback is formatted stays a downstream
     boundary the app owns (`"".join(exc.format())` for the stdlib text, or walk

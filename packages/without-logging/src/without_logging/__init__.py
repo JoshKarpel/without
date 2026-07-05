@@ -7,6 +7,11 @@ from without_logging.processors import at_least
 from without_logging.record import Level
 from without_logging.record import Record
 from without_logging.record import parse_record
+from without_logging.renderers import exception_to_dict
+from without_logging.renderers import exception_to_text
+from without_logging.renderers import iso_timestamp
+from without_logging.renderers import render_console
+from without_logging.renderers import render_json
 from without_logging.sinks import at_times
 from without_logging.sinks import offload
 from without_logging.sinks import to_rotating_file
@@ -21,9 +26,14 @@ __all__ = [
     "at_times",
     "bind",
     "capture",
+    "exception_to_dict",
+    "exception_to_text",
+    "iso_timestamp",
     "merge_context",
     "offload",
     "parse_record",
+    "render_console",
+    "render_json",
     "to_rotating_file",
     "to_stream",
 ]

@@ -388,50 +388,49 @@ writer = to_rotating_file(
 )
 ```
 
-## Rendering to structured JSON, exception and all
+## Rendering: `render_json` and `render_console`
 
-Because `Record.exception` is a structured `TracebackException` rather than a
-pre-rendered string, a JSON sink can encode the traceback as *data*: walk
-`exc.stack` (a `StackSummary` of `FrameSummary`) into an array of frames, and
-follow `exc.__cause__` to nest a `raise ... from ...` chain. The render is an
-ordinary `from_map(Record -> str)`, the encoding boundary the app owns:
+Rendering a `Record` to text is the app's encoding boundary, so the core ships no
+*mandatory* formatter. But the two everyone reaches for come as *optional*,
+opt-in `Processor[Record, str]` helpers you compose in front of a string sink:
+`render_json()` for structured logging and `render_console()` for a
+human-readable line. Both surface the record's `fields` (the structured `extra=`
+data, plus anything `add_fields`/`bind` enriched) as first-class output:
 
 ```python
-import json
-from traceback import TracebackException
+import sys
 
+from without import compose
+from without_logging import capture, offload, render_console, render_json, to_stream
 
-def exception_to_json(exc: TracebackException) -> dict[str, object]:
-    return {
-        "type": exc.exc_type_str,
-        "message": "".join(exc.format_exception_only()).strip(),
-        "frames": [
-            {"file": f.filename, "line": f.lineno, "func": f.name, "code": f.line}
-            for f in exc.stack
-        ],
-        "cause": exception_to_json(exc.__cause__) if exc.__cause__ else None,
-    }
-
-
-async def render_json(record) -> str:
-    payload: dict[str, object] = {
-        "ts": record.timestamp.isoformat(),
-        "level": record.level_name,
-        "logger": record.logger,
-        "message": record.message,
-        **record.fields,
-    }
-    if record.exception is not None:
-        payload["exception"] = exception_to_json(record.exception)
-    return json.dumps(payload)
+async with (
+    offload(to_stream(sys.stdout)) as out,
+    capture(compose(render_json(), out)),   # one JSON object per line
+):
+    ...
 ```
 
-A record logged with `log.exception("charge failed", extra={"order_id": "ord-7788"})`
-inside a `raise ValueError(...) from KeyError(...)` then encodes to:
+A renderer is a `Processor[Record, str]`, so it runs *on the event loop*, as part
+of the sink-phase pipeline, while `offload`'s worker thread does the blocking
+*write*. Under CPython's GIL that is the right split: a file or socket write
+releases the GIL, so offloading it lets the loop run during the I/O, whereas
+rendering is CPU-bound Python that holds the GIL and so gains nothing from a
+thread. (Moving rendering onto the worker thread becomes a real parallelism win
+only under a free-threaded build; it is a noted follow-up, not needed today.) An
+async sink is the same on the loop without a thread at all: `compose(render_json(),
+network_sink)`, since its `await`ed I/O yields the loop on its own.
+
+`render_json()` puts the envelope (`timestamp`, `level`, `logger`, `message`) and
+every field flat at the top level, where a log aggregator can index them, and the
+envelope wins a name clash so a field cannot shadow `level`. It leans on the
+structured exception: because `Record.exception` is a `TracebackException` rather
+than a pre-rendered string, the traceback is encoded as *data*, not an opaque blob.
+So `log.exception("charge failed", extra={"order_id": "ord-7788"})` inside a
+`raise ValueError(...) from KeyError(...)` renders to:
 
 ```json
 {
-  "ts": "2026-07-05T14:56:09.468581+00:00",
+  "timestamp": "2026-07-05T14:56:09.468581+00:00",
   "level": "ERROR",
   "logger": "billing",
   "message": "charge failed",
@@ -439,19 +438,29 @@ inside a `raise ValueError(...) from KeyError(...)` then encodes to:
   "exception": {
     "type": "ValueError",
     "message": "ValueError: token expired",
-    "frames": [{"file": "app.py", "line": 49, "func": "charge", "code": "raise ValueError(...) from missing"}],
+    "frames": [{"file": "app.py", "line": 49, "function": "charge", "code": "raise ValueError(...) from missing"}],
     "cause": {
       "type": "KeyError",
       "message": "KeyError: 'region'",
-      "frames": [{"file": "app.py", "line": 47, "func": "charge", "code": "raise KeyError('region')"}],
-      "cause": null
+      "frames": [{"file": "app.py", "line": 47, "function": "charge", "code": "raise KeyError('region')"}]
     }
   }
 }
 ```
 
-The same `Record` handed to a text sink instead does
-`"".join(record.exception.format())` for the familiar multi-line traceback. One
+The `cause` follows Python's own chaining rule (an explicit `raise ... from`, else
+the implicit context unless suppressed). How the exception is encoded is *the
+caller's* choice, injected: `render_json(exception=exception_to_text)` emits the
+flat traceback string instead of structured frames, and any
+`TracebackException -> <json value>` works. The timestamp is injectable the same way
+(`render_json(timestamp=lambda when: when.timestamp())` for an epoch number; default
+`iso_timestamp`), and `exception_to_dict`/`exception_to_text` are exported so a
+custom schema can reuse them. (Non-serializable *field* values coerce with `str`,
+not `repr`: JSON is machine-consumed, so a clean indexable value wins, and `str`
+still degrades to the `repr` form for an object with no `__str__`.)
+`render_console()` takes the *same* record and instead emits
+`TIMESTAMP [LEVEL] logger: message key=value ...`, appending stdlib's own
+multi-line traceback (`"".join(record.exception.format())`) when present. One
 value, two encodings, both the app's choice: this is exactly why the exception is
 captured as structure and not flattened to a string at the edge.
 
@@ -472,9 +481,10 @@ carrying its own filtering, rendering, and terminal:
 import logging
 import sys
 
-from without import compose, from_map, from_selector, tee
+from without import compose, from_selector, tee
 from without_logging import (
-    Level, add_fields, at_least, capture, offload, to_rotating_file, to_stream,
+    Level, add_fields, at_least, capture, offload,
+    render_console, render_json, to_rotating_file, to_stream,
 )
 
 async with (
@@ -484,10 +494,10 @@ async with (
         compose(
             add_fields(service="api"),                        # shared: parsed + enriched once
             tee(
-                compose(from_map(render_console), console),   # console: everything, human-readable
-                compose(                                      # file: WARNING+, as JSON
+                compose(render_console(), console),              # console: everything, human-readable
+                compose(                                          # file: WARNING+, as JSON
                     from_selector(at_least(Level.WARNING)),
-                    compose(from_map(render_json), file),
+                    compose(render_json(), file),
                 ),
             ),
         ),
@@ -498,9 +508,9 @@ async with (
 ```
 
 `parse_record` runs once and `add_fields` runs once; then the stream splits. The
-console branch renders every record, the file branch keeps `WARNING`+ and renders
-JSON (`render_console` and `render_json` are your `from_map(Record -> str)`
-steps, the encoding boundary the app owns). Each branch owns its own worker
+console branch renders every record with the shipped `render_console`, the file
+branch keeps `WARNING`+ and renders `render_json` (each branch owns its encoding;
+a custom `from_map(Record -> str)` slots in the same place). Each branch owns its own worker
 thread through its `offload`, so a slow disk never blocks the console. A branch
 MAY itself be another `tee`, so "one input, several sink groups" nests. With one
 `capture` at `DEBUG`, the per-branch `from_selector` does the level filtering, so
@@ -517,10 +527,12 @@ day. Neither is needed to drive several sinks today.
 
 ## What is deliberately not here
 
-- **No formatter.** Rendering a `Record` to bytes (JSON, logfmt, a console line)
-  is a boundary the app owns, so it is your `from_map(Record -> bytes)` ahead of
-  the sink, not a shipped `format_json`. This mirrors `without-web` shipping no
-  `json_response`.
+- **No *mandatory* formatter.** Rendering a `Record` to text is a boundary the app
+  owns, composed as a `from_map(Record -> str)` ahead of the sink, never forced by
+  the core path (mirroring `without-web` shipping no `json_response`). The two
+  common choices, `render_json` and `render_console`, ship as *optional* opt-in
+  renderers you compose yourself; logfmt, msgpack, or a bespoke schema stay a
+  `from_map` you write.
 - **No rotation, batching, or network sinks yet.** Each is an ordinary processor
   or sink you compose; the package ships the substrate (the value, the edge, the
   filter), not a batteries-included handler zoo.
@@ -530,3 +542,10 @@ day. Neither is needed to drive several sinks today.
   `from_map`, mirroring the no-formatter stance above. The separate call-stack
   capture from `stack_info=True` is still dropped; folding it in is the same move
   on a rarer field.
+- **No thread-side rendering.** A renderer runs on the loop (see above), which is
+  the right split under the GIL: only the blocking write benefits from a thread,
+  and rendering is GIL-bound CPU. Under a free-threaded build, rendering *inside*
+  the `offload` worker would parallelize; that wants a sync `Record -> str` core
+  plus a "compose for the worker world" combinator (the offload analog of
+  `compose(from_map(render), sink)`), an additive follow-up when free-threading
+  makes it pay.

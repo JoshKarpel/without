@@ -42,7 +42,11 @@
   Per-call-site context binds at the edge with the scoped `bind(**fields)` context
   manager and the `merge_context` `Record -> Record` enrichment composed into the
   default parser (the structlog-style `bind_contextvars` equivalent), since the
-  pipeline runs off the caller's task and cannot recover it.
+  pipeline runs off the caller's task and cannot recover it. Optional opt-in
+  renderers `render_json` (fields flat) and `render_console` (human line) cover the
+  common encodings without the core forcing one, with
+  the timestamp and exception encodings injected: `exception_to_dict` (structured
+  frames) or `exception_to_text` (flat traceback), and `iso_timestamp` by default.
   `offload` bridges a
   blocking worker onto a dedicated thread (delivering items in bursts, so the
   worker flushes when it catches up, no per-write thread hop) so file I/O stays off
