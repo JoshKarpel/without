@@ -108,29 +108,32 @@ def render_console(
     """
     A `Record -> str` renderer emitting one human-readable line per record.
 
-    `TIMESTAMP [LEVEL] logger: message key=value ...`: the fields trail as
-    `key=value` pairs (each value `repr`'d, so strings quote and nothing breaks on a
-    space), and an exception is appended as its full traceback text
-    (`exception_to_text`, cause chain and all) on following lines. `timestamp`
-    chooses the time format (default `iso_timestamp`). No coloring: wrap the line, or
-    write your own `from_map(Record -> str)`, if you want ANSI.
+    `TIMESTAMP LEVEL logger "message" {key=value, ...}`: the message is quoted and
+    the fields grouped in braces (each value `repr`'d), so the free-text message and
+    the structured fields never blur into each other or the leading metadata. The
+    braces are omitted when there are no fields. An exception is appended as its full
+    traceback text (`exception_to_text`, cause chain and all), indented, on following
+    lines. `timestamp` chooses the time format (default `iso_timestamp`). No coloring:
+    wrap the line, or write your own `from_map(Record -> str)`, if you want ANSI.
 
     Optional and opt-in, like `render_json`: `compose(render_console(),
     offload(to_stream(sys.stderr)))`.
     """
 
     async def render(record: Record) -> str:
-        summary = " ".join(
-            [
-                timestamp(record.timestamp),
-                f"[{record.level_name}]",
-                f"{record.logger}:",
-                record.message,
-                *(f"{key}={value!r}" for key, value in record.fields.items()),
-            ]
-        )
+        parts = [
+            timestamp(record.timestamp),
+            record.level_name,
+            record.logger,
+            f'"{record.message}"',
+        ]
+        if record.fields:
+            fields = ", ".join(f"{key}={value!r}" for key, value in record.fields.items())
+            parts.append("{" + fields + "}")
+        summary = " ".join(parts)
         if record.exception is None:
             return summary
-        return f"{summary}\n{exception_to_text(record.exception)}"
+        body = "\n".join(f"  {line}" if line else "" for line in exception_to_text(record.exception).splitlines())
+        return f"{summary}\n{body}"
 
     return from_map(render)

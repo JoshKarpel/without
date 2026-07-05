@@ -133,26 +133,32 @@ async def test_render_json_uses_an_injected_timestamp_format() -> None:
     assert payload["timestamp"] == datetime(2026, 7, 5, 14, 56, 9, tzinfo=UTC).timestamp()
 
 
-async def test_render_console_line_carries_timestamp_level_logger_and_message() -> None:
+async def test_render_console_line_quotes_the_message_after_the_metadata() -> None:
     line = await rendered(render_console(), a_record(level=logging.WARNING))
 
-    assert line == "2026-07-05T14:56:09+00:00 [WARNING] svc.billing: charge accepted"
+    assert line == '2026-07-05T14:56:09+00:00 WARNING svc.billing "charge accepted"'
 
 
-async def test_render_console_appends_extra_fields_as_key_value_pairs() -> None:
+async def test_render_console_groups_extra_fields_in_braces() -> None:
     line = await rendered(render_console(), a_record(order_id="ord-77", attempt=3))
 
-    assert line.endswith("order_id='ord-77' attempt=3")
+    assert line.endswith("\"charge accepted\" {order_id='ord-77', attempt=3}")
 
 
-async def test_render_console_appends_the_traceback_when_the_record_carries_one() -> None:
+async def test_render_console_omits_the_braces_when_there_are_no_fields() -> None:
+    line = await rendered(render_console(), a_record())
+
+    assert "{" not in line
+
+
+async def test_render_console_appends_the_indented_traceback_when_present() -> None:
     line = await rendered(render_console(), a_record(exception=a_chained_traceback()))
 
-    assert "\nTraceback (most recent call last):" in line
+    assert "\n  Traceback (most recent call last):" in line
     assert "ValueError: token expired" in line
 
 
 async def test_render_console_uses_an_injected_timestamp_format() -> None:
     line = await rendered(render_console(timestamp=lambda when: when.strftime("%H:%M:%S")), a_record())
 
-    assert line.startswith("14:56:09 [INFO]")
+    assert line.startswith('14:56:09 INFO svc.billing "charge accepted"')

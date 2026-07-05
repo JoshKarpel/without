@@ -459,10 +459,11 @@ custom schema can reuse them. (Non-serializable *field* values coerce with `str`
 not `repr`: JSON is machine-consumed, so a clean indexable value wins, and `str`
 still degrades to the `repr` form for an object with no `__str__`.)
 `render_console()` takes the *same* record and instead emits
-`TIMESTAMP [LEVEL] logger: message key=value ...`, appending stdlib's own
-multi-line traceback (`"".join(record.exception.format())`) when present. One
-value, two encodings, both the app's choice: this is exactly why the exception is
-captured as structure and not flattened to a string at the edge.
+`TIMESTAMP LEVEL logger "message" {key=value, ...}`, quoting the message and
+grouping the fields in braces so the free-text message and the structured fields
+never blur into each other, with the traceback indented on following lines when
+present. One value, two encodings, both the app's choice: this is exactly why the
+exception is captured as structure and not flattened to a string at the edge.
 
 ## Fan-out to several sinks
 
