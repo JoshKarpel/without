@@ -30,6 +30,7 @@ def a_record(message: str) -> Record:
         level=logging.INFO,
         logger="svc.test",
         message=message,
+        exception=None,
         fields={},
     )
 
@@ -44,6 +45,22 @@ async def test_capture_delivers_logged_records_to_the_sink() -> None:
 
     assert [r.message for r in collected] == ["hello world", "careful"]
     assert collected[1].fields == {"code": 7}
+
+
+async def test_capture_carries_the_traceback_from_logger_exception() -> None:
+    logger = logging.getLogger("test.capture.exception")
+    collected: list[Record] = []
+
+    async with capture(sink_into(collected), logger=logger, level=logging.INFO):
+        try:
+            raise RuntimeError("downstream unavailable")
+        except RuntimeError:
+            logger.exception("request failed")
+
+    (record,) = collected
+    assert record.message == "request failed"
+    assert record.exception is not None
+    assert "RuntimeError: downstream unavailable" in "".join(record.exception.format())
 
 
 async def test_capture_fans_out_to_several_sinks_sharing_a_prefix() -> None:

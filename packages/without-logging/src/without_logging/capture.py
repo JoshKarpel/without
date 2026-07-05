@@ -9,8 +9,14 @@ from contextlib import asynccontextmanager
 from without.contracts import Sink
 from without.wiring import stream_from_queue
 
+from without_logging.context import merge_context
 from without_logging.record import Record
 from without_logging.record import parse_record
+
+
+def parse_with_bound_context(log_record: logging.LogRecord) -> Record:
+    """`capture`'s default parser: `parse_record`, then `merge_context` folds in any bound context."""
+    return merge_context(parse_record(log_record))
 
 
 class CaptureHandler(logging.Handler):
@@ -62,7 +68,7 @@ async def capture(
     logger: logging.Logger | None = None,
     level: int = logging.INFO,
     capacity: int | None = 1024,
-    parse: Callable[[logging.LogRecord], Record] = parse_record,
+    parse: Callable[[logging.LogRecord], Record] = parse_with_bound_context,
 ) -> AsyncIterator[CaptureHandler]:
     """
     Capture stdlib log records into `sink` for the duration of the block.
@@ -84,6 +90,16 @@ async def capture(
     to `level` (restoring it on exit, scoped to the block) *and* sets the handler
     to `level`, the latter keeping the threshold exact for records that propagate
     up from a descendant logger pinned to its own lower level.
+
+    `parse` is the enrichment of the *emit phase*, the first of the pipeline's two
+    phases split by the queue: it turns each `LogRecord` into a `Record`
+    *synchronously* in the handler's `emit`, on the logging call's own task
+    (stdlib's shape), where the *sink phase* (`sink`, async, draining the queue) has
+    not yet begun. It defaults to `parse_with_bound_context` (`parse_record` then
+    `merge_context`), so any fields bound with `bind` are stamped on here, where
+    they are still live (the sink phase has left the caller's context). A custom
+    parser composes `merge_context` the same way, `merge_context(my_parse(log_record))`,
+    to keep binds, or omits it to opt out.
 
     The handler itself is yielded so a caller can read `handler.dropped` after
     the block to see how many records overflowed the queue.

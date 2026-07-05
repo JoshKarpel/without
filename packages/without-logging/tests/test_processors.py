@@ -17,6 +17,7 @@ def record(level: int, message: str, **fields: object) -> Record:
         level=level,
         logger="svc.orders",
         message=message,
+        exception=None,
         fields=fields,
     )
 

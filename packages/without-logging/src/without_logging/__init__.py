@@ -1,5 +1,7 @@
 from without_logging.capture import CaptureHandler
 from without_logging.capture import capture
+from without_logging.context import bind
+from without_logging.context import merge_context
 from without_logging.processors import add_fields
 from without_logging.processors import at_least
 from without_logging.record import Level
@@ -17,7 +19,9 @@ __all__ = [
     "add_fields",
     "at_least",
     "at_times",
+    "bind",
     "capture",
+    "merge_context",
     "offload",
     "parse_record",
     "to_rotating_file",

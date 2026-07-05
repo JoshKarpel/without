@@ -32,9 +32,14 @@ def add_fields(**fields: object) -> Processor[Record, Record]:
     A processor that merges static `fields` onto every record: enrichment.
 
     Enrichment *is* expressible as a `from_map` (one record in, one enriched
-    record out), so it uses the core builder directly. Dynamic enrichment
-    (stamping, say, a request id sampled from a `Context`) is the same shape with
-    the value read via `current()` inside the step.
+    record out), so it uses the core builder directly. Enriching from a *shared
+    behavior* (a value the whole pipeline sees the latest of: the current config
+    revision, a sampling rate) is the same shape, reading it via `current()`
+    inside the step. Per-call-site context (a request or trace id, which is
+    task-local) is *not* recoverable here: the pipeline runs in the sink task,
+    having left the caller's context. Bind it at the edge instead with
+    `bind`/`merge_context`, which read it while `emit` is still on the caller's
+    task (see the guide).
     """
 
     async def enrich(record: Record) -> Record:

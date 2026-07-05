@@ -1,10 +1,19 @@
 import logging
+import sys
 from datetime import UTC
 from datetime import datetime
+from traceback import TracebackException
 
 from without_logging import Level
 from without_logging import Record
 from without_logging import parse_record
+
+
+def caught(exc: Exception) -> tuple[type[BaseException], BaseException, object]:
+    try:
+        raise exc
+    except Exception:  # noqa: BLE001 - re-raise whatever the caller handed us to capture a live exc_info
+        return sys.exc_info()  # type: ignore[return-value]
 
 
 def make_log_record(**overrides: object) -> logging.LogRecord:
@@ -54,6 +63,27 @@ def test_parse_excludes_the_standard_envelope_from_fields() -> None:
     assert set(record.fields) == {"request_id"}
 
 
+def test_parse_captures_the_exception_as_a_structured_traceback_value() -> None:
+    record = parse_record(make_log_record(exc_info=caught(ValueError("token expired"))))
+
+    assert isinstance(record.exception, TracebackException)
+    assert "ValueError: token expired" in "".join(record.exception.format())
+
+
+def test_parse_leaves_exception_none_when_the_record_carries_no_exc_info() -> None:
+    assert parse_record(make_log_record()).exception is None
+
+
+def test_parse_leaves_exception_none_when_exc_info_holds_no_active_exception() -> None:
+    assert parse_record(make_log_record(exc_info=(None, None, None))).exception is None
+
+
+def test_parse_keeps_exc_info_out_of_the_structured_fields() -> None:
+    record = parse_record(make_log_record(exc_info=caught(KeyError("region")), request_id="r-9"))
+
+    assert set(record.fields) == {"request_id"}
+
+
 def test_parse_carries_a_non_standard_numeric_level_through_unchanged() -> None:
     record = parse_record(make_log_record(levelno=25))
 
@@ -85,6 +115,7 @@ def test_a_record_at_a_level_compares_against_the_level_enum() -> None:
         level=logging.ERROR,
         logger="svc.billing",
         message="charge declined",
+        exception=None,
         fields={},
     )
 

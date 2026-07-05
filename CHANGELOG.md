@@ -34,9 +34,16 @@
   into a `Processor` via `from_map`.
 - **`without-logging`**: a logging pipeline. Stdlib log records parsed into
   immutable `Record` values at a `capture` boundary (stdlib as a one-way source),
-  filtered with the core `from_selector` (plus the `at_least` level predicate) and
-  enriched with `add_fields`, drained to a sink the app owns (or several at once,
-  each with its own tail, through the core `tee`). `offload` bridges a
+  the message resolved and any exception captured as a structured
+  `TracebackException` at that edge (no live traceback carried downstream, and its
+  formatting left to the app), filtered with the core `from_selector` (plus the
+  `at_least` level predicate) and enriched with `add_fields`, drained to a sink the
+  app owns (or several at once, each with its own tail, through the core `tee`).
+  Per-call-site context binds at the edge with the scoped `bind(**fields)` context
+  manager and the `merge_context` `Record -> Record` enrichment composed into the
+  default parser (the structlog-style `bind_contextvars` equivalent), since the
+  pipeline runs off the caller's task and cannot recover it.
+  `offload` bridges a
   blocking worker onto a dedicated thread (delivering items in bursts, so the
   worker flushes when it catches up, no per-write thread hop) so file I/O stays off
   the event loop. Destination-shaped writers take strings (render a `Record` to text
