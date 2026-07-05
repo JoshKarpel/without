@@ -8,8 +8,10 @@
   contracts, the builders (`from_map`, `from_scan`, `from_sink`, `from_fold`, and
   the polarity-dual predicate filters `from_selector` / `from_filter`), the wiring
   connectors (`compose`, which also composes a processor onto a terminal `Sink`;
-  `sample`, `stream_from_iterable`, `stream_from_queue`, `collect`, `buffer`,
-  `stack`), and the `with`-scoped task helpers
+  `tee`, its terminal fan-out counterpart, splitting a stream across several `Sink`
+  branches so a shared prefix runs once; `sample`, `stream_from_iterable`,
+  `stream_from_queue`, `collect`, `buffer`, `stack`), and the `with`-scoped task
+  helpers
   (`background_task`, `limit_concurrency`, `sleep_forever`, `cancel_futures`,
   `as_async_iterator`).
 - **`without-env`**: a static `Context` loaded once from environment variables
@@ -33,7 +35,8 @@
 - **`without-logging`**: a logging pipeline. Stdlib log records parsed into
   immutable `Record` values at a `capture` boundary (stdlib as a one-way source),
   filtered with the core `from_selector` (plus the `at_least` level predicate) and
-  enriched with `add_fields`, drained to a sink the app owns. `offload` bridges a
+  enriched with `add_fields`, drained to a sink the app owns (or several at once,
+  each with its own tail, through the core `tee`). `offload` bridges a
   blocking worker onto a dedicated thread (delivering items in bursts, so the
   worker flushes when it catches up, no per-write thread hop) so file I/O stays off
   the event loop. Destination-shaped writers take strings (render a `Record` to text

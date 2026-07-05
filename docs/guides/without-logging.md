@@ -118,8 +118,8 @@ pipeline = compose(from_selector(at_least(Level.WARNING)), from_sink(write))
 `at_least(level)` is an `async` predicate over a `Record` (predicates are one
 color of function throughout `without`, so it matches what `from_selector`
 expects even though the decision just compares integers). Splitting one record
-across *several* sinks is the other direction, and it stays a wiring concern (the
-fan-out family, issue #13); see below.
+across *several* sinks is the other direction, and it stays a wiring concern:
+`tee` from `without` core; see below.
 
 Enrichment, by contrast, *is* count-preserving, so `add_fields` is a plain
 `from_map`. Dynamic enrichment (stamping a request id sampled from a `Context`)
@@ -250,28 +250,65 @@ writer = to_rotating_file(
 )
 ```
 
-## Where fan-out slots in (issue #13)
+## Fan-out to several sinks
 
 A real logging setup wants more than one sink: console *and* a file, or a file
-*and* the network. That is fan-out, one record stream tee'd into several
-independent sinks, and it is exactly the
-[fan-out/fan-in connectors](https://github.com/JoshKarpel/without/issues/13)
-(`tee`, `broadcast`, `merge`) that `without` core does not yet ship, having
-removed them as speculative surface.
+*and* the network. That is fan-out, one record stream split into several
+independent sinks, and it is [`tee`](../reference/without.md) from `without`
+core. `tee(*sinks)` returns a single `Sink` that feeds every event to every
+branch, consuming the input exactly once, so there is one `capture` and one pass
+through the shared middleware.
 
-`without-logging` is the concrete use case that motivates bringing them back, and
-it motivates the *hard* half, not just static `tee`:
+The split point is yours to place. Whatever you `compose` *before* the `tee` is
+the shared prefix (parsed and enriched once); each branch is its own `Sink`,
+carrying its own filtering, rendering, and terminal:
 
-- **Fan-out** (`tee` / `broadcast`): one `Record` stream into a console sink and a
-  file sink at once.
-- **Dynamic fan-in** (dynamic `merge`): app records, stdlib-captured records, and
-  per-request sub-streams that appear and vanish, merged into one pipeline. A
-  merge over a *changing* set of sources is the primitive issue #13 flags as the
-  one the old static `merge` never covered.
+```python
+import logging
+import sys
 
-Until those land, a `capture` block drives a single composed sink. That is the
-honest state of the package: a single-sink pipeline today, and the concrete
-pressure that turns issue #13 from speculative into motivated.
+from without import compose, from_map, from_selector, tee
+from without_logging import (
+    Level, add_fields, at_least, capture, offload, to_rotating_file, to_stream,
+)
+
+async with (
+    offload(to_stream(sys.stderr)) as console,
+    offload(to_rotating_file(name, max_bytes=64 * 1024 * 1024)) as file,
+    capture(
+        compose(
+            add_fields(service="api"),                        # shared: parsed + enriched once
+            tee(
+                compose(from_map(render_console), console),   # console: everything, human-readable
+                compose(                                      # file: WARNING+, as JSON
+                    from_selector(at_least(Level.WARNING)),
+                    compose(from_map(render_json), file),
+                ),
+            ),
+        ),
+        level=logging.DEBUG,
+    ),
+):
+    ...
+```
+
+`parse_record` runs once and `add_fields` runs once; then the stream splits. The
+console branch renders every record, the file branch keeps `WARNING`+ and renders
+JSON (`render_console` and `render_json` are your `from_map(Record -> str)`
+steps, the encoding boundary the app owns). Each branch owns its own worker
+thread through its `offload`, so a slow disk never blocks the console. A branch
+MAY itself be another `tee`, so "one input, several sink groups" nests. With one
+`capture` at `DEBUG`, the per-branch `from_selector` does the level filtering, so
+each sink keeps exactly what it wants without a second pass over the records.
+
+The *fan-in* half is still ahead. `tee` covers splitting one stream; merging
+several back (app records, stdlib-captured records, and per-request sub-streams
+that appear and vanish, folded into one pipeline) wants a `merge` over a
+*changing* set of sources, the primitive
+[issue #13](https://github.com/JoshKarpel/without/issues/13) flags as the one the
+old static `merge` never covered. `broadcast` (fan-out-*fan-in*, a `tee` whose
+branches emit and are merged back into one stream) is reserved there for the same
+day. Neither is needed to drive several sinks today.
 
 ## What is deliberately not here
 

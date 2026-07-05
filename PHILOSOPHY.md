@@ -165,9 +165,10 @@ background task), which is why they are builders and not wiring; dropping an eve
 needs neither. Their predicate is `async` like every other builder step, keeping
 one color of function throughout: a decision that must `await` I/O composes with a
 pure one that never does. Emitting *several* outputs per event is the other
-direction, and it stays deliberately a wiring concern (the fan-out family, issue
-#13), because splitting one input across many outputs is where the
-queue-and-background-task complexity lives.
+direction, and it stays deliberately a wiring concern, because splitting one input
+across many consumers is where the queue-and-background-task complexity lives:
+fanning a stream out to several terminal sinks ships as `tee`, and the mid-stream
+fan-out/fan-in family stays in issue #13.
 
 ## How processors connect
 
@@ -188,11 +189,14 @@ canonical one: it is where a stream becomes readable state. Closability is
 signalled structurally: shutting down a queue (`queue.shutdown()`) ends the
 stream it feeds, which lets a downstream fold return its final value.
 
-Wiring deliberately stops there. A cluster of fan-out/fan-in connectors
-(`distribute`, `tee`, `broadcast`, `route`, `merge`) is *not* part of the core: no
-shipped package needs them, so they would be speculative surface carrying real
-queue-and-background-task complexity. The design is recorded for when a concrete
-fan-out/fan-in need calls for them (see `issues/`).
+One fan-out connector earns its place: `tee` splits a stream across several
+terminal `Sink` branches, each with its own tail, so a shared prefix runs once and
+every branch consumes its own copy. `without-logging`'s need to drive a console and
+a file at once is the concrete use case that motivates it. The rest of the
+fan-out/fan-in cluster (`distribute`, `broadcast`, `route`, `merge`) stays out of
+the core: no shipped package needs it, so it would be speculative surface carrying
+real queue-and-background-task complexity, and the design is recorded for when a
+concrete need calls for it (see issue #13).
 
 ## Lifespan as a variable: a connection's lifecycle is a stream's
 

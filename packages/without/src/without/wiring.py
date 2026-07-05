@@ -1,6 +1,8 @@
 # How processors connect. `compose` chains one processor into the next on the
 # event edge (pure composition, nothing running), or a processor onto a terminal
-# `Sink` to yield a `Sink`. `stack` composes middleware
+# `Sink` to yield a `Sink`. `tee` is the terminal fan-out: it splits one stream
+# across several `Sink` branches, each with its own tail, so a shared prefix runs
+# once and each branch consumes its own copy. `stack` composes middleware
 # (handler-wrapping functions) into one. `sample` is the behavior edge: it
 # exposes a stream's latest value as a Context, which needs a `background_task`
 # running, the thin boundary where the imperative shell shows up.
@@ -133,6 +135,62 @@ def compose[A, B, C](first: Processor[A, B], second: Processor[B, C] | Sink[B]) 
         return second(first(inputs))
 
     return cast("Processor[A, C] | Sink[A]", composed)
+
+
+def tee[T](*sinks: Sink[T], buffer: int = 1) -> Sink[T]:
+    """
+    Fan one stream out to every `sink`: the terminal counterpart to `compose`.
+
+    Where `compose` chains a processor onto a *single* sink, `tee` splits the stream
+    across several, after the Unix tool that writes one input to many destinations.
+    Every sink sees every event, in order, and the input is consumed exactly once.
+    The caller controls the split point purely by placement, since each argument is
+    itself a `Sink`: whatever is composed *before* the `tee` is the shared prefix
+    (parsed and enriched once), and each branch is its own `Sink`, carrying its own
+    filtering, rendering, and terminal. A branch MAY itself be another `tee`, so
+    "one input, several sink groups" nests without new machinery.
+
+    One pump reads the source once and pushes each value onto every branch's bounded
+    queue; each sink drains its own queue concurrently, and when the source ends the
+    queues are shut so each branch's stream ends and its sink returns. Every branch
+    MUST be consumed to completion and concurrently: a sink that stops early leaves
+    its queue to fill and stalls the pump (real sinks, a filter that drops events
+    included, drain every input). A sink failure tears the whole `tee` down and
+    surfaces as an `ExceptionGroup`, so a broken branch fails loud rather than
+    silently starving the rest.
+
+    `buffer` is how far a branch may run ahead: the queues are bounded to it, so the
+    slowest branch gates the pump (and thus backpressure onto the source), while a
+    larger value trades memory for slack so a fast branch need not wait on a slow
+    one. The default `1` keeps memory `O(sinks)`. At least one sink is REQUIRED, and
+    `buffer` MUST be at least 1 (an unbounded branch could grow memory without limit).
+    """
+    if not sinks:
+        raise ValueError("tee requires at least one sink")
+    if buffer < 1:
+        raise ValueError(f"buffer must be at least 1, but got {buffer}")
+
+    async def teeing(inputs: Stream[T]) -> None:
+        queues: list[asyncio.Queue[T]] = [asyncio.Queue(maxsize=buffer) for _ in sinks]
+
+        async def pump() -> None:
+            try:
+                async for value in inputs:
+                    for queue in queues:
+                        await queue.put(value)
+            finally:
+                for queue in queues:
+                    queue.shutdown()
+
+        async def drive(sink: Sink[T], queue: asyncio.Queue[T]) -> None:
+            await sink(stream_from_queue(queue))
+
+        async with asyncio.TaskGroup() as group:
+            group.create_task(pump())
+            for sink, queue in zip(sinks, queues, strict=True):
+                group.create_task(drive(sink, queue))
+
+    return teeing
 
 
 type Endo[T] = Callable[[T], T]

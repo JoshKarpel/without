@@ -39,8 +39,9 @@ is its polarity-dual, dropping the matches. They are the zero-or-one case the
 `Processor` protocol always allowed, so no new machinery. Their predicate is
 `async` like every other builder step (one color of function throughout, so a
 decision that needs to `await` I/O composes without ceremony; a pure one just
-never awaits). Emitting *several* outputs per event, by contrast, stays a wiring
-concern (issue #13), not a builder.
+never awaits). Emitting *several* outputs per event, by contrast, is a wiring
+concern, not a builder: fan-out to several sinks is `tee` (below), and the
+fan-in family (`broadcast`, `merge`) is reserved in issue #13.
 
 ## Wiring (`without.wiring`)
 
@@ -48,6 +49,9 @@ concern (issue #13), not a builder.
 the only connector that needs nothing running. When its second argument is a
 `Sink` rather than a `Processor`, the result is a `Sink` too, which is how a
 middleware chain (a filter, an enrichment) is prefixed onto a terminal consumer.
+`tee` is its terminal fan-out counterpart: `tee(*sinks)` returns one `Sink` that
+splits a stream across several branches, each with its own tail, so a shared
+prefix composed ahead of it runs once and every branch consumes its own copy.
 `sample` is the behavior edge: it
 exposes a stream's latest value as a `Context` (latest-wins, no backpressure),
 driven by a `background_task` for the life of its `with` block. The source and
