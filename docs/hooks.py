@@ -60,7 +60,9 @@ def workspace_edges(members: dict[str, dict[str, object]]) -> list[tuple[str, st
 
 def render_graph_page(members: dict[str, dict[str, object]]) -> str:
     published = {name: members[name] for name in publishable(members)}
-    lines = ["graph TD"]
+    # Bottom-to-top so the depended-on core (arrow heads) ranks at the top and
+    # dependents build upward from it, while each arrow still reads "depends on".
+    lines = ["graph BT"]
     lines.extend(f"    {import_name(name)}[{name}]" for name in published)
     lines.extend(
         f"    {import_name(source)} --> {import_name(target)}" for source, target in workspace_edges(published)

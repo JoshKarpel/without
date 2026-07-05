@@ -7,9 +7,11 @@ from without import buffer
 from without import collect
 from without import compose
 from without import from_scan
+from without import from_sink
 from without import sample
 from without import stream_from_iterable
 from without import stream_from_queue
+from without import tee
 from without.testing import yield_once
 
 
@@ -35,6 +37,85 @@ async def test_compose_adapts_the_join_type() -> None:
     chained = compose(from_scan(None, measure), from_scan(None, label))
 
     assert await collect(chained(stream_from_iterable(["ab", "cdef"]))) == ["len=2", "len=4"]
+
+
+async def test_compose_prefixes_a_processor_onto_a_sink() -> None:
+    async def measure(event: str, _: None) -> Transition[None, int]:
+        return Transition(state=None, output=len(event))
+
+    drained: list[int] = []
+
+    async def collect_length(length: int) -> None:
+        drained.append(length)
+
+    lengths_into = compose(from_scan(None, measure), from_sink(collect_length))
+
+    await lengths_into(stream_from_iterable(["ab", "cdef", "x"]))
+
+    assert drained == [2, 4, 1]
+
+
+async def test_tee_delivers_every_value_to_every_sink_in_order() -> None:
+    left: list[int] = []
+    right: list[int] = []
+
+    async def push_left(value: int) -> None:
+        left.append(value)
+
+    async def push_right(value: int) -> None:
+        right.append(value)
+
+    await tee(from_sink(push_left), from_sink(push_right))(stream_from_iterable([5, 6, 7]))
+
+    assert left == [5, 6, 7]
+    assert right == [5, 6, 7]
+
+
+async def test_tee_delivers_every_value_to_a_slower_branch() -> None:
+    fast: list[int] = []
+    slow: list[int] = []
+
+    async def push_fast(value: int) -> None:
+        fast.append(value)
+
+    async def push_slow(value: int) -> None:
+        await yield_once()  # let the fast branch pull ahead before this one records
+        slow.append(value)
+
+    await tee(from_sink(push_fast), from_sink(push_slow), buffer=4)(stream_from_iterable([8, 9, 10]))
+
+    assert fast == [8, 9, 10]
+    assert slow == [8, 9, 10]
+
+
+async def test_tee_requires_at_least_one_sink() -> None:
+    with pytest.raises(ValueError, match="at least one sink"):
+        tee()
+
+
+async def test_tee_rejects_a_nonpositive_buffer() -> None:
+    async def discard(value: int) -> None: ...
+
+    with pytest.raises(ValueError, match="at least 1"):
+        tee(from_sink(discard), buffer=0)
+
+
+async def test_tee_surfaces_a_sink_failure() -> None:
+    class SinkFailed(Exception):
+        pass
+
+    seen: list[int] = []
+
+    async def record(value: int) -> None:
+        seen.append(value)
+
+    async def fail(value: int) -> None:
+        raise SinkFailed("branch broke")
+
+    with pytest.raises(ExceptionGroup) as excinfo:
+        await tee(from_sink(record), from_sink(fail))(stream_from_iterable([1, 2, 3]))
+
+    assert any(isinstance(error, SinkFailed) for error in excinfo.value.exceptions)
 
 
 async def test_stream_from_queue_yields_pushed_values_in_order() -> None:
