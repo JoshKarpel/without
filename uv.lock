@@ -19,6 +19,7 @@ members = [
     "without-dag",
     "without-env",
     "without-http",
+    "without-logging",
     "without-web",
     "without-workspace",
 ]
@@ -1392,6 +1393,17 @@ requires-dist = [
 ]
 
 [[package]]
+name = "without-logging"
+version = "0.0.0"
+source = { editable = "packages/without-logging" }
+dependencies = [
+    { name = "without" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "without", editable = "packages/without" }]
+
+[[package]]
 name = "without-web"
 version = "0.0.0"
 source = { editable = "packages/without-web" }
@@ -1417,6 +1429,7 @@ dependencies = [
     { name = "without-dag" },
     { name = "without-env" },
     { name = "without-http" },
+    { name = "without-logging" },
     { name = "without-web" },
 ]
 
@@ -1454,6 +1467,7 @@ requires-dist = [
     { name = "without-dag", editable = "packages/without-dag" },
     { name = "without-env", editable = "packages/without-env" },
     { name = "without-http", editable = "packages/without-http" },
+    { name = "without-logging", editable = "packages/without-logging" },
     { name = "without-web", editable = "packages/without-web" },
 ]
 

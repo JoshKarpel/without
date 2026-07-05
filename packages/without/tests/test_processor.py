@@ -1,8 +1,10 @@
 from without import Transition
 from without import collect
+from without import from_filter
 from without import from_fold
 from without import from_map
 from without import from_scan
+from without import from_selector
 from without import from_sink
 from without import stream_from_iterable
 from without.testing import resolved_next_turn
@@ -52,6 +54,26 @@ async def test_from_map_awaits_contained_io_per_event() -> None:
     outputs = await collect(doubler(stream_from_iterable([3, 4, 5])))
 
     assert outputs == [6, 8, 10]
+
+
+async def is_even(n: int) -> bool:
+    return n % 2 == 0
+
+
+async def test_from_selector_keeps_only_the_matching_events() -> None:
+    keep_even = from_selector(is_even)
+
+    outputs = await collect(keep_even(stream_from_iterable([3, 4, 5, 6, 7])))
+
+    assert outputs == [4, 6]
+
+
+async def test_from_filter_drops_the_matching_events() -> None:
+    drop_even = from_filter(is_even)
+
+    outputs = await collect(drop_even(stream_from_iterable([3, 4, 5, 6, 7])))
+
+    assert outputs == [3, 5, 7]
 
 
 async def test_from_fold_reduces_the_stream_to_a_final_state() -> None:

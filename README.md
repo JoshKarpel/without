@@ -48,6 +48,9 @@ packages). Each package is its own top-level import.
   workflows: a `Graph` builder threads value types through the wiring, and a
   single-input graph is an async callable that `from_map` lifts straight into a
   `Processor`. Imported as `without_dag`.
+- `packages/without-logging` — a logging pipeline: stdlib log records parsed into
+  immutable `Record` values at a `capture` boundary, filtered and enriched as
+  processors, drained to a sink the app owns. Imported as `without_logging`.
 - `packages/integration` — not a real package (and never published: its name
   sits outside the `without*` family, so the publish workflow skips it): depends
   on `without` and every plugin so they can be exercised together in

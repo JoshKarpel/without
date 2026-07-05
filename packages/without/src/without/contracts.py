@@ -143,6 +143,55 @@ async def _map[In, Out](
         yield await step(event)
 
 
+def from_selector[T](keep: Callable[[T], Awaitable[bool]]) -> Processor[T, T]:
+    """
+    Build a processor that keeps events for which `keep` is true and drops the rest.
+
+    A `Processor` is any `Stream -> Stream` function, so a step is under no
+    obligation to emit exactly one output per event the way `from_map` does: it
+    MAY yield zero. A selector is that zero-or-one case, an async generator that
+    re-emits an event on a match and skips to the next input otherwise, keeping
+    the matching *subset* through unchanged. This is the same sense as Python's
+    built-in `filter` (keep the matches).
+
+    Like every other builder step, `keep` is `async`: a predicate is one color
+    of function throughout `without`, so a decision that needs to `await` I/O (an
+    async permission check, a lookup) composes without ceremony, and a pure
+    decision simply never awaits (it MAY read injected `Context` values, whose
+    `current` never blocks). The polarity-opposite builder is `from_filter`,
+    which drops the matches. Emitting *several* outputs per event, by contrast, is
+    a wiring-style concern rather than a builder one (see `without.wiring`).
+    """
+
+    async def selected(inputs: Stream[T]) -> AsyncIterator[T]:
+        async for event in inputs:
+            if await keep(event):
+                yield event
+
+    return selected
+
+
+def from_filter[T](reject: Callable[[T], Awaitable[bool]]) -> Processor[T, T]:
+    """
+    Build a processor that drops events for which `reject` is true and keeps the rest.
+
+    `from_selector` with the opposite polarity: where a selector keeps the
+    matching subset, a filter removes it (filtering those events *out*). The two
+    are duals, `from_filter(reject)` being `from_selector` of the negated
+    predicate, and both exist because naming the intent positively at the call
+    site (`from_filter(is_health_check)`, `from_selector(is_error)`) reads better
+    than threading a negation through a predicate. Note this is the opposite
+    polarity to Python's built-in `filter`, which *keeps* matches, as
+    `from_selector` does; `from_filter` is `itertools.filterfalse`. Like
+    `from_selector`, the predicate is `async`.
+    """
+
+    async def keep(event: T) -> bool:
+        return not await reject(event)
+
+    return from_selector(keep)
+
+
 type Sink[In] = Callable[[Stream[In]], Awaitable[None]]
 type Fold[In, S] = Callable[[Stream[In]], Awaitable[S]]
 
