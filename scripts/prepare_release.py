@@ -55,11 +55,14 @@ def publishable_pyprojects(packages_dir: Path) -> list[Path]:
 
 
 def main(version: str, packages_dir: Path) -> None:
-    pyprojects = publishable_pyprojects(packages_dir)
-    siblings = frozenset(tomllib.loads(path.read_text())["project"]["name"] for path in pyprojects)
-    for path in pyprojects:
-        path.write_text(stamp_and_pin(path.read_text(), version, siblings))
-        print(f"pinned {path.parent.name} -> {version}")
+    names = {
+        path: str(tomllib.loads(path.read_text(encoding="utf-8"))["project"]["name"])
+        for path in publishable_pyprojects(packages_dir)
+    }
+    siblings = frozenset(names.values())
+    for path, name in names.items():
+        path.write_text(stamp_and_pin(path.read_text(encoding="utf-8"), version, siblings), encoding="utf-8")
+        print(f"pinned {name} -> {version}")
 
 
 if __name__ == "__main__":
