@@ -50,18 +50,25 @@ from without_web.patterns import PathSpec
 from without_web.patterns import Segment
 from without_web.patterns import split_path
 from without_web.responses import buffered
+from without_web.router import Delegate
 from without_web.router import Endpoint
 from without_web.router import HttpEndpoint
 from without_web.router import Match
-from without_web.router import Mount
 from without_web.router import Pattern
+from without_web.router import Reversible
 from without_web.router import Route
 from without_web.router import Router
+from without_web.router import WebsocketDelegate
 from without_web.router import WebsocketEndpoint
 from without_web.router import WebsocketRoute
 from without_web.router import WebsocketRouter
+from without_web.router import delegate
+from without_web.router import mount
 from without_web.router import route
+from without_web.router import url_for
 from without_web.router import with_middleware
+from without_web.router import ws_delegate
+from without_web.router import ws_mount
 from without_web.router import ws_route
 
 __all__ = [
@@ -73,6 +80,7 @@ __all__ = [
     "Body",
     "CatchAll",
     "Converter",
+    "Delegate",
     "Describable",
     "Endpoint",
     "ExceptionRecover",
@@ -81,7 +89,6 @@ __all__ = [
     "HttpEndpoint",
     "Literal",
     "Match",
-    "Mount",
     "Param",
     "PathSpec",
     "Pattern",
@@ -90,6 +97,7 @@ __all__ = [
     "Request",
     "ResponseSpec",
     "Returned",
+    "Reversible",
     "Route",
     "RouteSpec",
     "Router",
@@ -98,6 +106,7 @@ __all__ = [
     "Segment",
     "Sequence",
     "Single",
+    "WebsocketDelegate",
     "WebsocketEndpoint",
     "WebsocketExceptionRecover",
     "WebsocketReturned",
@@ -108,6 +117,7 @@ __all__ = [
     "catch_all",
     "catching",
     "catching_websocket",
+    "delegate",
     "delete",
     "describe",
     "get",
@@ -117,6 +127,7 @@ __all__ = [
     "header_param",
     "http_scope",
     "into",
+    "mount",
     "openapi",
     "options",
     "patch",
@@ -126,8 +137,11 @@ __all__ = [
     "query_param",
     "route",
     "split_path",
+    "url_for",
     "websocket_scope",
     "with_middleware",
     "ws",
+    "ws_delegate",
+    "ws_mount",
     "ws_route",
 ]

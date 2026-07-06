@@ -4,8 +4,8 @@ An opinionated HTTP and WebSocket router for
 [`without-asgi`](../without-asgi). `without-asgi` deliberately ships *no* router,
 only the unopinionated boundary and composition tools. `without-web` is the
 opinionated layer on top: t-string patterns with typed parameters, typed request
-extraction, 405-vs-404, mounting, scoped middleware, exception handlers, and
-OpenAPI.
+extraction, 405-vs-404, mounting, scoped middleware, exception handlers, reverse
+routing (`url_for`), and OpenAPI.
 
 It snaps onto the boundary through nothing but the existing `HttpRouter` type:
 `Router.dispatch` *is* an `HttpRouter[T]`, so `make_asgi_app(http=router.dispatch)`
@@ -39,4 +39,4 @@ See the
 [`without-web` guide](https://without.help/guides/without-web/)
 (with the [API reference](https://without.help/reference/without_web/))
 for the full surface: patterns, extractors, streaming input, mounting,
-middleware, exception handlers, OpenAPI, and WebSocket routing.
+middleware, exception handlers, reverse routing, OpenAPI, and WebSocket routing.

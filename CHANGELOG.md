@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Added
+
+- **`without-web`**: reverse routing. `url_for(route, values)` renders a route back to a concrete
+  path from the values for its path parameters, the inverse of the trie walk. It is a plain
+  function of the route *value* (routes are identified by value, no registry), each value fed back
+  through its converter to prove it round-trips (parse, don't validate, in reverse). Because
+  `mount` bakes any prefix into the route, a route is a self-contained value whose segments are its
+  full path, so reversing needs no router and holds no hidden prefix: a handler links by referencing
+  a route value (immutable), and a websocket handler reverses an HTTP route to link to its resource
+  with the same call.
+
+### Changed
+
+- **`without-web`**: routing and mounting reworked around self-contained route values. `mount(prefix,
+  *middleware)` and `ws_mount(...)` are transforms that bake the prefix (and per-route middleware)
+  into routes, reusable and usable as decorators; `delegate(prefix, app)` and `ws_delegate(...)`
+  mount an opaque BYO app as a black box with the prefix-trimmed scope. This replaces the former
+  `Mount`/`WebsocketMount` wrapper (a transparent sub-router is now just its baked routes), so a
+  route carries its own full path — matching, OpenAPI, and reverse routing all read it directly, and
+  a nested opaque app is trimmed by its full accumulated prefix by construction. Reverse routing is
+  now the free `url_for` function rather than a `Router.url_for` method plus a `url_for()` extractor
+  injected through `Match`.
+
 ## 0.0.1
 
 ### Added
