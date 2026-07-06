@@ -2,9 +2,11 @@
 
 ## Unreleased
 
+## 0.0.1
+
 ### Added
 
-- **`without`**: the narrow-waist core. The `Stream` / `Processor` / `Context`
+- **`without-core`** (imported as `without`): the narrow-waist core. The `Stream` / `Processor` / `Context`
   contracts, the builders (`from_map`, `from_scan`, `from_sink`, `from_fold`, and
   the polarity-dual predicate filters `from_selector` / `from_filter`), the wiring
   connectors (`compose`, which also composes a processor onto a terminal `Sink`;

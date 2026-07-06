@@ -3,7 +3,11 @@ requires = ["uv_build>=0.11.25,<0.12"]
 build-backend = "uv_build"
 
 [project]
-name = "without"
+# The bare `without` distribution name is rejected by PyPI (too similar to an
+# existing project / prohibited; PyPI does not disclose which). The importable
+# module stays `without` via `[tool.uv.build-backend] module-name` below, so
+# only the published distribution name carries the `-core` suffix.
+name = "without-core"
 version = "0.0.0"
 description = "Core contracts and executor for without: the sans-IO stream-processor substrate."
 readme = "README.md"
@@ -14,10 +18,17 @@ authors = [
 requires-python = ">=3.14"
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
+    "Framework :: AsyncIO",
     "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
     "Typing :: Typed",
 ]
 dependencies = []
+
+[tool.uv.build-backend]
+module-name = "without"

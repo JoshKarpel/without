@@ -60,7 +60,7 @@ from the source docstrings.
 ## Installing
 
 ```bash
-pip install without           # the core contracts
+pip install without-core      # the core contracts (imported as `without`)
 pip install without-web       # plus whichever plugins you need
 ```
 
