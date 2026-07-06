@@ -31,21 +31,51 @@ def requirement_name(requirement: str) -> str:
     return re.split(r"[<>=!~;\[ ]", requirement, maxsplit=1)[0].strip()
 
 
-def stamp_and_pin(pyproject_text: str, version: str, siblings: frozenset[str]) -> str:
+def replace_once(text: str, old: str, new: str, *, path: Path, what: str) -> str:
+    """
+    Like `text.replace(old, new)`, but raise if `old` was not present.
+
+    A silent no-op replace here would defeat the release safety goal: a wheel
+    could publish with an unstamped version or an unpinned sibling. Failing
+    loud on the missing substring (usually pyproject formatting drift) surfaces
+    the problem before anything is built.
+    """
+    if old not in text:
+        raise ValueError(f"{path}: expected to {what} but found no '{old}' to replace")
+    return text.replace(old, new)
+
+
+def stamp_and_pin(pyproject_text: str, version: str, siblings: frozenset[str], path: Path) -> str:
     """
     Set the member's own version to `version` and pin each sibling dependency to it.
 
     Only dependencies naming a `sibling` are rewritten; third-party requirements
     are left untouched. Editing the raw text (rather than re-serializing the
     parsed document) keeps formatting and comments stable.
+
+    Raises `ValueError` naming `path` if any expected substitution finds no
+    target to replace, so formatting drift cannot silently produce an unpinned
+    build.
     """
     document = tomllib.loads(pyproject_text)
     project = document["project"]
-    pinned = pyproject_text.replace(f'version = "{project["version"]}"', f'version = "{version}"', 1)
+    pinned = replace_once(
+        pyproject_text,
+        f'version = "{project["version"]}"',
+        f'version = "{version}"',
+        path=path,
+        what=f"stamp version {version}",
+    )
     for requirement in project.get("dependencies", []):
         name = requirement_name(requirement)
         if name in siblings:
-            pinned = pinned.replace(f'"{requirement}"', f'"{name}=={version}"')
+            pinned = replace_once(
+                pinned,
+                f'"{requirement}"',
+                f'"{name}=={version}"',
+                path=path,
+                what=f"pin sibling {name}",
+            )
     return pinned
 
 
@@ -61,7 +91,7 @@ def main(version: str, packages_dir: Path) -> None:
     }
     siblings = frozenset(names.values())
     for path, name in names.items():
-        path.write_text(stamp_and_pin(path.read_text(encoding="utf-8"), version, siblings), encoding="utf-8")
+        path.write_text(stamp_and_pin(path.read_text(encoding="utf-8"), version, siblings, path), encoding="utf-8")
         print(f"pinned {name} -> {version}")
 
 

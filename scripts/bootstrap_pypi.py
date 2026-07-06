@@ -2,20 +2,21 @@
 # requires-python = ">=3.14"
 # ///
 """
-Reserve named PyPI projects with empty `0.0.0` placeholder releases.
+Reserve PyPI projects with empty `0.0.0` placeholder releases.
 
 A brand-new project cannot use this repo's trusted-publishing workflow directly:
 pending trusted publishers must be unique on `(owner, repo, workflow,
-environment)`, so the seven `without*` projects that share one workflow cannot
-all be pre-registered (https://github.com/pypi/warehouse/issues/16920). The way
-around it is to make each project *exist* first, then attach a normal trusted
-publisher (those freely share the tuple).
+environment)`, so the `without*` projects that share one workflow cannot all be
+pre-registered (https://github.com/pypi/warehouse/issues/16920). The way around
+it is to make each project *exist* first, then attach a normal trusted publisher
+(those freely share the tuple).
 
 This script creates each named project by uploading a minimal, empty `0.0.0`
 distribution. The first real release (a `v0.1.0`+ tag) supersedes it via the
 normal publish workflow. It is idempotent (names already on the index are
-skipped), and you name exactly the projects to reserve, so the same command
-covers both the initial bootstrap and a single new package added later.
+skipped), and you name exactly the projects to reserve: PyPI caps new-project
+creation at a few per day, so the initial bootstrap is done in batches, and a
+single new package added later is the same one-name command.
 
 Auth uses an account-scoped token, since the projects do not exist yet: set
 `UV_PUBLISH_TOKEN` (or let `uv publish` prompt). Pass `--test` to target TestPyPI.
@@ -36,10 +37,6 @@ TEST_PYPI_INDEX = "https://test.pypi.org"
 TEST_PYPI_UPLOAD = "https://test.pypi.org/legacy/"
 
 
-def import_name(distribution_name: str) -> str:
-    return distribution_name.replace("-", "_")
-
-
 def placeholder_pyproject(name: str) -> str:
     return (
         "[build-system]\n"
@@ -57,7 +54,7 @@ def placeholder_pyproject(name: str) -> str:
 def write_placeholder(name: str, root: Path) -> Path:
     """Write a minimal empty package for `name` under `root`, returning its directory."""
     package_dir = root / name
-    module_dir = package_dir / "src" / import_name(name)
+    module_dir = package_dir / "src" / name.replace("-", "_")
     module_dir.mkdir(parents=True)
     (module_dir / "__init__.py").write_text("")
     (package_dir / "pyproject.toml").write_text(placeholder_pyproject(name))

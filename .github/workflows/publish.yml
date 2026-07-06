@@ -13,11 +13,11 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      # This monorepo publishes seven distributions from one run, so no single
-      # PyPI project is "the" project; the repo name (`without`) is not itself a
+      # This monorepo publishes the whole `without*` family from one run, so no
+      # single PyPI project is "the" project; the repo name (`without`) is not a
       # project (the core distributes as `without-core`). Trusted publishing is
       # many-to-many, so this one workflow uploads the whole `without*` family:
-      # register the same trusted publisher on each project. Link the flagship.
+      # register the same trusted publisher on each project.
       url: https://pypi.org/p/without-core
     permissions:
       id-token: write # trusted publishing exchanges this OIDC token for a PyPI upload credential

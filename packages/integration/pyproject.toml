@@ -11,11 +11,11 @@ license = "MIT"
 authors = [
     { name = "Josh Karpel", email = "josh.karpel@gmail.com" },
 ]
+requires-python = ">=3.14"
 # Never published: the name sits outside the `without*` family the publish
 # workflow globs, and this classifier makes PyPI reject an upload if it ever
 # slips through.
 classifiers = ["Private :: Do Not Upload"]
-requires-python = ">=3.14"
 dependencies = [
     "without-core",
     "without-env",

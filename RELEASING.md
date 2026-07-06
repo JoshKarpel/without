@@ -20,16 +20,20 @@ bounds are not.
 
 ## Distribution names
 
-- **`without-core`** is the core distribution; it imports as `without` (the bare
+The publishable set is exactly the `packages/without*` workspace members. That
+glob is the single source of truth (the publish workflow, the release stamper,
+and the bootstrap script all derive it), so this document does not enumerate the
+packages.
+
+- The core distribution is **`without-core`**, imported as `without`: the bare
   `without` name is unavailable on PyPI, so a `[tool.uv.build-backend]
   module-name` override keeps the import name while the distribution carries the
-  `-core` suffix).
-- **`without-env`, `without-configmap`, `without-asgi`, `without-web`,
-  `without-http`, `without-dag`** are the plugins; distribution name and import
-  name match (with `-`/`_` normalization).
+  `-core` suffix.
+- Every other `without*` member's distribution name matches its import name
+  (with `-`/`_` normalization).
 - **`integration`** is never published: its name sits outside the `without*`
-  family the publish glob selects, and its `Private :: Do Not Upload` classifier
-  makes PyPI reject an upload if it ever slips through.
+  family the glob selects, and its `Private :: Do Not Upload` classifier makes
+  PyPI reject an upload if it ever slips through.
 
 ## Intra-workspace dependencies are pinned at build
 
@@ -80,7 +84,7 @@ above is repeated once per project.
 
 A project must **exist** before a normal trusted publisher can be attached to it,
 and the pending-publisher shortcut does not scale to this monorepo: pending
-publishers must be unique on `(owner, repo, workflow, environment)`, so the seven
+publishers must be unique on `(owner, repo, workflow, environment)`, so the
 `without*` projects sharing one workflow cannot all be pre-registered
 ([warehouse#16920](https://github.com/pypi/warehouse/issues/16920)).
 
@@ -90,38 +94,26 @@ publisher above to each:
 
 1. Create a short-lived **account-scoped** PyPI API token (Account settings →
    API tokens), and export it: `export UV_PUBLISH_TOKEN=pypi-...`.
-2. Reserve every project by name (the recipe confirms first, since it uploads to
-   the real index):
+2. Reserve the publishable `without*` members, naming each explicitly (the
+   recipe confirms first, since it uploads to the real index). PyPI caps
+   new-project creation at a few per day, so reserve them in batches over a few
+   days rather than all at once:
 
    ```bash
-   just bootstrap-pypi without-core without-asgi without-configmap \
-       without-dag without-env without-http without-web
+   just bootstrap-pypi without-core without-asgi
    ```
 
    It uploads an empty `0.0.0` placeholder for each named project that does not
-   yet exist, skipping any already registered. To rehearse without uploading,
-   call the script directly: `uv run --script scripts/bootstrap_pypi.py --test
-   <names>` (TestPyPI) or `--dry-run` (build only).
+   yet exist, skipping any already registered, so re-running to pick up where a
+   batch left off is safe. To rehearse without uploading, call the script
+   directly: `uv run --script scripts/bootstrap_pypi.py --test <names...>`
+   (TestPyPI) or `--dry-run` (build only).
 3. On each freshly created project, add the trusted publisher (owner
    `JoshKarpel`, repo `without`, workflow `publish.yml`, environment `pypi`).
 4. Delete the account-scoped token. From here on, releases authenticate over
    OIDC with no stored secret; the first real release (`v0.1.0`+) supersedes the
    `0.0.0` placeholders.
 
-The script is idempotent and reserves exactly the names you pass, so introducing
-a new package later is the same two steps for that one name: `just bootstrap-pypi
-without-newthing`, then attach its trusted publisher.
-
-## Cooldown for consumers
-
-Downstream projects that depend on `without*` should adopt a dependency cooldown
-(a sliding "last N days" window) as a supply-chain defense against a compromised
-release, rather than resolving to a brand-new upload the moment it lands. With
-uv, set it in the consumer's `pyproject.toml`:
-
-```toml
-[tool.uv]
-exclude-newer = "7 days"
-```
-
-Pin a specific version to bypass the cooldown when a fresh release is needed.
+The script is idempotent, so introducing a new package later is the same two
+steps: `just bootstrap-pypi without-newthing` to reserve just that name, then
+attach its trusted publisher.
