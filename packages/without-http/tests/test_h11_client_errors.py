@@ -43,5 +43,5 @@ async def test_a_connection_close_response_is_not_returned_to_the_pool() -> None
         async with pool.request("GET", f"http://{host}:{port}/") as (head, body):
             assert head.status == 200
             assert await body.read() == b"hi"
-        idle = sum(len(connections) for connections in pool._idle_h11.values())
+        idle = sum(len(host_pool.idle) for host_pool in pool._h11.values())
     assert idle == 0

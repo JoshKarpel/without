@@ -114,7 +114,7 @@ async def test_h11_dropping_trailers_still_keeps_the_connection_alive() -> None:
     async with _raw_http11_server(response) as (host, port), ConnectionPool() as pool:
         async with pool.request("GET", f"http://{host}:{port}/") as (_head, body):
             assert await body.read() == b"hello"  # drops the trailer block
-        idle = sum(len(connections) for connections in pool._idle_h11.values())
+        idle = sum(len(host_pool.idle) for host_pool in pool._h11.values())
     assert idle == 1
 
 

@@ -208,3 +208,8 @@ force-single-line = true
     "ASYNC110", # tests poll observed state (in_flight, started counts) with sleep loops; no Event to await
     "SIM117",   # nested `with` expresses resource scoping (server > pool > request); flattening moves scoped asserts
 ]
+"packages/without-http/src/without_http/client.py" = [
+    # `timeout` is a `Timeout` config value threaded to the API boundary (the httpx-parity public name),
+    # not a raw seconds deadline; it is applied via `asyncio.timeout` inside `phase`, so ASYNC109's advice is met.
+    "ASYNC109",
+]

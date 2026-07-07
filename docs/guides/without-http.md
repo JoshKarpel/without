@@ -185,6 +185,104 @@ Open the pool as an async context manager so its connections are closed on exit;
 directly-constructed `ConnectionPool()` works for short-lived use but does not manage
 the long-lived connections keep-alive retains.
 
+`max_connections_per_host` bounds the concurrent HTTP/1.1 connections to one origin:
+at the bound a checkout *waits* for one to be returned rather than opening another
+(the wait a `pool` timeout guards). It is unbounded by default, mirroring the
+server's choice to let OS backpressure cap connections rather than an in-process
+limit; opt into a bound when you want explicit per-host backpressure. The h2 side has
+an intrinsic sibling: stream issuance is gated against the server's advertised
+`SETTINGS_MAX_CONCURRENT_STREAMS`, so a burst never over-issues streams on the one
+multiplexed connection.
+
+### Duplex and bidirectional streaming
+
+The request body and the response are handled **concurrently**: the body is sent by
+a background task while the response head and body are read, so a server can answer
+before the request body is fully sent. This is what lets a client survive the classic
+large-upload deadlock, where a server rejects a big upload early (a `413`, a redirect)
+and stops reading: the early response is read even though the request-body write is
+still backed up on the wire.
+
+Because the request body is a lazy `Stream[bytes]`, this extends to genuine
+bidirectional streaming: hand `pool.request` a queue-backed generator and feed it
+*in reaction to* the response you are reading (the gRPC ping-pong shape).
+
+```python
+outbound: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+async def request_body() -> AsyncIterator[bytes]:
+    while (chunk := await outbound.get()) is not None:
+        yield chunk
+
+await outbound.put(first_message)          # client speaks first
+async with pool.request("POST", url, body=request_body()) as (head, body):
+    async for message in body:
+        await outbound.put(reply_to(message))   # or None to end the request
+```
+
+The framework provides the *mechanism* (a concurrent duplex transport); you own the
+*policy* (the interleaving protocol, and the knowledge of the server's contract that
+keeps it from deadlocking). It deliberately does not buffer or force the body to
+finish first, since that would defeat the pattern. A `write`/`read` timeout (below) is
+the opt-in safety net that turns a mis-designed interleaving from an eternal hang into
+a typed error you chose to arm.
+
+This is genuinely correct over **HTTP/2**, whose independent per-direction flow
+control is what bidi is built on. Over **HTTP/1.1** the same code runs, but real
+duplex is limited by server and proxy support in the wild; there the concurrency
+buys the deadlock fix rather than a promise of robust bidi. (A body that withholds
+its first chunk delays the request headers over h2, so a *server-speaks-first* duplex
+over one request is not supported; a client-speaks-first one is.)
+
+### Timeouts
+
+By default a request has **no timeouts**: a hung connect or a stalled server blocks
+until you cancel it. A timeout is a *policy* keyed to your time budget ("fail rather
+than make slow progress, so my caller can react"), which the transport cannot know,
+so you opt in per phase with a `Timeout` value, on the pool or per request:
+
+```python
+from without_http import Timeout
+
+async with ConnectionPool(timeout=Timeout(connect=10.0, read=30.0)) as pool:
+    async with pool.request("GET", url, timeout=Timeout(read=5.0)) as (head, body):
+        ...
+```
+
+Each axis is an *inactivity* bound (it re-arms on progress), not a total deadline:
+`read`/`write` bound the gap between chunks, so a slow-but-progressing transfer is
+not killed. Every field defaults to `None` (that axis disabled), and there is no
+shared-default scalar, since one number across four unrelated phases carries no
+meaning. A per-request `Timeout` *replaces* the pool's wholesale (it does not layer
+through middleware; `None` inherits the pool default). For an overall wall-clock cap,
+compose one on the substrate: `async with asyncio.timeout(t): pool.request(...)`.
+
+**What each axis bounds** (what is actually happening on the wire; the thing most
+clients leave you to guess at):
+
+| Axis | Phase it bounds | On the network |
+|---|---|---|
+| `connect` | DNS + TCP connect, and (over TLS) the handshake | one `open_connection` await; ALPN is negotiated here |
+| `write` | making progress sending a request-body chunk | a socket write + `drain`; over h2, waiting for the flow-control window |
+| `read` | waiting for the next response chunk (head, body, trailers) | a socket read; over h2, the next `DATA` for this stream |
+| `pool` | acquiring a connection slot | *nothing on the wire*: the per-host bound or the h2 stream gate |
+
+Over HTTP/2 the read/write axes measure *per-stream* progress, not socket progress:
+a `read` timeout means "no `DATA` for **my** stream in N seconds" even while the
+socket is busy with other streams.
+
+**What to do when one fires.** Each axis raises a typed error under `HTTPTimeout`
+(itself a `TimeoutError`), so a coarse `except TimeoutError` catches any while the
+specific type tells you *how far the request got*, which is what determines the safe
+recovery:
+
+| Fired | Request got as far as | Safe to retry? |
+|---|---|---|
+| `PoolTimeout` | never left the process | **always**; usually the real fix is local backpressure, not retrying the peer |
+| `ConnectTimeout` | no connection established | **always**, even a non-idempotent request, or fail over to another origin |
+| `WriteTimeout` | mid-sending the request | idempotent: yes; otherwise ambiguous. The connection is discarded, so a retry gets a fresh one |
+| `ReadTimeout` | request fully sent, awaiting the response | only if idempotent (the server may already have processed it); if mid-body, decide keep-vs-discard the partial |
+
 ### Client middleware
 
 A client *exchange* (`ClientRequest -> ClientResponse`) is the dual of a server

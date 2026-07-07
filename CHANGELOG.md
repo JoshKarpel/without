@@ -12,6 +12,14 @@
   full path, so reversing needs no router and holds no hidden prefix: a handler links by referencing
   a route value (immutable), and a websocket handler reverses an HTTP route to link to its resource
   with the same call.
+- **`without-http`**: granular client request timeouts. A `Timeout` value bounds each phase
+  independently (`connect`, `read`, `write`, `pool`), each an *inactivity* bound that re-arms on
+  progress and is disabled by default (a deadline is the caller's policy, not the transport's). A
+  timeout raises a typed `ConnectTimeout` / `ReadTimeout` / `WriteTimeout` / `PoolTimeout` under
+  `HTTPTimeout` (itself a `TimeoutError`), so a caller can tell how far the request got and retry
+  the right ones. Also: a per-host connection bound (`max_connections_per_host`, whose acquire-wait
+  the `pool` axis guards, unbounded by default) and gating of HTTP/2 stream issuance against the
+  server's `SETTINGS_MAX_CONCURRENT_STREAMS`.
 
 ### Changed
 
@@ -24,6 +32,11 @@
   a nested opaque app is trimmed by its full accumulated prefix by construction. Reverse routing is
   now the free `url_for` function rather than a `Router.url_for` method plus a `url_for()` extractor
   injected through `Match`.
+- **`without-http`**: the client sends the request body concurrently with reading the response
+  (consumer-driven duplex) instead of sending it whole first. A server can now answer early (a `413`,
+  a redirect) without deadlocking a large upload, and a caller can drive genuine bidirectional
+  streaming over HTTP/2 by feeding a queue-backed request body in reaction to the response. Connection
+  teardown is a single release-exactly-once path shared by the background sender and the response body.
 
 ## 0.0.1
 
