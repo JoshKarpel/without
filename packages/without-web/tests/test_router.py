@@ -16,17 +16,30 @@ from without_asgi import RequestBody
 from without_asgi import Response
 from without_asgi import ResponseBody
 from without_asgi import ResponseStart
+from without_asgi import WebsocketHandler
+from without_asgi import WebsocketInbound
+from without_asgi import WebsocketOutbound
+from without_asgi import WebsocketScope
+from without_asgi import WebsocketSend
+from without_asgi import WebsocketText
 from without_asgi import encode_response
 from without_asgi.routing import HttpMiddleware
+from without_asgi.routing import WebsocketMiddleware
 from without_web import INT
 from without_web import Match
-from without_web import Mount
 from without_web import Router
+from without_web import WebsocketEndpoint
+from without_web import WebsocketRouter
 from without_web import buffered
 from without_web import catching
+from without_web import delegate
+from without_web import mount
 from without_web import path_param
 from without_web import route
 from without_web import with_middleware
+from without_web import ws_delegate
+from without_web import ws_mount
+from without_web import ws_route
 
 
 class DomainError(Exception):
@@ -139,26 +152,43 @@ async def test_a_string_pattern_is_a_literal_only_convenience() -> None:
     assert json.loads(body) == {"who": "ok"}
 
 
-async def test_a_mounted_router_is_grafted_at_the_prefix() -> None:
-    inner: Router[object] = Router(routes=(route("/stats", get=_ok),), fallback=_fallback)
-    outer: Router[object] = Router(routes=(Mount("/admin", inner),), fallback=_fallback)
+async def test_mount_bakes_its_prefix_into_a_route() -> None:
+    outer: Router[object] = Router(routes=(mount("/admin")(route("/stats", get=_ok)),), fallback=_fallback)
     start, body = await _run(outer.dispatch(object(), _scope("GET", "/admin/stats")))
     assert start.status == 200
     assert json.loads(body) == {"who": "ok"}
 
 
-async def test_an_opaque_mount_receives_the_prefix_trimmed_scope() -> None:
-    def echo(state: object, head: HttpScope) -> HttpHandler:
-        def handler(inputs: Stream[Inbound]) -> Stream[Outbound]:
-            return stream_from_iterable(
-                encode_response(json_response(200, {"path": head.path, "root_path": head.root_path}))
-            )
+async def test_mount_applied_to_many_routes_returns_a_tuple() -> None:
+    api = mount("/api")
+    outer: Router[object] = Router(routes=api(route("/a", get=_ok), route("/b", get=_created)), fallback=_fallback)
+    a_start, _ = await _run(outer.dispatch(object(), _scope("GET", "/api/a")))
+    b_start, _ = await _run(outer.dispatch(object(), _scope("GET", "/api/b")))
+    assert a_start.status == 200
+    assert b_start.status == 201
 
-        return handler
 
-    outer: Router[object] = Router(routes=(Mount("/legacy", echo),), fallback=_fallback)
+def _echo(state: object, head: HttpScope) -> HttpHandler:
+    def handler(inputs: Stream[Inbound]) -> Stream[Outbound]:
+        return stream_from_iterable(
+            encode_response(json_response(200, {"path": head.path, "root_path": head.root_path}))
+        )
+
+    return handler
+
+
+async def test_an_opaque_delegate_receives_the_prefix_trimmed_scope() -> None:
+    outer: Router[object] = Router(routes=(delegate("/legacy", _echo),), fallback=_fallback)
     _start, body = await _run(outer.dispatch(object(), _scope("GET", "/legacy/ping")))
     assert json.loads(body) == {"path": "/ping", "root_path": "/legacy"}
+
+
+async def test_mount_rebases_a_nested_delegate_to_the_full_prefix() -> None:
+    app: Router[object] = Router(routes=(mount("/admin")(delegate("/legacy", _echo)),), fallback=_fallback)
+    # `mount` prepends its prefix to the delegate, so the opaque app sits at
+    # `/admin/legacy` and its scope is trimmed by that full prefix.
+    _start, body = await _run(app.dispatch(object(), _scope("GET", "/admin/legacy/ping")))
+    assert json.loads(body) == {"path": "/ping", "root_path": "/admin/legacy"}
 
 
 async def test_an_exception_before_response_start_is_mapped_to_a_response() -> None:
@@ -276,41 +306,127 @@ async def test_with_middleware_scopes_to_one_route() -> None:
     assert not any(name == b"x-auth" for name, _ in open_route.headers)
 
 
-async def test_a_mounted_router_keeps_its_own_middleware() -> None:
-    section: Router[object] = Router(
-        routes=(route("/users", get=_ok),), fallback=_fallback, middleware=_mark(b"x-zone", b"admin")
+async def test_mount_bakes_its_middleware_onto_the_routes_under_it() -> None:
+    admin = mount("/admin", _mark(b"x-zone", b"admin"))
+    app: Router[object] = Router(
+        routes=(route("/health", get=_created), admin(route("/users", get=_ok))), fallback=_fallback
     )
-    app: Router[object] = Router(routes=(route("/health", get=_created), Mount("/admin", section)), fallback=_fallback)
     inside, _ = await _run(app.dispatch(object(), _scope("GET", "/admin/users")))
     outside, _ = await _run(app.dispatch(object(), _scope("GET", "/health")))
     assert (b"x-zone", b"admin") in inside.headers
     assert not any(name == b"x-zone" for name, _ in outside.headers)
 
 
-async def test_subtree_middleware_wraps_an_opaque_mount_within_it() -> None:
+async def test_mount_wraps_a_nested_delegate_with_its_middleware() -> None:
     def opaque(state: object, head: HttpScope) -> HttpHandler:
         def handler(inputs: Stream[Inbound]) -> Stream[Outbound]:
             return stream_from_iterable(encode_response(json_response(200, {"who": "opaque"})))
 
         return handler
 
-    section: Router[object] = Router(
-        routes=(Mount("/legacy", opaque),), fallback=_fallback, middleware=_mark(b"x-zone", b"admin")
-    )
-    app: Router[object] = Router(routes=(Mount("/admin", section),), fallback=_fallback)
+    admin = mount("/admin", _mark(b"x-zone", b"admin"))
+    app: Router[object] = Router(routes=(admin(delegate("/legacy", opaque)),), fallback=_fallback)
     start, body = await _run(app.dispatch(object(), _scope("GET", "/admin/legacy/ping")))
     assert start.status == 200
     assert json.loads(body) == {"who": "opaque"}
     assert (b"x-zone", b"admin") in start.headers
 
 
-async def test_parent_and_mounted_middleware_both_apply() -> None:
-    section: Router[object] = Router(
-        routes=(route("/users", get=_ok),), fallback=_fallback, middleware=_mark(b"x-inner", b"section")
-    )
+async def test_router_wide_and_mount_baked_middleware_both_apply() -> None:
+    admin = mount("/admin", _mark(b"x-inner", b"section"))
     app: Router[object] = Router(
-        routes=(Mount("/admin", section),), fallback=_fallback, middleware=_mark(b"x-outer", b"app")
+        routes=(admin(route("/users", get=_ok)),), fallback=_fallback, middleware=_mark(b"x-outer", b"app")
     )
     start, _ = await _run(app.dispatch(object(), _scope("GET", "/admin/users")))
     assert (b"x-outer", b"app") in start.headers
     assert (b"x-inner", b"section") in start.headers
+
+
+def _ws_scope(path: str) -> WebsocketScope:
+    return WebsocketScope(
+        asgi=Asgi(version="3.0", spec_version="2.0"),
+        http_version="1.1",
+        scheme="ws",
+        path=path,
+        raw_path=None,
+        query_string=b"",
+        root_path="",
+        headers=(),
+        client=None,
+        server=None,
+        subprotocols=(),
+        extensions=None,
+    )
+
+
+def _ws_says(label: str) -> WebsocketEndpoint[object]:
+    def endpoint(state: object, match: Match[WebsocketScope]) -> WebsocketHandler:
+        def processor(inputs: Stream[WebsocketInbound]) -> Stream[WebsocketOutbound]:
+            return stream_from_iterable((WebsocketSend(WebsocketText(text=label)),))
+
+        return processor
+
+    return endpoint
+
+
+def _ws_echo(state: object, scope: WebsocketScope) -> WebsocketHandler:
+    def processor(inputs: Stream[WebsocketInbound]) -> Stream[WebsocketOutbound]:
+        return stream_from_iterable((WebsocketSend(WebsocketText(text=f"{scope.path}|{scope.root_path}")),))
+
+    return processor
+
+
+def _ws_prepend(label: str) -> WebsocketMiddleware[object]:
+    def middleware(handler: WebsocketHandler, _state: object, scope: WebsocketScope) -> WebsocketHandler:
+        async def processor(inputs: Stream[WebsocketInbound]) -> AsyncIterator[WebsocketOutbound]:
+            yield WebsocketSend(WebsocketText(text=label))
+            async for event in handler(inputs):
+                yield event
+
+        return processor
+
+    return middleware
+
+
+async def _ws_texts(handler: WebsocketHandler) -> list[str]:
+    events = [event async for event in handler(stream_from_iterable(()))]
+    return [
+        event.data.text
+        for event in events
+        if isinstance(event, WebsocketSend) and isinstance(event.data, WebsocketText)
+    ]
+
+
+async def test_ws_mount_bakes_its_prefix_into_a_route() -> None:
+    outer: WebsocketRouter[object] = WebsocketRouter(
+        routes=(ws_mount("/admin")(ws_route("/stats", _ws_says("stats"))),), fallback=_ws_says("fallback")
+    )
+    assert await _ws_texts(outer.dispatch(object(), _ws_scope("/admin/stats"))) == ["stats"]
+
+
+async def test_ws_mount_bakes_its_middleware_onto_the_routes_under_it() -> None:
+    admin = ws_mount("/admin", _ws_prepend("zone"))
+    app: WebsocketRouter[object] = WebsocketRouter(
+        routes=(admin(ws_route("/feed", _ws_says("feed"))),), fallback=_ws_says("fallback")
+    )
+    inside = await _ws_texts(app.dispatch(object(), _ws_scope("/admin/feed")))
+    outside = await _ws_texts(app.dispatch(object(), _ws_scope("/nowhere")))
+    assert inside == ["zone", "feed"]
+    assert outside == ["fallback"]
+
+
+async def test_an_opaque_ws_delegate_receives_the_prefix_trimmed_scope() -> None:
+    app: WebsocketRouter[object] = WebsocketRouter(
+        routes=(ws_delegate("/legacy", _ws_echo),), fallback=_ws_says("fallback")
+    )
+    assert await _ws_texts(app.dispatch(object(), _ws_scope("/legacy/ping"))) == ["/ping|/legacy"]
+
+
+async def test_ws_mount_wraps_a_nested_delegate_with_its_middleware() -> None:
+    admin = ws_mount("/admin", _ws_prepend("zone"))
+    app: WebsocketRouter[object] = WebsocketRouter(
+        routes=(admin(ws_delegate("/legacy", _ws_echo)),), fallback=_ws_says("fallback")
+    )
+    # `ws_mount` prepends its prefix to the delegate, so the opaque app sits at
+    # `/admin/legacy` and its scope is trimmed by that full prefix.
+    assert await _ws_texts(app.dispatch(object(), _ws_scope("/admin/legacy/ping"))) == ["zone", "/ping|/admin/legacy"]

@@ -57,8 +57,9 @@ todo-list REST API, chosen because it hits the whole router design at once:
 the segment and is reused as the handler's `int` argument), `GET` vs `POST` on
 `/todos` is method
 dispatch (so a `PUT` is a `405` with `Allow`, not a `404`), `?done=` is a typed
-`query_param` extractor, `/admin` is a grafted sub-router and `/legacy` an opaque
-mount (handed the prefix-trimmed scope), `TodoNotFound`/`ValidationError` are
+`query_param` extractor, `/admin` is a `mount(...)` that bakes its prefix and auth
+gate into the routes under it and `/legacy` an opaque `delegate(...)` (handed the
+prefix-trimmed scope), `TodoNotFound`/`ValidationError` are
 mapped to `404`/`422` by HTTP exception handlers, two endpoints read their input
 *live* and fold it into a working list across the connection (`POST /todos/import`
 as a `@post.stream` route over an NDJSON upload, and the `/todos/session`

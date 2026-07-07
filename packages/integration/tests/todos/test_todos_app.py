@@ -167,12 +167,13 @@ async def test_a_missing_todo_is_a_mapped_404() -> None:
     assert body == {"error": "no todo with id 99", "id": 99}
 
 
-async def test_creating_a_todo_echoes_the_next_id() -> None:
+async def test_creating_a_todo_echoes_it_with_its_url() -> None:
     app = todos_app(_todos())
     async with _running(app):
         status, _headers, body = await _request(app, "POST", "/todos", body=b'{"title": "deploy"}')
     assert status == 201
-    assert body == {"id": 3, "title": "deploy", "done": False}
+    # The body carries the new todo plus its URL, reversed from the `show_todo` route.
+    assert body == {"id": 3, "title": "deploy", "done": False, "url": "/todos/3"}
 
 
 async def test_import_echoes_each_todo_as_the_ndjson_stream_arrives() -> None:
@@ -354,9 +355,11 @@ async def test_the_session_folds_each_submission_into_the_running_list() -> None
     assert sent[0]["type"] == "websocket.accept"
     # The second reply's id and total advance past the first, proving the fold's
     # accumulator carries across frames rather than restarting from the seed each time.
+    # Each reply carries the new todo's URL, reversed from the HTTP `show_todo` route
+    # via the injected `url_for()` (the same path `POST /todos` sets as `Location`).
     assert _sent_replies(sent) == [
-        {"ok": True, "todo": {"id": 3, "title": "soon", "done": False}, "total": 3},
-        {"ok": True, "todo": {"id": 4, "title": "later", "done": True}, "total": 4},
+        {"ok": True, "todo": {"id": 3, "title": "soon", "done": False}, "url": "/todos/3", "total": 3},
+        {"ok": True, "todo": {"id": 4, "title": "later", "done": True}, "url": "/todos/4", "total": 4},
     ]
 
 

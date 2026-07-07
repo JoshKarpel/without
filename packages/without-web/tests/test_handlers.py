@@ -258,7 +258,7 @@ async def test_post_stream_decorator_builds_a_streaming_route() -> None:
         yield ResponseStart(status=200, headers=((b"content-type", b"application/json"),))
         yield ResponseBody(body=json.dumps({"id": target_id, "bytes": total}).encode(), more_body=False)
 
-    route = post.stream(t"/uploads/{id}", requested_id, summary="Stream an upload")(upload)
+    route = post.stream(t"/uploads/{requested_id}", requested_id, summary="Stream an upload")(upload)
     assert tuple(route.methods) == ("POST",)
     handler = route.methods["POST"]("tenant", Match(_scope(), {"id": 3}))
     events = [event async for event in handler(_chunks(b"ab", b"cde"))]

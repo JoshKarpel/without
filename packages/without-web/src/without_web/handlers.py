@@ -32,6 +32,7 @@ from without_web.router import Match
 from without_web.router import Pattern
 from without_web.router import Route
 from without_web.router import WebsocketRoute
+from without_web.router import _segments
 
 # What a handler ultimately produces: a single `Response` (buffered output) or an
 # already-streaming `Stream[Outbound]`. Input buffering is the one build-time axis
@@ -647,7 +648,7 @@ class _Method:
     ) -> Callable[[Callable[..., Returned]], Route[object]]:
         def decorate(fn: Callable[..., Returned]) -> Route[object]:
             endpoint = _build_endpoint(extractors, fn, summary, responses)
-            return Route(pattern=pattern, methods={self.method: endpoint})
+            return Route(_segments(pattern), {self.method: endpoint})
 
         return decorate
 
@@ -865,7 +866,7 @@ class _StreamMethod:
     ) -> Callable[[Callable[..., Returned]], Route[object]]:
         def decorate(fn: Callable[..., Returned]) -> Route[object]:
             endpoint = _build_stream_endpoint(extractors, fn, summary, responses, request_body)
-            return Route(pattern=pattern, methods={self.method: endpoint})
+            return Route(_segments(pattern), {self.method: endpoint})
 
         return decorate
 
@@ -1036,7 +1037,7 @@ def ws[T](
 
             return processor
 
-        return WebsocketRoute(pattern=pattern, endpoint=endpoint)
+        return WebsocketRoute(_segments(pattern), endpoint)
 
     return decorate
 

@@ -5,9 +5,9 @@ An opinionated HTTP and WebSocket router for
 router, only the unopinionated boundary (scope/event parsing) and composition
 tools (`Middleware`, `stack`, `wrap`, `buffered`). `without-web` is the
 opinionated layer on top: tuple patterns with typed parameters, typed request
-extraction, 405-vs-404, mounting, scoped middleware, exception handlers, and
-OpenAPI. See the [`without_web` API reference](../reference/without_web.md) for
-the full surface.
+extraction, 405-vs-404, mounting, scoped middleware, exception handlers, reverse
+routing (`url_for`), and OpenAPI. See the
+[`without_web` API reference](../reference/without_web.md) for the full surface.
 
 It snaps onto the boundary through nothing but the existing `HttpRouter` type:
 `Router.dispatch` *is* an `HttpRouter[T]`, so `make_asgi_app(http=router.dispatch)`
@@ -85,7 +85,9 @@ walk. Three things fall out of the structure rather than being authored by hand:
   `405` with an `Allow` header. Dead-end the walk → the `fallback` (typically a
   `404`). This is the distinction an exact `method == m and path == p` router
   cannot express.
-- **Mounting** is a subtree graft at a prefix node.
+- **Delegation** to an opaque sub-app is a black-box leaf at a prefix node.
+  (Transparent mounting isn't a router concern at all: `mount(...)` bakes the
+  prefix into the routes before they reach the router, see [Mounting](#mounting).)
 
 The one subtlety: a converter can *reject* (`INT` against `abc`), so the walk
 backtracks to try sibling branches when a converter rejects, with a defined
@@ -106,11 +108,11 @@ registry to register it in.
 
 An `Extractor[V]` is parsing-as-a-value: a pure `Request -> V` paired with the
 OpenAPI fragment it contributes. `path_param`, `query_param`, `header_param`,
-`body`, `catch_all`, `http_scope`, and `websocket_scope` build them. An extractor
-that raises *rejects* the request, mapped to a 4xx by the exception handlers; it
-never decides which handler runs. `http_scope()`/`websocket_scope()` hand back
-the unparsed scope, so "pass the scope down" and "parse parts of it" compose
-instead of competing. The same `query_param`/`header_param`/`path_param` tokens
+`body`, `catch_all`, `http_scope`, and `websocket_scope` build them. An
+extractor that raises *rejects* the request, mapped to a 4xx by the exception
+handlers; it never decides which handler runs. `http_scope()`/`websocket_scope()`
+hand back the unparsed scope, so "pass the scope down" and "parse parts of it"
+compose instead of competing. The same `query_param`/`header_param`/`path_param` tokens
 serve both HTTP and websocket handlers (`Request.scope` is
 `HttpScope | WebsocketScope`).
 
@@ -168,24 +170,55 @@ handlers; `Match` carries the scope plus the already-parsed path params.
 
 ## Mounting
 
-`Mount(prefix, target)` composes a sub-application as a value. Two cases:
+Mounting a sub-application has two genuinely different cases, and `without-web`
+keeps them apart rather than folding both into one `Mount` object.
 
-- a **`without-web` `Router`** is grafted: its routes are prepended with the
-  prefix, so matching and OpenAPI see straight through, and the sub-router's own
-  `middleware` is carried onto each grafted route (so middleware on a mounted
-  router applies to its whole subtree, and nowhere else);
-- an **opaque `HttpRouter`** (a BYO router or another app) is handed the
-  prefix-trimmed scope (ASGI `root_path` semantics) and treated as a black box.
+**Transparent — routes you own.** `mount(prefix, *middleware)` returns a *transform*
+that bakes the prefix (and any per-route middleware) into each route you hand it,
+returning plain routes whose path *already includes the prefix*:
 
-## Middleware: router-wide, per-subtree, or per-route
+```python
+api = mount("/api", require_auth)          # a reusable mount point
+
+routes = api(list_users, create_user)      # -> rebased routes, /api/... behind auth
+
+@mount("/api")                             # or as a decorator on one route
+@get(t"/users/{uid}", uid)
+async def show_user(...): ...
+```
+
+Because the prefix is baked into the route's segments, a mounted route is still a
+first-class, self-contained value: there is no `Mount` wrapper in the router,
+matching and OpenAPI see the full path directly, and reverse routing (`url_for`)
+needs no router and cannot lose the prefix (this is what dissolves the old
+cross-router footgun, see [Reverse routing](#reverse-routing-url_for)). Nesting
+composes: `mount("/api")(mount("/v1")(route))` is `/api/v1/...`. This is also the
+clean shape for *distributing* a route group: a package ships a factory
+`build(prefix, ...)` that constructs its mounted, interlinked routes together, and
+the consumer picks the prefix.
+
+**Opaque — a sub-app whose routes you cannot see.** `delegate(prefix, app)` mounts
+a bring-your-own `HttpRouter` (a legacy app, a third-party mount) as a black box:
+its routes cannot be baked, so it is handed the prefix-trimmed scope (ASGI
+`root_path` semantics) and left alone. A `delegate` can itself be rebased by
+`mount` (`mount("/admin")(delegate("/legacy", app))` sits at `/admin/legacy`), so a
+nested opaque app is trimmed by its full accumulated path.
+
+`ws_mount` and `ws_delegate` are the exact WebSocket siblings (see
+[WebSocket routing](#websocket-routing)).
+
+## Middleware: router-wide, per-prefix, or per-route
 
 A `Router`'s `middleware` runs on every dispatch. To scope middleware to *part* of
 an app, two composing tools, no new mechanism:
 
-- **A subtree:** give a mounted sub-`Router` its own `middleware` (see Mounting).
-  It applies to every route under the mount and nothing outside it. This is the
-  natural home for cross-cutting concerns like auth on `/admin`. See
-  `integration.todos`, whose `admin` mount carries an `Authorization`-header gate.
+- **A prefix:** hand middleware to `mount(prefix, *middleware)` (see Mounting). It
+  is baked onto every route placed under the mount and nothing outside it. This is
+  the natural home for cross-cutting concerns like auth on `/admin`. See
+  `integration.todos`, whose `admin = mount("/admin", require_authorization)`
+  carries an `Authorization`-header gate. (Mount middleware is state-agnostic
+  `HttpMiddleware[object]`, which auth and logging already are; state-specific
+  middleware goes on a route with `with_middleware`.)
 - **One route:** `with_middleware(endpoint, *middleware)` wraps a single endpoint.
   An `Endpoint` builds the handler and a `Middleware` is `(T, H, S) -> H`, so this
   is just composition; the result is a narrower `Endpoint`. Use it per method, e.g.
@@ -253,11 +286,58 @@ streaming-input route has no `body` extractor to recover an inbound schema from,
 so it declares one directly: `@post.stream(..., request_body=Body(
 "application/x-ndjson", Sequence(...)))`.
 
+## Reverse routing: `url_for`
+
+`url_for(route, values)` is the inverse of dispatch: given a route and the values
+for its path parameters, it renders the concrete path the route would match at, so
+a handler or template links to a route by its *value* rather than hand-assembling a
+string that drifts when the path changes. It is a **plain function** of the route
+value, no router involved:
+
+```python
+show_user = get(t"/users/{uid}", uid)   # a Route value you hold
+
+@post("/users", new_user_body)
+async def create_user(state, new):
+    location = url_for(show_user, {"id": created.id})   # -> "/users/<id>"
+    return Response(status=201, headers=((b"location", location.encode()),), body=...)
+```
+
+The handler references the `show_user` *value* (immutable, like a constant) and
+calls a free function: it names no router, so there is no app-level singleton to
+depend on and no runtime handler→router cycle. This works because a route is a
+**self-contained value**: `mount` bakes any prefix into the route's segments (see
+[Mounting](#mounting)), so the route's own path *is* its full path. Three things
+follow:
+
+- **Identity is the value, not a name.** You pass the route you already hold; there
+  is no registry of names to keep in sync (the same stance the trie takes, see
+  [Matching](#matching-a-radix-tree-trie)).
+- **No router, no cross-router footgun.** Because the prefix lives *in the route*,
+  not in a router, reversing needs no router and cannot miss a prefix that some
+  other router knew about. A websocket handler reverses an HTTP `Route` to link to
+  its resource with the same call, since neither is tied to a router.
+- **Values are checked in reverse.** Each value is rendered and fed back through
+  the segment's converter to prove it would parse straight back (parse, don't
+  validate, in reverse): a value the converter would reject, one that does not
+  round-trip, or one that spans multiple segments (a `/` in a single-segment
+  param) raises, as does a missing or unknown parameter. A `catch_all` segment
+  is the one place `/` is allowed. `url_for` reverses a `WebsocketRoute` the same
+  way.
+
+See `integration.todos`: `create_todo`'s `201` body carries the new todo's URL,
+reversed from the `show_todo` route, and the `/todos/session` websocket puts that
+*same* reversed URL in each reply, an HTTP route linked from a websocket handler
+with nothing but the route value.
+
 ## WebSocket routing
 
 `WebsocketRouter` reuses the same trie machinery with no method layer (so no
 405): a connection either matches a path or falls to the `fallback`. Its
-`dispatch` is a `WebsocketRouter[T]` for `make_asgi_app(websocket=...)`.
+`dispatch` is a `WebsocketRouter[T]` for `make_asgi_app(websocket=...)`. Mounting
+mirrors HTTP: `ws_mount(prefix, *middleware)` bakes a prefix into WebSocket routes
+and `ws_delegate(prefix, app)` mounts an opaque WebSocket app as a black box (see
+[Mounting](#mounting)).
 
 `@ws(pattern, *extractors)` is the websocket sibling of `@get`/`@post`: it ties
 typed `path_param`/`query_param`/`header_param` tokens to the handler's arguments
