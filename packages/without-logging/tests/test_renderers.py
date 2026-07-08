@@ -5,6 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 from traceback import TracebackException
 
+import pytest
 from without import Processor
 from without import collect
 from without import stream_from_iterable
@@ -137,6 +138,14 @@ async def test_render_console_line_quotes_the_message_after_the_metadata() -> No
     line = await rendered(render_console(), a_record(level=logging.WARNING))
 
     assert line == '2026-07-05T14:56:09+00:00 WARNING svc.billing "charge accepted"'
+
+
+@pytest.mark.security("a newline in a log message is escaped, preventing log-line forging")
+async def test_render_console_escapes_a_newline_in_the_message() -> None:
+    line = await rendered(render_console(), a_record(message="ok\nWARNING forged line"))
+
+    assert "\n" not in line
+    assert r"ok\nWARNING forged line" in line
 
 
 async def test_render_console_groups_extra_fields_in_braces() -> None:

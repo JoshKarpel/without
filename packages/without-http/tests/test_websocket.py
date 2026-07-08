@@ -9,6 +9,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from dataclasses import field
 
+import pytest
 from without_asgi import RawScope
 from without_asgi import Receive
 from without_asgi import Send
@@ -200,6 +201,42 @@ async def test_reassembles_a_fragmented_binary_message() -> None:
         echo = await client.next_event()
         assert isinstance(echo, BytesMessage)
         assert echo.data == b"\x00\x01\x02\x03"
+
+
+@pytest.mark.security("an oversized WebSocket message is rejected (1009), bounding reassembly memory")
+@pytest.mark.parametrize("kind", ["text", "binary"])
+async def test_a_websocket_message_over_the_cap_is_rejected(kind: str) -> None:
+    async with serving(echo_any_ws_app, max_websocket_message_bytes=8) as server:
+        async with ws_session(server.host, server.port, "/live") as client:
+            assert isinstance(await client.next_event(), AcceptConnection)
+
+            if kind == "text":
+                await client.send_text("x" * 20)
+            else:
+                await client.send_bytes(b"x" * 20)
+
+            event = await client.next_event()
+            assert isinstance(event, CloseConnection)
+            assert event.code == 1009
+
+
+@pytest.mark.security("the WebSocket message cap is scoped: a message within it is still delivered")
+@pytest.mark.parametrize("kind", ["text", "binary"])
+async def test_a_websocket_message_within_the_cap_is_delivered(kind: str) -> None:
+    async with serving(echo_any_ws_app, max_websocket_message_bytes=64) as server:
+        async with ws_session(server.host, server.port, "/live") as client:
+            assert isinstance(await client.next_event(), AcceptConnection)
+
+            if kind == "text":
+                await client.send_text("hi")
+                echo = await client.next_event()
+                assert isinstance(echo, TextMessage)
+                assert echo.data == "echo:hi"
+            else:
+                await client.send_bytes(b"hi")
+                echo = await client.next_event()
+                assert isinstance(echo, BytesMessage)
+                assert echo.data == b"hi"
 
 
 async def test_a_malformed_websocket_frame_disconnects_the_app() -> None:

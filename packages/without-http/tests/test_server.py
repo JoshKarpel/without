@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from contextlib import suppress
+from datetime import timedelta
 
 import httpx
 import pytest
@@ -72,6 +73,27 @@ async def _client(app: ASGIApp) -> AsyncIterator[httpx.AsyncClient]:
 async def test_serves_a_get_response() -> None:
     async with _client(echo_app) as client:
         response = await client.get("/items")
+
+    assert response.status_code == 200
+    assert response.text == "GET /items "
+
+
+@pytest.mark.security("an idle connection is closed after the idle timeout (slowloris defense)")
+async def test_an_idle_connection_is_closed_after_the_idle_timeout() -> None:
+    async with serving(echo_app, idle_timeout=timedelta(seconds=0.1)) as server:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        # Send nothing: the server's read outlives the idle timeout and it closes the socket.
+        assert await reader.read(65536) == b""
+        writer.close()
+        with suppress(OSError):
+            await writer.wait_closed()
+
+
+@pytest.mark.security("the idle timeout is scoped: a request completing within it is served")
+async def test_a_request_within_the_idle_timeout_is_served() -> None:
+    async with serving(echo_app, idle_timeout=timedelta(seconds=30)) as server:
+        async with httpx.AsyncClient(base_url=f"http://{server.host}:{server.port}") as client:
+            response = await client.get("/items")
 
     assert response.status_code == 200
     assert response.text == "GET /items "

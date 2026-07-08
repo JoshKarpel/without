@@ -49,4 +49,9 @@ FLOAT: Converter[float] = Converter(name="float", parse=float, schema={"type": "
 UUID: Converter[uuid.UUID] = Converter(name="uuid", parse=uuid.UUID, schema={"type": "string", "format": "uuid"})
 # `path` is the catch-all converter: the trie consumes the rest of the request
 # target into one segment, so its `parse` is the identity on the joined string.
+# Security note: the value is the raw remaining path, *not* normalized. It can
+# contain `..` and encoded separators, so an app that joins it onto a filesystem
+# path, a proxy target, or a redirect URL MUST normalize and confine it first
+# (e.g. resolve and check it stays within a base directory); the router itself
+# never touches the filesystem, so it cannot do this for you.
 PATH: Converter[str] = Converter(name="path", parse=str, schema={"type": "string"})

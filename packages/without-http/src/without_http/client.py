@@ -12,6 +12,9 @@ from contextlib import suppress
 from dataclasses import dataclass
 from dataclasses import field
 from dataclasses import replace
+from datetime import UTC
+from datetime import datetime
+from email.utils import parsedate_to_datetime
 from typing import NamedTuple
 from typing import Self
 from urllib.parse import SplitResult
@@ -923,6 +926,14 @@ def add_headers(*headers: tuple[bytes, bytes]) -> ClientMiddleware:
     return wrap(request=lambda request: replace(request, headers=extra + request.headers))
 
 
+_SENSITIVE_REDIRECT_HEADERS = frozenset({b"authorization", b"cookie", b"proxy-authorization"})
+_BODY_FRAMING_HEADERS = frozenset({b"content-length", b"content-type", b"transfer-encoding"})
+
+
+def _strip_headers(headers: RawHeaders, drop: frozenset[bytes]) -> RawHeaders:
+    return tuple((name, value) for name, value in headers if name.lower() not in drop)
+
+
 def follow_redirects(max_hops: int = 5) -> ClientMiddleware:
     """
     Client middleware that follows `3xx` redirects, up to `max_hops`.
@@ -931,6 +942,12 @@ def follow_redirects(max_hops: int = 5) -> ClientMiddleware:
     released. The follow re-issues the same request body, so redirects with a
     one-shot streaming body are not replayable; in practice redirects follow bodyless
     requests.
+
+    Credentials are not replayed across an origin boundary: when a hop's target has a
+    different scheme, host, or port, `Authorization`, `Cookie`, and
+    `Proxy-Authorization` are dropped before the request is re-issued. A hop that
+    would downgrade `https` to `http` is refused outright (the `3xx` is returned
+    unfollowed) so nothing is replayed over cleartext.
     """
 
     def middleware(inner: ClientExchange) -> ClientExchange:
@@ -942,8 +959,21 @@ def follow_redirects(max_hops: int = 5) -> ClientMiddleware:
                 location = next((value for name, value in response.head.headers if name.lower() == b"location"), None)
                 if location is None:
                     return response
+                source = urlsplit(request.url)
+                target = urlsplit(urljoin(request.url, location.decode("ascii")))
+                if source.scheme == "https" and target.scheme == "http":
+                    return response
+                headers = request.headers
+                if _origin(target) != _origin(source):
+                    headers = _strip_headers(headers, _SENSITIVE_REDIRECT_HEADERS)
+                method, body = request.method, request.body
+                if response.head.status == 303 and request.method not in ("GET", "HEAD"):
+                    # RFC 7231 §6.4.4: a 303 tells the client to fetch the target with GET,
+                    # so the original method and body (and their framing headers) are dropped.
+                    method, body = "GET", _empty_body()
+                    headers = _strip_headers(headers, _BODY_FRAMING_HEADERS)
                 await response.body.aclose()
-                request = replace(request, url=urljoin(request.url, location.decode("ascii")))
+                request = replace(request, url=target.geturl(), headers=headers, method=method, body=body)
                 response = await inner(request)
             return response
 
@@ -969,6 +999,7 @@ class _Cookie:
     path: str
     secure: bool
     host_only: bool
+    expires: datetime | None
 
 
 def _default_path(request_path: str) -> str:
@@ -995,6 +1026,21 @@ def _path_matches(request_path: str, cookie: _Cookie) -> bool:
     return cookie.path.endswith("/") or request_path[len(cookie.path)] == "/"
 
 
+def _domain_acceptable(host: str, domain: str) -> bool:
+    """
+    Whether a response from `host` may set a cookie scoped to `Domain=domain`.
+
+    Enforces RFC 6265 §5.3: the host must equal `domain` or be a subdomain of it, so
+    `evil.example` cannot set a cookie for `victim.com`. A `domain` with no internal
+    dot (a bare TLD like `com`, or `localhost`) is a stand-in for the public-suffix
+    check and is rejected outright, blocking a domain-wide supercookie. Full
+    public-suffix-list coverage (rejecting e.g. `co.uk`) is not yet implemented.
+    """
+    if "." not in domain:
+        return False
+    return host == domain or host.endswith(f".{domain}")
+
+
 def _deletes(max_age: str | None) -> bool:
     if max_age is None:
         return False
@@ -1004,13 +1050,27 @@ def _deletes(max_age: str | None) -> bool:
         return False
 
 
+def _parse_expires(value: str | None) -> datetime | None:
+    """Parse a `Set-Cookie` `Expires` value into an aware UTC datetime, or `None`."""
+    if value is None:
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+    except ValueError, TypeError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
 def _parse_set_cookie(header: str, host: str, request_path: str) -> tuple[_Cookie, bool] | None:
     """
     Parse one `Set-Cookie` value into a `_Cookie` and whether it deletes one.
 
-    `None` for a header with no `name=value`. A `Max-Age` of zero or less marks the
-    cookie for deletion (the second tuple element); `Expires` is not parsed, so
-    date-based expiry is not yet honored.
+    `None` for a header with no `name=value`, or one whose `Domain` the response host is
+    not allowed to set (see `_domain_acceptable`). A `Max-Age` of zero or less marks the
+    cookie for deletion (the second tuple element); an `Expires` in the past is handled
+    the same way by the jar. `Max-Age` takes precedence over `Expires`, so `Expires` is
+    parsed onto the cookie only when no `Max-Age` is present. Whether a `Secure` cookie
+    is admitted at all depends on the response transport, which the jar checks at store.
     """
     pair, _, rest = header.partition(";")
     name, sep, value = pair.partition("=")
@@ -1024,6 +1084,9 @@ def _parse_set_cookie(header: str, host: str, request_path: str) -> tuple[_Cooki
         if key:
             attributes[key] = val.strip()
     domain = attributes.get("domain", "").lstrip(".").lower()
+    if domain and not _domain_acceptable(host, domain):
+        return None
+    max_age = attributes.get("max-age")
     path = attributes.get("path", "")
     cookie = _Cookie(
         name=name,
@@ -1032,8 +1095,13 @@ def _parse_set_cookie(header: str, host: str, request_path: str) -> tuple[_Cooki
         path=path if path.startswith("/") else _default_path(request_path),
         secure="secure" in attributes,
         host_only=not domain,
+        expires=_parse_expires(attributes.get("expires")) if max_age is None else None,
     )
-    return cookie, _deletes(attributes.get("max-age"))
+    return cookie, _deletes(max_age)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
 
 
 @dataclass(slots=True)
@@ -1048,15 +1116,58 @@ class CookieJar:
     session regardless of how connections are pooled.
 
     Supports host-only and `Domain` (subdomain) matching, `Path` matching, the `Secure`
-    attribute, and deletion via `Max-Age<=0`. Not yet: `Expires` date-based expiry.
+    attribute, and expiry via `Max-Age<=0` or a past `Expires`. A `Set-Cookie` whose
+    `Domain` the response host is not allowed to set, or a `Secure` cookie offered over a
+    cleartext response, is rejected at store time. `_now` supplies the clock for expiry
+    (injectable for tests). Not yet: full public-suffix-list rejection of `Domain` values
+    like `co.uk`, and forward expiry of a positive `Max-Age`.
+
+    Two ways in: `store`, which parses `Set-Cookie` off an (untrusted) response and so
+    applies the origin guards above; and `add`, which places a hand-written cookie the
+    caller vouches for, skipping those guards.
     """
 
     _cookies: dict[tuple[str, str, str], _Cookie] = field(default_factory=dict)
+    _now: Callable[[], datetime] = field(default=_utcnow)
+
+    def add(
+        self,
+        name: str,
+        value: str,
+        *,
+        domain: str,
+        path: str = "/",
+        secure: bool = False,
+        subdomains: bool = False,
+        expires: datetime | None = None,
+    ) -> None:
+        """
+        Add a hand-written cookie directly, without a `Set-Cookie` response.
+
+        The trusted counterpart to `store`: because the caller vouches for the cookie
+        (a session token already in hand, a test fixture), the origin checks `store`
+        applies to an untrusted response, the `Domain` scope check and the
+        `Secure`-over-cleartext rejection, do not apply here. `subdomains=True` sends it
+        to `domain` and its subdomains; the default sends it only to the exact `domain`
+        host. An entry with the same `(domain, path, name)` identity is replaced.
+        """
+        cookie = _Cookie(
+            name=name,
+            value=value,
+            domain=domain.lower(),
+            path=path,
+            secure=secure,
+            host_only=not subdomains,
+            expires=expires,
+        )
+        self._cookies[(cookie.domain, cookie.path, cookie.name)] = cookie
 
     def store(self, url: str, headers: RawHeaders) -> None:
         """Fold every `Set-Cookie` in a response into the jar."""
         parts = urlsplit(url)
         host = (parts.hostname or "").lower()
+        secure_request = parts.scheme == "https"
+        now = self._now()
         for name, value in headers:
             if name.lower() != b"set-cookie":
                 continue
@@ -1064,8 +1175,10 @@ class CookieJar:
             if parsed is None:
                 continue
             cookie, deletes = parsed
+            if cookie.secure and not secure_request:
+                continue  # a Secure cookie may only be set over a secure transport
             key = (cookie.domain, cookie.path, cookie.name)
-            if deletes:
+            if deletes or (cookie.expires is not None and cookie.expires <= now):
                 self._cookies.pop(key, None)
             else:
                 self._cookies[key] = cookie
@@ -1076,10 +1189,14 @@ class CookieJar:
         host = (parts.hostname or "").lower()
         path = parts.path or "/"
         secure = parts.scheme == "https"
+        now = self._now()
         matched = [
             cookie
             for cookie in self._cookies.values()
-            if _domain_matches(host, cookie) and _path_matches(path, cookie) and (secure or not cookie.secure)
+            if _domain_matches(host, cookie)
+            and _path_matches(path, cookie)
+            and (secure or not cookie.secure)
+            and (cookie.expires is None or cookie.expires > now)
         ]
         if not matched:
             return None

@@ -191,6 +191,15 @@ async def test_mount_rebases_a_nested_delegate_to_the_full_prefix() -> None:
     assert json.loads(body) == {"path": "/ping", "root_path": "/admin/legacy"}
 
 
+@pytest.mark.security("a delegate trims the mount prefix by matched segment count, not byte length")
+async def test_a_delegate_trims_by_segment_not_string_length() -> None:
+    # A leading double slash still matches segment-wise; trimming must be by matched
+    # segment count, so the sub-app sees `/ping`, not a byte-sliced `y/ping`.
+    outer: Router[object] = Router(routes=(delegate("/legacy", _echo),), fallback=_fallback)
+    _start, body = await _run(outer.dispatch(object(), _scope("GET", "//legacy/ping")))
+    assert json.loads(body) == {"path": "/ping", "root_path": "/legacy"}
+
+
 async def test_an_exception_before_response_start_is_mapped_to_a_response() -> None:
     @buffered
     def boom(state: object, match: Match[HttpScope], body: bytes) -> Response:
@@ -420,6 +429,14 @@ async def test_an_opaque_ws_delegate_receives_the_prefix_trimmed_scope() -> None
         routes=(ws_delegate("/legacy", _ws_echo),), fallback=_ws_says("fallback")
     )
     assert await _ws_texts(app.dispatch(object(), _ws_scope("/legacy/ping"))) == ["/ping|/legacy"]
+
+
+@pytest.mark.security("a WebSocket delegate trims the mount prefix by matched segment count, not byte length")
+async def test_a_ws_delegate_trims_by_segment_not_string_length() -> None:
+    app: WebsocketRouter[object] = WebsocketRouter(
+        routes=(ws_delegate("/legacy", _ws_echo),), fallback=_ws_says("fallback")
+    )
+    assert await _ws_texts(app.dispatch(object(), _ws_scope("//legacy/ping"))) == ["/ping|/legacy"]
 
 
 async def test_ws_mount_wraps_a_nested_delegate_with_its_middleware() -> None:

@@ -9,18 +9,21 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import timedelta
 
 import h2.config
 import h2.connection
+import h2.errors
 import h2.events
 import h2.exceptions
+import h2.settings
 import h11
 from without import background_task
 from without import cancel_futures
+from without import timeout
 from without_asgi import ASGIApp
 from without_asgi import Disconnect
 from without_asgi import EarlyHint
-from without_asgi import Inbound
 from without_asgi import PathSend
 from without_asgi import RawMessage
 from without_asgi import RequestBody
@@ -68,6 +71,23 @@ _BUFFER = 65536
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True, slots=True)
+class _Limits:
+    """
+    The per-connection resource bounds a served connection enforces.
+
+    Bundled into one value so `serving` threads a single argument down through the
+    protocol handlers, and a new bound snaps in as a field rather than another
+    parameter on every signature. `serving` exposes each field as an explicit keyword
+    argument, keeping the public surface flat while the plumbing stays terse.
+    """
+
+    max_concurrent_streams: int
+    max_stream_resets: int
+    idle_timeout: timedelta | None
+    max_websocket_message_bytes: int | None
+
+
 def _address(info: object) -> tuple[str, int] | None:
     if isinstance(info, tuple) and len(info) >= 2 and isinstance(info[0], str) and isinstance(info[1], int):
         return info[0], info[1]
@@ -89,12 +109,26 @@ async def _send_simple(conn: h11.Connection, writer: asyncio.StreamWriter, statu
         await writer.drain()
 
 
-async def _read_request(conn: h11.Connection, reader: asyncio.StreamReader) -> h11.Request | None:
+async def _read(reader: asyncio.StreamReader, idle_timeout: timedelta | None) -> bytes:
+    """
+    Read the next chunk off the socket, bounding the wait by `idle_timeout` when set.
+
+    A `TimeoutError` propagates to the connection loop, which closes the socket, so a
+    peer that opens a connection and then stalls (a slowloris) cannot hold it open
+    indefinitely. `None` leaves the read unbounded.
+    """
+    async with timeout(idle_timeout):
+        return await reader.read(_BUFFER)
+
+
+async def _read_request(
+    conn: h11.Connection, reader: asyncio.StreamReader, idle_timeout: timedelta | None
+) -> h11.Request | None:
     """Pull h11 events until the next request line+headers, reading the socket as needed."""
     while True:
         event = conn.next_event()
         if event is h11.NEED_DATA:
-            conn.receive_data(await reader.read(_BUFFER))
+            conn.receive_data(await _read(reader, idle_timeout))
             continue
         if isinstance(event, h11.Request):
             return event
@@ -111,6 +145,7 @@ async def _run_request(
     server: tuple[str, int] | None,
     client: tuple[str, int] | None,
     request: h11.Request,
+    idle_timeout: timedelta | None,
 ) -> bool:
     """Drive one request/response exchange. Returns whether the connection may keep alive."""
     scope = scope_from_request(request, scheme=scheme, server=server, client=client)
@@ -125,7 +160,7 @@ async def _run_request(
         while True:
             event = conn.next_event()
             if event is h11.NEED_DATA:
-                conn.receive_data(await reader.read(_BUFFER))
+                conn.receive_data(await _read(reader, idle_timeout))
                 continue
             # Unreachable defensive guards: after NEED_DATA is handled, h11 yields only
             # body-phase Events (Data, EndOfMessage, ConnectionClosed), each of which
@@ -183,6 +218,7 @@ async def _serve_websocket(
     server: tuple[str, int] | None,
     client: tuple[str, int] | None,
     request: h11.Request,
+    limits: _Limits,
 ) -> None:
     """
     Drive one WebSocket connection over the HTTP/1.1 upgrade, via wsproto.
@@ -191,6 +227,12 @@ async def _serve_websocket(
     the app's `receive` drains, while `send` writes the app's frames out. The h11
     connection already consumed the handshake request; `initiate_upgrade_connection`
     hands wsproto the parsed request so it can produce the `101` on accept.
+
+    Fragment reassembly is bounded by `limits.max_websocket_message_bytes`: a message
+    whose reassembled frames exceed the cap is refused with a `1009` (message too big)
+    close, so an endless-fragment client cannot grow memory without bound. The pump's
+    read is bounded by `limits.idle_timeout`, so an idle peer that sends no frames is
+    eventually disconnected.
     """
     ws = WSConnection(ConnectionType.SERVER)
     handshake = [(bytes(name), bytes(value)) for name, value in request.headers]
@@ -199,27 +241,45 @@ async def _serve_websocket(
         pass  # discard wsproto's Request; the scope is built from the h11 request
     scope = encode_websocket_scope(websocket_scope_from_request(request, scheme=scheme, server=server, client=client))
 
+    max_message = limits.max_websocket_message_bytes
     inbound: asyncio.Queue[RawMessage] = asyncio.Queue()
     inbound.put_nowait(encode_websocket_inbound(WebsocketConnect()))
     finished = asyncio.Event()
     accepted = False
     text_parts: list[str] = []
     binary_parts = bytearray()
+    pending_bytes = 0
+
+    async def reject_oversized() -> bool:
+        logger.warning(f"Closing WebSocket after a message exceeded {max_message} bytes")
+        writer.write(ws.send(CloseConnection(code=1009, reason="message too big")))
+        await writer.drain()
+        await inbound.put(encode_websocket_inbound(WebsocketDisconnect(code=1009, reason="message too big")))
+        return False
 
     async def drain_events() -> bool:
+        nonlocal pending_bytes
         for event in ws.events():
             match event:
                 case TextMessage(data=data, message_finished=done):
                     text_parts.append(data)
+                    pending_bytes += len(data.encode())
+                    if max_message is not None and pending_bytes > max_message:
+                        return await reject_oversized()
                     if done:
                         message = WebsocketReceive(WebsocketText("".join(text_parts)))
                         text_parts.clear()
+                        pending_bytes = 0
                         await inbound.put(encode_websocket_inbound(message))
                 case BytesMessage(data=data, message_finished=done):
                     binary_parts.extend(data)
+                    pending_bytes += len(data)
+                    if max_message is not None and pending_bytes > max_message:
+                        return await reject_oversized()
                     if done:
                         message = WebsocketReceive(WebsocketBinary(bytes(binary_parts)))
                         binary_parts.clear()
+                        pending_bytes = 0
                         await inbound.put(encode_websocket_inbound(message))
                 case Ping():
                     writer.write(ws.send(event.response()))
@@ -239,7 +299,7 @@ async def _serve_websocket(
         try:
             if not (trailing := conn.trailing_data[0]) or await _feed(ws, trailing, drain_events):
                 while True:
-                    data = await reader.read(_BUFFER)
+                    data = await _read(reader, limits.idle_timeout)
                     if data == b"" or not await _feed(ws, data, drain_events):
                         break
         # wsproto folds malformed frames into a CloseConnection event rather than
@@ -281,6 +341,7 @@ async def _serve_connection(
     app: ASGIApp,
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
+    limits: _Limits,
 ) -> None:
     """
     Pick the wire protocol for one connection, serve it, then close the socket.
@@ -289,6 +350,9 @@ async def _serve_connection(
     *prior knowledge* over cleartext, recognizing the h2 connection preface in the
     first bytes (which must be peeked before feeding `h11`, since `h11` would
     mis-parse `PRI` as an HTTP/1 method). Everything else is HTTP/1.1.
+
+    A `TimeoutError` from a read that outlived `limits.idle_timeout` is a clean idle
+    close, not an error: it unwinds to the `finally` that closes the socket.
     """
     server = _address(writer.get_extra_info("sockname"))
     client = _address(writer.get_extra_info("peername"))
@@ -297,17 +361,23 @@ async def _serve_connection(
     alpn = ssl_object.selected_alpn_protocol() if ssl_object is not None else None
     try:
         if alpn == "h2":
-            await _serve_h2_connection(app, reader, writer, initial=b"", secure=secure, server=server, client=client)
+            await _serve_h2_connection(
+                app, reader, writer, initial=b"", secure=secure, server=server, client=client, limits=limits
+            )
             return
         initial = b""
         if alpn is None:
-            initial = await reader.read(_BUFFER)
+            initial = await _read(reader, limits.idle_timeout)
             if initial.startswith(H2_PREFACE):
                 await _serve_h2_connection(
-                    app, reader, writer, initial=initial, secure=secure, server=server, client=client
+                    app, reader, writer, initial=initial, secure=secure, server=server, client=client, limits=limits
                 )
                 return
-        await _serve_h11_connection(app, reader, writer, initial=initial, secure=secure, server=server, client=client)
+        await _serve_h11_connection(
+            app, reader, writer, initial=initial, secure=secure, server=server, client=client, limits=limits
+        )
+    except TimeoutError:
+        logger.info("Closing a connection idle beyond the idle timeout")
     finally:
         with suppress(OSError):
             writer.close()
@@ -323,6 +393,7 @@ async def _serve_h11_connection(
     secure: bool,
     server: tuple[str, int] | None,
     client: tuple[str, int] | None,
+    limits: _Limits,
 ) -> None:
     """Serve sequential HTTP/1.1 requests (and WebSocket upgrades) on one connection."""
     conn = h11.Connection(our_role=h11.SERVER)
@@ -330,7 +401,7 @@ async def _serve_h11_connection(
         conn.receive_data(initial)
     while True:
         try:
-            request = await _read_request(conn, reader)
+            request = await _read_request(conn, reader, limits.idle_timeout)
         except h11.RemoteProtocolError as exc:
             await _send_simple(conn, writer, exc.error_status_hint, b"bad request\n")
             return
@@ -339,12 +410,20 @@ async def _serve_h11_connection(
         if is_websocket_upgrade(request):
             scheme = "wss" if secure else "ws"
             await _serve_websocket(
-                app, conn, reader, writer, scheme=scheme, server=server, client=client, request=request
+                app, conn, reader, writer, scheme=scheme, server=server, client=client, request=request, limits=limits
             )
             return
         scheme = "https" if secure else "http"
         keep_alive = await _run_request(
-            app, conn, reader, writer, scheme=scheme, server=server, client=client, request=request
+            app,
+            conn,
+            reader,
+            writer,
+            scheme=scheme,
+            server=server,
+            client=client,
+            request=request,
+            idle_timeout=limits.idle_timeout,
         )
         if not keep_alive:
             return
@@ -361,9 +440,10 @@ async def _serve_h11_connection(
 class _H2Stream:
     """The per-request mutable state the read loop and the stream's app task share."""
 
-    inbound: asyncio.Queue[Inbound]
+    inbound: asyncio.Queue[tuple[RequestBody, int]]
     window: asyncio.Event
     head: bool
+    task: asyncio.Task[None] | None = None
     response_started: bool = False
     response_done: bool = False
 
@@ -377,6 +457,7 @@ async def _serve_h2_connection(
     secure: bool,
     server: tuple[str, int] | None,
     client: tuple[str, int] | None,
+    limits: _Limits,
 ) -> None:
     """
     Serve concurrent multiplexed HTTP/2 requests on one connection.
@@ -392,11 +473,21 @@ async def _serve_h2_connection(
     ever sets that event after applying a `WINDOW_UPDATE` under the same lock. So the
     window can never grow between a sender's check and its wait, which would
     otherwise be a lost wakeup that strands the response.
+
+    Three peer-driven resource bounds: `MAX_CONCURRENT_STREAMS` is advertised as
+    `limits.max_concurrent_streams`, so h2 rejects a client that opens too many streams
+    at once; a client `RST_STREAM` cancels the stream's app task immediately (rather
+    than letting it run to completion against a dead stream), and once resets on one
+    connection exceed `limits.max_stream_resets` the connection is closed with
+    `ENHANCE_YOUR_CALM`, defeating the HTTP/2 Rapid Reset flood (CVE-2023-44487).
+    Received body is acknowledged to the peer only as the app consumes it, so the
+    inbound flow-control window bounds buffered body rather than reopening on receipt.
     """
     scheme = "https" if secure else "http"
     conn = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=False, header_encoding=None))
     lock = asyncio.Lock()
     streams: dict[int, _H2Stream] = {}
+    resets = 0
     tasks: set[asyncio.Task[None]] = set()
     closed = asyncio.Event()
 
@@ -465,23 +556,47 @@ async def _serve_h2_connection(
                 writer.write(conn.data_to_send())
         await writer.drain()
 
+    async def send_bad_request(stream_id: int) -> None:
+        async with lock:
+            with suppress(h2.exceptions.ProtocolError, h2.exceptions.StreamClosedError):
+                conn.send_headers(stream_id, [(b":status", b"400"), (b"content-type", b"text/plain; charset=utf-8")])
+                conn.send_data(stream_id, b"bad request\n", end_stream=True)
+                writer.write(conn.data_to_send())
+        await writer.drain()
+
     async def run_stream(stream_id: int, headers: list[tuple[bytes, bytes]], stream: _H2Stream) -> None:
-        scope = scope_from_h2_headers(headers, scheme=scheme, server=server, client=client)
-        request_done = False
-
-        async def receive() -> RawMessage:
-            nonlocal request_done
-            if request_done:
-                return encode_inbound(Disconnect())
-            inbound = await stream.inbound.get()
-            if isinstance(inbound, Disconnect) or (isinstance(inbound, RequestBody) and not inbound.more_body):
-                request_done = True
-            return encode_inbound(inbound)
-
-        async def send(message: RawMessage) -> None:
-            await send_outbound(stream_id, stream, message)
-
         try:
+            try:
+                scope = scope_from_h2_headers(headers, scheme=scheme, server=server, client=client)
+            except UnicodeDecodeError:
+                # A non-ASCII `:method`/`:path` fails the header decode; answer a clean 400
+                # rather than letting the stream hang with nothing sent.
+                logger.warning(f"Rejecting HTTP/2 stream {stream_id} with a non-ASCII :method or :path")
+                await send_bad_request(stream_id)
+                stream.response_done = True
+                return
+            request_done = False
+
+            async def receive() -> RawMessage:
+                nonlocal request_done
+                if request_done:
+                    return encode_inbound(Disconnect())
+                body, length = await stream.inbound.get()
+                # Acknowledge received body only as the app consumes it, so the inbound
+                # flow-control window bounds buffered body instead of reopening on receipt.
+                if length:
+                    async with lock:
+                        with suppress(h2.exceptions.ProtocolError, h2.exceptions.StreamClosedError):
+                            conn.acknowledge_received_data(length, stream_id)
+                            writer.write(conn.data_to_send())
+                    await writer.drain()
+                if not body.more_body:
+                    request_done = True
+                return encode_inbound(body)
+
+            async def send(message: RawMessage) -> None:
+                await send_outbound(stream_id, stream, message)
+
             try:
                 await app(encode_http_scope(scope), receive, send)
             except asyncio.CancelledError:
@@ -493,40 +608,53 @@ async def _serve_h2_connection(
         finally:
             streams.pop(stream_id, None)
 
+    async def close_after_reset_flood() -> None:
+        logger.warning(
+            f"Closing HTTP/2 connection after {resets} stream resets exceeded the budget of {limits.max_stream_resets}"
+        )
+        async with lock:
+            conn.close_connection(error_code=h2.errors.ErrorCodes.ENHANCE_YOUR_CALM)
+            writer.write(conn.data_to_send())
+        await writer.drain()
+        closed.set()
+
     async def handle_event(event: h2.events.Event) -> None:
+        nonlocal resets
         match event:
             case h2.events.RequestReceived(stream_id=stream_id, headers=headers):
                 method = next((v for n, v in headers if n == b":method"), b"")
                 new = _H2Stream(inbound=asyncio.Queue(), window=asyncio.Event(), head=method == b"HEAD")
                 streams[stream_id] = new
-                task = asyncio.create_task(run_stream(stream_id, list(headers), new))
-                tasks.add(task)
-                task.add_done_callback(tasks.discard)
+                new.task = asyncio.create_task(run_stream(stream_id, list(headers), new))
+                tasks.add(new.task)
+                new.task.add_done_callback(tasks.discard)
             case h2.events.DataReceived(stream_id=stream_id, data=data, flow_controlled_length=length):
                 # `is not None` guards are defensive: h2 raises a protocol error rather
                 # than emitting a body/end/reset/window event for a stream it is not
-                # tracking, so the miss branch cannot be reached.
+                # tracking, so the miss branch cannot be reached. The body is not
+                # acknowledged here; `receive` acks it as the app consumes it.
                 if (target := streams.get(stream_id)) is not None:
-                    target.inbound.put_nowait(RequestBody(body=bytes(data), more_body=True))
+                    target.inbound.put_nowait((RequestBody(body=bytes(data), more_body=True), length))
                 else:  # pragma: no cover - h2 rejects DATA for an untracked stream before this point
                     logger.warning(f"Discarding HTTP/2 DATA for untracked stream {stream_id}")
-                async with lock:
-                    conn.acknowledge_received_data(length, stream_id)
-                    writer.write(conn.data_to_send())
-                await writer.drain()
             case h2.events.StreamEnded(stream_id=stream_id):
                 if (target := streams.get(stream_id)) is not None:
-                    target.inbound.put_nowait(RequestBody(body=b"", more_body=False))
+                    target.inbound.put_nowait((RequestBody(body=b"", more_body=False), 0))
                 else:  # pragma: no cover - h2 rejects END_STREAM for an untracked stream before this point
                     logger.warning(f"Discarding HTTP/2 END_STREAM for untracked stream {stream_id}")
             case h2.events.StreamReset(stream_id=stream_id):
+                resets += 1
                 if (target := streams.get(stream_id)) is not None:
-                    target.inbound.put_nowait(Disconnect())
-                    # Wake a sender blocked on the window so it observes the closed
-                    # stream and unwinds, rather than lingering until connection close.
-                    target.window.set()
+                    # Cancel the stream's app task immediately rather than letting it run to
+                    # completion against a dead stream (an app may shield critical sections
+                    # from cancellation if it needs them to finish).
+                    logger.info(f"Cancelling HTTP/2 stream {stream_id} after a client reset")
+                    assert target.task is not None
+                    target.task.cancel()
                 else:  # pragma: no cover - h2 rejects RST_STREAM for an untracked stream before this point
                     logger.warning(f"Discarding HTTP/2 RST_STREAM for untracked stream {stream_id}")
+                if resets > limits.max_stream_resets:
+                    await close_after_reset_flood()
             case h2.events.WindowUpdated(stream_id=stream_id):
                 if stream_id == 0:
                     for target in streams.values():
@@ -562,13 +690,14 @@ async def _serve_h2_connection(
 
     async with lock:
         conn.initiate_connection()
+        conn.update_settings({h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS: limits.max_concurrent_streams})
         writer.write(conn.data_to_send())
     await writer.drain()
     try:
         if initial and not await feed(initial):
             return
         while True:
-            data = await reader.read(_BUFFER)
+            data = await _read(reader, limits.idle_timeout)
             if not data or not await feed(data):
                 return
     finally:
@@ -623,6 +752,10 @@ async def serving(
     host: str = "127.0.0.1",
     port: int = 0,
     max_pending_connections: int = 100,
+    max_concurrent_streams: int = 100,
+    max_stream_resets: int = 200,
+    idle_timeout: timedelta | None = None,
+    max_websocket_message_bytes: int | None = None,
     ssl_context: ssl.SSLContext | None = None,
     ssl_handshake_timeout: float | None = None,
     ssl_shutdown_timeout: float | None = None,
@@ -656,11 +789,27 @@ async def serving(
     failures (pausing for `ACCEPT_RETRY_DELAY` on resource exhaustion) and binds every
     address `host` resolves to.
 
+    Four per-connection resource bounds harden a public deployment. `idle_timeout`
+    (a `timedelta`, off by default) closes a connection whose peer stops sending data
+    mid-exchange, defeating a slowloris; it also bounds an idle WebSocket. Over HTTP/2,
+    `max_concurrent_streams` is advertised as `MAX_CONCURRENT_STREAMS` and
+    `max_stream_resets` caps how many stream resets one connection may issue before it
+    is dropped, together defeating the Rapid Reset flood (CVE-2023-44487).
+    `max_websocket_message_bytes` (off by default) caps a reassembled WebSocket message.
+    Tune them at your composition root, e.g. from a settings value parsed by
+    `without_env.EnvContext`, rather than reaching for the environment here.
+
     Pass `ssl_context` to serve `https`/`wss` directly; `server_ssl_context` builds
     one for the common case. `ssl_handshake_timeout` bounds a single TLS handshake
     (asyncio's default is 60s) and `ssl_shutdown_timeout` the closing `close_notify`
     exchange (default 30s); both are meaningful only alongside `ssl_context`.
     """
+    limits = _Limits(
+        max_concurrent_streams=max_concurrent_streams,
+        max_stream_resets=max_stream_resets,
+        idle_timeout=idle_timeout,
+        max_websocket_message_bytes=max_websocket_message_bytes,
+    )
     live = _LiveConnections()
     connections: set[asyncio.Task[None]] = set()
 
@@ -670,7 +819,7 @@ async def serving(
         connections.add(task)
         try:
             async with live.tracked():
-                await _serve_connection(app, reader, writer)
+                await _serve_connection(app, reader, writer, limits)
         finally:
             connections.discard(task)
 

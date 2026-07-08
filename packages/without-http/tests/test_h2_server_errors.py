@@ -8,6 +8,7 @@ import h2.connection
 import h2.errors
 import h2.events
 import h2.settings
+import pytest
 from without_asgi import ASGIApp
 from without_asgi import RawScope
 from without_asgi import Receive
@@ -59,10 +60,12 @@ async def start_only_app(scope: RawScope, receive: Receive, send: Send) -> None:
     await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
 
 
-def slow_chunked_app(second_sent: asyncio.Event) -> ASGIApp:
+def contained_after_reset_app(second_sent: asyncio.Event) -> ASGIApp:
     """
-    Send a first chunk, pause for the client to reset, then send again (a write the
-    server contains), setting `second_sent` once that second send has been attempted.
+    Send a first chunk, then swallow the cancellation the client's reset triggers (the
+    documented escape hatch: an app may shield work from cancellation) and attempt a
+    second send. That send hits the now-closed stream and is contained by the server,
+    after which `second_sent` is set.
     """
 
     async def app(scope: RawScope, receive: Receive, send: Send) -> None:
@@ -70,7 +73,8 @@ def slow_chunked_app(second_sent: asyncio.Event) -> ASGIApp:
             raise RuntimeError("this app serves only http")
         await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
         await send({"type": "http.response.body", "body": b"first", "more_body": True})
-        await asyncio.sleep(0.15)  # let the client's reset reach the server before the next chunk
+        with suppress(asyncio.CancelledError):
+            await asyncio.Event().wait()  # cancelled by the client's reset; the app ignores it
         await send({"type": "http.response.body", "body": b"second", "more_body": True})
         second_sent.set()
 
@@ -182,9 +186,10 @@ async def test_receiving_after_the_request_body_yields_a_disconnect_over_h2() ->
     assert body == b"http.disconnect"
 
 
+@pytest.mark.security("a client reset mid-response cancels the stream task and contains the doomed send")
 async def test_resetting_a_stream_mid_response_is_contained() -> None:
     second_sent = asyncio.Event()
-    async with serving(slow_chunked_app(second_sent)) as server:
+    async with serving(contained_after_reset_app(second_sent)) as server:
         reader, writer = await asyncio.open_connection(server.host, server.port)
         conn = _client()
         conn.initiate_connection()
@@ -332,3 +337,132 @@ async def test_an_in_flight_stream_is_cancelled_on_server_shutdown() -> None:
     writer.close()
     with suppress(OSError):
         await writer.wait_closed()
+
+
+def cancel_recording_app(entered: asyncio.Event, cancelled: asyncio.Event) -> ASGIApp:
+    """Set `entered` once dispatched, then record a cancellation in `cancelled`."""
+
+    async def app(scope: RawScope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            raise RuntimeError("this app serves only http")
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    return app
+
+
+@pytest.mark.security("a client RST_STREAM cancels the stream's app task promptly", cve="CVE-2023-44487")
+async def test_a_client_reset_cancels_the_stream_task() -> None:
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    async with serving(cancel_recording_app(entered, cancelled)) as server:
+        _reader, writer = await asyncio.open_connection(server.host, server.port)
+        conn = _client()
+        conn.initiate_connection()
+        stream_id = conn.get_next_available_stream_id()
+        conn.send_headers(stream_id, _headers(server.host, server.port, "GET", "/r"), end_stream=True)
+        writer.write(conn.data_to_send())
+        await writer.drain()
+        async with asyncio.timeout(5):
+            await entered.wait()
+        conn.reset_stream(stream_id, error_code=h2.errors.ErrorCodes.CANCEL)
+        writer.write(conn.data_to_send())
+        await writer.drain()
+        async with asyncio.timeout(5):
+            await cancelled.wait()  # the reset cancelled the app task
+        writer.close()
+        with suppress(OSError):
+            await writer.wait_closed()
+
+
+@pytest.mark.security("the server advertises MAX_CONCURRENT_STREAMS to bound concurrent streams", cve="CVE-2023-44487")
+async def test_advertises_the_configured_max_concurrent_streams() -> None:
+    async with serving(echo_app, max_concurrent_streams=7) as server:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        conn = _client()
+        conn.initiate_connection()
+        writer.write(conn.data_to_send())
+        await writer.drain()
+        settings_seen = False
+        async with asyncio.timeout(5):
+            while not settings_seen:
+                for event in conn.receive_data(await reader.read(65536)):
+                    if isinstance(event, h2.events.RemoteSettingsChanged):
+                        settings_seen = True
+                writer.write(conn.data_to_send())
+                await writer.drain()
+        assert conn.remote_settings.max_concurrent_streams == 7
+        writer.close()
+        with suppress(OSError):
+            await writer.wait_closed()
+
+
+@pytest.mark.security("a stream-reset flood past the budget drops the connection (Rapid Reset)", cve="CVE-2023-44487")
+async def test_a_reset_flood_closes_the_connection() -> None:
+    async with serving(echo_app, max_stream_resets=2) as server:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        conn = _client()
+        conn.initiate_connection()
+        writer.write(conn.data_to_send())
+        await writer.drain()
+        for _ in range(3):  # three resets exceed the budget of two
+            stream_id = conn.get_next_available_stream_id()
+            conn.send_headers(stream_id, _headers(server.host, server.port, "GET", "/x"), end_stream=True)
+            conn.reset_stream(stream_id, error_code=h2.errors.ErrorCodes.CANCEL)
+            writer.write(conn.data_to_send())
+            await writer.drain()
+        terminated = False
+        async with asyncio.timeout(5):
+            while not terminated:
+                data = await reader.read(65536)
+                if not data:  # pragma: no cover - the GOAWAY arrives before the socket EOF
+                    terminated = True
+                    break
+                for event in conn.receive_data(data):
+                    if isinstance(event, h2.events.ConnectionTerminated):
+                        terminated = True
+        assert terminated
+        writer.close()
+        with suppress(OSError):
+            await writer.wait_closed()
+
+
+@pytest.mark.security("a non-ASCII HTTP/2 :path is answered with 400 rather than hanging the stream")
+async def test_a_non_ascii_path_becomes_a_400() -> None:
+    async with serving(echo_app) as server:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        conn = h2.connection.H2Connection(
+            config=h2.config.H2Configuration(
+                client_side=True,
+                header_encoding=None,
+                validate_outbound_headers=False,
+                normalize_outbound_headers=False,
+            )
+        )
+        conn.initiate_connection()
+        stream_id = conn.get_next_available_stream_id()
+        headers = [
+            (b":method", b"GET"),
+            (b":path", b"/caf\xc3\xa9\xff"),  # not decodable as ASCII
+            (b":scheme", b"http"),
+            (b":authority", f"{server.host}:{server.port}".encode()),
+        ]
+        conn.send_headers(stream_id, headers, end_stream=True)
+        writer.write(conn.data_to_send())
+        await writer.drain()
+        status = 0
+        async with asyncio.timeout(5):
+            while status == 0:
+                for event in conn.receive_data(await reader.read(65536)):
+                    if isinstance(event, h2.events.ResponseReceived):
+                        status = int(next(value for name, value in event.headers if name == b":status"))
+                writer.write(conn.data_to_send())
+                await writer.drain()
+        assert status == 400
+        writer.close()
+        with suppress(OSError):
+            await writer.wait_closed()

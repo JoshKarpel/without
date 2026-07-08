@@ -34,16 +34,19 @@ jobs:
 
       - name: Derive shared version from release tag
         id: version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
         run: |
-          tag="${{ github.event.release.tag_name }}"
-          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
       # Lockstep versioning: stamp every publishable member with the one shared
       # version and pin each intra-workspace dependency to it, so a built wheel
       # (which strips `[tool.uv.sources]`) requires exactly the siblings it was
       # built against instead of an unbounded bare name.
       - name: Stamp the shared version and pin intra-workspace dependencies
-        run: uv run --script scripts/prepare_release.py "${{ steps.version.outputs.version }}"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: uv run --script scripts/prepare_release.py "$VERSION"
 
       # The publishable packages are exactly the `without*` workspace members
       # (the core `without-core` plus its `without-` plugins); the `integration`

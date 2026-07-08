@@ -79,6 +79,17 @@ What the server handles:
   `Server.in_flight` reports the live connection count for metrics. To bound in-flight
   *requests* (the right limit once one HTTP/2 connection multiplexes many requests),
   wrap the app in `limit_concurrent_requests`, which sheds with a `503`.
+- **Resource bounds.** `serving` takes per-connection bounds for a hostile network,
+  off or generous by default and tuned at the composition root (e.g. from an
+  `EnvContext` settings value). `idle_timeout` (a `timedelta`) closes a connection
+  whose peer stalls mid-exchange (slowloris) and bounds an idle WebSocket. Over
+  HTTP/2, `max_concurrent_streams` is advertised and `max_stream_resets` caps how many
+  resets one connection may issue before it is dropped, together defeating the Rapid
+  Reset flood (CVE-2023-44487); a client reset also cancels the stream's app task, and
+  received body is acked only as the app consumes it, so the flow-control window bounds
+  buffered body. `max_websocket_message_bytes` caps a reassembled WebSocket message.
+  For a body-size cap that works under any transport, wrap the app in
+  `without-asgi`'s `limit_request_body`, which answers `413`.
 
 The pure wire cores (`h11_wire`, `h2_wire`, `ws_wire`) are sans-IO and unit-tested:
 they map `h11`/`h2`/`wsproto` events to the typed `without-asgi` vocabulary and
@@ -229,4 +240,7 @@ request-spanning identity belongs in a value you own and pass per request. A
 so cookie scope (application identity) stays independent of connection reuse
 (transport) rather than both hiding in the pool. Two requests share cookies exactly
 when they share a jar. Place `cookies` *inside* `follow_redirects` in a `stack` so each
-redirect hop both sends and collects cookies.
+redirect hop both sends and collects cookies. The jar fills from responses via `store`,
+which applies the origin guards a `Set-Cookie` needs; to seed a cookie you already hold
+(a session token, a fixture), `jar.add(name, value, domain=...)` places it directly,
+trusting the caller instead.
