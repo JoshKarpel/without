@@ -92,6 +92,7 @@ nav:
       - guides/without-http.md
       - guides/without-dag.md
       - guides/without-logging.md
+  - Security: security.md
   - Architecture:
       - architecture/package-graph.md
   - API Reference:

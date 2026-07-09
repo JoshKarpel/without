@@ -37,6 +37,11 @@
   a redirect) without deadlocking a large upload, and a caller can drive genuine bidirectional
   streaming over HTTP/2 by feeding a queue-backed request body in reaction to the response. Connection
   teardown is a single release-exactly-once path shared by the background sender and the response body.
+  Closing an early-answered HTTP/1.1 connection is now a bounded *lingering close* (a half-close `FIN`
+  plus a short, fixed drain window, never draining to end-of-input) rather than a reset that could
+  race ahead of and discard the response the server already sent, and the client stops streaming its
+  body the moment the peer half-closes rather than writing on into a closing connection. See the new
+  [Security](https://without.help/security/) page.
 
 ## 0.0.1
 

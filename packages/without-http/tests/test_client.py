@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 from collections.abc import AsyncIterator
+from collections.abc import Awaitable
+from collections.abc import Callable
 from dataclasses import replace
 from urllib.parse import urlsplit
 
+import h11
 import pytest
 from without_asgi import RawScope
 from without_asgi import Receive
@@ -25,6 +28,9 @@ from without_http.client import _REDIRECT_STATUSES
 from without_http.client import _build_request
 from without_http.client import _Http11Connection
 from without_http.client import _origin
+
+type _Endpoint = tuple[asyncio.StreamReader, asyncio.StreamWriter]
+type _StreamPairFactory = Callable[[], Awaitable[tuple[_Endpoint, _Endpoint]]]
 
 
 async def _read_body(receive: Receive) -> bytes:
@@ -223,6 +229,55 @@ async def test_early_response_to_a_large_upload_does_not_deadlock() -> None:
         assert _idle_count(pool) == 0  # the unfinished upload is never a reusable connection
         # A second request proves the single permit was released, not stranded.
         assert await asyncio.wait_for(post_status(pool, url), timeout=10) == 413
+
+
+async def test_send_body_stops_at_a_chunk_boundary_when_the_peer_half_closes(
+    stream_pair: _StreamPairFactory,
+) -> None:
+    (client_reader, client_writer), (peer_reader, peer_writer) = await stream_pair()
+    connection = _Http11Connection.new(client_reader, client_writer)
+    url = "http://upstream/upload"
+
+    async def body() -> AsyncIterator[bytes]:
+        yield b"first-chunk"
+        peer_writer.write_eof()  # the peer half-closes after the first chunk
+        assert await client_reader.read() == b""  # ...and the client observes the FIN
+        yield b"second-chunk"  # pulled, but the send stops before writing it
+
+    request = _build_request("POST", url, (), body())
+    await connection.send_head(request, urlsplit(url))
+    await connection.send_body(request)
+    client_writer.write_eof()
+    sent = await peer_reader.read()
+
+    assert b"first-chunk" in sent  # the pre-close chunk went out
+    assert b"second-chunk" not in sent  # the post-close chunk was pulled but never written
+    assert connection._conn.our_state is h11.SEND_BODY  # the body was never framed to its end
+
+
+async def test_send_body_skips_the_end_of_message_when_the_peer_half_closes(
+    stream_pair: _StreamPairFactory,
+) -> None:
+    (client_reader, client_writer), (peer_reader, peer_writer) = await stream_pair()
+    connection = _Http11Connection.new(client_reader, client_writer)
+    url = "http://upstream/upload"
+
+    async def body() -> AsyncIterator[bytes]:
+        yield b"only-chunk"
+        peer_writer.write_eof()  # the peer half-closes just as the body ends
+        assert await client_reader.read() == b""
+
+    request = _build_request("POST", url, (), body())
+    await connection.send_head(request, urlsplit(url))
+    await connection.send_body(request)
+    client_writer.write_eof()
+    sent = await peer_reader.read()
+
+    # The body drains fully, but the trailing EndOfMessage (a chunked `0\r\n\r\n`
+    # terminator) is suppressed by the half-close, leaving the request unfinished.
+    assert b"only-chunk" in sent
+    assert b"0\r\n\r\n" not in sent
+    assert connection._conn.our_state is h11.SEND_BODY
 
 
 async def _raising_body() -> AsyncIterator[bytes]:

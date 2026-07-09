@@ -63,7 +63,10 @@ What the server handles:
   per-stream `WINDOW_UPDATE` flow control. The same `without-asgi` server-direction
   codecs carry over; only the wire mapping (`h2_wire`) is new.
 - **Keep-alive.** Sequential requests on one HTTP/1.1 connection reuse it
-  (`h11`'s `start_next_cycle`).
+  (`h11`'s `start_next_cycle`). A connection closed with an unread request body
+  (an early response) is closed *gracefully*, with a bounded lingering `FIN`
+  rather than a reset that could discard the response: see
+  [Security](../security.md#early-responses-and-connection-close).
 - **WebSockets** over the HTTP/1.1 `Upgrade`: the handshake is handed to `wsproto`,
   and the connection runs full-duplex (a reader pump feeds inbound frames to the
   app's `receive` while `send` writes outbound frames). A `websocket.close` sent
@@ -233,6 +236,11 @@ duplex is limited by server and proxy support in the wild; there the concurrency
 buys the deadlock fix rather than a promise of robust bidi. (A body that withholds
 its first chunk delays the request headers over h2, so a *server-speaks-first* duplex
 over one request is not supported; a client-speaks-first one is.)
+
+Answering early and closing safely has a security dimension on both sides (the
+client stops sending on the peer's half-close; the server closes with a bounded
+lingering `FIN` rather than an `RST` that could discard its own response). See
+[Security](../security.md#early-responses-and-connection-close).
 
 ### Timeouts
 

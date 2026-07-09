@@ -277,6 +277,43 @@ async def _feed(ws: WSConnection, data: bytes, drain_events: Callable[[], Awaita
     return await drain_events()
 
 
+# Matches Go net/http's `rstAvoidanceDelay`: long enough for our FIN, and the
+# response we already sent, to reach the client before we fully close; short
+# enough that a client which keeps sending cannot hold the connection open.
+_LINGER_TIMEOUT = 0.5
+
+
+async def _lingering_close(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """
+    Close a connection whose peer may still be sending, without RST-ing it.
+
+    Closing a socket that still has unread inbound data makes the OS send a TCP
+    `RST` instead of a clean `FIN`, and that reset can race ahead of a response we
+    already wrote, so the peer reads `ECONNRESET` and never sees it. This is the
+    early-response case: we answered (say a `413`) before reading the request body.
+
+    Mirror nginx `lingering_close` and Go `closeWriteAndWait`: half-close our write
+    side so a well-behaved client learns to stop sending and read the response,
+    then read and discard any in-flight body for a short bounded window before
+    closing. We never drain to end-of-input, so a client that keeps sending only
+    gets the `RST` it would have gotten anyway; it cannot hold the connection open.
+
+    Half-closing needs a duplex transport; TLS cannot half-close, so over TLS we
+    skip the `FIN` and rely on the bounded drain alone (as nginx notes, the signal
+    cannot reach a client behind a TLS-terminating proxy in any case).
+    """
+    if writer.can_write_eof():
+        with suppress(OSError):
+            writer.write_eof()
+    with suppress(OSError, TimeoutError):
+        async with asyncio.timeout(_LINGER_TIMEOUT):
+            while await reader.read(_BUFFER):
+                pass
+    with suppress(OSError):
+        writer.close()
+        await writer.wait_closed()
+
+
 async def _serve_connection(
     app: ASGIApp,
     reader: asyncio.StreamReader,
@@ -332,7 +369,10 @@ async def _serve_h11_connection(
         try:
             request = await _read_request(conn, reader)
         except h11.RemoteProtocolError as exc:
+            # An early error response before the (malformed) body was read: linger so
+            # the client reads the response instead of an `RST`. See `_lingering_close`.
             await _send_simple(conn, writer, exc.error_status_hint, b"bad request\n")
+            await _lingering_close(reader, writer)
             return
         if request is None:
             return
@@ -347,6 +387,12 @@ async def _serve_h11_connection(
             app, conn, reader, writer, scheme=scheme, server=server, client=client, request=request
         )
         if not keep_alive:
+            # An unread request body means the peer is still sending; close with a
+            # lingering FIN so an early response is not lost to an `RST`. A cleanly
+            # finished exchange (body fully read) needs none of this. See
+            # `_lingering_close`.
+            if conn.their_state is not h11.DONE:
+                await _lingering_close(reader, writer)
             return
         try:
             conn.start_next_cycle()

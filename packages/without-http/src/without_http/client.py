@@ -385,13 +385,27 @@ class _Http11Connection:
         on EOF, so `release` can surface it to the caller. It is recorded rather than
         re-raised so the teardown that awaits this task never has to catch it. `WriteTimeout`
         is handled before `OSError` because it is itself an `OSError` subclass.
+
+        The send also stops the moment the peer half-closes (`reader.at_eof()`), the
+        duplex-safe "connection is closing" signal: an early response or connection close
+        means the server is going away, so there is no point streaming the rest of the
+        body, and continuing to write would only trip the socket into a reset that could
+        discard the response the read side is concurrently reading. An unfinished send
+        just leaves the connection non-reusable (see `finish`); the response read owns
+        surfacing the outcome. The arrival of the *response head* is deliberately not the
+        signal: over a duplex exchange a response can begin while the request body is
+        still legitimately in flight.
         """
         try:
             async for chunk in request.body:
+                if self._reader.at_eof():
+                    return
                 if chunk:
                     self._writer.write(self._conn.send(h11.Data(data=chunk)))
                     async with phase(write, WriteTimeout):
                         await self._writer.drain()
+            if self._reader.at_eof():
+                return
             self._writer.write(self._conn.send(h11.EndOfMessage()))
             async with phase(write, WriteTimeout):
                 await self._writer.drain()
