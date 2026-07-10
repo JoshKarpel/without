@@ -12,6 +12,7 @@ import h2.events
 import h2.settings
 import pytest
 from without_http import ConnectionPool
+from without_http.client import _empty_body
 from without_http.client import _Http2Connection
 from without_http.client import _Stream
 
@@ -106,13 +107,9 @@ async def test_request_on_a_closed_connection_raises() -> None:
     async with _idle_connection() as connection:
         connection._closed.set()
 
-        async def _empty() -> AsyncIterator[bytes]:
-            return
-            yield
-
         with pytest.raises(ConnectionError, match="closed before the request was sent"):
             await connection.request(
-                method=b"GET", target=b"/", scheme="http", authority=b"h", headers=(), body=_empty()
+                method=b"GET", target=b"/", scheme="http", authority=b"h", headers=(), body=_empty_body()
             )
 
 

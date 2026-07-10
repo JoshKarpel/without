@@ -231,11 +231,13 @@ the opt-in safety net that turns a mis-designed interleaving from an eternal han
 a typed error you chose to arm.
 
 This is genuinely correct over **HTTP/2**, whose independent per-direction flow
-control is what bidi is built on. Over **HTTP/1.1** the same code runs, but real
-duplex is limited by server and proxy support in the wild; there the concurrency
-buys the deadlock fix rather than a promise of robust bidi. (A body that withholds
-its first chunk delays the request headers over h2, so a *server-speaks-first* duplex
-over one request is not supported; a client-speaks-first one is.)
+control is what bidi is built on. The request head is sent immediately, before the
+first body chunk is produced, so both a *client-speaks-first* duplex (send an opening
+chunk, then feed more in reaction to the response) and a *server-speaks-first* one (let
+the server respond before any body chunk is ready) work over one request. Over
+**HTTP/1.1** the same code runs, but real duplex is limited by server and proxy support
+in the wild; there the concurrency buys the deadlock fix rather than a promise of robust
+bidi.
 
 Answering early and closing safely has a security dimension on both sides (the
 client stops sending on the peer's half-close; the server closes with a bounded

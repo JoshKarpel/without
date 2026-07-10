@@ -201,6 +201,22 @@ async def test_h2_bidirectional_ping_pong_streams_both_ways() -> None:
     assert received == [b"ONE", b"MSG1", b"MSG2"]
 
 
+async def test_h2_server_speaks_first_before_the_request_body_is_ready() -> None:
+    async with serving(bidi_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
+        head_seen = asyncio.Event()
+
+        async def request_body() -> AsyncIterator[bytes]:
+            await head_seen.wait()  # withhold the first chunk until the head has arrived
+            yield b"late"
+
+        url = f"http://{HOST}:{server.port}/bidi"
+        async with pool.request("POST", url, body=request_body()) as (head, body):
+            assert head.status == 200  # the head arrives though no body chunk has been produced yet
+            head_seen.set()
+            received = [chunk async for chunk in body if chunk]  # skip the trailing empty end-of-stream frame
+        assert received == [b"LATE"]
+
+
 async def test_h2_abandoning_a_bidi_body_cancels_the_parked_sender() -> None:
     async with serving(bidi_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
         outbound: asyncio.Queue[bytes | None] = asyncio.Queue()

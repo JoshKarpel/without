@@ -246,20 +246,6 @@ type ClientMiddleware = Endo[ClientExchange]
 _PASSTHROUGH: ClientMiddleware = stack()
 
 
-async def _peek(body: Stream[bytes]) -> tuple[bytes | None, AsyncIterator[bytes]]:
-    """
-    The first non-empty chunk of a body and the iterator positioned after it.
-
-    `None` means the body is empty, which lets a sender end the request on the headers
-    (no DATA frame, no chunked body) instead of sending an empty body.
-    """
-    iterator = aiter(body)
-    async for chunk in iterator:
-        if chunk:
-            return chunk, iterator
-    return None, iterator
-
-
 def _has(headers: RawHeaders, name: bytes) -> bool:
     return any(existing.lower() == name for existing, _ in headers)
 
@@ -556,17 +542,17 @@ class _Http2Connection:
         body: Stream[bytes],
         timeout: Timeout = _NO_TIMEOUT,
     ) -> tuple[int, RawHeaders, int, AsyncGenerator[bytes | ResponseTrailers], asyncio.Task[None] | None]:
-        # `_peek` pulls the body's first chunk to decide whether to end the stream on the
-        # headers (a bodyless request needs no DATA frame). A body that withholds its
-        # first chunk delays the headers, so a *server-speaks-first* duplex over one h2
-        # request is not supported; a client-speaks-first duplex (send the opening chunk,
-        # then feed more in reaction to the response) is, since its first chunk is ready.
-        first, rest = await _peek(body)
+        # Send the head immediately (`end_stream=False`) and stream the body as a background
+        # task, so a slow-to-produce first chunk never delays the headers and the server can
+        # respond, or speak first, while the body is still going out (the h2 mirror of h11's
+        # duplex). The body task ends the stream: for a bodyless request it sends a lone empty
+        # END_STREAM DATA frame, one extra frame in exchange for never blocking the head on the
+        # body. This is what makes both client-speaks-first and server-speaks-first duplex work.
         stream = _Stream(window=asyncio.Event(), head=asyncio.Event(), chunks=asyncio.Queue())
         stream_id = await self._open_stream(
             stream,
             request_headers(method, target, scheme, authority, headers),
-            end_stream=first is None,
+            end_stream=False,
             pool=timeout.pool,
         )
         # Once the stream is registered, any failure before the head is returned must
@@ -575,10 +561,7 @@ class _Http2Connection:
         try:
             async with phase(timeout.write, WriteTimeout):
                 await self._writer.drain()
-            # The body sends as a background task so the head (and the response body) can be
-            # read while the request body is still going out, the h2 mirror of h11's duplex.
-            if first is not None:
-                stream.send_task = asyncio.create_task(self._send_body(stream_id, stream, first, rest, timeout.write))
+            stream.send_task = asyncio.create_task(self._send_body(stream_id, stream, body, timeout.write))
             async with phase(timeout.read, ReadTimeout):
                 await stream.head.wait()
             if stream.error is not None:
@@ -626,11 +609,10 @@ class _Http2Connection:
                 await self._stream_gate.wait()
 
     async def _send_body(
-        self, stream_id: int, stream: _Stream, first: bytes, rest: AsyncIterator[bytes], write: float | None = None
+        self, stream_id: int, stream: _Stream, body: Stream[bytes], write: float | None = None
     ) -> None:
         try:
-            await self._send_data(stream_id, stream, first, end=False, write=write)
-            async for chunk in rest:
+            async for chunk in body:
                 if chunk:
                     await self._send_data(stream_id, stream, chunk, end=False, write=write)
             await self._send_data(stream_id, stream, b"", end=True, write=write)
@@ -822,17 +804,31 @@ class _Http2Connection:
             await self._writer.wait_closed()
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class _HostPool:
     """
     The per-origin HTTP/1.1 pool: idle connections plus an optional capacity permit.
 
-    A permit tracks a *checkout*, not a socket: it is held from acquire until the
-    connection is returned or closed, and a fresh socket is opened only when no idle
-    connection is available under a held permit, so live sockets stay `<= max`. The
-    permit is the bound issue #5 asks for and the wait a `PoolTimeout` guards. When
-    `max_connections` is `None` the pool is unbounded and `acquire`/`release` are
-    no-ops, so the `pool` timeout axis stays inert until a caller opts into a bound.
+    Two pieces coordinate to bound concurrency without also bounding reuse. The
+    `idle` list holds kept-alive connections not currently in use; the semaphore
+    issues at most `max_connections` *permits*. They are deliberately separate
+    because a permit tracks a **checkout, not a socket**:
+
+    - A checkout takes a permit first (blocking, at the bound, until one is freed:
+      the wait a `PoolTimeout` guards), then reuses an idle connection if one is
+      available and opens a fresh socket only if none is. So a permit is held for
+      the whole time a connection is in use, whether reused or freshly opened.
+    - A release frees the permit and, if the connection is still reusable, returns
+      it to `idle`; an idle connection therefore holds **no** permit.
+
+    That split is what a single bounded queue of connections could not express: the
+    permit gates *concurrent use* (so a burst waits instead of opening unbounded
+    sockets), while reuse-before-open under a held permit keeps the count of live
+    sockets `<= max`. Idle connections never exceed the high-water mark of concurrent
+    checkouts, and are reused (not stacked on top of) the permitted ones, so the bound
+    holds across both. When `max_connections` is `None` the pool is unbounded and
+    `acquire`/`release` are no-ops, so the `pool` timeout axis stays inert until a
+    caller opts into a bound.
     """
 
     idle: list[_Http11Connection] = field(default_factory=list)
@@ -955,7 +951,14 @@ class ConnectionPool:
         response = await exchange(outgoing)
         try:
             yield response
-        finally:
+        except BaseException:
+            # An error is already in flight; still close the body to release the connection,
+            # but suppress any close error (e.g. a surfaced request-body send failure) so it
+            # cannot mask the original exception the caller is trying to debug.
+            with suppress(Exception):
+                await response.body.aclose()
+            raise
+        else:
             await response.body.aclose()
 
     async def _exchange(self, request: ClientRequest, timeout: Timeout) -> ClientResponse:

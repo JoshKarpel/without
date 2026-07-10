@@ -35,7 +35,9 @@
 - **`without-http`**: the client sends the request body concurrently with reading the response
   (consumer-driven duplex) instead of sending it whole first. A server can now answer early (a `413`,
   a redirect) without deadlocking a large upload, and a caller can drive genuine bidirectional
-  streaming over HTTP/2 by feeding a queue-backed request body in reaction to the response. Connection
+  streaming over HTTP/2: the request head is sent before the first body chunk is produced, so both a
+  client-speaks-first duplex (feed a queue-backed body in reaction to the response) and a
+  server-speaks-first one (let the server respond before any body chunk is ready) work. Connection
   teardown is a single release-exactly-once path shared by the background sender and the response body.
   Closing an early-answered HTTP/1.1 connection is now a bounded *lingering close* (a half-close `FIN`
   plus a short, fixed drain window, never draining to end-of-input) rather than a reset that could
