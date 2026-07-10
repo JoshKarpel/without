@@ -2,9 +2,9 @@
 
 A `without` behavior source backed by a Kubernetes ConfigMap mount: the first
 context that actually *changes*, proving the context-updated-by-a-stream half of
-the model end to end. Where [`without-env`](without-env.md) loads a static value
+the model end to end. Where [`without-env`](../without-env/index.md) loads a static value
 once, this one re-parses on every mount change. See the
-[`without_configmap` API reference](../reference/without_configmap.md) for the
+[`without_configmap` API reference](../without-configmap/reference.md) for the
 full surface.
 
 `watch_config(mount, parse)` is a `Stream` that yields the parsed config now and a

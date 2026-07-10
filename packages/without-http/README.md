@@ -38,7 +38,7 @@ body)` response split, buffered and streaming bodies in both directions,
 opt-in trailers, HTTP/2 multiplexing, and `stack`-composed middleware.
 
 See the
-[`without-http` guide](https://without.help/guides/without-http/)
+[`without-http` guide](https://without.help/without-http/)
 (with the [API reference](https://without.help/reference/without_http/))
 for the full surface, including the deferred work (WebSockets over HTTP/2, HTTP/3,
 duplex).

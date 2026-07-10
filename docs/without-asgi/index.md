@@ -8,7 +8,7 @@ expects, and exposes `receive` as a `Stream` and `send` as a `Sink`. Routing,
 middleware, and handlers are left to the application, which hooks processors
 together in its own code. The one piece of protocol the adapter does drive is
 lifespan (see `make_asgi_app` below), because that is boundary work, not app
-policy. See the [`without_asgi` API reference](../reference/without_asgi.md) for
+policy. See the [`without_asgi` API reference](../without-asgi/reference.md) for
 the full surface.
 
 An ASGI app is `async def app(scope, receive, send)`. The adapters let the body
@@ -76,7 +76,7 @@ protocol-generic `Router` built from these, dispatching both an HTTP and a
 WebSocket route.
 
 For a full, opinionated router you don't have to hand-roll, the sibling
-[`without-web`](without-web.md) package provides trie matching with typed path
+[`without-web`](../without-web/index.md) package provides trie matching with typed path
 parameters, 405-vs-404, mounting, scoped middleware, exception handlers, and
 OpenAPI. It snaps onto this boundary through nothing but the `HttpRouter` type
 (`Router.dispatch` *is* one), so adopting it is opt-in and bring-your-own stays
@@ -123,6 +123,6 @@ the *server* direction, which is what a transport provider needs to drive an app
 
 So the same typed vocabulary parses and encodes in both directions, and a server
 that owns the wire can work in typed values at the boundary rather than raw dicts.
-The sibling [`without-http`](without-http.md) package is exactly that: an ASGI
+The sibling [`without-http`](../without-http/index.md) package is exactly that: an ASGI
 server built on `h11`/`h2`/`wsproto` that uses these server-direction codecs to
 talk ASGI to any app, `make_asgi_app`-built or third-party.

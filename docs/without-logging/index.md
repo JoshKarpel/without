@@ -2,7 +2,7 @@
 
 A `without` pipeline for logs: logger calls produce a stream of records, which
 you process (filter, enrich, sample) and drain into a sink. See the
-[`without_logging` API reference](../reference/without_logging.md) for the full
+[`without_logging` API reference](../without-logging/reference.md) for the full
 surface.
 
 This guide doubles as the design narrative for the package, because the
@@ -262,7 +262,7 @@ otherwise skips to the next input.
 
 That is ordinary enough that it belongs in `without` core, not here: needing to
 filter a log stream is exactly what motivated adding
-[`from_selector` and `from_filter`](../reference/without.md) to the core
+[`from_selector` and `from_filter`](../without/reference.md) to the core
 builders. `from_selector(keep)` re-emits the matching records; `from_filter`
 drops them (the polarity-dual). So without-logging ships only the *predicates*
 that are specific to logs, and composes them with the core selector:
@@ -497,7 +497,7 @@ exception is captured as structure and not flattened to a string at the edge.
 
 A real logging setup wants more than one sink: console *and* a file, or a file
 *and* the network. That is fan-out, one record stream split into several
-independent sinks, and it is [`tee`](../reference/without.md) from `without`
+independent sinks, and it is [`tee`](../without/reference.md) from `without`
 core. `tee(*sinks)` returns a single `Sink` that feeds every event to every
 branch, consuming the input exactly once, so there is one `capture` and one pass
 through the shared middleware.

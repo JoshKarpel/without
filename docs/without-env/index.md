@@ -2,14 +2,14 @@
 
 A `without` `Context` backed by environment variables: the simplest possible
 context, a static one loaded at startup and never changed. See the
-[`without_env` API reference](../reference/without_env.md) for the full surface.
+[`without_env` API reference](../without-env/reference.md) for the full surface.
 
 `EnvContext.load(MySettings)` reads the environment once, at the boundary, into a
 validated [`pydantic-settings`](https://docs.pydantic.dev/latest/concepts/pydantic_settings/)
 model (parse, don't validate), then hands that immutable value to processors via
 `current()`. Because it never changes, a reloading source (a watched file, a
 ConfigMap mount) is a separate plugin; see
-[`without-configmap`](without-configmap.md) for the context-updated-by-a-stream
+[`without-configmap`](../without-configmap/index.md) for the context-updated-by-a-stream
 case.
 
 ```python

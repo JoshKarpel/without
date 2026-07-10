@@ -1,11 +1,11 @@
 # without-http
 
 A sans-IO-backed ASGI **server** and **HTTP client** for `without`. Where
-[`without-asgi`](without-asgi.md) is the *app* side of the ASGI boundary (it turns
+[`without-asgi`](../without-asgi/index.md) is the *app* side of the ASGI boundary (it turns
 a server's `receive`/`send` into typed streams), `without-http` is the *server*
 side: it owns the socket and the HTTP wire protocol, and drives any ASGI app via
 `app(scope, receive, send)`. See the
-[`without_http` API reference](../reference/without_http.md) for the full surface.
+[`without_http` API reference](../without-http/reference.md) for the full surface.
 
 The wire-protocol state machines are themselves sans-IO libraries:
 [`h11`](https://h11.readthedocs.io/) for HTTP/1.1,
@@ -29,7 +29,7 @@ async with serving(app, host="127.0.0.1", port=8000):
 ```
 
 Because `without-http` speaks plain ASGI to the app, *any* ASGI app runs over it,
-interchangeably with uvicorn: a [`without-web`](without-web.md) router, a bare
+interchangeably with uvicorn: a [`without-web`](../without-web/index.md) router, a bare
 `without-asgi` handler, or a third-party app (Starlette, FastAPI).
 
 `serving(app, ...)` is the entrypoint: an async context manager that drives the
@@ -239,8 +239,5 @@ request-spanning identity belongs in a value you own and pass per request. A
 `CookieJar` is the canonical case: you construct the jar and hand it to `cookies(jar)`,
 so cookie scope (application identity) stays independent of connection reuse
 (transport) rather than both hiding in the pool. Two requests share cookies exactly
-when they share a jar. Place `cookies` *inside* `follow_redirects` in a `stack` so each
-redirect hop both sends and collects cookies. The jar fills from responses via `store`,
-which applies the origin guards a `Set-Cookie` needs; to seed a cookie you already hold
-(a session token, a fixture), `jar.add(name, value, domain=...)` places it directly,
-trusting the caller instead.
+when they share a jar. See [Cookies](cookies.md) for the jar's matching rules, the
+origin guards it enforces on untrusted `Set-Cookie` responses, and its expiry model.

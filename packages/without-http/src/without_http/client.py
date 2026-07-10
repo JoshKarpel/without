@@ -1050,6 +1050,11 @@ def _deletes(max_age: str | None) -> bool:
         return False
 
 
+def _as_utc(when: datetime) -> datetime:
+    """Normalize a datetime to an aware UTC value, assuming UTC for a naive input."""
+    return when.replace(tzinfo=UTC) if when.tzinfo is None else when.astimezone(UTC)
+
+
 def _parse_expires(value: str | None) -> datetime | None:
     """Parse a `Set-Cookie` `Expires` value into an aware UTC datetime, or `None`."""
     if value is None:
@@ -1058,7 +1063,7 @@ def _parse_expires(value: str | None) -> datetime | None:
         parsed = parsedate_to_datetime(value)
     except ValueError, TypeError:
         return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    return _as_utc(parsed)
 
 
 def _parse_set_cookie(header: str, host: str, request_path: str) -> tuple[_Cookie, bool] | None:
@@ -1158,7 +1163,7 @@ class CookieJar:
             path=path,
             secure=secure,
             host_only=not subdomains,
-            expires=expires,
+            expires=_as_utc(expires) if expires is not None else None,
         )
         self._cookies[(cookie.domain, cookie.path, cookie.name)] = cookie
 
@@ -1168,6 +1173,7 @@ class CookieJar:
         host = (parts.hostname or "").lower()
         secure_request = parts.scheme == "https"
         now = self._now()
+        self._prune_expired(now)
         for name, value in headers:
             if name.lower() != b"set-cookie":
                 continue
@@ -1182,6 +1188,12 @@ class CookieJar:
                 self._cookies.pop(key, None)
             else:
                 self._cookies[key] = cookie
+
+    def _prune_expired(self, now: datetime) -> None:
+        """Drop cookies whose `Expires` has passed so a long-lived jar stays bounded."""
+        expired = [key for key, cookie in self._cookies.items() if cookie.expires is not None and cookie.expires <= now]
+        for key in expired:
+            del self._cookies[key]
 
     def header_for(self, url: str) -> bytes | None:
         """The `Cookie` header value for a request to `url`, or `None` if none match."""

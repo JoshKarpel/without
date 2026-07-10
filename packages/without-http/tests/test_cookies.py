@@ -156,6 +156,14 @@ def test_parse_expires_assumes_utc_for_a_date_without_a_zone() -> None:
     assert parsed == datetime(2027, 6, 9, 10, 18, 14, tzinfo=UTC)
 
 
+def test_parse_expires_normalizes_a_nonutc_offset_to_utc() -> None:
+    parsed = _parse_expires("Wed, 09 Jun 2027 10:18:14 +0200")
+
+    assert parsed is not None
+    assert parsed == datetime(2027, 6, 9, 8, 18, 14, tzinfo=UTC)
+    assert parsed.tzinfo is UTC
+
+
 def test_parse_expires_ignores_an_unparseable_date() -> None:
     assert _parse_expires("not-a-date") is None
 
@@ -245,6 +253,31 @@ def test_cookie_jar_add_honors_secure_and_expiry() -> None:
 
     assert jar.header_for("http://example.test/") is None  # secure cookie withheld over cleartext
     assert jar.header_for("https://example.test/") == b"session=abc"
+
+
+def test_cookie_jar_add_normalizes_a_naive_expires() -> None:
+    clock = _Clock(_BASE)
+    jar = CookieJar(_now=clock)
+
+    jar.add("session", "abc", domain="example.test", expires=_BASE.replace(tzinfo=None) + timedelta(hours=1))
+
+    assert jar.header_for("http://example.test/") == b"session=abc"
+    clock.now = _BASE + timedelta(hours=2)
+    assert jar.header_for("http://example.test/") is None
+
+
+def test_cookie_jar_store_prunes_expired_cookies_from_the_jar() -> None:
+    clock = _Clock(_BASE)
+    jar = CookieJar(_now=clock)
+    expires = (_BASE + timedelta(hours=1)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+    jar.store("http://example.test/", ((b"set-cookie", f"sid=abc; Expires={expires}".encode()),))
+    assert ("example.test", "/", "sid") in jar._cookies
+
+    clock.now = _BASE + timedelta(hours=2)
+    jar.store("http://other.test/", ((b"set-cookie", b"other=xyz"),))
+
+    assert ("example.test", "/", "sid") not in jar._cookies
 
 
 def test_cookie_jar_add_skips_the_origin_guards_store_applies() -> None:

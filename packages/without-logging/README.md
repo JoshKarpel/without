@@ -56,7 +56,7 @@ async with offload(writer) as sink:
 ```
 
 See the
-[`without-logging` guide](https://without.help/guides/without-logging/)
+[`without-logging` guide](https://without.help/without-logging/)
 (with the [API reference](https://without.help/reference/without_logging/))
 for the design narrative: why stdlib becomes a one-way source, why filtering is
 just the core `from_selector` builder, and where fan-out to multiple sinks slots

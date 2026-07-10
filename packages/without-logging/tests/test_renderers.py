@@ -148,6 +148,14 @@ async def test_render_console_escapes_a_newline_in_the_message() -> None:
     assert r"ok\nWARNING forged line" in line
 
 
+@pytest.mark.security("a newline in a field value is escaped, preventing log-line forging")
+async def test_render_console_escapes_a_newline_in_a_field_value() -> None:
+    line = await rendered(render_console(), a_record(path="ok\nWARNING forged line"))
+
+    assert "\n" not in line
+    assert r"ok\nWARNING forged line" in line
+
+
 async def test_render_console_groups_extra_fields_in_braces() -> None:
     line = await rendered(render_console(), a_record(order_id="ord-77", attempt=3))
 

@@ -33,7 +33,7 @@ time with no glitch), acyclicity is proven at the boundary via stdlib
 what `from_map` lifts into a `Processor`.
 
 See the
-[`without-dag` guide](https://without.help/guides/without-dag/)
+[`without-dag` guide](https://without.help/without-dag/)
 (with the [API reference](https://without.help/reference/without_dag/))
 for the full surface: the object-seam execution core (`Plan`, `drive`,
 `evaluate`), the typed frontend, and lifting into a processor.

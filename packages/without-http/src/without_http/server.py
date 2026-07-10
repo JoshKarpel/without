@@ -255,6 +255,7 @@ async def _serve_websocket(
         writer.write(ws.send(CloseConnection(code=1009, reason="message too big")))
         await writer.drain()
         await inbound.put(encode_websocket_inbound(WebsocketDisconnect(code=1009, reason="message too big")))
+        finished.set()
         return False
 
     async def drain_events() -> bool:
@@ -290,6 +291,7 @@ async def _serve_websocket(
                     writer.write(ws.send(event.response()))
                     await writer.drain()
                     await inbound.put(encode_websocket_inbound(WebsocketDisconnect(code=code, reason=reason or "")))
+                    finished.set()
                     return False
                 case _:  # pragma: no cover - post-handshake wsproto emits only the events handled above
                     logger.warning(f"Discarding unexpected WebSocket event from wsproto: {event!r}")
@@ -307,7 +309,8 @@ async def _serve_websocket(
         # either way the connection becomes a WebSocket disconnect below.
         except Exception as exc:  # noqa: BLE001  # pragma: no cover
             logger.warning(f"WebSocket read pump ended on a connection error: {exc!r}")
-        await inbound.put(encode_websocket_inbound(WebsocketDisconnect(code=1006, reason="")))
+        if not finished.is_set():
+            await inbound.put(encode_websocket_inbound(WebsocketDisconnect(code=1006, reason="")))
         finished.set()
 
     async def receive() -> RawMessage:
