@@ -197,6 +197,16 @@ an intrinsic sibling: stream issuance is gated against the server's advertised
 `SETTINGS_MAX_CONCURRENT_STREAMS`, so a burst never over-issues streams on the one
 multiplexed connection.
 
+`max_keepalive_per_host` bounds a different axis: how many *idle* HTTP/1.1
+connections are retained per origin once a burst subsides. Where the peak cap governs
+how high the pool climbs under concurrent load, the idle cap governs how much it holds
+onto when quiet: at the cap a returned connection is closed instead of pooled, so the
+pool ramps up to `max_connections_per_host` under load but settles back down to
+`max_keepalive_per_host` afterward rather than leaving every socket open. It is
+unbounded by default (every reusable connection is kept); a value above
+`max_connections_per_host` is never reached, since idle connections cannot outnumber
+concurrent checkouts. Both knobs, when set, must be `>= 1`.
+
 ### Duplex and bidirectional streaming
 
 The request body and the response are handled **concurrently**: the body is sent by

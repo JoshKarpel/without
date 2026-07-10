@@ -804,45 +804,109 @@ class _Http2Connection:
             await self._writer.wait_closed()
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _HostPool:
     """
-    The per-origin HTTP/1.1 pool: idle connections plus an optional capacity permit.
+    The per-origin HTTP/1.1 pool: the owner of checkout-or-open and checkin-or-close.
 
-    Two pieces coordinate to bound concurrency without also bounding reuse. The
-    `idle` list holds kept-alive connections not currently in use; the semaphore
-    issues at most `max_connections` *permits*. They are deliberately separate
-    because a permit tracks a **checkout, not a socket**:
+    A caller asks for a connection with `checkout` and unconditionally hands it back with
+    `checkin`; the pool alone decides where each one comes from and goes to. It never
+    opens sockets itself: `open_connection` is injected once at construction (bound to
+    this origin's host, port, and TLS), so every connection the pool opens is opened the
+    same way and this stays pure pool policy while the client keeps the TLS/connect
+    concerns. Three pieces coordinate to bound concurrency *and* retention without
+    conflating them, because a permit tracks a **checkout, not a socket**:
 
-    - A checkout takes a permit first (blocking, at the bound, until one is freed:
-      the wait a `PoolTimeout` guards), then reuses an idle connection if one is
-      available and opens a fresh socket only if none is. So a permit is held for
-      the whole time a connection is in use, whether reused or freshly opened.
-    - A release frees the permit and, if the connection is still reusable, returns
-      it to `idle`; an idle connection therefore holds **no** permit.
+    - `checkout` takes a permit first (blocking, at the bound, until one is freed: the
+      wait a `PoolTimeout` guards), then reuses an idle connection if one is available
+      and calls `open_connection` only if none is. So a permit is held for the whole time
+      a connection is in use, whether reused or freshly opened.
+    - `checkin` frees the permit and, if the connection is still reusable, returns it to
+      `idle` (closing it instead once `idle` is at `max_keepalive`); an idle connection
+      therefore holds **no** permit.
 
-    That split is what a single bounded queue of connections could not express: the
-    permit gates *concurrent use* (so a burst waits instead of opening unbounded
-    sockets), while reuse-before-open under a held permit keeps the count of live
-    sockets `<= max`. Idle connections never exceed the high-water mark of concurrent
-    checkouts, and are reused (not stacked on top of) the permitted ones, so the bound
-    holds across both. When `max_connections` is `None` the pool is unbounded and
-    `acquire`/`release` are no-ops, so the `pool` timeout axis stays inert until a
-    caller opts into a bound.
+    The `_semaphore` gates *concurrent use* (so a burst waits instead of opening unbounded
+    sockets), and reuse-before-open under a held permit keeps the count of live sockets
+    `<= max_connections`. `max_keepalive` bounds a different axis: how many idle sockets
+    are *retained* once a burst subsides, so the pool ramps up under load and settles back
+    down when quiet. Idle count never exceeds the high-water mark of concurrent checkouts,
+    so `max_keepalive` above `max_connections` is simply never reached. When
+    `max_connections` is `None` the pool is unbounded and permits are no-ops, so the
+    `pool` timeout axis stays inert until a caller opts into a bound; when `max_keepalive`
+    is `None` every reusable connection is retained.
     """
 
+    open_connection: Callable[[Timeout], Awaitable[_Http11Connection]]
+    max_keepalive: int | None = None
     idle: list[_Http11Connection] = field(default_factory=list)
+    closed: bool = False
     _semaphore: asyncio.Semaphore | None = None
 
     @classmethod
-    def new(cls, max_connections: int | None) -> _HostPool:
-        return cls(_semaphore=asyncio.Semaphore(max_connections) if max_connections is not None else None)
+    def new(
+        cls,
+        open_connection: Callable[[Timeout], Awaitable[_Http11Connection]],
+        max_connections: int | None,
+        max_keepalive: int | None,
+    ) -> _HostPool:
+        semaphore = asyncio.Semaphore(max_connections) if max_connections is not None else None
+        return cls(open_connection=open_connection, max_keepalive=max_keepalive, _semaphore=semaphore)
 
-    async def acquire(self) -> None:
-        if self._semaphore is not None:
-            await self._semaphore.acquire()
+    async def checkout(self, timeout: Timeout, *, preopened: _Http11Connection | None = None) -> _Http11Connection:
+        """
+        Take a permit (waiting at the bound, under the `pool` timeout) and return a
+        connection to use: `preopened` if the caller already has one in hand (an h2 ALPN
+        fallback), else a reusable idle one, else a freshly opened one (via the injected
+        `open_connection`, under the `connect` timeout). The permit is held until the
+        matching `checkin`; if anything past the permit fails, it is freed here.
+        """
+        try:
+            async with phase(timeout.pool, PoolTimeout):
+                if self._semaphore is not None:
+                    await self._semaphore.acquire()
+        except BaseException:
+            # Freeing a preopened fallback here is all but unreachable: that origin's first
+            # permit is essentially always free, so this only guards a cancel or a
+            # concurrent-fallback race.
+            if preopened is not None:  # pragma: no cover
+                preopened.close()
+            raise
+        try:
+            if preopened is not None:
+                return preopened
+            while self.idle:
+                connection = self.idle.pop()
+                if connection.usable:
+                    return connection
+                connection.close()
+            return await self.open_connection(timeout)
+        except BaseException:
+            self._release()
+            raise
 
-    def release(self) -> None:
+    async def checkin(self, connection: _Http11Connection, *, reusable: bool) -> None:
+        """
+        Hand a checked-out connection back and free its permit. The pool retains it as
+        idle only when the caller reports it reusable, the pool is open, and `idle` is
+        below `max_keepalive`; otherwise it is closed. The caller reports connection
+        health only, never pool policy.
+        """
+        try:
+            under_keepalive = self.max_keepalive is None or len(self.idle) < self.max_keepalive
+            if reusable and not self.closed and under_keepalive:
+                self.idle.append(connection)
+            else:
+                await connection.aclose()
+        finally:
+            self._release()
+
+    async def aclose(self) -> None:
+        self.closed = True
+        idle, self.idle = self.idle, []
+        for connection in idle:
+            await connection.aclose()
+
+    def _release(self) -> None:
         if self._semaphore is not None:
             self._semaphore.release()
 
@@ -888,6 +952,15 @@ class ConnectionPool:
     to let OS backpressure cap connections rather than an in-process limit; opt into a
     bound when a caller wants explicit per-host backpressure.
 
+    `max_keepalive_per_host` bounds a different axis: how many *idle* HTTP/1.1 connections
+    are retained per origin once a burst subsides. At the cap, a returned connection is
+    closed instead of pooled, so the pool ramps up to `max_connections_per_host` under
+    concurrent load but settles back down to `max_keepalive_per_host` when quiet rather
+    than holding every socket open. It is unbounded by default (every reusable connection
+    is kept); a value above `max_connections_per_host` is never reached, since idle
+    connections cannot outnumber concurrent checkouts. Both knobs, when set, MUST be `>=
+    1`.
+
     `timeout` bounds each phase of a request (see `Timeout`); it defaults to no timeouts,
     since a deadline is the caller's policy, not the transport's. A per-request `timeout`
     on `request` replaces it wholesale for that call.
@@ -898,13 +971,21 @@ class ConnectionPool:
     ssl_context_factory: Callable[[], ssl.SSLContext] = ssl.create_default_context
     middleware: ClientMiddleware = _PASSTHROUGH
     max_connections_per_host: int | None = None
+    max_keepalive_per_host: int | None = None
     timeout: Timeout = _NO_TIMEOUT
     _h2: dict[Origin, _Http2Connection] = field(default_factory=dict)
     _h11: dict[Origin, _HostPool] = field(default_factory=dict)
     _h11_only: set[Origin] = field(default_factory=set)
     _contexts: dict[tuple[str, ...], ssl.SSLContext] = field(default_factory=dict)
     _origin_locks: dict[Origin, asyncio.Lock] = field(default_factory=dict)
-    _closed: bool = False
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("max_connections_per_host", self.max_connections_per_host),
+            ("max_keepalive_per_host", self.max_keepalive_per_host),
+        ):
+            if value is not None and value < 1:
+                raise ValueError(f"{name} must be >= 1 when set, got {value}")
 
     async def __aenter__(self) -> Self:
         return self
@@ -1018,14 +1099,9 @@ class ConnectionPool:
         if connection is not None:
             return await self._h2_response(connection, request, parts, timeout)
         if fallback is not None:
-            # The fallback connection was opened during the h2 handshake, so it holds no
-            # permit yet; take one for it before use so its release balances exactly.
-            try:
-                async with phase(timeout.pool, PoolTimeout):
-                    await self._host_pool(origin).acquire()
-            except BaseException:  # pragma: no cover - defensive: the fallback origin's first permit is always free, so this only guards a cancel
-                fallback.close()
-                raise
+            # The fallback connection was opened during the h2 handshake; hand it to
+            # `checkout` as preopened so it takes a permit for this already-open socket
+            # (closing it if the permit cannot be taken) and its checkin balances exactly.
             return await self._request_h11(origin, request, parts, timeout, preopened=fallback)
         return await self._request_h11(origin, request, parts, timeout)
 
@@ -1070,40 +1146,34 @@ class ConnectionPool:
         timeout: Timeout,
         preopened: _Http11Connection | None = None,
     ) -> ClientResponse:
-        connection = preopened if preopened is not None else await self._acquire_h11(origin, timeout)
+        pool = self._host_pool(origin)
+        connection = await pool.checkout(timeout, preopened=preopened)
         send_task: asyncio.Task[None] | None = None
         try:
             await connection.send_head(request, parts)
             send_task = asyncio.create_task(connection.send_body(request, timeout.write))
             status, headers = await connection.read_head(timeout.read)
         except BaseException:
-            # The response body (which owns release) is not armed yet, so tear the
-            # connection down here and free the permit exactly once. A caller-body error
-            # (recorded on the connection) is preferred over the read failure it caused.
+            # The response body (which owns checkin) is not armed yet, so hand the
+            # connection back here, unreusable, so the pool closes it and frees the permit
+            # exactly once. A caller-body error (recorded on the connection) is preferred
+            # over the read failure it caused.
             await cancel_futures([send_task])
-            await connection.aclose()
-            self._host_pool(origin).release()
+            await pool.checkin(connection, reusable=False)
             if connection.send_error is not None:
                 raise connection.send_error from None
             raise
 
         async def release(fully_read: bool) -> None:
-            try:
-                await cancel_futures([send_task])  # cancel-and-await the writer before deciding
-                reusable = (
-                    fully_read
-                    and send_task is not None
-                    and not send_task.cancelled()
-                    and connection.finish()
-                    and connection.usable
-                    and not self._closed
-                )
-                if reusable:
-                    self._return_h11(origin, connection)
-                else:
-                    await connection.aclose()
-            finally:
-                self._host_pool(origin).release()
+            await cancel_futures([send_task])  # cancel-and-await the writer before deciding
+            reusable = (
+                fully_read
+                and send_task is not None
+                and not send_task.cancelled()
+                and connection.finish()
+                and connection.usable
+            )
+            await pool.checkin(connection, reusable=reusable)
             if connection.send_error is not None:
                 raise connection.send_error
 
@@ -1114,32 +1184,18 @@ class ConnectionPool:
     def _host_pool(self, origin: Origin) -> _HostPool:
         pool = self._h11.get(origin)
         if pool is None:
-            pool = _HostPool.new(self.max_connections_per_host)
+            pool = _HostPool.new(
+                lambda timeout: self._open_h11(origin, timeout),
+                self.max_connections_per_host,
+                self.max_keepalive_per_host,
+            )
             self._h11[origin] = pool
         return pool
 
-    async def _acquire_h11(self, origin: Origin, timeout: Timeout) -> _Http11Connection:
-        pool = self._host_pool(origin)
-        async with phase(timeout.pool, PoolTimeout):
-            await pool.acquire()
-        try:
-            while pool.idle:
-                connection = pool.idle.pop()
-                if connection.usable:
-                    return connection
-                connection.close()
-            ssl_context = self._context_for_connection(http2=False) if origin.secure else None
-            reader, writer, _ = await _open(origin.host, origin.port, ssl_context=ssl_context, connect=timeout.connect)
-            return _Http11Connection.new(reader, writer)
-        except BaseException:
-            pool.release()
-            raise
-
-    def _return_h11(self, origin: Origin, connection: _Http11Connection) -> None:
-        if self._closed:
-            connection.close()
-            return
-        self._host_pool(origin).idle.append(connection)
+    async def _open_h11(self, origin: Origin, timeout: Timeout) -> _Http11Connection:
+        ssl_context = self._context_for_connection(http2=False) if origin.secure else None
+        reader, writer, _ = await _open(origin.host, origin.port, ssl_context=ssl_context, connect=timeout.connect)
+        return _Http11Connection.new(reader, writer)
 
     def _reusable_h2(self, origin: Origin) -> _Http2Connection | None:
         connection = self._h2.get(origin)
@@ -1156,15 +1212,14 @@ class ConnectionPool:
         return lock
 
     async def aclose(self) -> None:
-        self._closed = True
         multiplexed = list(self._h2.values())
-        idle = [connection for pool in self._h11.values() for connection in pool.idle]
+        host_pools = list(self._h11.values())
         self._h2.clear()
         self._h11.clear()
         for multiplexed_connection in multiplexed:
             await multiplexed_connection.aclose()
-        for idle_connection in idle:
-            await idle_connection.aclose()
+        for host_pool in host_pools:
+            await host_pool.aclose()
 
 
 def wrap(

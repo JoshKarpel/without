@@ -318,6 +318,37 @@ async def _read_one(pool: ConnectionPool, url: str) -> bytes:
         return await body.read()
 
 
+async def test_max_keepalive_per_host_caps_retained_idle_connections() -> None:
+    async with serving(sized_echo_app) as server, ConnectionPool(max_keepalive_per_host=1) as pool:
+        url = f"http://{server.host}:{server.port}/items"
+        # Two overlapping requests force two live connections (no peak bound is set), so the
+        # pool ramps up under load past the idle cap.
+        async with (
+            pool.request("GET", url) as (_first_head, first),
+            pool.request("GET", url) as (_second_head, second),
+        ):
+            assert await first.read() == b"GET /items body="
+            assert await second.read() == b"GET /items body="
+        # Both are reusable on return, but the idle list settles back to the cap: the first
+        # returned is retained and the second is closed rather than pooled.
+        assert _idle_count(pool) == 1
+
+
+@pytest.mark.parametrize(
+    ("knob", "make_pool"),
+    [
+        ("max_connections_per_host", lambda value: ConnectionPool(max_connections_per_host=value)),
+        ("max_keepalive_per_host", lambda value: ConnectionPool(max_keepalive_per_host=value)),
+    ],
+)
+@pytest.mark.parametrize("value", [0, -1])
+def test_non_positive_per_host_bounds_are_rejected(
+    knob: str, make_pool: Callable[[int], ConnectionPool], value: int
+) -> None:
+    with pytest.raises(ValueError, match=f"{knob} must be >= 1 when set, got {value}"):
+        make_pool(value)
+
+
 async def test_a_stale_pooled_connection_is_replaced_with_a_fresh_one() -> None:
     async with serving(sized_echo_app) as server, ConnectionPool() as pool:
         url = f"http://{server.host}:{server.port}/items"
@@ -469,16 +500,17 @@ async def test_follow_redirects_stops_when_a_redirect_lacks_a_location() -> None
             assert head.status == 302
 
 
-async def test_returning_an_h11_connection_to_a_closed_pool_closes_it() -> None:
+async def test_checking_in_to_a_closed_host_pool_closes_the_connection() -> None:
     async with serving(sized_echo_app) as server, ConnectionPool() as pool:
         url = f"http://{server.host}:{server.port}/items"
         async with pool.request("GET", url) as (_head, body):
             assert await body.read() == b"GET /items body="
-        (connection,) = _only_idle(pool)
-        pool._h11.clear()
-        pool._closed = True
+        host_pool = next(iter(pool._h11.values()))
+        (connection,) = host_pool.idle
+        host_pool.idle.clear()
+        host_pool.closed = True
 
-        pool._return_h11(_origin(urlsplit(url)), connection)
+        await host_pool.checkin(connection, reusable=True)
 
-        assert pool._h11 == {}
+        assert host_pool.idle == []
         assert connection._writer.is_closing()

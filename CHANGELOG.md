@@ -17,9 +17,12 @@
   progress and is disabled by default (a deadline is the caller's policy, not the transport's). A
   timeout raises a typed `ConnectTimeout` / `ReadTimeout` / `WriteTimeout` / `PoolTimeout` under
   `HTTPTimeout` (itself a `TimeoutError`), so a caller can tell how far the request got and retry
-  the right ones. Also: a per-host connection bound (`max_connections_per_host`, whose acquire-wait
-  the `pool` axis guards, unbounded by default) and gating of HTTP/2 stream issuance against the
-  server's `SETTINGS_MAX_CONCURRENT_STREAMS`.
+  the right ones. Also: per-host connection bounds and gating of HTTP/2 stream issuance against the
+  server's `SETTINGS_MAX_CONCURRENT_STREAMS`. `max_connections_per_host` bounds concurrent HTTP/1.1
+  connections to one origin (the acquire-wait the `pool` axis guards); `max_keepalive_per_host`
+  bounds how many *idle* connections are retained per origin once a burst subsides, so the pool ramps
+  up under load but settles back down when quiet. Both unbounded by default, and must be `>= 1` when
+  set.
 
 ### Changed
 
