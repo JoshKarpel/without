@@ -8,9 +8,9 @@
 # running, the thin boundary where the imperative shell shows up.
 # `stream_from_queue` sits at that same boundary from the other side: not a
 # connector between processors but a source adapter that turns a push-based queue
-# into a pull-based stream to feed the rest. `buffer` uses that same queue to
-# decouple a pull source's pace from its consumer's, driving the source in a
-# background task. `stream_from_iterable` (from a fixed iterable) and `collect`
+# into a pull-based stream to feed the rest. `spool` uses that same queue to drive
+# a pull source ahead of its consumer in a background task, decoupling their pace
+# (read-ahead). `stream_from_iterable` (from a fixed iterable) and `collect`
 # (drain to a list) are the in-memory source and terminal at that edge.
 
 from __future__ import annotations
@@ -64,29 +64,31 @@ async def stream_from_queue[T](queue: asyncio.Queue[T]) -> AsyncIterator[T]:
             return
 
 
-async def buffer[T](source: Stream[T], maxsize: int) -> AsyncIterator[T]:
+async def spool[T](source: Stream[T], ahead: int) -> AsyncIterator[T]:
     """
-    Decouple a stream's producer from its consumer through a bounded queue.
+    Drive a source ahead of its consumer through a bounded queue: read-ahead.
 
     A background task pulls from `source` as fast as backpressure allows and
-    drops each value into a queue of at most `maxsize` items; the returned stream
+    drops each value into a queue of at most `ahead` items; the returned stream
     yields from that queue. So the source is *driven* independently of how fast
-    the consumer pulls: a pull-based producer (an accept loop, a DAG's `executed`
-    iterator) keeps making progress while a slower consumer catches up, up to
-    `maxsize` items of slack before `put` blocks and backpressure reaches the
-    producer.
+    the consumer pulls: a pull-based producer (an accept loop, a file's chunks, a
+    DAG's `executed` iterator) keeps making progress while a slower consumer
+    catches up, up to `ahead` items of slack before `put` blocks and backpressure
+    reaches the producer. That overlaps the producer's work with the consumer's,
+    e.g. reading the next file chunk while the current one is still being written
+    to a socket.
 
-    `maxsize` must be at least 1: the bound *is* the backpressure, so an unbounded
-    buffer (which could let a fast producer grow memory without limit) is a
+    `ahead` must be at least 1: the bound *is* the backpressure, so an unbounded
+    spool (which could let a fast producer grow memory without limit) is a
     `ValueError` rather than a silent default. When `source` ends the queue is
-    shut down and the stream ends once drained; if `source` raises, the buffered
+    shut down and the stream ends once drained; if `source` raises, the spooled
     items still drain and then the error surfaces. Closing the stream early
     cancels the background task, so the producer never outlives its consumer.
     """
-    if maxsize < 1:
-        raise ValueError(f"maxsize must be at least 1, but got {maxsize}")
+    if ahead < 1:
+        raise ValueError(f"ahead must be at least 1, but got {ahead}")
 
-    queue: asyncio.Queue[T] = asyncio.Queue(maxsize)
+    queue: asyncio.Queue[T] = asyncio.Queue(ahead)
 
     async def pump() -> None:
         try:

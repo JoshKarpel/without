@@ -3,12 +3,12 @@ from collections.abc import AsyncIterator
 
 import pytest
 from without import Transition
-from without import buffer
 from without import collect
 from without import compose
 from without import from_scan
 from without import from_sink
 from without import sample
+from without import spool
 from without import stream_from_iterable
 from without import stream_from_queue
 from without import tee
@@ -130,16 +130,16 @@ async def test_stream_from_queue_yields_pushed_values_in_order() -> None:
     assert received == [5, 6, 7]
 
 
-async def test_buffer_yields_every_item_from_the_source() -> None:
-    assert await collect(buffer(stream_from_iterable([1, 2, 3]), maxsize=2)) == [1, 2, 3]
+async def test_spool_yields_every_item_from_the_source() -> None:
+    assert await collect(spool(stream_from_iterable([1, 2, 3]), ahead=2)) == [1, 2, 3]
 
 
-async def test_buffer_rejects_a_nonpositive_maxsize() -> None:
+async def test_spool_rejects_a_nonpositive_ahead() -> None:
     with pytest.raises(ValueError, match="at least 1"):
-        await anext(buffer(stream_from_iterable(["x"]), maxsize=0))
+        await anext(spool(stream_from_iterable(["x"]), ahead=0))
 
 
-async def test_buffer_lets_the_producer_run_ahead_of_the_consumer() -> None:
+async def test_spool_lets_the_producer_run_ahead_of_the_consumer() -> None:
     all_produced = asyncio.Event()
 
     async def source() -> AsyncIterator[str]:
@@ -147,24 +147,24 @@ async def test_buffer_lets_the_producer_run_ahead_of_the_consumer() -> None:
             yield value
         all_produced.set()
 
-    buffered = buffer(source(), maxsize=5)
+    spooled = spool(source(), ahead=5)
 
-    assert await anext(buffered) == "a"
+    assert await anext(spooled) == "a"
     await all_produced.wait()
 
-    assert [item async for item in buffered] == ["b", "c"]
+    assert [item async for item in spooled] == ["b", "c"]
 
 
-async def test_buffer_surfaces_a_source_error_after_draining_buffered_items() -> None:
+async def test_spool_surfaces_a_source_error_after_draining_spooled_items() -> None:
     async def source() -> AsyncIterator[str]:
         yield "ok"
         raise RuntimeError("boom")
 
-    buffered = buffer(source(), maxsize=5)
+    spooled = spool(source(), ahead=5)
 
-    assert await anext(buffered) == "ok"
+    assert await anext(spooled) == "ok"
     with pytest.raises(RuntimeError, match="boom"):
-        await anext(buffered)
+        await anext(spooled)
 
 
 async def test_sample_starts_at_the_first_value() -> None:

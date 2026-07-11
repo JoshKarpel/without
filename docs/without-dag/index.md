@@ -70,8 +70,8 @@ node with no path to the output still runs.
 
 `drive` is pull-driven: the DAG advances only as the consumer iterates. To drive
 it in the background instead (so the graph makes progress while a slower consumer
-catches up), wrap it with `without.buffer`, which pumps any stream into a bounded
-queue on a background task.
+catches up), wrap it with `without.spool`, which drives any stream ahead of its
+consumer through a bounded queue on a background task.
 
 ## The typed frontend
 

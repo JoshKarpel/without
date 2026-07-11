@@ -6,6 +6,7 @@ from without_asgi.app import WebsocketRouter
 from without_asgi.app import make_asgi_app
 from without_asgi.app import refuse_http
 from without_asgi.app import refuse_websocket
+from without_asgi.files import file_response
 from without_asgi.inbound import Disconnect
 from without_asgi.inbound import Inbound
 from without_asgi.inbound import LifespanEvent
@@ -150,6 +151,7 @@ __all__ = [
     "encode_websocket_outbound",
     "encode_websocket_scope",
     "extension",
+    "file_response",
     "http_inbound",
     "http_outbound",
     "lifespan_inbound",

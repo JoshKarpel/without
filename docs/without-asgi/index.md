@@ -111,6 +111,72 @@ socket: build a `scope`, a scripted `receive`, and a capturing `send`, then call
 text-transform service that reads the request body and dynamic config from a
 `without-configmap` `Context`.
 
+## Streaming a file
+
+`file_response(path)` builds the outbound stream that serves a file: a
+`ResponseStart` with `Content-Type` and `Content-Length` filled in, then the
+`ResponseBody` chunks. It returns a `Stream[Outbound]`, so it drops straight into
+a handler's output (or a `without-web` `Reply`), and `Response` stays the pure
+buffered value it is; streaming is the other, already-existing arm rather than an
+iterator smuggled into that value.
+
+It exists because the offloaded-file ASGI extensions
+(`http.response.pathsend`, `http.response.zerocopysend`) only pay off when the
+transport can push bytes *below* Python (a native `sendfile`), which a pure-Python
+asyncio server cannot do; rather than advertise an offload it can't honor, the
+reusable-but-fiddly work moves here. That work is: guess the content type, compute
+the length, and chunk the bytes off the event loop into the `ResponseBody` events
+the framework already streams to `send`, so a large file is never slurped into one
+`bytes`.
+
+`file_response` is a coroutine, not an async generator, and the ordering is the
+point. Awaiting it runs the `stat` up front, so a missing file raises
+`FileNotFoundError` *before* any `ResponseStart` is emitted, while nothing is on
+the wire yet and a handler can still answer a clean `404`. This is the
+parse-don't-validate move, and precisely the wart `http.response.pathsend` cannot
+avoid: its path is opened only *after* the status and headers have already been
+sent, so a missing file there can only truncate a response that already claimed
+`200`.
+
+```python
+from pathlib import Path
+
+from without_asgi import Response, file_response
+
+async def download(state, match) -> Reply:
+    try:
+        return await file_response(Path("/srv/report.pdf"))
+    except FileNotFoundError:
+        return Response(status=404, body=b"not found\n")
+```
+
+`Content-Type` is guessed from the suffix with `mimetypes.guess_file_type`
+(falling back to `application/octet-stream`) and overridable with `content_type`;
+any `headers` given are prepended, for a `content-disposition` say. The body is
+read in `chunk_size` pieces via `asyncio.to_thread`, matching the package's
+`pathlib.Path` + thread-offload file-I/O discipline, and the file is closed when
+the stream ends or is closed early (`make_asgi_app` closes an abandoned outbound
+stream, e.g. on a client disconnect mid-download). A `HEAD` request needs nothing
+special: the transport drops the body chunks on the wire. Range requests (`206`)
+and conditional requests (`ETag`, `Last-Modified`) are not modeled yet; a caller
+that wants them sets the headers and status itself.
+
+Reads and writes are lockstep by default: the next chunk is read only once the
+consumer has drained the current one, so disk and socket never overlap. Because
+the chunks are an ordinary `Stream`, read-ahead is opt-in composition rather than
+a built-in, `spool` from the core:
+
+```python
+from without import spool
+
+return spool(await file_response(path), ahead=2)
+```
+
+`spool` drives the file reads up to `ahead` chunks ahead of the socket writes
+through a bounded queue on a background task, so the next `read` overlaps the
+current chunk's send; `ahead` still bounds the memory held and applies
+backpressure.
+
 ## The codec runs both directions
 
 Everything above is the *app* side of the boundary: parse the dicts an ASGI
