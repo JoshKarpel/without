@@ -34,16 +34,15 @@ from without_asgi import RawHeaders
 
 from without_http.h2_wire import request_headers
 from without_http.h2_wire import response_status_and_headers
-from without_http.timeouts import ConnectTimeout
-from without_http.timeouts import PoolTimeout
-from without_http.timeouts import ReadTimeout
+from without_http.keepalive import TCPKeepalive
+from without_http.keepalive import apply_tcp_keepalive
 from without_http.timeouts import Timeout
 from without_http.timeouts import WriteTimeout
-from without_http.timeouts import phase
 
 _BUFFER = 65536
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _NO_TIMEOUT = Timeout()  # a shared immutable "no timeouts" value, safe as a default
+_DEFAULT_KEEPALIVE = TCPKeepalive()  # likewise: a shared immutable "keepalive on" default
 
 logger = logging.getLogger(__name__)
 
@@ -291,7 +290,12 @@ _ALPN_HTTP11 = ("http/1.1",)
 
 
 async def _open(
-    host: str, port: int, *, ssl_context: ssl.SSLContext | None, connect: float | None = None
+    host: str,
+    port: int,
+    *,
+    ssl_context: ssl.SSLContext | None,
+    timeout: Timeout = _NO_TIMEOUT,
+    keepalive: TCPKeepalive | None = None,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, str]:
     """
     Open a connection and report the negotiated wire protocol.
@@ -300,14 +304,18 @@ async def _open(
     `http/1.1` (prior-knowledge h2c is opened directly by the pool instead), or a ready
     context whose ALPN offer the pool has already settled. Over TLS the protocol is
     whatever ALPN selected: `h2` when the server takes the offer, else `http/1.1`. The
-    `connect` deadline covers the TCP connect and, over TLS, the handshake, since both
+    `connect` bound covers the TCP connect and, over TLS, the handshake, since both
     happen in the one `open_connection` await; the ALPN read after it is synchronous.
+
+    When `keepalive` is set, TCP keepalive is enabled on the socket so a peer that vanishes
+    silently is detected even while the connection sits idle in the pool.
     """
-    async with phase(connect, ConnectTimeout):
-        if ssl_context is None:
-            reader, writer = await asyncio.open_connection(host, port)
-            return reader, writer, "http/1.1"
+    async with timeout.connecting():
         reader, writer = await asyncio.open_connection(host, port, ssl=ssl_context)
+    if keepalive is not None:
+        apply_tcp_keepalive(writer, keepalive)
+    if ssl_context is None:
+        return reader, writer, "http/1.1"
     ssl_object = writer.get_extra_info("ssl_object")
     negotiated = ssl_object.selected_alpn_protocol() if ssl_object is not None else None
     return reader, writer, "h2" if negotiated == "h2" else "http/1.1"
@@ -359,11 +367,11 @@ class _Http11Connection:
         self._writer.write(self._conn.send(h11.Request(method=request.method, target=_target(parts), headers=headers)))
         await self._writer.drain()
 
-    async def send_body(self, request: ClientRequest, write: float | None = None) -> None:
+    async def send_body(self, request: ClientRequest, timeout: Timeout = _NO_TIMEOUT) -> None:
         """
         Stream the request body, then end the message, as a background task.
 
-        Draining per chunk gives ordinary write backpressure, and the `write` deadline
+        Draining per chunk gives ordinary write backpressure, and `timeout.writing()`
         bounds each drain: it bounds write *progress*, not the whole send, so a lazily-fed
         body that pauses between chunks does not trip it. An `OSError` means the peer
         stopped reading (the early-response half-close): the response is still valid, so
@@ -391,12 +399,12 @@ class _Http11Connection:
                     return
                 if chunk:
                     self._writer.write(self._conn.send(h11.Data(data=chunk)))
-                    async with phase(write, WriteTimeout):
+                    async with timeout.writing():
                         await self._writer.drain()
             if self._reader.at_eof():
                 return
             self._writer.write(self._conn.send(h11.EndOfMessage()))
-            async with phase(write, WriteTimeout):
+            async with timeout.writing():
                 await self._writer.drain()
         except asyncio.CancelledError:
             raise
@@ -409,11 +417,11 @@ class _Http11Connection:
             self.send_error = exc
             self.close()
 
-    async def read_head(self, read: float | None = None) -> tuple[int, RawHeaders]:
+    async def read_head(self, timeout: Timeout = _NO_TIMEOUT) -> tuple[int, RawHeaders]:
         while True:
             event = self._conn.next_event()
             if event is h11.NEED_DATA:
-                async with phase(read, ReadTimeout):
+                async with timeout.reading():
                     data = await self._reader.read(_BUFFER)
                 self._conn.receive_data(data)
                 continue
@@ -427,11 +435,11 @@ class _Http11Connection:
             # defensive backstop against an unexpected h11 event.
             raise ConnectionError("the server closed the connection before sending a response")  # pragma: no cover
 
-    async def iter_body(self, read: float | None = None) -> AsyncGenerator[bytes | ResponseTrailers]:
+    async def iter_body(self, timeout: Timeout = _NO_TIMEOUT) -> AsyncGenerator[bytes | ResponseTrailers]:
         while True:
             event = self._conn.next_event()
             if event is h11.NEED_DATA:
-                async with phase(read, ReadTimeout):
+                async with timeout.reading():
                     data = await self._reader.read(_BUFFER)
                 self._conn.receive_data(data)
                 continue
@@ -556,16 +564,16 @@ class _Http2Connection:
             stream,
             request_headers(method, target, scheme, authority, headers),
             end_stream=False,
-            pool=timeout.pool,
+            timeout=timeout,
         )
         # Once the stream is registered, any failure before the head is returned must
         # cancel the sender and reset the stream, so the slot and the connection are not
         # stranded (the h2 mirror of h11's pre-body guard).
         try:
-            async with phase(timeout.write, WriteTimeout):
+            async with timeout.writing():
                 await self._writer.drain()
-            stream.send_task = asyncio.create_task(self._send_body(stream_id, stream, body, timeout.write))
-            async with phase(timeout.read, ReadTimeout):
+            stream.send_task = asyncio.create_task(self._send_body(stream_id, stream, body, timeout))
+            async with timeout.reading():
                 await stream.head.wait()
             if stream.error is not None:
                 raise stream.error
@@ -577,12 +585,12 @@ class _Http2Connection:
             stream.status,
             stream.headers,
             stream_id,
-            self._iter_body(stream_id, stream, timeout.read),
+            self._iter_body(stream_id, stream, timeout),
             stream.send_task,
         )
 
     async def _open_stream(
-        self, stream: _Stream, headers: list[tuple[bytes, bytes]], *, end_stream: bool, pool: float | None = None
+        self, stream: _Stream, headers: list[tuple[bytes, bytes]], *, end_stream: bool, timeout: Timeout = _NO_TIMEOUT
     ) -> int:
         """
         Register and send a new stream's headers, waiting when at the server's stream limit.
@@ -595,9 +603,9 @@ class _Http2Connection:
         the read loop sets it after a `StreamEnded`/`StreamReset`/settings change frees or
         raises a slot. Because capacity is re-checked under the lock on each pass, a lost
         wakeup only costs a re-check, never a stall, the same discipline as `window`. The
-        `pool` deadline bounds the whole wait for a slot (the wait a `PoolTimeout` guards).
+        `pool` bound (`timeout.pooling()`) covers the whole wait for a slot (a `PoolTimeout`).
         """
-        async with phase(pool, PoolTimeout):
+        async with timeout.pooling():
             while True:
                 async with self._lock:
                     if self._closed.is_set():
@@ -612,13 +620,13 @@ class _Http2Connection:
                 await self._stream_gate.wait()
 
     async def _send_body(
-        self, stream_id: int, stream: _Stream, body: Stream[bytes], write: float | None = None
+        self, stream_id: int, stream: _Stream, body: Stream[bytes], timeout: Timeout = _NO_TIMEOUT
     ) -> None:
         try:
             async for chunk in body:
                 if chunk:
-                    await self._send_data(stream_id, stream, chunk, end=False, write=write)
-            await self._send_data(stream_id, stream, b"", end=True, write=write)
+                    await self._send_data(stream_id, stream, chunk, end=False, timeout=timeout)
+            await self._send_data(stream_id, stream, b"", end=True, timeout=timeout)
         except asyncio.CancelledError:
             raise
         except (
@@ -642,7 +650,7 @@ class _Http2Connection:
         await self.abort(stream_id)
 
     async def _send_data(
-        self, stream_id: int, stream: _Stream, data: bytes, *, end: bool, write: float | None = None
+        self, stream_id: int, stream: _Stream, data: bytes, *, end: bool, timeout: Timeout = _NO_TIMEOUT
     ) -> None:
         remaining = memoryview(data)
         while True:
@@ -676,19 +684,19 @@ class _Http2Connection:
                     stream.window.clear()
                     blocked = True
             if blocked:
-                async with phase(write, WriteTimeout):
+                async with timeout.writing():
                     await stream.window.wait()
                 continue
-            async with phase(write, WriteTimeout):
+            async with timeout.writing():
                 await self._writer.drain()
             if len(remaining) == 0:
                 return
 
     async def _iter_body(
-        self, stream_id: int, stream: _Stream, read: float | None = None
+        self, stream_id: int, stream: _Stream, timeout: Timeout = _NO_TIMEOUT
     ) -> AsyncGenerator[bytes | ResponseTrailers]:
         while True:
-            async with phase(read, ReadTimeout):
+            async with timeout.reading():
                 item = await stream.chunks.get()
             if item is None:
                 break
@@ -864,7 +872,7 @@ class _HostPool:
         matching `checkin`; if anything past the permit fails, it is freed here.
         """
         try:
-            async with phase(timeout.pool, PoolTimeout):
+            async with timeout.pooling():
                 if self._semaphore is not None:
                     await self._semaphore.acquire()
         except BaseException:
@@ -976,6 +984,7 @@ class ConnectionPool:
     max_connections_per_host: int | None = None
     max_keepalive_per_host: int | None = None
     timeout: Timeout = _NO_TIMEOUT
+    tcp_keepalive: TCPKeepalive | None = _DEFAULT_KEEPALIVE
     _h2: dict[Origin, _Http2Connection] = field(default_factory=dict)
     _h11: dict[Origin, _HostPool] = field(default_factory=dict)
     _h11_only: set[Origin] = field(default_factory=set)
@@ -1089,7 +1098,8 @@ class ConnectionPool:
                         origin.host,
                         origin.port,
                         ssl_context=self._context_for_connection(http2=True),
-                        connect=timeout.connect,
+                        timeout=timeout,
+                        keepalive=self.tcp_keepalive,
                     )
                     if protocol == "h2":
                         connection = _Http2Connection.start(reader, writer)
@@ -1114,7 +1124,13 @@ class ConnectionPool:
             async with self._lock_for(origin):
                 connection = self._reusable_h2(origin)
                 if connection is None:
-                    reader, writer, _ = await _open(origin.host, origin.port, ssl_context=None, connect=timeout.connect)
+                    reader, writer, _ = await _open(
+                        origin.host,
+                        origin.port,
+                        ssl_context=None,
+                        timeout=timeout,
+                        keepalive=self.tcp_keepalive,
+                    )
                     connection = _Http2Connection.start(reader, writer)
                     self._h2[origin] = connection
         return connection
@@ -1154,8 +1170,8 @@ class ConnectionPool:
         send_task: asyncio.Task[None] | None = None
         try:
             await connection.send_head(request, parts)
-            send_task = asyncio.create_task(connection.send_body(request, timeout.write))
-            status, headers = await connection.read_head(timeout.read)
+            send_task = asyncio.create_task(connection.send_body(request, timeout))
+            status, headers = await connection.read_head(timeout)
         except BaseException:
             # The response body (which owns checkin) is not armed yet, so hand the
             # connection back here, unreusable, so the pool closes it and frees the permit
@@ -1169,6 +1185,10 @@ class ConnectionPool:
 
         async def release(fully_read: bool) -> None:
             await cancel_futures([send_task])  # cancel-and-await the writer before deciding
+            # This conjunction is the barrier against handing a desync'd connection back to the
+            # pool: a half-sent request or half-read response cannot reach h11 DONE, so
+            # `connection.finish()` fails and the connection is closed rather than reused. Do not
+            # loosen it (e.g. trusting `fully_read` alone) — that reopens request smuggling.
             reusable = (
                 fully_read
                 and send_task is not None
@@ -1181,7 +1201,7 @@ class ConnectionPool:
                 raise connection.send_error
 
         return ClientResponse(
-            ResponseHead(status, headers), ResponseBody(await _releasing(connection.iter_body(timeout.read), release))
+            ResponseHead(status, headers), ResponseBody(await _releasing(connection.iter_body(timeout), release))
         )
 
     def _host_pool(self, origin: Origin) -> _HostPool:
@@ -1197,7 +1217,9 @@ class ConnectionPool:
 
     async def _open_h11(self, origin: Origin, timeout: Timeout) -> _Http11Connection:
         ssl_context = self._context_for_connection(http2=False) if origin.secure else None
-        reader, writer, _ = await _open(origin.host, origin.port, ssl_context=ssl_context, connect=timeout.connect)
+        reader, writer, _ = await _open(
+            origin.host, origin.port, ssl_context=ssl_context, timeout=timeout, keepalive=self.tcp_keepalive
+        )
         return _Http11Connection.new(reader, writer)
 
     def _reusable_h2(self, origin: Origin) -> _Http2Connection | None:

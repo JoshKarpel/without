@@ -20,6 +20,7 @@ from without_http.h2_wire import scope_from_h2_headers
 from without_http.h11_wire import h11_events_from_outbound
 from without_http.h11_wire import inbound_from_event
 from without_http.h11_wire import scope_from_request
+from without_http.keepalive import TCPKeepalive
 from without_http.lifespan import LifespanError
 from without_http.lifespan import run_lifespan
 from without_http.server import Server
@@ -53,6 +54,7 @@ __all__ = [
     "ResponseHead",
     "ResponseTrailers",
     "Server",
+    "TCPKeepalive",
     "Timeout",
     "WriteTimeout",
     "add_headers",

@@ -13,8 +13,10 @@
   a route value (immutable), and a websocket handler reverses an HTTP route to link to its resource
   with the same call.
 - **`without-http`**: granular client request timeouts. A `Timeout` value bounds each phase
-  independently (`connect`, `read`, `write`, `pool`), each an *inactivity* bound that re-arms on
-  progress and is disabled by default (a deadline is the caller's policy, not the transport's). A
+  independently (`connect`, `read`, `write`, `pool`), each a `timedelta` and an *inactivity* bound
+  that re-arms on progress, disabled by default (a deadline is the caller's policy, not the
+  transport's). Each axis applies through its own bound (`connecting()`, `reading()`, `writing()`,
+  `pooling()`), so the axis-to-error mapping lives on `Timeout` rather than at every call site. A
   timeout raises a typed `ConnectTimeout` / `ReadTimeout` / `WriteTimeout` / `PoolTimeout` under
   `HTTPTimeout` (itself a `TimeoutError`), so a caller can tell how far the request got and retry
   the right ones. Also: per-host connection bounds and gating of HTTP/2 stream issuance against the
@@ -23,6 +25,13 @@
   bounds how many *idle* connections are retained per origin once a burst subsides, so the pool ramps
   up under load but settles back down when quiet. Both unbounded by default, and must be `>= 1` when
   set.
+- **`without-http`**: TCP keepalive on pooled client connections, on by default and configured with a
+  `TCPKeepalive` value on the pool (`idle`/`interval` as `timedelta`s, `count`, or `None` to disable).
+  The kernel probes
+  an otherwise-idle connection and drops it when a peer has vanished *silently* (a crash, a partition, a
+  NAT dropping the flow), which a clean server-side close does not: that sends a `FIN` the pool already
+  detects before reuse. This matters most because request timeouts are disabled by default, so nothing
+  else would notice a dead idle socket until a request hung on it.
 
 ### Changed
 

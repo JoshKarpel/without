@@ -273,17 +273,20 @@ than make slow progress, so my caller can react"), which the transport cannot kn
 so you opt in per phase with a `Timeout` value, on the pool or per request:
 
 ```python
+from datetime import timedelta
+
 from without_http import Timeout
 
-async with ConnectionPool(timeout=Timeout(connect=10.0, read=30.0)) as pool:
-    async with pool.request("GET", url, timeout=Timeout(read=5.0)) as (head, body):
+async with ConnectionPool(timeout=Timeout(connect=timedelta(seconds=10), read=timedelta(seconds=30))) as pool:
+    async with pool.request("GET", url, timeout=Timeout(read=timedelta(seconds=5))) as (head, body):
         ...
 ```
 
-Each axis is an *inactivity* bound (it re-arms on progress), not a total deadline:
+Each axis is a `timedelta`, so the unit is explicit rather than an ambiguous bare
+number, and an *inactivity* bound (it re-arms on progress), not a total deadline:
 `read`/`write` bound the gap between chunks, so a slow-but-progressing transfer is
 not killed. Every field defaults to `None` (that axis disabled), and there is no
-shared-default scalar, since one number across four unrelated phases carries no
+shared-default scalar, since one duration across four unrelated phases carries no
 meaning. A per-request `Timeout` *replaces* the pool's wholesale (it does not layer
 through middleware; `None` inherits the pool default). For an overall wall-clock cap,
 compose one on the substrate: `async with asyncio.timeout(t): pool.request(...)`.
@@ -313,6 +316,47 @@ recovery:
 | `ConnectTimeout` | no connection established | **always**, even a non-idempotent request, or fail over to another origin |
 | `WriteTimeout` | mid-sending the request | idempotent: yes; otherwise ambiguous. The connection is discarded, so a retry gets a fresh one |
 | `ReadTimeout` | request fully sent, awaiting the response | only if idempotent (the server may already have processed it); if mid-body, decide keep-vs-discard the partial |
+
+### TCP keepalive
+
+Pooled connections outlive the request that opened them, so a kept-alive socket can
+sit idle for a long time between uses. Two things can end it while it waits, and they
+need different handling:
+
+- A server *cleanly* closing its end of an idle keep-alive connection sends a
+  `TCP FIN`, which asyncio surfaces on the event loop. The pool notices it before
+  reuse (the checkout skips a connection that is closing or at EOF) and opens a fresh
+  one, so this common case needs nothing from you.
+- A peer that *silently* vanishes (a crashed server, a network partition, a NAT or
+  firewall dropping the flow) sends no `FIN`. Nothing surfaces on the event loop, so
+  the dead socket looks reusable until a request stalls on it. With no request
+  timeouts armed (the default), that stall has nothing to bound it.
+
+TCP keepalive closes that second gap: the kernel probes an otherwise-idle connection
+and tears it down when the peer stops answering, independent of any request. It is
+**on by default** with modest probe timing, configured with a `TCPKeepalive` value on
+the pool:
+
+```python
+from datetime import timedelta
+
+from without_http import ConnectionPool, TCPKeepalive
+
+# The default: probe after 60s idle, every 10s, drop after 6 unanswered probes.
+async with ConnectionPool() as pool:
+    ...
+
+# Tune the probe timing, or pass None to disable keepalive entirely.
+keepalive = TCPKeepalive(idle=timedelta(seconds=30), interval=timedelta(seconds=5), count=4)
+async with ConnectionPool(tcp_keepalive=keepalive) as pool:
+    ...
+```
+
+`idle` and `interval` are `timedelta`s and MUST be a whole number of seconds (the
+underlying options carry only integer seconds, so a sub-second component is rejected
+at construction rather than silently truncated); `count` is a plain probe count. `SO_KEEPALIVE` is enabled portably; the per-probe
+tuning maps to the Linux `TCP_KEEPIDLE`/`TCP_KEEPINTVL`/`TCP_KEEPCNT` socket options,
+and a platform that lacks one of those knobs keeps its own default for that axis.
 
 ### Client middleware
 
