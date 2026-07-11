@@ -57,18 +57,41 @@ async def test_open_leaves_keepalive_off_when_disabled(listener: tuple[str, int]
         writer.close()
 
 
-@pytest.mark.skipif(not hasattr(socket, "TCP_KEEPIDLE"), reason="per-probe tuning is Linux-specific")
+# The per-probe option names are platform-specific (typeshed marks them Linux-only), so
+# fetch them by name: `getattr` keeps the type checker happy on macOS/Windows, and the
+# skip guards the runtime lookup where a platform lacks one of the three.
+_KEEPIDLE = getattr(socket, "TCP_KEEPIDLE", None)
+_KEEPINTVL = getattr(socket, "TCP_KEEPINTVL", None)
+_KEEPCNT = getattr(socket, "TCP_KEEPCNT", None)
+
+
+@pytest.mark.skipif(
+    None in (_KEEPIDLE, _KEEPINTVL, _KEEPCNT), reason="per-probe tuning options are not all present on this platform"
+)
 async def test_open_applies_the_per_probe_tuning(listener: tuple[str, int]) -> None:
     host, port = listener
     keepalive = TCPKeepalive(idle=timedelta(seconds=45), interval=timedelta(seconds=7), count=3)
     _reader, writer, _ = await _open(host, port, ssl_context=None, keepalive=keepalive)
     sock = writer.get_extra_info("socket")
     try:
-        assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE) == 45
-        assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL) == 7
-        assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT) == keepalive.count
+        assert sock.getsockopt(socket.IPPROTO_TCP, _KEEPIDLE) == 45
+        assert sock.getsockopt(socket.IPPROTO_TCP, _KEEPINTVL) == 7
+        assert sock.getsockopt(socket.IPPROTO_TCP, _KEEPCNT) == keepalive.count
     finally:
         writer.close()
+
+
+@pytest.mark.skipif(
+    None in (_KEEPIDLE, _KEEPINTVL, _KEEPCNT), reason="per-probe tuning options are not all present on this platform"
+)
+def test_socket_options_maps_each_axis_to_its_setsockopt_triple() -> None:
+    keepalive = TCPKeepalive(idle=timedelta(seconds=45), interval=timedelta(seconds=7), count=3)
+    assert keepalive.socket_options() == [
+        (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+        (socket.IPPROTO_TCP, _KEEPIDLE, 45),
+        (socket.IPPROTO_TCP, _KEEPINTVL, 7),
+        (socket.IPPROTO_TCP, _KEEPCNT, 3),
+    ]
 
 
 def test_apply_is_a_noop_when_the_transport_has_no_socket() -> None:
