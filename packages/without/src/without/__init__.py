@@ -15,6 +15,7 @@ from without.tasks import background_task
 from without.tasks import cancel_futures
 from without.tasks import limit_concurrency
 from without.tasks import sleep_forever
+from without.tasks import timeout
 from without.wiring import Endo
 from without.wiring import Sample
 from without.wiring import buffer
@@ -54,4 +55,5 @@ __all__ = [
     "stream_from_iterable",
     "stream_from_queue",
     "tee",
+    "timeout",
 ]

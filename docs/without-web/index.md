@@ -1,13 +1,13 @@
 # without-web
 
 An opinionated HTTP and WebSocket router for
-[`without-asgi`](without-asgi.md). `without-asgi` deliberately ships *no*
+[`without-asgi`](../without-asgi/index.md). `without-asgi` deliberately ships *no*
 router, only the unopinionated boundary (scope/event parsing) and composition
 tools (`Middleware`, `stack`, `wrap`, `buffered`). `without-web` is the
 opinionated layer on top: tuple patterns with typed parameters, typed request
 extraction, 405-vs-404, mounting, scoped middleware, exception handlers, reverse
 routing (`url_for`), and OpenAPI. See the
-[`without_web` API reference](../reference/without_web.md) for the full surface.
+[`without_web` API reference](../without-web/reference.md) for the full surface.
 
 It snaps onto the boundary through nothing but the existing `HttpRouter` type:
 `Router.dispatch` *is* an `HttpRouter[T]`, so `make_asgi_app(http=router.dispatch)`

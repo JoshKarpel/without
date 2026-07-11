@@ -53,9 +53,9 @@ needs, and in the package that owns the exchange shape it wraps.**
   that needs only the `HttpScope` / `Inbound` / `Outbound` / `Response` vocabulary,
   so it works under any router and any transport (HTTP/1.1, HTTP/2, HTTP/3, and even
   uvicorn), because it wraps the handler rather than the socket. `limit_concurrent_requests`
-  is the first; natural neighbors are default response headers, gzip/decompression,
-  a request-body size cap, a per-request timeout, request-ID injection, structured
-  access logging, and CORS preflight.
+  and `limit_request_body` (a `413` body-size cap) live here; natural neighbors are
+  default response headers, gzip/decompression, a per-request timeout, request-ID
+  injection, structured access logging, and CORS preflight.
 - **`without-web`** holds route-aware middleware: anything keyed on the matched
   route or that maps exceptions to responses, plus route-scoped middleware and
   OpenAPI-aware pieces. Only that layer can see route metadata.

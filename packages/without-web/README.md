@@ -36,7 +36,7 @@ by hand. Encoding stays the app's choice, so the router ships no
 `json_response`-style helper.
 
 See the
-[`without-web` guide](https://without.help/guides/without-web/)
+[`without-web` guide](https://without.help/without-web/)
 (with the [API reference](https://without.help/reference/without_web/))
 for the full surface: patterns, extractors, streaming input, mounting,
 middleware, exception handlers, reverse routing, OpenAPI, and WebSocket routing.

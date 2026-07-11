@@ -3,7 +3,7 @@
 The narrow waist of the project: the contracts every plugin speaks, plus the
 stream connectors and a `with`-scoped background task helper. See the
 [Philosophy](../philosophy.md) for why the model is shaped this way, and the
-[`without` API reference](../reference/without.md) for the full surface.
+[`without` API reference](../without/reference.md) for the full surface.
 
 ## The substrate (`without.contracts`)
 
@@ -67,6 +67,8 @@ server handlers and client exchanges.
 
 The async task helpers: `sleep_forever`; the `with`-scoped `background_task`
 (starts a task on entry, cancels-then-awaits it on exit, so nothing leaks);
+`timeout`, a `timedelta | None`-typed wrapper over `asyncio.timeout` that models
+"no limit" as `None` (an always-open context) rather than a sentinel float;
 `limit_concurrency`, a bounded-concurrency driver that pulls work from a source
 only while below the limit (so a lazy source is never advanced past it); and its
 building blocks `cancel_futures` (cancel a set, then await them all) and

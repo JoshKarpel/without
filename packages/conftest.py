@@ -4,6 +4,8 @@ import asyncio
 import sys
 from collections.abc import Callable
 
+import pytest
+
 # Shared across every workspace package: pytest loads this conftest for all tests
 # under `packages/**/tests`, so the whole suite runs under every event loop the
 # project supports. `without` never pins a loop: the app chooses one at its
@@ -28,3 +30,23 @@ if sys.platform != "win32":  # pragma: no cover
 
 def pytest_asyncio_loop_factories() -> dict[str, LoopFactory]:
     return _LOOP_FACTORIES
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    # Enforce the convention that every `@pytest.mark.security` test names the gap it
+    # closes as its first positional argument (see the marker note in pyproject). The
+    # guard arms are excluded from coverage because a healthy suite never trips them:
+    # they exist to make a *future* undocumented mark fail loudly at collection.
+    undocumented: list[str] = []
+    for item in items:
+        marker = item.get_closest_marker("security")
+        if marker is None:
+            continue
+        gap = marker.args[0] if marker.args else None
+        if not (isinstance(gap, str) and gap.strip()):  # pragma: no cover - the suite keeps every mark documented
+            undocumented.append(item.nodeid)
+    if undocumented:  # pragma: no cover - unreachable while the convention holds
+        raise pytest.UsageError(
+            "every @pytest.mark.security test must name the gap it closes as its first argument; missing on:\n  "
+            + "\n  ".join(undocumented)
+        )

@@ -365,11 +365,20 @@ def _method_not_allowed[T](methods: Mapping[str, HttpEndpoint[T]]) -> HttpHandle
     return handler
 
 
+def _strip_mount(path: str, prefix: str) -> str:
+    # The sub-path an app mounted at `prefix` sees: `path` with the matched prefix
+    # segments removed. Trimming by *segment count* rather than raw string length keeps
+    # this consistent with the segment-wise, slash-insensitive matching: a request like
+    # `//legacy/foo` matches `delegate("/legacy")`, and a byte-length slice would leave a
+    # corrupted `y/foo` rather than the correct `/foo`.
+    remainder = split_path(path)[len(split_path(prefix)) :]
+    return "/" + "/".join(remainder) if remainder else "/"
+
+
 def _remount(scope: HttpScope, prefix: str) -> HttpScope:
     # ASGI root_path semantics: the sub-app sees the path with the mount prefix
     # stripped and the prefix folded into root_path.
-    trimmed = scope.path[len(prefix) :] or "/"
-    return replace(scope, path=trimmed, root_path=scope.root_path + prefix)
+    return replace(scope, path=_strip_mount(scope.path, prefix), root_path=scope.root_path + prefix)
 
 
 _NO_VALUES: Mapping[str, object] = MappingProxyType({})
@@ -596,9 +605,9 @@ def _flatten_ws[T](
 
 def _remount_ws(scope: WebsocketScope, prefix: str) -> WebsocketScope:
     # The websocket sibling of `_remount`: the sub-app sees the path with the mount
-    # prefix stripped and the prefix folded into root_path.
-    trimmed = scope.path[len(prefix) :] or "/"
-    return replace(scope, path=trimmed, root_path=scope.root_path + prefix)
+    # prefix stripped (by segment count, see `_strip_mount`) and the prefix folded
+    # into root_path.
+    return replace(scope, path=_strip_mount(scope.path, prefix), root_path=scope.root_path + prefix)
 
 
 @dataclass(frozen=True, slots=True)

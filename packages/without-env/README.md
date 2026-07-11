@@ -26,6 +26,6 @@ config.current().default_mode        # the parsed value, same every call
 ```
 
 See the
-[`without-env` guide](https://without.help/guides/without-env/)
+[`without-env` guide](https://without.help/without-env/)
 (with the [API reference](https://without.help/reference/without_env/))
 for the full surface.

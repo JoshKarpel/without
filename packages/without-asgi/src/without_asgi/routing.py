@@ -13,12 +13,14 @@ from without_asgi.app import HttpHandler
 from without_asgi.app import HttpRouter
 from without_asgi.app import WebsocketHandler
 from without_asgi.inbound import Inbound
+from without_asgi.inbound import RequestBody
 from without_asgi.outbound import Outbound
 from without_asgi.outbound import Response
 from without_asgi.outbound import encode_response
 from without_asgi.scope import HttpScope
 from without_asgi.scope import WebsocketScope
 from without_asgi.shell import read_body
+from without_asgi.types import RawHeaders
 
 __all__ = [
     "HttpMiddleware",
@@ -26,6 +28,7 @@ __all__ = [
     "WebsocketMiddleware",
     "buffered",
     "limit_concurrent_requests",
+    "limit_request_body",
     "stack",
     "wrap",
 ]
@@ -170,6 +173,84 @@ def limit_concurrent_requests(limit: int, *, overloaded: Response = _OVERLOADED)
 
     def middleware(handler: HttpHandler, _state: object, _scope: HttpScope) -> HttpHandler:
         def processor(inputs: Stream[Inbound]) -> Stream[Outbound]:
+            return gated(handler, inputs)
+
+        return processor
+
+    return middleware
+
+
+_TOO_LARGE = Response(
+    status=413,
+    headers=((b"content-type", b"text/plain; charset=utf-8"),),
+    body=b"request entity too large\n",
+)
+
+
+class _BodyTooLarge(Exception):
+    """Signals that a request body passed the cap; caught and turned into `too_large`."""
+
+
+def _declared_length(headers: RawHeaders) -> int | None:
+    for name, value in headers:
+        if name.lower() == b"content-length":
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
+
+
+def limit_request_body(max_bytes: int, *, too_large: Response = _TOO_LARGE) -> HttpMiddleware[object]:
+    """
+    An `HttpMiddleware` that rejects a request whose body exceeds `max_bytes`.
+
+    Two layers. A request declaring a `Content-Length` over the cap is refused up front
+    with `too_large` (a `413 Request Entity Too Large` by default), without reading the
+    body or invoking the inner handler. A request that lies about or omits its length
+    (a chunked upload) is counted as its `RequestBody` chunks flow to the handler; the
+    running total passing `max_bytes` raises before the offending chunk reaches the
+    handler, and if the handler has not yet produced output the `413` is sent in its
+    place. A handler that has already started responding when the cap trips (a streaming
+    handler emitting before it finishes reading) cannot be cleanly turned into a `413`,
+    so the overflow surfaces as an error rather than a corrupted response.
+
+    The cap bounds buffered body under any transport, so it belongs here rather than in
+    the wire server. Pass your own `Response` to control the status, body, and headers.
+    """
+    rejection = tuple(encode_response(too_large))
+
+    async def reject() -> AsyncIterator[Outbound]:
+        for event in rejection:
+            yield event
+
+    async def counted(inputs: Stream[Inbound]) -> AsyncIterator[Inbound]:
+        total = 0
+        async for event in inputs:
+            if isinstance(event, RequestBody):
+                total += len(event.body)
+                if total > max_bytes:
+                    raise _BodyTooLarge
+            yield event
+
+    async def gated(handler: HttpHandler, inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
+        started = False
+        try:
+            async for event in handler(counted(inputs)):
+                started = True
+                yield event
+        except _BodyTooLarge:
+            if started:
+                raise
+            async for event in reject():
+                yield event
+
+    def middleware(handler: HttpHandler, _state: object, scope: HttpScope) -> HttpHandler:
+        declared = _declared_length(scope.headers)
+
+        def processor(inputs: Stream[Inbound]) -> Stream[Outbound]:
+            if declared is not None and declared > max_bytes:
+                return reject()
             return gated(handler, inputs)
 
         return processor

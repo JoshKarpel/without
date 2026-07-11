@@ -1,11 +1,11 @@
 # without-http
 
 A sans-IO-backed ASGI **server** and **HTTP client** for `without`. Where
-[`without-asgi`](without-asgi.md) is the *app* side of the ASGI boundary (it turns
+[`without-asgi`](../without-asgi/index.md) is the *app* side of the ASGI boundary (it turns
 a server's `receive`/`send` into typed streams), `without-http` is the *server*
 side: it owns the socket and the HTTP wire protocol, and drives any ASGI app via
 `app(scope, receive, send)`. See the
-[`without_http` API reference](../reference/without_http.md) for the full surface.
+[`without_http` API reference](../without-http/reference.md) for the full surface.
 
 The wire-protocol state machines are themselves sans-IO libraries:
 [`h11`](https://h11.readthedocs.io/) for HTTP/1.1,
@@ -29,7 +29,7 @@ async with serving(app, host="127.0.0.1", port=8000):
 ```
 
 Because `without-http` speaks plain ASGI to the app, *any* ASGI app runs over it,
-interchangeably with uvicorn: a [`without-web`](without-web.md) router, a bare
+interchangeably with uvicorn: a [`without-web`](../without-web/index.md) router, a bare
 `without-asgi` handler, or a third-party app (Starlette, FastAPI).
 
 `serving(app, ...)` is the entrypoint: an async context manager that drives the
@@ -79,6 +79,17 @@ What the server handles:
   `Server.in_flight` reports the live connection count for metrics. To bound in-flight
   *requests* (the right limit once one HTTP/2 connection multiplexes many requests),
   wrap the app in `limit_concurrent_requests`, which sheds with a `503`.
+- **Resource bounds.** `serving` takes per-connection bounds for a hostile network,
+  off or generous by default and tuned at the composition root (e.g. from an
+  `EnvContext` settings value). `idle_timeout` (a `timedelta`) closes a connection
+  whose peer stalls mid-exchange (slowloris) and bounds an idle WebSocket. Over
+  HTTP/2, `max_concurrent_streams` is advertised and `max_stream_resets` caps how many
+  resets one connection may issue before it is dropped, together defeating the Rapid
+  Reset flood (CVE-2023-44487); a client reset also cancels the stream's app task, and
+  received body is acked only as the app consumes it, so the flow-control window bounds
+  buffered body. `max_websocket_message_bytes` caps a reassembled WebSocket message.
+  For a body-size cap that works under any transport, wrap the app in
+  `without-asgi`'s `limit_request_body`, which answers `413`.
 
 The pure wire cores (`h11_wire`, `h2_wire`, `ws_wire`) are sans-IO and unit-tested:
 they map `h11`/`h2`/`wsproto` events to the typed `without-asgi` vocabulary and
@@ -228,5 +239,5 @@ request-spanning identity belongs in a value you own and pass per request. A
 `CookieJar` is the canonical case: you construct the jar and hand it to `cookies(jar)`,
 so cookie scope (application identity) stays independent of connection reuse
 (transport) rather than both hiding in the pool. Two requests share cookies exactly
-when they share a jar. Place `cookies` *inside* `follow_redirects` in a `stack` so each
-redirect hop both sends and collects cookies.
+when they share a jar. See [Cookies](cookies.md) for the jar's matching rules, the
+origin guards it enforces on untrusted `Set-Cookie` responses, and its expiry model.
