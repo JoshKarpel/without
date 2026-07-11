@@ -43,7 +43,11 @@ Outbound]` (and the websocket equivalent) selects the `Processor` that serves th
 connection. `make_asgi_app` then owns the receive/send wiring around it: it wraps
 `receive` into the inbound stream, runs the returned `Processor`, and drains its
 outbound stream into `send`, so a router and its handler only ever see streams,
-never the raw callables or the lifespan scope. Each protocol's router defaults to
+never the raw callables or the lifespan scope. It closes the inbound stream when
+the handler exits (via `aclosing`), so a handler that abandons the request body
+early has its `finally` run deterministically rather than leaving the generator
+dangling for GC: the server-side mirror of the client folding connection release
+into its response-body generator. Each protocol's router defaults to
 one that refuses the connection, so an app serves a protocol only by passing its
 own router to override the default; an unserved HTTP scope gets a `501 Not
 Implemented` and an unserved WebSocket scope is closed before `accept` (a `403`).

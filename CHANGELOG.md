@@ -57,6 +57,15 @@
   body the moment the peer half-closes rather than writing on into a closing connection. See the new
   [Security](https://without.help/without-http/security/) page.
 
+### Fixed
+
+- **`without-asgi`**: `make_asgi_app` now closes the inbound stream when a connection handler exits,
+  so a handler that abandons the request body early (reads part of it, then returns) has the inbound
+  generator's `finally` run deterministically instead of leaving it suspended for garbage collection.
+  This is the server-side mirror of the client folding connection release into its response-body
+  generator; the handler's inbound stream is wrapped in `aclosing`, covering both the HTTP and
+  WebSocket paths.
+
 ## 0.0.1
 
 ### Added
