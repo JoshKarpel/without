@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from collections.abc import AsyncIterator
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -31,7 +32,11 @@ class CaptureHandler(logging.Handler):
     Control only ever flows outward from stdlib into `without`, never back.
 
     A log call MAY happen off the event loop thread, so the parsed value is handed
-    to the loop with `call_soon_threadsafe`. The queue is bounded, so a burst that
+    to the loop with `call_soon_threadsafe`, which writes the loop's self-pipe to
+    wake it. A log call *on* the loop thread (an async handler logging) does not
+    need that wakeup, so those take the cheaper `call_soon`; the construction thread
+    is the loop thread (`capture` builds this right after `get_running_loop`), so its
+    id captured here identifies loop-thread emits. The queue is bounded, so a burst that
     outruns the sink is dropped rather than growing memory without limit;
     `dropped` counts how many so an operator can see it. The overflow policy is a
     boundary decision the app owns: raise `capacity`, or pass `capacity=None` for
@@ -46,13 +51,17 @@ class CaptureHandler(logging.Handler):
     ) -> None:
         super().__init__()
         self._loop = loop
+        self._loop_thread_id = threading.get_ident()
         self._queue = queue
         self._parse = parse
         self.dropped = 0
 
     def emit(self, log_record: logging.LogRecord) -> None:
         record = self._parse(log_record)
-        self._loop.call_soon_threadsafe(self._offer, record)
+        if threading.get_ident() == self._loop_thread_id:
+            self._loop.call_soon(self._offer, record)
+        else:
+            self._loop.call_soon_threadsafe(self._offer, record)
 
     def _offer(self, record: Record) -> None:
         try:

@@ -117,6 +117,8 @@ async def _read(reader: asyncio.StreamReader, idle_timeout: timedelta | None) ->
     peer that opens a connection and then stalls (a slowloris) cannot hold it open
     indefinitely. `None` leaves the read unbounded.
     """
+    if idle_timeout is None:
+        return await reader.read(_BUFFER)
     async with timeout(idle_timeout):
         return await reader.read(_BUFFER)
 
@@ -264,9 +266,10 @@ async def _serve_websocket(
             match event:
                 case TextMessage(data=data, message_finished=done):
                     text_parts.append(data)
-                    pending_bytes += len(data.encode())
-                    if max_message is not None and pending_bytes > max_message:
-                        return await reject_oversized()
+                    if max_message is not None:
+                        pending_bytes += len(data.encode())
+                        if pending_bytes > max_message:
+                            return await reject_oversized()
                     if done:
                         message = WebsocketReceive(WebsocketText("".join(text_parts)))
                         text_parts.clear()

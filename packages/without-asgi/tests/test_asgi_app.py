@@ -243,7 +243,7 @@ async def test_an_unserved_http_scope_is_refused_with_501() -> None:
         {
             "type": "http.response.start",
             "status": 501,
-            "headers": [[b"content-type", b"text/plain; charset=utf-8"]],
+            "headers": ((b"content-type", b"text/plain; charset=utf-8"),),
         },
         {"type": "http.response.body", "body": b"this application does not serve http\n", "more_body": False},
     ]

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
+from dataclasses import field
 from typing import Generic
 from typing import TypeVar
 from typing import cast
@@ -27,10 +28,13 @@ class Request:
     """
     The parsed-once context an extractor reads from.
 
-    `params` holds the path parameters the router already parsed during the trie
-    walk (typed values, stored as `object`); `body` is the fully-buffered request
-    body (empty for a websocket handshake, which has none). One value, built once
-    per connection, fed to every extractor a handler declares.
+    `path_params` holds the path parameters the router already parsed during the
+    trie walk (typed values, stored as `object`); `query_params` is the query
+    string decoded and parsed *once* (via `parse_qs`) at construction, so a handler
+    declaring N `query_param` tokens shares one parse rather than re-decoding the
+    query string per token. `body` is the fully-buffered request body (empty for a
+    websocket handshake, which has none). One value, built once per request, fed to
+    every extractor a handler declares.
 
     `scope` is `HttpScope | WebsocketScope` so a `query_param`/`header_param`
     token reads either (both carry `query_string` and `headers`). The whole-scope
@@ -39,8 +43,12 @@ class Request:
     """
 
     scope: HttpScope | WebsocketScope
-    params: Mapping[str, object]
+    path_params: Mapping[str, object]
     body: bytes
+    query_params: Mapping[str, list[str]] = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "query_params", parse_qs(self.scope.query_string.decode()))
 
 
 # Covariant: `V` appears only in `extract`'s return, so `Extractor[int]` is an
@@ -85,7 +93,7 @@ def path_param[V](name: str, converter: Converter[V]) -> Extractor[V]:
     spec = PathSpec(name=name, converter=converter)
 
     def extract(request: Request) -> V:
-        return cast(V, request.params[name])
+        return cast(V, request.path_params[name])
 
     return Extractor(extract, path=spec)
 
@@ -100,7 +108,7 @@ def catch_all(name: str, converter: Converter[str] = PATH) -> Extractor[str]:
     spec = PathSpec(name=name, converter=converter, catch_all=True)
 
     def extract(request: Request) -> str:
-        return cast(str, request.params[name])
+        return cast(str, request.path_params[name])
 
     return Extractor(extract, path=spec)
 
@@ -117,7 +125,7 @@ def query_param[V](
     """
 
     def extract(request: Request) -> V:
-        values = parse_qs(request.scope.query_string.decode()).get(name, [])
+        values = request.query_params.get(name, [])
         return parse(values)
 
     return Extractor(extract, query=(QueryParam(name=name, schema=schema, required=required),))

@@ -45,7 +45,7 @@ def test_encode_outbound_renders_a_response_start() -> None:
     assert encode_outbound(event) == {
         "type": "http.response.start",
         "status": 404,
-        "headers": [[b"content-type", b"application/json"]],
+        "headers": ((b"content-type", b"application/json"),),
     }
 
 
@@ -55,7 +55,7 @@ def test_encode_outbound_marks_a_response_start_with_trailers() -> None:
     assert encode_outbound(event) == {
         "type": "http.response.start",
         "status": 200,
-        "headers": [],
+        "headers": (),
         "trailers": True,
     }
 
@@ -83,7 +83,7 @@ def test_encode_outbound_renders_a_server_push() -> None:
     assert encode_outbound(event) == {
         "type": "http.response.push",
         "path": "/style.css",
-        "headers": [[b"accept", b"text/css"]],
+        "headers": ((b"accept", b"text/css"),),
     }
 
 
@@ -129,7 +129,7 @@ def test_encode_outbound_renders_response_trailers() -> None:
 
     assert encode_outbound(event) == {
         "type": "http.response.trailers",
-        "headers": [[b"digest", b"sha-256=abc"]],
+        "headers": ((b"digest", b"sha-256=abc"),),
         "more_trailers": False,
     }
 
@@ -159,7 +159,7 @@ def test_encode_websocket_outbound_renders_an_accept() -> None:
     assert encode_websocket_outbound(event) == {
         "type": "websocket.accept",
         "subprotocol": "graphql-ws",
-        "headers": [[b"x-app", b"flags"]],
+        "headers": ((b"x-app", b"flags"),),
     }
 
 
@@ -191,7 +191,7 @@ def test_encode_websocket_outbound_renders_a_denial_response_start() -> None:
     assert encode_websocket_outbound(event) == {
         "type": "websocket.http.response.start",
         "status": 403,
-        "headers": [[b"content-type", b"text/plain"]],
+        "headers": ((b"content-type", b"text/plain"),),
     }
 
 

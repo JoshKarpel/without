@@ -182,7 +182,7 @@ def encode_outbound(event: Outbound) -> RawMessage:
             start: dict[str, object] = {
                 "type": "http.response.start",
                 "status": status,
-                "headers": [[name, value] for name, value in headers],
+                "headers": headers,
             }
             if trailers:
                 start["trailers"] = True
@@ -190,7 +190,7 @@ def encode_outbound(event: Outbound) -> RawMessage:
         case ResponseBody(body, more_body):
             return {"type": "http.response.body", "body": body, "more_body": more_body}
         case ServerPush(path, headers):
-            return {"type": "http.response.push", "path": path, "headers": [[n, v] for n, v in headers]}
+            return {"type": "http.response.push", "path": path, "headers": headers}
         case ZeroCopySend(file, offset, count, more_body):
             zerocopy: dict[str, object] = {"type": "http.response.zerocopysend", "file": file, "more_body": more_body}
             if offset is not None:
@@ -205,7 +205,7 @@ def encode_outbound(event: Outbound) -> RawMessage:
         case ResponseTrailers(headers, more_trailers):
             return {
                 "type": "http.response.trailers",
-                "headers": [[n, v] for n, v in headers],
+                "headers": headers,
                 "more_trailers": more_trailers,
             }
         case ResponseDebug(info):
@@ -229,7 +229,7 @@ def encode_websocket_outbound(event: WebsocketOutbound) -> RawMessage:
             return {
                 "type": "websocket.accept",
                 "subprotocol": subprotocol,
-                "headers": [[n, v] for n, v in headers],
+                "headers": headers,
             }
         case WebsocketSend(data):
             return {"type": "websocket.send", **encode_websocket_data(data)}
@@ -239,7 +239,7 @@ def encode_websocket_outbound(event: WebsocketOutbound) -> RawMessage:
             return {
                 "type": "websocket.http.response.start",
                 "status": status,
-                "headers": [[n, v] for n, v in headers],
+                "headers": headers,
             }
         case WebsocketResponseBody(body, more_body):
             return {"type": "websocket.http.response.body", "body": body, "more_body": more_body}

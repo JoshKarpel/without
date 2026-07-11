@@ -49,9 +49,9 @@ async def file_response(
     `Content-Type` is guessed from the file suffix with `mimetypes.guess_file_type`,
     falling back to `application/octet-stream`; pass `content_type` to override it.
     Any `headers` given are prepended, for things like `content-disposition`. The
-    body is read in `chunk_size` pieces via `asyncio.to_thread`, so the reads never
-    block the event loop. The file is opened only once streaming begins and is
-    closed when the stream is exhausted, errored, or closed early (`make_asgi_app`
+    body is read in `chunk_size` pieces via `asyncio.to_thread`, so neither the open
+    nor the reads block the event loop. The file is opened only once streaming begins
+    and is closed when the stream is exhausted, errored, or closed early (`make_asgi_app`
     closes an abandoned outbound stream, e.g. on a client disconnect mid-download).
     """
     stat = await asyncio.to_thread(path.stat)
@@ -74,7 +74,10 @@ async def file_response(
 # every call, which matters on a hot file-serving path.
 async def _stream_file(path: Path, start: ResponseStart, chunk_size: int) -> AsyncIterator[Outbound]:
     yield start
-    with path.open("rb") as handle:
+    # `open` resolves the path and hits the inode, which can block on a slow/networked
+    # filesystem, so it goes to a pool thread like the reads rather than running on the loop.
+    handle = await asyncio.to_thread(path.open, "rb")
+    with handle:
         # Each read goes to a pool thread because a regular file cannot be polled by the
         # event loop. The point of doing it one chunk at a time is that a pool thread is
         # held only *briefly*, for the read itself, and released while the chunk is written

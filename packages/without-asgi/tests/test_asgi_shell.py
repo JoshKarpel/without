@@ -104,7 +104,7 @@ async def test_http_outbound_encodes_each_event_to_send() -> None:
     await http_outbound(send)(stream_from_iterable(events))
 
     assert sent == [
-        {"type": "http.response.start", "status": 200, "headers": [[b"content-type", b"text/plain"]]},
+        {"type": "http.response.start", "status": 200, "headers": ((b"content-type", b"text/plain"),)},
         {"type": "http.response.body", "body": b"ok", "more_body": False},
     ]
 
