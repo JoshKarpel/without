@@ -58,8 +58,9 @@ driven by a `background_task` for the life of its `with` block. The source and
 terminal adapters sit alongside: `stream_from_iterable` lifts a fixed iterable
 into a `Stream`, `collect` drains one to a list, `stream_from_queue` turns a
 push-based queue (an accept loop, a callback client) into the pull-based stream
-the rest of the system consumes, and `buffer` decouples a source's pace from its
-consumer's by pumping it into a bounded queue on a background task. `stack`
+the rest of the system consumes, and `spool` drives a source ahead of its
+consumer (read-ahead) by pumping it into a bounded queue on a background task.
+`stack`
 composes middleware (any `(handler, *context) -> handler`) into one, serving both
 server handlers and client exchanges.
 

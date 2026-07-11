@@ -32,8 +32,19 @@
   NAT dropping the flow), which a clean server-side close does not: that sends a `FIN` the pool already
   detects before reuse. This matters most because request timeouts are disabled by default, so nothing
   else would notice a dead idle socket until a request hung on it.
+- **`without-asgi`**: `file_response(path)` streams a file as the `ResponseStart` + `ResponseBody` event
+  stream a handler yields, with `Content-Type` guessed from the suffix (`mimetypes.guess_file_type`,
+  overridable) and `Content-Length` from `stat`, the body read in `chunk_size` pieces off the event loop
+  (`asyncio.to_thread`) so a large file is never buffered whole. It is a coroutine, not an async
+  generator: awaiting it runs the `stat` up front, so a missing file raises `FileNotFoundError` before
+  any `ResponseStart` is emitted and a handler can still answer a clean `404`. Reads and writes are
+  lockstep by default; wrap the result in `spool` for read-ahead.
 
 ### Changed
+
+- **`without-core`** (imported as `without`): the `buffer` wiring connector is renamed `spool`, and its
+  `maxsize` argument renamed `ahead`, so `spool(source, ahead=n)` reads as the read-ahead it is (drive a
+  source ahead of its consumer through a bounded queue on a background task). Behavior is unchanged.
 
 - **`without-web`**: routing and mounting reworked around self-contained route values. `mount(prefix,
   *middleware)` and `ws_mount(...)` are transforms that bake the prefix (and per-route middleware)

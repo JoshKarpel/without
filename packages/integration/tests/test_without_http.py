@@ -8,11 +8,20 @@ from contextlib import asynccontextmanager
 from contextlib import suppress
 from dataclasses import dataclass
 from dataclasses import field
+from pathlib import Path
 
 import httpx
 from integration.todos.app import todos_app
 from integration.todos.core import Todo
 from integration.todos.core import TodoList
+from without import Stream
+from without_asgi import ASGIApp
+from without_asgi import HttpHandler
+from without_asgi import HttpScope
+from without_asgi import Inbound
+from without_asgi import Outbound
+from without_asgi import file_response
+from without_asgi import make_asgi_app
 from without_http import ConnectionPool
 from without_http import add_headers
 from without_http import serving
@@ -66,6 +75,38 @@ async def _websocket(host: str, port: int, path: str) -> AsyncIterator[_WebSocke
         writer.close()
         with suppress(OSError):
             await writer.wait_closed()
+
+
+def _file_app(path: Path) -> ASGIApp:
+    """A minimal ASGI app that streams `path` for any request via `file_response`."""
+
+    @asynccontextmanager
+    async def lifespan() -> AsyncIterator[None]:
+        yield None
+
+    async def serve(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
+        async for event in await file_response(path, chunk_size=1024):
+            yield event
+
+    def router(state: None, scope: HttpScope) -> HttpHandler:
+        return serve
+
+    return make_asgi_app(lifespan, http=router)
+
+
+async def test_file_response_streams_a_file_over_without_http(tmp_path: Path) -> None:
+    payload = b"%PDF-1.7\n" + bytes(range(256)) * 40  # ~10 KB, spans several 1 KB chunks
+    path = tmp_path / "report.pdf"
+    path.write_bytes(payload)
+
+    async with serving(_file_app(path)) as server:
+        async with httpx.AsyncClient(base_url=f"http://{server.host}:{server.port}") as client:
+            response = await client.get("/download")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/pdf"
+    assert response.headers["content-length"] == str(len(payload))
+    assert response.content == payload
 
 
 async def test_todos_router_served_over_without_http_is_reachable_by_httpx() -> None:
