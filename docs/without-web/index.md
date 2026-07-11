@@ -106,14 +106,14 @@ registry to register it in.
 
 ## Reading the request: extractors
 
-An `Extractor[V]` is parsing-as-a-value: a pure `Request -> V` paired with the
+An `Extractor[V]` is parsing-as-a-value: a pure `RequestHead -> V` paired with the
 OpenAPI fragment it contributes. `path_param`, `query_param`, `header_param`,
 `body`, `catch_all`, `http_scope`, and `websocket_scope` build them. An
 extractor that raises *rejects* the request, mapped to a 4xx by the exception
 handlers; it never decides which handler runs. `http_scope()`/`websocket_scope()`
 hand back the unparsed scope, so "pass the scope down" and "parse parts of it"
 compose instead of competing. The same `query_param`/`header_param`/`path_param` tokens
-serve both HTTP and websocket handlers (`Request.scope` is
+serve both HTTP and websocket handlers (`RequestHead.scope` is
 `HttpScope | WebsocketScope`).
 
 `handle(*extractors, fn=...)` ties the extractor types to `fn`'s parameters via
@@ -137,8 +137,8 @@ avoids. The output is free here too (yield to stream, return or await a `Respons
 to buffer), so the **input/output 2×2** is fully covered: input buffering is the
 one build-time axis (`handle` vs `handle_stream`), output is always the handler's
 return. The inbound stream is deliberately *not* an extractor: an `Extractor`
-reads the parsed-once `Request` *value*, and a live stream is a consume-once
-*place*, so it is passed as an argument rather than smuggled into `Request`.
+reads the parsed-once `RequestHead` *value*, and a live stream is a consume-once
+*place*, so it is passed as an argument rather than smuggled into `RequestHead`.
 
 `into(make, *extractors)` combines extractors into one that builds a typed value,
 the escape hatch from the per-handler arity ceiling and the way to parse a group

@@ -10,9 +10,10 @@ from without_asgi import RawHeaders
 from without_asgi import WebsocketScope
 from without_web import INT
 from without_web import Body
+from without_web import BufferedRequest
 from without_web import HeaderParam
 from without_web import QueryParam
-from without_web import Request
+from without_web import RequestHead
 from without_web import Single
 from without_web import body
 from without_web import catch_all
@@ -43,10 +44,27 @@ def _scope(*, query: bytes = b"", headers: RawHeaders = ()) -> HttpScope:
     )
 
 
+def _ws_scope(*, query: bytes = b"") -> WebsocketScope:
+    return WebsocketScope(
+        asgi=Asgi(version="3.0", spec_version="2.0"),
+        http_version="1.1",
+        scheme="ws",
+        path="/todos/7/events",
+        raw_path=None,
+        query_string=query,
+        root_path="",
+        headers=(),
+        client=None,
+        server=None,
+        subprotocols=(),
+        extensions=None,
+    )
+
+
 def _request(
-    *, query: bytes = b"", headers: RawHeaders = (), path_params: dict[str, object] | None = None, body: bytes = b""
-) -> Request:
-    return Request.parsed(scope=_scope(query=query, headers=headers), path_params=path_params or {}, body=body)
+    *, query: bytes = b"", headers: RawHeaders = (), path_params: dict[str, object] | None = None
+) -> RequestHead:
+    return RequestHead.parsed(scope=_scope(query=query, headers=headers), path_params=path_params or {})
 
 
 def test_path_param_reads_the_already_parsed_value_at_its_type() -> None:
@@ -117,8 +135,13 @@ def test_optional_rejects_a_repeated_value() -> None:
 
 
 def test_body_parses_the_buffered_bytes() -> None:
-    request = _request(body=b'{"count": 3}')
+    request = BufferedRequest.buffered(scope=_scope(), path_params={}, body=b'{"count": 3}')
     assert body(json.loads, schema={"type": "object"}).extract(request) == {"count": 3}
+
+
+def test_body_requires_a_buffered_request_not_a_bare_head() -> None:
+    with pytest.raises(TypeError, match="buffered request"):
+        body(json.loads, schema={"type": "object"}).extract(_request())
 
 
 def test_http_scope_hands_back_the_unparsed_http_scope() -> None:
@@ -126,23 +149,21 @@ def test_http_scope_hands_back_the_unparsed_http_scope() -> None:
     assert http_scope().extract(request) is request.scope
 
 
+def test_http_scope_rejects_a_websocket_route() -> None:
+    request = RequestHead.parsed(scope=_ws_scope(), path_params={})
+    with pytest.raises(TypeError, match="HTTP route"):
+        http_scope().extract(request)
+
+
 def test_websocket_scope_hands_back_the_unparsed_websocket_scope() -> None:
-    scope = WebsocketScope(
-        asgi=Asgi(version="3.0", spec_version="2.0"),
-        http_version="1.1",
-        scheme="ws",
-        path="/todos/7/events",
-        raw_path=None,
-        query_string=b"since=5",
-        root_path="",
-        headers=(),
-        client=None,
-        server=None,
-        subprotocols=(),
-        extensions=None,
-    )
-    request = Request.parsed(scope=scope, path_params={}, body=b"")
+    scope = _ws_scope(query=b"since=5")
+    request = RequestHead.parsed(scope=scope, path_params={})
     assert websocket_scope().extract(request) is scope
+
+
+def test_websocket_scope_rejects_an_http_route() -> None:
+    with pytest.raises(TypeError, match="websocket route"):
+        websocket_scope().extract(_request())
 
 
 def test_query_param_contributes_its_openapi_fragment() -> None:

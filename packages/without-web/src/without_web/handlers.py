@@ -20,8 +20,9 @@ from without_asgi import WebsocketScope
 from without_asgi import encode_response
 from without_asgi import read_body
 
+from without_web.extractors import BufferedRequest
 from without_web.extractors import Extractor
-from without_web.extractors import Request
+from without_web.extractors import RequestHead
 from without_web.extractors import single_body
 from without_web.openapi import Body
 from without_web.openapi import ResponseSpec
@@ -236,8 +237,8 @@ def handle[T](
     extractors' types to `fn`'s parameters, so a `path_param(..., INT)` paired
     with an `fn` that expects a `str` is a mypy error, not a runtime surprise.
 
-    At dispatch the *input* body is buffered once, a `Request` is built, every
-    extractor runs (raising to reject, mapped by the router's exception
+    At dispatch the *input* body is buffered once, a `BufferedRequest` is built,
+    every extractor runs (raising to reject, mapped by the router's exception
     handlers), and `fn` is called with the typed values. The handler is always
     `async`; the *output* is free: an `async def` that resolves to a `Response`,
     or an `async def ... yield` that streams `Outbound` events, and `_emit` relays
@@ -1029,8 +1030,8 @@ def ws[T](
 
     def decorate(fn: Callable[..., WebsocketReturned]) -> WebsocketRoute[T]:
         def endpoint(state: T, match: Match[WebsocketScope]) -> WebsocketHandler:
-            request = Request.parsed(scope=match.scope, path_params=match.params, body=b"")
-            values = tuple(extractor.extract(request) for extractor in extractors)
+            head = RequestHead.parsed(scope=match.scope, path_params=match.params)
+            values = tuple(extractor.extract(head) for extractor in extractors)
 
             def processor(inputs: Stream[WebsocketInbound]) -> Stream[WebsocketOutbound]:
                 return fn(state, *values, inputs)
@@ -1081,8 +1082,8 @@ def _build_stream_endpoint(
     )
 
     def endpoint(state: object, match: Match[HttpScope]) -> HttpHandler:
-        request = Request.parsed(scope=match.scope, path_params=match.params, body=b"")
-        values = tuple(extractor.extract(request) for extractor in extractors)
+        head = RequestHead.parsed(scope=match.scope, path_params=match.params)
+        values = tuple(extractor.extract(head) for extractor in extractors)
 
         def processor(inputs: Stream[Inbound]) -> Stream[Outbound]:
             return _emit(fn(state, *values, inputs))
@@ -1123,6 +1124,6 @@ async def _reply(
     fn: Callable[..., Returned],
 ) -> AsyncIterator[Outbound]:
     body = await read_body(inputs)
-    request = Request.parsed(scope=match.scope, path_params=match.params, body=body)
-    async for event in _emit(fn(state, *(extractor.extract(request) for extractor in extractors))):
+    head = BufferedRequest.buffered(scope=match.scope, path_params=match.params, body=body)
+    async for event in _emit(fn(state, *(extractor.extract(head) for extractor in extractors))):
         yield event

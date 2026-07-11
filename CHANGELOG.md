@@ -56,9 +56,15 @@
 
 ### Changed
 
+- **`without-web`**: the extractor context type `Request` is renamed `RequestHead` and no longer
+  carries the request body. `RequestHead` is exactly the parsed head an extractor reads (scope,
+  path params, query params), mirroring `without-http`'s `ResponseHead`; the buffered body moves to
+  a `BufferedRequest` subtype that only the buffered-HTTP path builds and the `body` extractor
+  requires. Streaming and websocket routes now build a bodyless `RequestHead` instead of faking an
+  empty body. Custom extractors typed on `Request` become `RequestHead`.
 - **`without-web`**: query and header extractor `parse` callbacks now receive an immutable `tuple`
   of values rather than a `list` (`query_param`, `header_param`, and the `once`/`optional`
-  adapters), and `Request.query_params` values are tuples. The parsed request is a value no
+  adapters), and `RequestHead.query_params` values are tuples. The parsed head is a value no
   consumer can mutate out from under another (values over places); a `parse` typed on `list` must
   widen to `tuple`.
 - **`without-core`** (imported as `without`): the `buffer` wiring connector is renamed `spool`, and its

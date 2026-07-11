@@ -23,42 +23,59 @@ from without_web.openapi import Single
 from without_web.patterns import PathSpec
 
 
+def _parse_query(scope: HttpScope | WebsocketScope) -> dict[str, tuple[str, ...]]:
+    return {name: tuple(values) for name, values in parse_qs(scope.query_string.decode()).items()}
+
+
 @dataclass(frozen=True, slots=True)
-class Request:
+class RequestHead:
     """
-    The parsed-once context an extractor reads from.
+    The parsed head of a request (or websocket handshake): everything an extractor
+    reads *except* the body. The read-only, parsed-once context handed to each
+    scope-derived extractor.
 
     `path_params` holds the path parameters the router already parsed during the
     trie walk (typed values, stored as `object`); `query_params` is the query
     string decoded and parsed *once* (via `parse_qs`), each name's values held as an
     immutable tuple, so a handler declaring N `query_param` tokens shares one parse
-    rather than re-decoding the query string per token. Both are handed in
-    already-parsed, in the same spirit: the shell parses at the boundary and this
-    value just holds the result. `body` is the
-    fully-buffered request body (empty for a websocket handshake, which has none).
-    One value, built once per request, fed to every extractor a handler declares.
+    rather than re-decoding the query string per token. `scope` is
+    `HttpScope | WebsocketScope` so a `query_param`/`header_param` token reads either
+    (both carry `query_string` and `headers`); the whole-scope read is split into the
+    protocol-specific `http_scope()`/`websocket_scope()`, since only those know the
+    concrete type. A `header_param` reads the scope's raw header pairs directly
+    through the `without_asgi.headers` functions.
 
-    `scope` is `HttpScope | WebsocketScope` so a `query_param`/`header_param`
-    token reads either (both carry `query_string` and `headers`). The whole-scope
-    read is split into the protocol-specific `http_scope()`/`websocket_scope()`,
-    since only those know the concrete type. A `header_param` reads the scope's raw
-    header pairs directly through the `without_asgi.headers` functions.
+    The body is *not* here: only the buffered-HTTP path has one, so it lives on the
+    `BufferedRequest` subtype that path builds and the `body` extractor requires. A
+    streaming or websocket route has no body, so there is nothing to fake.
     """
 
     scope: HttpScope | WebsocketScope
     path_params: Mapping[str, object]
     query_params: Mapping[str, tuple[str, ...]]
+
+    @classmethod
+    def parsed(cls, scope: HttpScope | WebsocketScope, path_params: Mapping[str, object]) -> RequestHead:
+        """Assemble a `RequestHead`, parsing the scope's query string once at the boundary."""
+        return RequestHead(scope=scope, path_params=path_params, query_params=_parse_query(scope))
+
+
+@dataclass(frozen=True, slots=True)
+class BufferedRequest(RequestHead):
+    """
+    A `RequestHead` plus the fully-buffered request body, built only on the
+    buffered-HTTP path. The `body` extractor requires it; a build-time check keeps
+    body extractors off streaming and websocket routes, which have no buffered body.
+    """
+
     body: bytes
 
     @classmethod
-    def parsed(cls, scope: HttpScope | WebsocketScope, path_params: Mapping[str, object], body: bytes) -> Request:
-        """Assemble a `Request`, parsing the scope's query string once at the boundary."""
-        return cls(
-            scope=scope,
-            path_params=path_params,
-            query_params={name: tuple(values) for name, values in parse_qs(scope.query_string.decode()).items()},
-            body=body,
-        )
+    def buffered(
+        cls, scope: HttpScope | WebsocketScope, path_params: Mapping[str, object], body: bytes
+    ) -> BufferedRequest:
+        """Assemble a `BufferedRequest`, parsing the query string and carrying the buffered body."""
+        return BufferedRequest(scope=scope, path_params=path_params, query_params=_parse_query(scope), body=body)
 
 
 # Covariant: `V` appears only in `extract`'s return, so `Extractor[int]` is an
@@ -74,7 +91,7 @@ class Extractor(Generic[_V_co]):  # noqa: UP046 - PEP 695 infers a frozen datacl
     """
     A typed piece of a request, paired with the OpenAPI it contributes.
 
-    `extract` is a pure `Request -> V` that raises to *reject* a bad request
+    `extract` is a pure `RequestHead -> V` that raises to *reject* a bad request
     (a `catching` middleware's `recover` maps the raised type to a 4xx); it never
     decides which handler runs. The same value carries its own OpenAPI fragment,
     so a handler's parameter list and request body are *recovered* from the
@@ -82,7 +99,7 @@ class Extractor(Generic[_V_co]):  # noqa: UP046 - PEP 695 infers a frozen datacl
     (parse and describe).
     """
 
-    extract: Callable[[Request], _V_co]
+    extract: Callable[[RequestHead], _V_co]
     query: tuple[QueryParam, ...] = ()
     headers: tuple[HeaderParam, ...] = ()
     request_body: Body | None = None
@@ -102,8 +119,8 @@ def path_param[V](name: str, converter: Converter[V]) -> Extractor[V]:
     """
     spec = PathSpec(name=name, converter=converter)
 
-    def extract(request: Request) -> V:
-        return cast(V, request.path_params[name])
+    def extract(head: RequestHead) -> V:
+        return cast(V, head.path_params[name])
 
     return Extractor(extract, path=spec)
 
@@ -117,8 +134,8 @@ def catch_all(name: str, converter: Converter[str] = PATH) -> Extractor[str]:
     """
     spec = PathSpec(name=name, converter=converter, catch_all=True)
 
-    def extract(request: Request) -> str:
-        return cast(str, request.path_params[name])
+    def extract(head: RequestHead) -> str:
+        return cast(str, head.path_params[name])
 
     return Extractor(extract, path=spec)
 
@@ -134,8 +151,8 @@ def query_param[V](
     `V` or raising to reject. The `schema` is this value's OpenAPI contribution.
     """
 
-    def extract(request: Request) -> V:
-        return parse(request.query_params.get(name, ()))
+    def extract(head: RequestHead) -> V:
+        return parse(head.query_params.get(name, ()))
 
     return Extractor(extract, query=(QueryParam(name=name, schema=schema, required=required),))
 
@@ -151,8 +168,8 @@ def header_param[V](
     """
     wanted = name.encode()
 
-    def extract(request: Request) -> V:
-        return parse(headers.get_all(request.scope.headers, wanted))
+    def extract(head: RequestHead) -> V:
+        return parse(headers.get_all(head.scope.headers, wanted))
 
     return Extractor(extract, headers=(HeaderParam(name=name, schema=schema, required=required),))
 
@@ -209,10 +226,17 @@ def body[V](parse: Callable[[bytes], V], *, schema: SchemaRef, media_type: str =
     `parse` is injected so `without-web` stays serialization-agnostic: an app
     passes a pydantic model's `model_validate_json`, a dataclass loader, or any
     `bytes -> V`, and the matching `schema` is this value's OpenAPI request body.
+
+    The buffered body lives on `BufferedRequest`, which only the buffered-HTTP path
+    builds; a body extractor on a bodyless streaming or websocket route (which the
+    build-time check already forbids) is refused loudly rather than reading a missing
+    body, mirroring `http_scope`.
     """
 
-    def extract(request: Request) -> V:
-        return parse(request.body)
+    def extract(head: RequestHead) -> V:
+        if not isinstance(head, BufferedRequest):
+            raise TypeError("body() requires a buffered request; a streaming or websocket route has no body to read")
+        return parse(head.body)
 
     return Extractor(extract, request_body=Body(media_type=media_type, shape=Single(schema)))
 
@@ -224,13 +248,14 @@ def http_scope() -> Extractor[HttpScope]:
     The escape hatch that keeps "pass the scope down" and "parse parts of it"
     from competing: a handler composes `http_scope()` alongside parsed extractors
     and gets the raw connection facts as just another typed argument. Using it off
-    an HTTP route is the invariant; the assert turns misuse on a websocket route
-    into a loud error rather than a confusing `AttributeError` downstream.
+    an HTTP route is the invariant; misuse on a websocket route is refused loudly
+    rather than surfacing later as a confusing `AttributeError`.
     """
 
-    def extract(request: Request) -> HttpScope:
-        scope = request.scope
-        assert isinstance(scope, HttpScope)
+    def extract(head: RequestHead) -> HttpScope:
+        scope = head.scope
+        if not isinstance(scope, HttpScope):
+            raise TypeError("http_scope() must be used on an HTTP route, not a websocket route")
         return scope
 
     return Extractor(extract)
@@ -240,13 +265,13 @@ def websocket_scope() -> Extractor[WebsocketScope]:
     """
     Hand a websocket handler the unparsed `WebsocketScope`.
 
-    The websocket sibling of `http_scope()`; the assert guards against using it on
-    an HTTP route.
+    The websocket sibling of `http_scope()`, refusing use on an HTTP route.
     """
 
-    def extract(request: Request) -> WebsocketScope:
-        scope = request.scope
-        assert isinstance(scope, WebsocketScope)
+    def extract(head: RequestHead) -> WebsocketScope:
+        scope = head.scope
+        if not isinstance(scope, WebsocketScope):
+            raise TypeError("websocket_scope() must be used on a websocket route, not an HTTP route")
         return scope
 
     return Extractor(extract)
@@ -400,8 +425,8 @@ def into[M](make: Callable[..., M], *extractors: Extractor[object]) -> Extractor
     handlers map like any other parse failure.
     """
 
-    def extract(request: Request) -> M:
-        return make(*(extractor.extract(request) for extractor in extractors))
+    def extract(head: RequestHead) -> M:
+        return make(*(extractor.extract(head) for extractor in extractors))
 
     return Extractor(
         extract,

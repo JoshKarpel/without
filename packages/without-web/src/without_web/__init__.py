@@ -8,8 +8,9 @@ from without_web.exceptions import ExceptionRecover
 from without_web.exceptions import WebsocketExceptionRecover
 from without_web.exceptions import catching
 from without_web.exceptions import catching_websocket
+from without_web.extractors import BufferedRequest
 from without_web.extractors import Extractor
-from without_web.extractors import Request
+from without_web.extractors import RequestHead
 from without_web.extractors import body
 from without_web.extractors import catch_all
 from without_web.extractors import header_param
@@ -80,6 +81,7 @@ __all__ = [
     "STR",
     "UUID",
     "Body",
+    "BufferedRequest",
     "CatchAll",
     "Converter",
     "Delegate",
@@ -96,7 +98,7 @@ __all__ = [
     "Pattern",
     "QueryParam",
     "Reply",
-    "Request",
+    "RequestHead",
     "ResponseSpec",
     "Returned",
     "Reversible",
