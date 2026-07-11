@@ -33,6 +33,6 @@ async with sample(source) as config:
 ```
 
 See the
-[`without-configmap` guide](https://without.help/guides/without-configmap/)
+[`without-configmap` guide](https://without.help/without-configmap/)
 (with the [API reference](https://without.help/reference/without_configmap/))
 for the full surface.

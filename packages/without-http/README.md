@@ -40,6 +40,6 @@ request timeouts, consumer-driven duplex (with bidirectional streaming over
 HTTP/2), and `stack`-composed middleware.
 
 See the
-[`without-http` guide](https://without.help/guides/without-http/)
+[`without-http` guide](https://without.help/without-http/)
 (with the [API reference](https://without.help/reference/without_http/))
 for the full surface, including the deferred work (WebSockets over HTTP/2, HTTP/3).

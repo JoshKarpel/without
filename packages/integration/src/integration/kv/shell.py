@@ -37,6 +37,7 @@ from collections.abc import Awaitable
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 
 from pydantic_settings import BaseSettings
 from pydantic_settings import SettingsConfigDict
@@ -47,6 +48,7 @@ from without import Transition
 from without import from_fold
 from without import from_scan
 from without import stream_from_queue
+from without import timeout
 
 from integration.kv.core import EMPTY_STORE
 from integration.kv.core import Reply
@@ -77,8 +79,8 @@ class ServeConfig(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 0
     max_pending: int = 100
-    drain_timeout: float = 5.0
-    idle_timeout: float | None = None  # reap a connection silent this long; None disables it
+    drain_timeout: timedelta = timedelta(seconds=5)
+    idle_timeout: timedelta | None = None  # reap a connection silent this long; None disables it
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,7 +132,7 @@ async def serve[In, Out](
     without limit.
 
     On exit the server drains within a single `drain_timeout` budget. It stops
-    accepting new connections, then, inside one `asyncio.timeout`, waits for
+    accepting new connections, then, inside one `timeout`, waits for
     accepted sessions to finish on their own (clients hanging up, the consumer
     answering their asks) and for the consumer to drain the `inbox`. If that whole
     graceful phase overruns the one budget, the server hard-stops: cancel the
@@ -155,7 +157,8 @@ async def serve[In, Out](
         async def input_lines() -> AsyncIterator[str]:
             while True:
                 try:
-                    raw = await asyncio.wait_for(reader.readline(), settings.idle_timeout)
+                    async with timeout(settings.idle_timeout):
+                        raw = await reader.readline()
                 except TimeoutError:
                     return  # idle past idle_timeout: end the stream, which returns the session and closes the writer
                 if not raw:
@@ -167,6 +170,8 @@ async def serve[In, Out](
                 writer.write(f"{output_line}\n".encode())
                 await writer.drain()
         except ConnectionError:  # client reset the connection (read or write); this session is simply over
+            pass
+        except asyncio.QueueShutDown:  # the drain shut the inbox as this session was still arriving; it just ends
             pass
         finally:
             writer.close()
@@ -188,9 +193,16 @@ async def serve[In, Out](
     finally:
         server.close()  # stop accepting new connections; in-flight ones keep going
         try:
-            async with asyncio.timeout(settings.drain_timeout):  # ONE global budget for the whole graceful drain
-                if connections:
+            async with timeout(settings.drain_timeout):  # ONE global budget for the whole graceful drain
+                # A connection accepted just before close() registers its session through a
+                # call_soon'd connection_made, so a just-arrived one may not be in `connections`
+                # yet. Yield to surface those callbacks, then wait out every session, re-looping
+                # since one can finish or newly appear across turns. The inbox stays open the whole
+                # time, so a late session's asks are still answered before we signal end-of-stream.
+                await asyncio.sleep(0)
+                while connections:
                     await asyncio.wait(connections)  # each session finishes: its client hangs up, the consumer answers
+                    await asyncio.sleep(0)
                 inbox.shutdown()  # sessions all done, so no more asks; the consumer drains the rest and returns
                 await asyncio.wait([consumer_task])
         except TimeoutError:

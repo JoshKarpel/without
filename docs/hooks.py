@@ -2,8 +2,9 @@
 # recovers pages from the workspace's own declarations rather than maintaining
 # them by hand, so none can drift from the source it describes: the package
 # dependency graph (from the published `without*` packages' pyproject.toml deps,
-# as Mermaid), one mkdocstrings API-reference page per publishable package, and
-# the root prose
+# as Mermaid), one mkdocstrings API-reference page per publishable package
+# (emitted as `<package>/reference.md`, alongside that package's hand-written
+# guide), and the root prose
 # (PHILOSOPHY.md, CHANGELOG.md) copied into the site tree. The nav lists these
 # pages by hand in mkdocs.yml; this hook supplies only their content.
 
@@ -122,6 +123,16 @@ def publishable(members: dict[str, Member]) -> list[str]:
     return ["without-core", *others]
 
 
+def package_dir(member: Member) -> str:
+    """
+    The docs directory that holds a package's guide and generated reference.
+
+    The core distributes as `without-core` but its guide lives under `without`
+    (its import name); every other member's directory is its distribution name.
+    """
+    return member.module if member.name == "without-core" else member.name
+
+
 def render_reference_page(member: Member) -> str:
     summary = f"{member.description}\n\n" if member.description else ""
     return f"# `{member.module}`\n\n{summary}::: {member.module}\n"
@@ -133,8 +144,9 @@ def on_files(files: Files, config: MkDocsConfig) -> Files:
     files.append(File.generated(config, "architecture/package-graph.md", content=render_graph_page(members)))
 
     for name in publishable(members):
+        member = members[name]
         files.append(
-            File.generated(config, f"reference/{members[name].module}.md", content=render_reference_page(members[name]))
+            File.generated(config, f"{package_dir(member)}/reference.md", content=render_reference_page(member))
         )
 
     for source_name, dest_uri in (("PHILOSOPHY.md", "philosophy.md"), ("CHANGELOG.md", "changelog.md")):

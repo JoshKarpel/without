@@ -111,10 +111,13 @@ def render_console(
     `TIMESTAMP LEVEL logger "message" {key=value, ...}`: the message is quoted and
     the fields grouped in braces (each value `repr`'d), so the free-text message and
     the structured fields never blur into each other or the leading metadata. The
-    braces are omitted when there are no fields. An exception is appended as its full
-    traceback text (`exception_to_text`, cause chain and all), indented, on following
-    lines. `timestamp` chooses the time format (default `iso_timestamp`). No coloring:
-    wrap the line, or write your own `from_map(Record -> str)`, if you want ANSI.
+    message is quoted with `json.dumps` and each field value is `repr`'d, so a control
+    character in either (a newline from a decoded request path, say) is escaped rather
+    than forging a new log line. The braces are omitted when there are no
+    fields. An exception is appended as its full traceback text (`exception_to_text`,
+    cause chain and all), indented, on following lines. `timestamp` chooses the time
+    format (default `iso_timestamp`). No coloring: wrap the line, or write your own
+    `from_map(Record -> str)`, if you want ANSI.
 
     Optional and opt-in, like `render_json`: `compose(render_console(),
     offload(to_stream(sys.stderr)))`.
@@ -125,7 +128,7 @@ def render_console(
             timestamp(record.timestamp),
             record.level_name,
             record.logger,
-            f'"{record.message}"',
+            json.dumps(record.message, ensure_ascii=False),
         ]
         if record.fields:
             fields = ", ".join(f"{key}={value!r}" for key, value in record.fields.items())

@@ -7,9 +7,9 @@ sub-steps that run with bounded concurrency and recombine into one output. It is
 the value-level fan-out/fan-in the substrate leaves room for: one input value
 drives many concurrent computations, distinct from the stream-level splitting a
 `distribute`/`merge` vocabulary would do. See the
-[`without_dag` API reference](../reference/without_dag.md) for the full surface.
+[`without_dag` API reference](../without-dag/reference.md) for the full surface.
 
-Like [`without-asgi`](without-asgi.md), this package handles only the *mechanism*,
+Like [`without-asgi`](../without-asgi/index.md), this package handles only the *mechanism*,
 execution, and leaves the graph-defining *policy* to a frontend. The two layers
 live here for now but meet at one narrow seam, so a different frontend (a YAML
 loader, a signature-inspecting decorator) could be layered on later without either

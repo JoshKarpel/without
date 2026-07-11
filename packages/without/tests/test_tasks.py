@@ -2,6 +2,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from contextlib import suppress
+from datetime import timedelta
 
 import pytest
 from without import as_async_iterator
@@ -9,8 +10,29 @@ from without import background_task
 from without import cancel_futures
 from without import limit_concurrency
 from without import sleep_forever
+from without import timeout
 from without.testing import resolved_next_turn
 from without.testing import yield_once
+
+
+async def test_timeout_raises_when_the_block_outlives_the_duration() -> None:
+    with pytest.raises(TimeoutError):
+        async with timeout(timedelta(seconds=0.01)):
+            await sleep_forever()
+
+
+async def test_timeout_lets_a_block_finishing_in_time_through() -> None:
+    async with timeout(timedelta(seconds=30)):
+        result = 7
+
+    assert result == 7
+
+
+async def test_timeout_of_none_never_bounds_the_block() -> None:
+    async with timeout(None):
+        result = 11
+
+    assert result == 11
 
 
 async def test_background_task_runs_during_the_block_then_cancels_on_exit() -> None:

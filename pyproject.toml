@@ -83,7 +83,13 @@ testpaths = ["packages/**/tests"]
 timeout = 30
 timeout_method = "thread"
 
-markers = ["slow"]
+markers = [
+    "slow",
+    # Pass the gap the test closes as the first argument, and any CVE via `cve=`, e.g.
+    # `@pytest.mark.security("strips credentials on a cross-origin redirect", cve="CVE-...")`.
+    # `packages/conftest.py` enforces that every security-marked test carries a description.
+    "security: exercises a security invariant; first arg names the gap it closes (see the note in pyproject)",
+]
 
 # Turn warnings into failures, then carve out narrow exceptions. Later entries win,
 # so the `ignore` overrides the blanket `error` for the one case it matches.

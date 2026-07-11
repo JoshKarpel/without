@@ -6,6 +6,7 @@ from collections.abc import Awaitable
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from contextlib import suppress
+from datetime import timedelta
 
 import httpx
 import pytest
@@ -19,11 +20,19 @@ from without_asgi import make_asgi_app
 from without_asgi.routing import buffered
 from without_http import serving
 from without_http.server import _address
+from without_http.server import _Limits
 from without_http.server import _LiveConnections
 from without_http.server import _serve_h11_connection
 
 type _Endpoint = tuple[asyncio.StreamReader, asyncio.StreamWriter]
 type _StreamPairFactory = Callable[[], Awaitable[tuple[_Endpoint, _Endpoint]]]
+
+_DEFAULT_LIMITS = _Limits(
+    max_concurrent_streams=100,
+    max_stream_resets=200,
+    idle_timeout=None,
+    max_websocket_message_bytes=None,
+)
 
 
 async def echo_app(scope: RawMessage, receive: Receive, send: Send) -> None:
@@ -78,6 +87,27 @@ async def _client(app: ASGIApp) -> AsyncIterator[httpx.AsyncClient]:
 async def test_serves_a_get_response() -> None:
     async with _client(echo_app) as client:
         response = await client.get("/items")
+
+    assert response.status_code == 200
+    assert response.text == "GET /items "
+
+
+@pytest.mark.security("an idle connection is closed after the idle timeout (slowloris defense)")
+async def test_an_idle_connection_is_closed_after_the_idle_timeout() -> None:
+    async with serving(echo_app, idle_timeout=timedelta(seconds=0.1)) as server:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        # Send nothing: the server's read outlives the idle timeout and it closes the socket.
+        assert await reader.read(65536) == b""
+        writer.close()
+        with suppress(OSError):
+            await writer.wait_closed()
+
+
+@pytest.mark.security("the idle timeout is scoped: a request completing within it is served")
+async def test_a_request_within_the_idle_timeout_is_served() -> None:
+    async with serving(echo_app, idle_timeout=timedelta(seconds=30)) as server:
+        async with httpx.AsyncClient(base_url=f"http://{server.host}:{server.port}") as client:
+            response = await client.get("/items")
 
     assert response.status_code == 200
     assert response.text == "GET /items "
@@ -203,7 +233,14 @@ async def test_a_malformed_request_lingers_so_the_client_reads_the_error(
     client_writer.write_eof()  # the peer stops sending; the server's linger drains to EOF
 
     await _serve_h11_connection(
-        echo_app, server_reader, server_writer, initial=b"", secure=False, server=None, client=None
+        echo_app,
+        server_reader,
+        server_writer,
+        initial=b"",
+        secure=False,
+        server=None,
+        client=None,
+        limits=_DEFAULT_LIMITS,
     )
 
     assert (await client_reader.read()).startswith(b"HTTP/1.1 400")

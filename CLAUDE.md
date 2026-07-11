@@ -8,11 +8,15 @@ functional-core/imperative-shell, and values-over-places. It is the durable
 rationale for why the code is shaped the way it is, and the right frame for any
 new work.
 
-Then read the per-package guide in [`docs/guides/`](docs/guides) for the area you
-are touching: the core (`without.md`), the ASGI boundary (`without-asgi.md`), the
-HTTP server and client (`without-http.md`), the opinionated router
-(`without-web.md`), the config sources (`without-env.md`, `without-configmap.md`),
-and the DAG executor (`without-dag.md`). Those guides carry the design narrative;
+Then read the per-package guide for the area you are touching. Each package owns
+a directory under [`docs/`](docs) (`docs/<package>/`) holding all of its docs:
+the guide is that directory's `index.md`, its API reference is the generated
+`reference.md` beside it, and any deep-dive sub-pages live alongside. So: the
+core (`without/index.md`), the ASGI boundary (`without-asgi/index.md`), the HTTP
+server and client (`without-http/index.md`, with cookie handling split out into
+`without-http/cookies.md`), the opinionated router (`without-web/index.md`), the
+config sources (`without-env/index.md`, `without-configmap/index.md`), and the
+DAG executor (`without-dag/index.md`). Those guides carry the design narrative;
 each package's `README.md` is now a short orientation that links to them, and the
 `integration` toys that exercise the whole stack live under `packages/integration`.
 

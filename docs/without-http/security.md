@@ -64,7 +64,7 @@ in-band.
 ### Client: stop sending when the peer closes
 
 The client's request body is streamed concurrently with reading the response
-(see [duplex streaming](guides/without-http.md#duplex-and-bidirectional-streaming)).
+(see [duplex streaming](index.md#duplex-and-bidirectional-streaming)).
 When the peer half-closes, the HTTP/1.1 body sender (`send_body` in `client.py`)
 stops streaming rather than writing on into a connection that is going away.
 
@@ -88,7 +88,7 @@ Two more knobs turn caller-controlled behavior into bounded, typed failures
 rather than unbounded resource use:
 
 - **Timeouts.** Per-phase `connect`/`read`/`write`/`pool` deadlines (see
-  [Timeouts](guides/without-http.md#timeouts)) bound how long any one phase can
+  [Timeouts](index.md#timeouts)) bound how long any one phase can
   hang, so a stalled peer becomes a typed error you chose to arm rather than an
   eternal wait.
 - **In-flight request limits.** The server does not cap raw connections (the

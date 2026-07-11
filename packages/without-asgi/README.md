@@ -34,7 +34,7 @@ For a full, opinionated router you don't have to hand-roll, the sibling
 but the `HttpRouter` type.
 
 See the
-[`without-asgi` guide](https://without.help/guides/without-asgi/)
+[`without-asgi` guide](https://without.help/without-asgi/)
 (with the [API reference](https://without.help/reference/without_asgi/))
 for the full surface, including the codec's server direction and the middleware
 body shapes.

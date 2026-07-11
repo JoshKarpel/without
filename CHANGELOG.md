@@ -46,7 +46,7 @@
   plus a short, fixed drain window, never draining to end-of-input) rather than a reset that could
   race ahead of and discard the response the server already sent, and the client stops streaming its
   body the moment the peer half-closes rather than writing on into a closing connection. See the new
-  [Security](https://without.help/security/) page.
+  [Security](https://without.help/without-http/security/) page.
 
 ## 0.0.1
 

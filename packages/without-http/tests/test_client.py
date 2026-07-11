@@ -14,10 +14,12 @@ from without_asgi import RawScope
 from without_asgi import Receive
 from without_asgi import Send
 from without_asgi import parse_http_scope
+from without_http import ClientRequest
 from without_http import ClientResponse
 from without_http import ConnectionPool
 from without_http import CookieJar
 from without_http import ResponseBody
+from without_http import ResponseHead
 from without_http import ResponseTrailers
 from without_http import add_headers
 from without_http import cookies
@@ -498,6 +500,105 @@ async def test_follow_redirects_stops_when_a_redirect_lacks_a_location() -> None
     async with serving(no_location_redirect_app) as server, ConnectionPool(middleware=follow_redirects()) as pool:
         async with pool.request("GET", f"http://{server.host}:{server.port}/start") as (head, _body):
             assert head.status == 302
+
+
+async def _closed_body() -> AsyncGenerator[bytes | ResponseTrailers]:
+    return
+    yield  # pragma: no cover - an empty response body for a scripted redirect hop
+
+
+def _redirect_to(location: str, status: int = 302) -> ClientResponse:
+    head = ResponseHead(status=status, headers=((b"location", location.encode()),))
+    return ClientResponse(head=head, body=ResponseBody(_closed_body()))
+
+
+def _terminal_ok() -> ClientResponse:
+    return ClientResponse(head=ResponseHead(status=200, headers=()), body=ResponseBody(_closed_body()))
+
+
+class _ScriptedExchange:
+    """A fake inner exchange that records requests and returns a scripted response list."""
+
+    def __init__(self, *responses: ClientResponse) -> None:
+        self.responses = list(responses)
+        self.requests: list[ClientRequest] = []
+
+    async def __call__(self, request: ClientRequest) -> ClientResponse:
+        self.requests.append(request)
+        return self.responses.pop(0)
+
+
+_CREDENTIALED = (
+    (b"authorization", b"Bearer secret-token"),
+    (b"cookie", b"sid=session-value"),
+    (b"proxy-authorization", b"Basic proxy-creds"),
+    (b"accept", b"application/json"),
+)
+
+
+@pytest.mark.security("Authorization/Cookie are stripped when a redirect crosses origins")
+async def test_follow_redirects_strips_credentials_on_a_cross_origin_hop() -> None:
+    inner = _ScriptedExchange(_redirect_to("https://evil.test/"), _terminal_ok())
+    exchange = follow_redirects()(inner)
+
+    request = ClientRequest(method="GET", url="https://api.victim.test/data", headers=_CREDENTIALED)
+    await exchange(request)
+
+    followed = inner.requests[1]
+    names = {name for name, _ in followed.headers}
+    assert names == {b"accept"}
+
+
+@pytest.mark.security("the cross-origin credential strip is scoped: a same-origin redirect keeps credentials")
+async def test_follow_redirects_keeps_credentials_on_a_same_origin_hop() -> None:
+    inner = _ScriptedExchange(_redirect_to("https://api.victim.test/next"), _terminal_ok())
+    exchange = follow_redirects()(inner)
+
+    request = ClientRequest(method="GET", url="https://api.victim.test/data", headers=_CREDENTIALED)
+    await exchange(request)
+
+    followed = inner.requests[1]
+    assert followed.headers == _CREDENTIALED
+
+
+@pytest.mark.security("a 303 redirect drops the original method and body (no cross-method replay)")
+async def test_follow_redirects_downgrades_a_303_to_a_bodyless_get() -> None:
+    inner = _ScriptedExchange(_redirect_to("https://api.victim.test/done", status=303), _terminal_ok())
+    exchange = follow_redirects()(inner)
+
+    request = ClientRequest(
+        method="POST",
+        url="https://api.victim.test/submit",
+        headers=((b"content-type", b"application/json"), (b"content-length", b"9")),
+    )
+    await exchange(request)
+
+    followed = inner.requests[1]
+    assert followed.method == "GET"
+    assert {name for name, _ in followed.headers} == set()
+
+
+async def test_follow_redirects_keeps_a_get_across_a_303() -> None:
+    inner = _ScriptedExchange(_redirect_to("https://api.victim.test/done", status=303), _terminal_ok())
+    exchange = follow_redirects()(inner)
+
+    request = ClientRequest(method="GET", url="https://api.victim.test/thing")
+    response = await exchange(request)
+
+    assert inner.requests[1].method == "GET"
+    assert await response.body.read() == b""
+
+
+@pytest.mark.security("an https->http redirect is refused, so credentials aren't replayed over cleartext")
+async def test_follow_redirects_refuses_an_https_to_http_downgrade() -> None:
+    inner = _ScriptedExchange(_redirect_to("http://api.victim.test/insecure"))
+    exchange = follow_redirects()(inner)
+
+    request = ClientRequest(method="GET", url="https://api.victim.test/data", headers=_CREDENTIALED)
+    response = await exchange(request)
+
+    assert response.head.status == 302
+    assert len(inner.requests) == 1
 
 
 async def test_checking_in_to_a_closed_host_pool_closes_the_connection() -> None:

@@ -37,25 +37,25 @@ Three types carry the whole model (`without.contracts`):
 This is a [`uv`](https://docs.astral.sh/uv/) workspace of flat, version-locked
 packages. Each is its own top-level import.
 
-- [`without`](guides/without.md): the core contracts every plugin speaks, the
+- [`without`](without/index.md): the core contracts every plugin speaks, the
   stream connectors, and a `with`-scoped background task helper.
-- [`without-env`](guides/without-env.md): a static `Context` parsed from
+- [`without-env`](without-env/index.md): a static `Context` parsed from
   environment variables with `pydantic-settings`.
-- [`without-configmap`](guides/without-configmap.md): config from a Kubernetes
+- [`without-configmap`](without-configmap/index.md): config from a Kubernetes
   mount, the context-updated-by-a-stream half of the model.
-- [`without-asgi`](guides/without-asgi.md): adapters that turn an ASGI app's
+- [`without-asgi`](without-asgi/index.md): adapters that turn an ASGI app's
   `receive`/`send` into typed event streams and back, in both directions.
-- [`without-web`](guides/without-web.md): an opinionated HTTP/WebSocket router
+- [`without-web`](without-web/index.md): an opinionated HTTP/WebSocket router
   with trie matching, typed path params, mounting, scoped middleware, exception
   handlers, and OpenAPI.
-- [`without-http`](guides/without-http.md): an `asyncio` ASGI server and HTTP
+- [`without-http`](without-http/index.md): an `asyncio` ASGI server and HTTP
   client built on the sans-IO `h11`/`h2`/`wsproto` state machines.
-- [`without-dag`](guides/without-dag.md): bounded-concurrency execution of
+- [`without-dag`](without-dag/index.md): bounded-concurrency execution of
   DAG-shaped async workflows, liftable straight into a `Processor`.
 
 The [package dependency graph](architecture/package-graph.md) is derived from the
-declared dependencies, and the [API reference](reference/without.md) is recovered
-from the source docstrings.
+declared dependencies, and each package's API reference (its `Reference` page,
+e.g. [`without`](without/reference.md)) is recovered from the source docstrings.
 
 ## Installing
 
