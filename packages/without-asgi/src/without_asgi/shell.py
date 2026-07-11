@@ -64,16 +64,16 @@ async def read_body(events: Stream[Inbound]) -> bytes:
     Raises `ClientDisconnect` if the client goes away before the final chunk,
     so a truncated body fails loudly rather than passing for a complete one.
     """
-    chunks = bytearray()
+    chunks: list[bytes] = []
     async for event in events:
         match event:
             case RequestBody(body=body):
-                chunks.extend(body)
+                chunks.append(body)
             case Disconnect():
                 raise ClientDisconnect
             case _ as unreachable:
                 assert_never(unreachable)
-    return bytes(chunks)
+    return b"".join(chunks)
 
 
 def http_outbound(send: Send) -> Sink[Outbound]:

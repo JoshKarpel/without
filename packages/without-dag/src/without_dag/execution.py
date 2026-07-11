@@ -76,10 +76,13 @@ async def drive(
     source keys, marked done without running and never yielded. `limit` caps how
     many nodes run concurrently (`None` is unbounded).
 
-    Scheduling replicates the shape of `without.limit_concurrency`
-    (`asyncio.wait(..., return_when=FIRST_COMPLETED)`) rather than calling it: the
-    scheduler needs the completed task's `NodeKey` to unlock successors, which
-    that lazy source hides. Acyclicity is proven by `TopologicalSorter.prepare`,
+    Scheduling drains completions off an `asyncio.Queue` that each spawned future
+    feeds via a done-callback attached once at spawn, rather than
+    `asyncio.wait(..., FIRST_COMPLETED)` re-registering a callback on every
+    in-flight future each step (O(W) callback churn per completion for a graph W
+    nodes wide). It reuses `without.limit_concurrency`'s bounded-concurrency shape
+    but not its call, since the scheduler needs the completed task's `NodeKey` to
+    unlock successors, which that lazy source hides. Acyclicity is proven by `TopologicalSorter.prepare`,
     which raises `graphlib.CycleError`. Each node runs once; a result is dropped
     as soon as its last dependent has captured it. A node that raises fails the
     whole run, cancelling in-flight siblings, which is also how closing the
@@ -93,6 +96,7 @@ async def drive(
     consumers: Counter[NodeKey] = Counter(plan.consumers)
     results: dict[NodeKey, object] = dict(inputs)
     running: dict[asyncio.Future[object], NodeKey] = {}
+    completed: asyncio.Queue[asyncio.Future[object]] = asyncio.Queue()
     ready: deque[NodeKey] = deque(sorter.get_ready())
     try:
         while sorter.is_active():
@@ -110,15 +114,16 @@ async def drive(
                     consumers[dependency] -= 1
                     if consumers[dependency] == 0:
                         del results[dependency]
-                running[asyncio.ensure_future(node.run(args))] = key
-            done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
-            for future in done:
-                key = running.pop(future)
-                value = future.result()
-                results[key] = value
-                sorter.done(key)
-                ready.extend(sorter.get_ready())
-                yield key, value
+                future = asyncio.ensure_future(node.run(args))
+                running[future] = key
+                future.add_done_callback(completed.put_nowait)
+            done = await completed.get()
+            key = running.pop(done)
+            value = done.result()
+            results[key] = value
+            sorter.done(key)
+            ready.extend(sorter.get_ready())
+            yield key, value
     finally:
         await cancel_futures(running)
 

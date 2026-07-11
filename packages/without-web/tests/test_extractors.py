@@ -42,18 +42,18 @@ def _scope(*, query: bytes = b"", headers: RawHeaders = ()) -> HttpScope:
 
 
 def _request(
-    *, query: bytes = b"", headers: RawHeaders = (), params: dict[str, object] | None = None, body: bytes = b""
+    *, query: bytes = b"", headers: RawHeaders = (), path_params: dict[str, object] | None = None, body: bytes = b""
 ) -> Request:
-    return Request(scope=_scope(query=query, headers=headers), params=params or {}, body=body)
+    return Request.parsed(scope=_scope(query=query, headers=headers), path_params=path_params or {}, body=body)
 
 
 def test_path_param_reads_the_already_parsed_value_at_its_type() -> None:
-    request = _request(params={"id": 7, "slug": "ship"})
+    request = _request(path_params={"id": 7, "slug": "ship"})
     assert path_param("id", INT).extract(request) == 7
 
 
 def test_catch_all_reads_the_rest_of_path_value_already_parsed_by_the_router() -> None:
-    request = _request(params={"rest": "a/b/c", "id": 7})
+    request = _request(path_params={"rest": "a/b/c", "id": 7})
     assert catch_all("rest").extract(request) == "a/b/c"
 
 
@@ -100,7 +100,7 @@ def test_websocket_scope_hands_back_the_unparsed_websocket_scope() -> None:
         subprotocols=(),
         extensions=None,
     )
-    request = Request(scope=scope, params={}, body=b"")
+    request = Request.parsed(scope=scope, path_params={}, body=b"")
     assert websocket_scope().extract(request) is scope
 
 
@@ -135,7 +135,7 @@ class Coords:
 
 def test_into_builds_a_value_by_reusing_the_existing_tokens() -> None:
     extractor = into(Coords, path_param("x", INT), path_param("y", INT))
-    assert extractor.extract(_request(params={"x": 3, "y": 8})) == Coords(x=3, y=8)
+    assert extractor.extract(_request(path_params={"x": 3, "y": 8})) == Coords(x=3, y=8)
 
 
 def test_into_carries_the_constituent_query_fragments_for_openapi() -> None:
@@ -159,7 +159,7 @@ class Span:
 
 def test_into_builds_the_value_when_the_constructor_accepts() -> None:
     extractor = into(Span, path_param("low", INT), path_param("high", INT))
-    assert extractor.extract(_request(params={"low": 2, "high": 9})) == Span(low=2, high=9)
+    assert extractor.extract(_request(path_params={"low": 2, "high": 9})) == Span(low=2, high=9)
 
 
 def test_into_propagates_a_constructor_validation_error() -> None:
@@ -167,4 +167,4 @@ def test_into_propagates_a_constructor_validation_error() -> None:
     # error propagates for the router's exception handlers to map to a 4xx.
     extractor = into(Span, path_param("low", INT), path_param("high", INT))
     with pytest.raises(ValueError, match="low must not exceed high"):
-        extractor.extract(_request(params={"low": 9, "high": 2}))
+        extractor.extract(_request(path_params={"low": 9, "high": 2}))

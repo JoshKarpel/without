@@ -49,8 +49,11 @@ Two properties fall out of the model:
   a diamond's shared ancestor executes a single time with no glitch.
 - **Acyclicity is proven at the boundary.** The scheduler sits on stdlib
   [`graphlib.TopologicalSorter`](https://docs.python.org/3/library/graphlib.html),
-  whose `prepare` raises `graphlib.CycleError` on a cycle. Scheduling replicates
-  the `asyncio.wait(..., return_when=FIRST_COMPLETED)` shape of
+  whose `prepare` raises `graphlib.CycleError` on a cycle. Scheduling drains
+  completions off an `asyncio.Queue` fed by a done-callback attached once per
+  spawned node, rather than `asyncio.wait(..., return_when=FIRST_COMPLETED)`
+  re-registering a callback on every in-flight future each step (which is
+  quadratic in the width of a graph). It keeps the bounded-concurrency shape of
   `without.limit_concurrency` rather than calling it, because the scheduler needs
   the completed task's key to unlock its successors, and that per-completion
   identity is what `limit_concurrency`'s lazy source hides.

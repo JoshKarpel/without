@@ -122,6 +122,21 @@ async def test_capture_accepts_an_unbounded_queue_and_never_drops() -> None:
     assert handler.dropped == 0
 
 
+async def test_emit_from_another_thread_reaches_the_queue() -> None:
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[Record] = asyncio.Queue(4)
+    handler = CaptureHandler(loop, queue, parse_record)
+    log_record = logging.LogRecord(
+        name="svc.test", level=logging.WARNING, pathname=__file__, lineno=7, msg="off thread", args=(), exc_info=None
+    )
+
+    await asyncio.to_thread(handler.emit, log_record)
+
+    offered = await queue.get()
+    assert offered.message == "off thread"
+    assert handler.dropped == 0
+
+
 async def test_offer_counts_a_record_dropped_when_the_queue_is_full() -> None:
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[Record] = asyncio.Queue(1)

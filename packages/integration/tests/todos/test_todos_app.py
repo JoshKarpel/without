@@ -87,7 +87,7 @@ async def _request(
     status = start["status"]
     assert isinstance(status, int)
     raw_headers = start["headers"]
-    assert isinstance(raw_headers, list)
+    assert isinstance(raw_headers, (list, tuple))
     collected: dict[str, list[bytes]] = {}
     for name, value in raw_headers:
         collected.setdefault(name.decode(), []).append(value)

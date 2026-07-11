@@ -69,8 +69,8 @@ def _json_body(message: RawMessage) -> object:
 
 def _has_header(message: RawMessage, name: bytes, value: bytes) -> bool:
     headers = message["headers"]
-    assert isinstance(headers, list)
-    return [name, value] in headers
+    assert isinstance(headers, (list, tuple))
+    return any(header[0] == name and header[1] == value for header in headers)
 
 
 async def _blocked(mount: Path) -> AsyncIterator[object]:
