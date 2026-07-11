@@ -33,6 +33,7 @@ from without_asgi import WebsocketScope
 from without_asgi import WebsocketSend
 from without_asgi import WebsocketText
 from without_asgi import extension
+from without_asgi import headers
 from without_asgi import make_asgi_app
 from without_asgi.routing import HttpMiddleware
 from without_asgi.routing import WebsocketMiddleware
@@ -164,7 +165,7 @@ def refuse_socket(settings: Settings, head: WebsocketScope) -> WebsocketHandler:
 async def inject_header(outputs: Stream[Outbound], name: bytes, value: bytes) -> AsyncIterator[Outbound]:
     async for event in outputs:
         if isinstance(event, ResponseStart):
-            yield ResponseStart(status=event.status, headers=(*event.headers, (name, value)))
+            yield ResponseStart(status=event.status, headers=headers.add(event.headers, name, value))
         else:
             yield event
 

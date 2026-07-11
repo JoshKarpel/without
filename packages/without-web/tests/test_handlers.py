@@ -155,7 +155,7 @@ def test_ws_ties_path_and_query_to_the_handler() -> None:
     since = query_param("since", lambda values: values, schema={"type": "string"})
 
     def make(
-        state: str, room_id: int, since_values: list[str], inputs: Stream[WebsocketInbound]
+        state: str, room_id: int, since_values: tuple[str, ...], inputs: Stream[WebsocketInbound]
     ) -> Stream[WebsocketOutbound]:
         seen.update(state=state, room_id=room_id, since=since_values)
         return _noop_ws(inputs)
@@ -163,7 +163,7 @@ def test_ws_ties_path_and_query_to_the_handler() -> None:
     route = ws(t"/feed/{room}", room, since)(make)
     processor = route.endpoint("tenant", Match(_ws_scope(query=b"since=5&since=9"), {"room": 7}))
     processor(stream_from_iterable(()))
-    assert seen == {"state": "tenant", "room_id": 7, "since": ["5", "9"]}
+    assert seen == {"state": "tenant", "room_id": 7, "since": ("5", "9")}
 
 
 def test_ws_rejects_a_body_extractor() -> None:

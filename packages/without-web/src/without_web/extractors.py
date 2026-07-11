@@ -11,6 +11,7 @@ from urllib.parse import parse_qs
 
 from without_asgi import HttpScope
 from without_asgi import WebsocketScope
+from without_asgi import headers
 
 from without_web.converters import PATH
 from without_web.converters import Converter
@@ -29,22 +30,24 @@ class Request:
 
     `path_params` holds the path parameters the router already parsed during the
     trie walk (typed values, stored as `object`); `query_params` is the query
-    string decoded and parsed *once* (via `parse_qs`), so a handler declaring N
-    `query_param` tokens shares one parse rather than re-decoding the query string
-    per token. Both are handed in already-parsed, in the same spirit: the shell
-    parses at the boundary and this value just holds the result. `body` is the
+    string decoded and parsed *once* (via `parse_qs`), each name's values held as an
+    immutable tuple, so a handler declaring N `query_param` tokens shares one parse
+    rather than re-decoding the query string per token. Both are handed in
+    already-parsed, in the same spirit: the shell parses at the boundary and this
+    value just holds the result. `body` is the
     fully-buffered request body (empty for a websocket handshake, which has none).
     One value, built once per request, fed to every extractor a handler declares.
 
     `scope` is `HttpScope | WebsocketScope` so a `query_param`/`header_param`
     token reads either (both carry `query_string` and `headers`). The whole-scope
     read is split into the protocol-specific `http_scope()`/`websocket_scope()`,
-    since only those know the concrete type.
+    since only those know the concrete type. A `header_param` reads the scope's raw
+    header pairs directly through the `without_asgi.headers` functions.
     """
 
     scope: HttpScope | WebsocketScope
     path_params: Mapping[str, object]
-    query_params: Mapping[str, list[str]]
+    query_params: Mapping[str, tuple[str, ...]]
     body: bytes
 
     @classmethod
@@ -53,7 +56,7 @@ class Request:
         return cls(
             scope=scope,
             path_params=path_params,
-            query_params=parse_qs(scope.query_string.decode()),
+            query_params={name: tuple(values) for name, values in parse_qs(scope.query_string.decode()).items()},
             body=body,
         )
 
@@ -121,39 +124,82 @@ def catch_all(name: str, converter: Converter[str] = PATH) -> Extractor[str]:
 
 
 def query_param[V](
-    name: str, parse: Callable[[list[str]], V], *, schema: SchemaRef, required: bool = False
+    name: str, parse: Callable[[tuple[str, ...]], V], *, schema: SchemaRef, required: bool = False
 ) -> Extractor[V]:
     """
     Parse a query parameter into `V`, given all of its raw values.
 
-    `parse` receives the (possibly empty, possibly repeated) values for `name`
-    and decides what their absence and multiplicity mean, returning `V` or
-    raising to reject. The `schema` is this value's OpenAPI contribution.
+    `parse` receives the (possibly empty, possibly repeated) values for `name` as an
+    immutable tuple and decides what their absence and multiplicity mean, returning
+    `V` or raising to reject. The `schema` is this value's OpenAPI contribution.
     """
 
     def extract(request: Request) -> V:
-        values = request.query_params.get(name, [])
-        return parse(values)
+        return parse(request.query_params.get(name, ()))
 
     return Extractor(extract, query=(QueryParam(name=name, schema=schema, required=required),))
 
 
 def header_param[V](
-    name: str, parse: Callable[[list[bytes]], V], *, schema: SchemaRef, required: bool = False
+    name: str, parse: Callable[[tuple[bytes, ...]], V], *, schema: SchemaRef, required: bool = False
 ) -> Extractor[V]:
     """
     Parse a request header into `V`, given all of its raw values.
 
-    Header names are matched case-insensitively (ASGI lower-cases them); `parse`
-    receives every value sent under `name`, in order, and returns `V` or raises.
+    Header names are matched case-insensitively; `parse` receives every value sent
+    under `name` as an immutable tuple, in order, and returns `V` or raises.
     """
-    wanted = name.lower().encode()
+    wanted = name.encode()
 
     def extract(request: Request) -> V:
-        values = [value for key, value in request.scope.headers if key == wanted]
-        return parse(values)
+        return parse(headers.get_all(request.scope.headers, wanted))
 
     return Extractor(extract, headers=(HeaderParam(name=name, schema=schema, required=required),))
+
+
+def once[E, V](parse: Callable[[E], V]) -> Callable[[tuple[E, ...]], V]:
+    """
+    Adapt a single-value `parse` into the tuple-taking form `query_param` and
+    `header_param` expect, requiring the value to appear exactly once.
+
+    Use it for a *singleton* field that must be present once: it raises `ValueError`
+    when the value is absent or repeated (a duplicated singleton is a protocol
+    violation, RFC 9110 §5.3) and otherwise applies `parse` to the sole value. For a
+    genuinely list-valued field, skip this and let `parse` take every value.
+    """
+
+    def parse_once(values: tuple[E, ...]) -> V:
+        match values:
+            case (value,):
+                return parse(value)
+            case ():
+                raise ValueError("expected exactly one value, got none")
+            case _:
+                raise ValueError(f"expected exactly one value, got {len(values)}")
+
+    return parse_once
+
+
+def optional[E, V](parse: Callable[[E], V]) -> Callable[[tuple[E, ...]], V | None]:
+    """
+    Like `once`, but for a field that may appear zero or one times.
+
+    Returns `None` when the value is absent and `parse(value)` when it appears once;
+    a repeated value still raises `ValueError` (a duplicated singleton is a protocol
+    violation, RFC 9110 §5.3). Use it for an *optional* singleton field, and `once`
+    when the field is required.
+    """
+
+    def parse_optional(values: tuple[E, ...]) -> V | None:
+        match values:
+            case ():
+                return None
+            case (value,):
+                return parse(value)
+            case _:
+                raise ValueError(f"expected at most one value, got {len(values)}")
+
+    return parse_optional
 
 
 def body[V](parse: Callable[[bytes], V], *, schema: SchemaRef, media_type: str = "application/json") -> Extractor[V]:

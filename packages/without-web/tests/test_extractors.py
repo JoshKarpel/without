@@ -19,6 +19,8 @@ from without_web import catch_all
 from without_web import header_param
 from without_web import http_scope
 from without_web import into
+from without_web import once
+from without_web import optional
 from without_web import path_param
 from without_web import query_param
 from without_web import websocket_scope
@@ -60,19 +62,58 @@ def test_catch_all_reads_the_rest_of_path_value_already_parsed_by_the_router() -
 def test_query_param_hands_the_parser_every_value_for_its_name() -> None:
     request = _request(query=b"done=true&done=false&other=x")
     seen = query_param("done", lambda values: values, schema={"type": "string"}).extract(request)
-    assert seen == ["true", "false"]
+    assert seen == ("true", "false")
 
 
-def test_query_param_hands_the_parser_an_empty_list_when_absent() -> None:
+def test_query_param_hands_the_parser_an_empty_tuple_when_absent() -> None:
     request = _request(query=b"other=x")
-    extractor = query_param("done", lambda values: values or ["missing"], schema={"type": "string"})
-    assert extractor.extract(request) == ["missing"]
+    extractor = query_param("done", lambda values: values or ("missing",), schema={"type": "string"})
+    assert extractor.extract(request) == ("missing",)
 
 
 def test_header_param_matches_case_insensitively_and_keeps_order() -> None:
     request = _request(headers=((b"x-trace", b"first"), (b"content-type", b"text/plain"), (b"x-trace", b"second")))
     extractor = header_param("X-Trace", lambda values: values, schema={"type": "string"})
-    assert extractor.extract(request) == [b"first", b"second"]
+    assert extractor.extract(request) == (b"first", b"second")
+
+
+def test_once_applies_the_parser_to_the_sole_value() -> None:
+    parse = once(bytes.decode)
+    assert parse((b"the-only-one",)) == "the-only-one"
+
+
+def test_once_rejects_an_absent_value() -> None:
+    parse = once(bytes.decode)
+    with pytest.raises(ValueError, match="got none"):
+        parse(())
+
+
+def test_once_rejects_a_repeated_value() -> None:
+    parse = once(bytes.decode)
+    with pytest.raises(ValueError, match="got 2"):
+        parse((b"one", b"two"))
+
+
+def test_once_composes_with_header_param_for_a_singleton_header() -> None:
+    request = _request(headers=((b"idempotency-key", b"abc-123"),))
+    extractor = header_param("Idempotency-Key", once(bytes.decode), schema={"type": "string"})
+    assert extractor.extract(request) == "abc-123"
+
+
+def test_optional_returns_none_when_the_value_is_absent() -> None:
+    parse = optional(bytes.decode)
+    assert parse(()) is None
+
+
+def test_optional_applies_the_parser_to_the_sole_value() -> None:
+    parse = optional(bytes.decode)
+    assert parse((b"present",)) == "present"
+
+
+def test_optional_rejects_a_repeated_value() -> None:
+    parse = optional(bytes.decode)
+    with pytest.raises(ValueError, match="got 2"):
+        parse((b"one", b"two"))
 
 
 def test_body_parses_the_buffered_bytes() -> None:

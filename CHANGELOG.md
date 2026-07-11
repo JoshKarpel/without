@@ -39,9 +39,28 @@
   generator: awaiting it runs the `stat` up front, so a missing file raises `FileNotFoundError` before
   any `ResponseStart` is emitted and a handler can still answer a clean `404`. Reads and writes are
   lockstep by default; wrap the result in `spool` for read-ahead.
+- **`without-asgi`**: `headers`, a module of pure functions over the raw ASGI header pairs
+  (`RawHeaders`) rather than a wrapper type. `get_all` returns every value under a name as an
+  immutable tuple and `first` the first (for singleton fields, where a duplicate is a protocol
+  violation); `add`, `replace`,
+  `remove`, `subset`, and `merge` are `RawHeaders -> RawHeaders` transforms. All match field names
+  case-insensitively (RFC 9110) and preserve duplicates, so a multi-valued `Set-Cookie` survives
+  intact. `RawHeaders` is the one representation the ASGI spec fixes on both edges, so operating on
+  it directly keeps reads a scan and writes a straight pass-through, no value to wrap or unwrap.
+- **`without-web`**: `once` and `optional`, parse adapters for singleton request fields. Each
+  lifts a one-value `parse` into the tuple-taking form `query_param`/`header_param` feed: `once`
+  requires the value exactly once (returning `V`), `optional` allows zero or one (returning
+  `V | None`, `None` when absent). A duplicated value raises `ValueError` in both (a duplicated
+  singleton violates RFC 9110 §5.3). Reading a single value stays a policy the call site chooses
+  rather than a second extractor.
 
 ### Changed
 
+- **`without-web`**: query and header extractor `parse` callbacks now receive an immutable `tuple`
+  of values rather than a `list` (`query_param`, `header_param`, and the `once`/`optional`
+  adapters), and `Request.query_params` values are tuples. The parsed request is a value no
+  consumer can mutate out from under another (values over places); a `parse` typed on `list` must
+  widen to `tuple`.
 - **`without-core`** (imported as `without`): the `buffer` wiring connector is renamed `spool`, and its
   `maxsize` argument renamed `ahead`, so `spool(source, ahead=n)` reads as the read-ahead it is (drive a
   source ahead of its consumer through a bounded queue on a background task). Behavior is unchanged.

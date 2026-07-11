@@ -15,6 +15,8 @@ from without_web.extractors import catch_all
 from without_web.extractors import header_param
 from without_web.extractors import http_scope
 from without_web.extractors import into
+from without_web.extractors import once
+from without_web.extractors import optional
 from without_web.extractors import path_param
 from without_web.extractors import query_param
 from without_web.extractors import websocket_scope
@@ -128,7 +130,9 @@ __all__ = [
     "http_scope",
     "into",
     "mount",
+    "once",
     "openapi",
+    "optional",
     "options",
     "patch",
     "path_param",

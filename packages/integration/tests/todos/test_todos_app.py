@@ -167,13 +167,39 @@ async def test_a_missing_todo_is_a_mapped_404() -> None:
     assert body == {"error": "no todo with id 99", "id": 99}
 
 
-async def test_creating_a_todo_echoes_it_with_its_url() -> None:
+async def test_creating_a_todo_echoes_it_with_its_url_and_idempotency_key() -> None:
+    app = todos_app(_todos())
+    async with _running(app):
+        status, _headers, body = await _request(
+            app, "POST", "/todos", body=b'{"title": "deploy"}', headers=[(b"idempotency-key", b"abc-123")]
+        )
+    assert status == 201
+    # The body carries the new todo plus its URL, reversed from the `show_todo` route.
+    assert body == {"id": 3, "title": "deploy", "done": False, "url": "/todos/3", "idempotency_key": "abc-123"}
+
+
+async def test_creating_a_todo_without_the_idempotency_key_is_a_400() -> None:
     app = todos_app(_todos())
     async with _running(app):
         status, _headers, body = await _request(app, "POST", "/todos", body=b'{"title": "deploy"}')
-    assert status == 201
-    # The body carries the new todo plus its URL, reversed from the `show_todo` route.
-    assert body == {"id": 3, "title": "deploy", "done": False, "url": "/todos/3"}
+    assert status == 400
+    assert isinstance(body, dict)
+    assert body["error"] == "expected exactly one value, got none"
+
+
+async def test_creating_a_todo_with_a_duplicated_idempotency_key_is_a_400() -> None:
+    app = todos_app(_todos())
+    async with _running(app):
+        status, _headers, body = await _request(
+            app,
+            "POST",
+            "/todos",
+            body=b'{"title": "deploy"}',
+            headers=[(b"idempotency-key", b"one"), (b"idempotency-key", b"two")],
+        )
+    assert status == 400
+    assert isinstance(body, dict)
+    assert body["error"] == "expected exactly one value, got 2"
 
 
 async def test_import_echoes_each_todo_as_the_ndjson_stream_arrives() -> None:
@@ -223,7 +249,9 @@ async def test_recover_lets_an_unmapped_exception_propagate() -> None:
 async def test_an_invalid_body_is_a_mapped_422() -> None:
     app = todos_app(_todos())
     async with _running(app):
-        status, _headers, body = await _request(app, "POST", "/todos", body=b"{}")
+        status, _headers, body = await _request(
+            app, "POST", "/todos", body=b"{}", headers=[(b"idempotency-key", b"abc-123")]
+        )
     assert status == 422
     assert isinstance(body, dict)
     assert body["error"] == "invalid todo body"
@@ -306,6 +334,10 @@ async def test_openapi_merges_router_and_handler_halves() -> None:
     )
     assert isinstance(properties, dict)
     assert "title" in properties
+
+    post_params = _dig(spec, "paths", "/todos", "post", "parameters")
+    assert isinstance(post_params, list)
+    assert {"name": "idempotency-key", "in": "header", "required": True, "schema": {"type": "string"}} in post_params
 
     list_params = _dig(spec, "paths", "/todos", "get", "parameters")
     assert isinstance(list_params, list)
