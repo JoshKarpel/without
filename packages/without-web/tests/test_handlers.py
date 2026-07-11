@@ -166,11 +166,6 @@ def test_ws_ties_path_and_query_to_the_handler() -> None:
     assert seen == {"state": "tenant", "room_id": 7, "since": ("5", "9")}
 
 
-def test_ws_rejects_a_body_extractor() -> None:
-    with pytest.raises(ValueError, match="no body"):
-        ws(t"/feed", body(json.loads, schema={"type": "object"}))
-
-
 async def _chunks(*payloads: bytes) -> AsyncIterator[Inbound]:
     for index, payload in enumerate(payloads):
         yield RequestBody(body=payload, more_body=index < len(payloads) - 1)
@@ -227,11 +222,6 @@ async def test_handle_stream_buffers_its_output_when_the_handler_returns_a_respo
 
     handler = handle_stream(fn=collect)("tenant", Match(_scope(), {}))
     assert await _run(handler, b"abcdef") == (201, {"state": "tenant", "received": 6})
-
-
-def test_handle_stream_rejects_a_body_extractor() -> None:
-    with pytest.raises(ValueError, match="cannot take a body extractor"):
-        handle_stream(body(json.loads, schema={"type": "object"}), fn=lambda state, payload, inputs: _empty())
 
 
 def test_handle_stream_recovers_its_openapi_from_the_extractors() -> None:

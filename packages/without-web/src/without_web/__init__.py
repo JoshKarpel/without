@@ -10,7 +10,9 @@ from without_web.exceptions import catching
 from without_web.exceptions import catching_websocket
 from without_web.extractors import BufferedRequest
 from without_web.extractors import Extractor
+from without_web.extractors import HttpRequestHead
 from without_web.extractors import RequestHead
+from without_web.extractors import WebsocketRequestHead
 from without_web.extractors import body
 from without_web.extractors import catch_all
 from without_web.extractors import header_param
@@ -91,6 +93,7 @@ __all__ = [
     "Extractor",
     "HeaderParam",
     "HttpEndpoint",
+    "HttpRequestHead",
     "Literal",
     "Match",
     "Param",
@@ -113,6 +116,7 @@ __all__ = [
     "WebsocketDelegate",
     "WebsocketEndpoint",
     "WebsocketExceptionRecover",
+    "WebsocketRequestHead",
     "WebsocketReturned",
     "WebsocketRoute",
     "WebsocketRouter",

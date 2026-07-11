@@ -12,9 +12,10 @@ from without_web import INT
 from without_web import Body
 from without_web import BufferedRequest
 from without_web import HeaderParam
+from without_web import HttpRequestHead
 from without_web import QueryParam
-from without_web import RequestHead
 from without_web import Single
+from without_web import WebsocketRequestHead
 from without_web import body
 from without_web import catch_all
 from without_web import header_param
@@ -63,8 +64,8 @@ def _ws_scope(*, query: bytes = b"") -> WebsocketScope:
 
 def _request(
     *, query: bytes = b"", headers: RawHeaders = (), path_params: dict[str, object] | None = None
-) -> RequestHead:
-    return RequestHead.parsed(scope=_scope(query=query, headers=headers), path_params=path_params or {})
+) -> HttpRequestHead:
+    return HttpRequestHead.parsed(scope=_scope(query=query, headers=headers), path_params=path_params or {})
 
 
 def test_path_param_reads_the_already_parsed_value_at_its_type() -> None:
@@ -139,31 +140,15 @@ def test_body_parses_the_buffered_bytes() -> None:
     assert body(json.loads, schema={"type": "object"}).extract(request) == {"count": 3}
 
 
-def test_body_requires_a_buffered_request_not_a_bare_head() -> None:
-    with pytest.raises(TypeError, match="buffered request"):
-        body(json.loads, schema={"type": "object"}).extract(_request())
-
-
 def test_http_scope_hands_back_the_unparsed_http_scope() -> None:
     request = _request(query=b"done=true")
     assert http_scope().extract(request) is request.scope
 
 
-def test_http_scope_rejects_a_websocket_route() -> None:
-    request = RequestHead.parsed(scope=_ws_scope(), path_params={})
-    with pytest.raises(TypeError, match="HTTP route"):
-        http_scope().extract(request)
-
-
 def test_websocket_scope_hands_back_the_unparsed_websocket_scope() -> None:
     scope = _ws_scope(query=b"since=5")
-    request = RequestHead.parsed(scope=scope, path_params={})
+    request = WebsocketRequestHead.parsed(scope=scope, path_params={})
     assert websocket_scope().extract(request) is scope
-
-
-def test_websocket_scope_rejects_an_http_route() -> None:
-    with pytest.raises(TypeError, match="websocket route"):
-        websocket_scope().extract(_request())
 
 
 def test_query_param_contributes_its_openapi_fragment() -> None:

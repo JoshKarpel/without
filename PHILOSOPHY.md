@@ -240,8 +240,9 @@ producing the typed value and push the decision out, or make it injectable.
 Alexis King's principle runs through `without-web`. A `Converter` is a `str ->
 value` parser paired with the JSON Schema it parses into; rejecting a segment
 (raising `ValueError`) makes the trie walk backtrack rather than erroring a
-handler. An `Extractor[V]` is parsing-as-a-value: a pure `Request -> V` paired
-with the OpenAPI fragment it contributes. Path params arrive at a handler already
+handler. An `Extractor[C, V]` is parsing-as-a-value: a pure `C -> V` (from the
+request context `C` it reads) paired with the OpenAPI fragment it contributes.
+Path params arrive at a handler already
 typed (`user_id: int`), with no `assert isinstance` and no runtime introspection;
 the extractor types are tied to the handler's parameters through an overload
 ladder, so a mismatch is a mypy error.

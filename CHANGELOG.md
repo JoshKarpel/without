@@ -58,10 +58,21 @@
 
 - **`without-web`**: the extractor context type `Request` is renamed `RequestHead` and no longer
   carries the request body. `RequestHead` is exactly the parsed head an extractor reads (scope,
-  path params, query params), mirroring `without-http`'s `ResponseHead`; the buffered body moves to
-  a `BufferedRequest` subtype that only the buffered-HTTP path builds and the `body` extractor
-  requires. Streaming and websocket routes now build a bodyless `RequestHead` instead of faking an
-  empty body. Custom extractors typed on `Request` become `RequestHead`.
+  path params, query params), mirroring `without-http`'s `ResponseHead`. It is now the top of a
+  small context lattice each route builds concretely: `HttpRequestHead` (scope narrowed to
+  `HttpScope`) for HTTP routes, `WebsocketRequestHead` (`WebsocketScope`) for websocket routes, and
+  `BufferedRequest` (an `HttpRequestHead` plus the buffered `body`) for the buffered-HTTP path.
+  Custom extractors typed on `Request` become `RequestHead` (or a narrower context if they read the
+  concrete scope or body).
+- **`without-web`**: `Extractor` gains a request-context type parameter, `Extractor[C, V]` (was
+  `Extractor[V]`), contravariant in `C`. This makes the wrong extractor on the wrong route a *static*
+  type error rather than a runtime guard: a `body` token (`Extractor[BufferedRequest, V]`) on a
+  streaming or websocket route, or an `http_scope`/`websocket_scope` on the wrong protocol, no longer
+  type-checks, so the former runtime `TypeError`/`ValueError` guards in `body`/`http_scope`/
+  `websocket_scope`/`handle_stream`/`ws` are removed. Permissive tokens
+  (`path_param`/`query_param`/`header_param`/`catch_all`) are `Extractor[RequestHead, V]` and still
+  serve any route. A custom extractor annotated `Extractor[V]` must add its context:
+  `Extractor[RequestHead, V]` for a scope/path/query read.
 - **`without-web`**: query and header extractor `parse` callbacks now receive an immutable `tuple`
   of values rather than a `list` (`query_param`, `header_param`, and the `once`/`optional`
   adapters), and `RequestHead.query_params` values are tuples. The parsed head is a value no

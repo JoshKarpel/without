@@ -27,7 +27,7 @@ class Node:
     `dependencies` order and returns this node's single result. Results cross
     this seam as `object` (the executor cannot know each step's type); a typed
     frontend restores precision above it, exactly as `without-web`'s `Extractor`
-    is collected as `Extractor[object]` and re-typed by `into`.
+    values are collected with `object` values and re-typed by `into`.
     """
 
     key: NodeKey

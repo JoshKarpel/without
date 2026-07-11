@@ -4,6 +4,7 @@ from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Generic
+from typing import Never
 from typing import TypeVar
 from typing import cast
 from typing import overload
@@ -32,7 +33,9 @@ class RequestHead:
     """
     The parsed head of a request (or websocket handshake): everything an extractor
     reads *except* the body. The read-only, parsed-once context handed to each
-    scope-derived extractor.
+    scope-derived extractor, and the *most general* context in the lattice below:
+    `path_param`, `catch_all`, `query_param`, and `header_param` read only what is
+    here, so they work on any route.
 
     `path_params` holds the path parameters the router already parsed during the
     trie walk (typed values, stored as `object`); `query_params` is the query
@@ -45,68 +48,121 @@ class RequestHead:
     concrete type. A `header_param` reads the scope's raw header pairs directly
     through the `without_asgi.headers` functions.
 
-    The body is *not* here: only the buffered-HTTP path has one, so it lives on the
-    `BufferedRequest` subtype that path builds and the `body` extractor requires. A
-    streaming or websocket route has no body, so there is nothing to fake.
+    The subtypes narrow the two facts a route fixes, so the wrong extractor on the
+    wrong route is a *static* error rather than a runtime guard (see `Extractor`):
+
+    - `HttpRequestHead` narrows `scope` to `HttpScope` (what `http_scope()` needs).
+    - `WebsocketRequestHead` narrows `scope` to `WebsocketScope` (`websocket_scope()`).
+    - `BufferedRequest` (an `HttpRequestHead`) adds the buffered `body` (`body()`).
+
+    Each route builds exactly its concrete context: the buffered-HTTP path a
+    `BufferedRequest`, the streaming-HTTP path an `HttpRequestHead`, a websocket a
+    `WebsocketRequestHead`. This base is never built directly; it names the shared
+    top so the permissive extractors can slot into all three.
     """
 
     scope: HttpScope | WebsocketScope
     path_params: Mapping[str, object]
     query_params: Mapping[str, tuple[str, ...]]
 
+
+@dataclass(frozen=True, slots=True)
+class HttpRequestHead(RequestHead):
+    """
+    A `RequestHead` whose `scope` is known to be an `HttpScope`: the context of any
+    HTTP route (buffered or streaming). `http_scope()` reads its narrowed `scope`
+    with no runtime check, and the streaming-HTTP path builds it directly.
+    """
+
+    scope: HttpScope
+
     @classmethod
-    def parsed(cls, scope: HttpScope | WebsocketScope, path_params: Mapping[str, object]) -> RequestHead:
-        """Assemble a `RequestHead`, parsing the scope's query string once at the boundary."""
-        return RequestHead(scope=scope, path_params=path_params, query_params=_parse_query(scope))
+    def parsed(cls, scope: HttpScope, path_params: Mapping[str, object]) -> HttpRequestHead:
+        """Assemble an `HttpRequestHead`, parsing the scope's query string once at the boundary."""
+        return HttpRequestHead(scope=scope, path_params=path_params, query_params=_parse_query(scope))
 
 
 @dataclass(frozen=True, slots=True)
-class BufferedRequest(RequestHead):
+class WebsocketRequestHead(RequestHead):
     """
-    A `RequestHead` plus the fully-buffered request body, built only on the
-    buffered-HTTP path. The `body` extractor requires it; a build-time check keeps
-    body extractors off streaming and websocket routes, which have no buffered body.
+    A `RequestHead` whose `scope` is known to be a `WebsocketScope`: the context of a
+    websocket route. `websocket_scope()` reads its narrowed `scope` with no runtime
+    check, and the websocket path builds it directly.
+    """
+
+    scope: WebsocketScope
+
+    @classmethod
+    def parsed(cls, scope: WebsocketScope, path_params: Mapping[str, object]) -> WebsocketRequestHead:
+        """Assemble a `WebsocketRequestHead`, parsing the scope's query string once at the boundary."""
+        return WebsocketRequestHead(scope=scope, path_params=path_params, query_params=_parse_query(scope))
+
+
+@dataclass(frozen=True, slots=True)
+class BufferedRequest(HttpRequestHead):
+    """
+    An `HttpRequestHead` plus the fully-buffered request body, built only on the
+    buffered-HTTP path. The `body` extractor's context is exactly this type, so a
+    `body` token on a streaming or websocket route (which build a bodyless
+    `HttpRequestHead`/`WebsocketRequestHead`) is a static type error, not a runtime
+    guard.
     """
 
     body: bytes
 
     @classmethod
-    def buffered(
-        cls, scope: HttpScope | WebsocketScope, path_params: Mapping[str, object], body: bytes
-    ) -> BufferedRequest:
+    def buffered(cls, scope: HttpScope, path_params: Mapping[str, object], body: bytes) -> BufferedRequest:
         """Assemble a `BufferedRequest`, parsing the query string and carrying the buffered body."""
-        return BufferedRequest(scope=scope, path_params=path_params, query_params=_parse_query(scope), body=body)
+        return cls(scope=scope, path_params=path_params, query_params=_parse_query(scope), body=body)
 
 
-# Covariant: `V` appears only in `extract`'s return, so `Extractor[int]` is an
-# `Extractor[object]`. This is what lets `handle` collect a heterogeneous mix of
-# extractors as `*extractors: Extractor[object]`. The legacy `TypeVar` is needed
-# because PEP 695's inferred variance treats a (frozen) dataclass field as
-# invariant; the variance is sound here, so we state it explicitly.
+# `Extractor` is contravariant in its context `C` and covariant in its value `V`:
+# both appear only through `extract: Callable[[C], V]` (C in an argument, V in the
+# return). Contravariance in `C` is what makes the route-kind split work: a
+# permissive `Extractor[RequestHead, V]` *is an* `Extractor[BufferedRequest, V]`
+# (it needs less than the route provides), so it slots into a buffered handler,
+# while a `body` token (`Extractor[BufferedRequest, V]`) is *not* an
+# `Extractor[HttpRequestHead, V]`, so a streaming handler rejects it at type-check
+# time. Covariance in `V` lets a handler collect a heterogeneous mix as
+# `Extractor[Context, object]`. Legacy `TypeVar`s are needed because PEP 695's
+# inferred variance treats a (frozen) dataclass field as invariant; both variances
+# are sound here, so we state them explicitly.
+_C_contra = TypeVar("_C_contra", contravariant=True)
 _V_co = TypeVar("_V_co", covariant=True)
+
+# An extractor of *any* context. `Never` is the bottom type, so by the
+# contravariance above `Extractor[Never, V]` is a supertype of every
+# `Extractor[C, V]`: the type of "an extractor, whatever request context it reads."
+# The variadic implementations collect a heterogeneous mix this way; the `@overload`
+# ladders restore the precise per-route context for callers.
+type AnyExtractor = Extractor[Never, object]
 
 
 @dataclass(frozen=True, slots=True)
-class Extractor(Generic[_V_co]):  # noqa: UP046 - PEP 695 infers a frozen dataclass field as invariant; the covariant TypeVar is deliberate (see above)
+class Extractor(Generic[_C_contra, _V_co]):  # noqa: UP046 - PEP 695 infers a frozen dataclass field as invariant; the explicit variances are deliberate (see above)
     """
     A typed piece of a request, paired with the OpenAPI it contributes.
 
-    `extract` is a pure `RequestHead -> V` that raises to *reject* a bad request
-    (a `catching` middleware's `recover` maps the raised type to a 4xx); it never
-    decides which handler runs. The same value carries its own OpenAPI fragment,
+    `extract` is a pure `C -> V` (where `C` is the request context it reads: the
+    permissive `RequestHead`, or a narrower `HttpRequestHead`/`WebsocketRequestHead`/
+    `BufferedRequest`) that raises to *reject* a bad request (a `catching`
+    middleware's `recover` maps the raised type to a 4xx); it never decides which
+    handler runs. The context parameter is what lets a handler refuse the wrong
+    extractor for its route kind statically (a `body` on a streaming route, an
+    `http_scope` on a websocket). The same value carries its own OpenAPI fragment,
     so a handler's parameter list and request body are *recovered* from the
     extractors it declares, never restated: one declaration, two consumers
     (parse and describe).
     """
 
-    extract: Callable[[RequestHead], _V_co]
+    extract: Callable[[_C_contra], _V_co]
     query: tuple[QueryParam, ...] = ()
     headers: tuple[HeaderParam, ...] = ()
     request_body: Body | None = None
     path: PathSpec | None = None
 
 
-def path_param[V](name: str, converter: Converter[V]) -> Extractor[V]:
+def path_param[V](name: str, converter: Converter[V]) -> Extractor[RequestHead, V]:
     """
     A typed path parameter: one value that is both a pattern segment and a read.
 
@@ -125,7 +181,7 @@ def path_param[V](name: str, converter: Converter[V]) -> Extractor[V]:
     return Extractor(extract, path=spec)
 
 
-def catch_all(name: str, converter: Converter[str] = PATH) -> Extractor[str]:
+def catch_all(name: str, converter: Converter[str] = PATH) -> Extractor[RequestHead, str]:
     """
     A typed catch-all path parameter: the `{name:path}` form as a token.
 
@@ -142,7 +198,7 @@ def catch_all(name: str, converter: Converter[str] = PATH) -> Extractor[str]:
 
 def query_param[V](
     name: str, parse: Callable[[tuple[str, ...]], V], *, schema: SchemaRef, required: bool = False
-) -> Extractor[V]:
+) -> Extractor[RequestHead, V]:
     """
     Parse a query parameter into `V`, given all of its raw values.
 
@@ -159,7 +215,7 @@ def query_param[V](
 
 def header_param[V](
     name: str, parse: Callable[[tuple[bytes, ...]], V], *, schema: SchemaRef, required: bool = False
-) -> Extractor[V]:
+) -> Extractor[RequestHead, V]:
     """
     Parse a request header into `V`, given all of its raw values.
 
@@ -219,7 +275,9 @@ def optional[E, V](parse: Callable[[E], V]) -> Callable[[tuple[E, ...]], V | Non
     return parse_optional
 
 
-def body[V](parse: Callable[[bytes], V], *, schema: SchemaRef, media_type: str = "application/json") -> Extractor[V]:
+def body[V](
+    parse: Callable[[bytes], V], *, schema: SchemaRef, media_type: str = "application/json"
+) -> Extractor[BufferedRequest, V]:
     """
     Parse the buffered request body into `V`.
 
@@ -227,182 +285,177 @@ def body[V](parse: Callable[[bytes], V], *, schema: SchemaRef, media_type: str =
     passes a pydantic model's `model_validate_json`, a dataclass loader, or any
     `bytes -> V`, and the matching `schema` is this value's OpenAPI request body.
 
-    The buffered body lives on `BufferedRequest`, which only the buffered-HTTP path
-    builds; a body extractor on a bodyless streaming or websocket route (which the
-    build-time check already forbids) is refused loudly rather than reading a missing
-    body, mirroring `http_scope`.
+    The buffered body lives on `BufferedRequest`, so that *is* this extractor's
+    context: a `body` token on a bodyless streaming or websocket route is a static
+    type error (its context is not the `HttpRequestHead`/`WebsocketRequestHead` those
+    routes provide), not a runtime guard.
     """
 
-    def extract(head: RequestHead) -> V:
-        if not isinstance(head, BufferedRequest):
-            raise TypeError("body() requires a buffered request; a streaming or websocket route has no body to read")
+    def extract(head: BufferedRequest) -> V:
         return parse(head.body)
 
     return Extractor(extract, request_body=Body(media_type=media_type, shape=Single(schema)))
 
 
-def http_scope() -> Extractor[HttpScope]:
+def http_scope() -> Extractor[HttpRequestHead, HttpScope]:
     """
     Hand an HTTP handler the unparsed `HttpScope`.
 
     The escape hatch that keeps "pass the scope down" and "parse parts of it"
     from competing: a handler composes `http_scope()` alongside parsed extractors
-    and gets the raw connection facts as just another typed argument. Using it off
-    an HTTP route is the invariant; misuse on a websocket route is refused loudly
-    rather than surfacing later as a confusing `AttributeError`.
+    and gets the raw connection facts as just another typed argument. Its context is
+    `HttpRequestHead`, whose `scope` is already an `HttpScope`, so it reads it with
+    no runtime check; using it on a websocket route (a `WebsocketRequestHead`) is a
+    static type error.
     """
 
-    def extract(head: RequestHead) -> HttpScope:
-        scope = head.scope
-        if not isinstance(scope, HttpScope):
-            raise TypeError("http_scope() must be used on an HTTP route, not a websocket route")
-        return scope
+    def extract(head: HttpRequestHead) -> HttpScope:
+        return head.scope
 
     return Extractor(extract)
 
 
-def websocket_scope() -> Extractor[WebsocketScope]:
+def websocket_scope() -> Extractor[WebsocketRequestHead, WebsocketScope]:
     """
     Hand a websocket handler the unparsed `WebsocketScope`.
 
-    The websocket sibling of `http_scope()`, refusing use on an HTTP route.
+    The websocket sibling of `http_scope()`: its context is `WebsocketRequestHead`,
+    so it reads the narrowed `scope` with no runtime check, and use on an HTTP route
+    is a static type error.
     """
 
-    def extract(head: RequestHead) -> WebsocketScope:
-        scope = head.scope
-        if not isinstance(scope, WebsocketScope):
-            raise TypeError("websocket_scope() must be used on a websocket route, not an HTTP route")
-        return scope
+    def extract(head: WebsocketRequestHead) -> WebsocketScope:
+        return head.scope
 
     return Extractor(extract)
 
 
 # [[[cog import cog; from ladders import emit; cog.outl(emit("into")) ]]]
 @overload
-def into[M, A](
+def into[R, M, A](
     make: Callable[[A], M],
-    a: Extractor[A],
+    a: Extractor[R, A],
     /,
-) -> Extractor[M]: ...
+) -> Extractor[R, M]: ...
 
 
 @overload
-def into[M, A, B](
+def into[R, M, A, B](
     make: Callable[[A, B], M],
-    a: Extractor[A],
-    b: Extractor[B],
+    a: Extractor[R, A],
+    b: Extractor[R, B],
     /,
-) -> Extractor[M]: ...
+) -> Extractor[R, M]: ...
 
 
 @overload
-def into[M, A, B, C](
+def into[R, M, A, B, C](
     make: Callable[[A, B, C], M],
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
+    a: Extractor[R, A],
+    b: Extractor[R, B],
+    c: Extractor[R, C],
     /,
-) -> Extractor[M]: ...
+) -> Extractor[R, M]: ...
 
 
 @overload
-def into[M, A, B, C, D](
+def into[R, M, A, B, C, D](
     make: Callable[[A, B, C, D], M],
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
+    a: Extractor[R, A],
+    b: Extractor[R, B],
+    c: Extractor[R, C],
+    d: Extractor[R, D],
     /,
-) -> Extractor[M]: ...
+) -> Extractor[R, M]: ...
 
 
 @overload
-def into[M, A, B, C, D, E](
+def into[R, M, A, B, C, D, E](
     make: Callable[[A, B, C, D, E], M],
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
+    a: Extractor[R, A],
+    b: Extractor[R, B],
+    c: Extractor[R, C],
+    d: Extractor[R, D],
+    e: Extractor[R, E],
     /,
-) -> Extractor[M]: ...
+) -> Extractor[R, M]: ...
 
 
 @overload
-def into[M, A, B, C, D, E, F](
+def into[R, M, A, B, C, D, E, F](
     make: Callable[[A, B, C, D, E, F], M],
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
-    f: Extractor[F],
+    a: Extractor[R, A],
+    b: Extractor[R, B],
+    c: Extractor[R, C],
+    d: Extractor[R, D],
+    e: Extractor[R, E],
+    f: Extractor[R, F],
     /,
-) -> Extractor[M]: ...
+) -> Extractor[R, M]: ...
 
 
 @overload
-def into[M, A, B, C, D, E, F, G](
+def into[R, M, A, B, C, D, E, F, G](
     make: Callable[[A, B, C, D, E, F, G], M],
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
-    f: Extractor[F],
-    g: Extractor[G],
+    a: Extractor[R, A],
+    b: Extractor[R, B],
+    c: Extractor[R, C],
+    d: Extractor[R, D],
+    e: Extractor[R, E],
+    f: Extractor[R, F],
+    g: Extractor[R, G],
     /,
-) -> Extractor[M]: ...
+) -> Extractor[R, M]: ...
 
 
 @overload
-def into[M, A, B, C, D, E, F, G, H](
+def into[R, M, A, B, C, D, E, F, G, H](
     make: Callable[[A, B, C, D, E, F, G, H], M],
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
-    f: Extractor[F],
-    g: Extractor[G],
-    h: Extractor[H],
+    a: Extractor[R, A],
+    b: Extractor[R, B],
+    c: Extractor[R, C],
+    d: Extractor[R, D],
+    e: Extractor[R, E],
+    f: Extractor[R, F],
+    g: Extractor[R, G],
+    h: Extractor[R, H],
     /,
-) -> Extractor[M]: ...
+) -> Extractor[R, M]: ...
 
 
 @overload
-def into[M, A, B, C, D, E, F, G, H, J](
+def into[R, M, A, B, C, D, E, F, G, H, J](
     make: Callable[[A, B, C, D, E, F, G, H, J], M],
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
-    f: Extractor[F],
-    g: Extractor[G],
-    h: Extractor[H],
-    j: Extractor[J],
+    a: Extractor[R, A],
+    b: Extractor[R, B],
+    c: Extractor[R, C],
+    d: Extractor[R, D],
+    e: Extractor[R, E],
+    f: Extractor[R, F],
+    g: Extractor[R, G],
+    h: Extractor[R, H],
+    j: Extractor[R, J],
     /,
-) -> Extractor[M]: ...
+) -> Extractor[R, M]: ...
 
 
 @overload
-def into[M, A, B, C, D, E, F, G, H, J, K](
+def into[R, M, A, B, C, D, E, F, G, H, J, K](
     make: Callable[[A, B, C, D, E, F, G, H, J, K], M],
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
-    f: Extractor[F],
-    g: Extractor[G],
-    h: Extractor[H],
-    j: Extractor[J],
-    k: Extractor[K],
+    a: Extractor[R, A],
+    b: Extractor[R, B],
+    c: Extractor[R, C],
+    d: Extractor[R, D],
+    e: Extractor[R, E],
+    f: Extractor[R, F],
+    g: Extractor[R, G],
+    h: Extractor[R, H],
+    j: Extractor[R, J],
+    k: Extractor[R, K],
     /,
-) -> Extractor[M]: ...
+) -> Extractor[R, M]: ...
 # [[[end]]]
-def into[M](make: Callable[..., M], *extractors: Extractor[object]) -> Extractor[M]:
+def into[M](make: Callable[..., M], *extractors: AnyExtractor) -> Extractor[Never, M]:
     """
     Combine several extractors into one that builds a typed value.
 
@@ -425,7 +478,10 @@ def into[M](make: Callable[..., M], *extractors: Extractor[object]) -> Extractor
     handlers map like any other parse failure.
     """
 
-    def extract(head: RequestHead) -> M:
+    # `head` is `Never` to match the `AnyExtractor` collection: the overloads pin
+    # the real context (the meet of the constituents') for callers, and the route
+    # hands this closure that concrete head at dispatch.
+    def extract(head: Never) -> M:
         return make(*(extractor.extract(head) for extractor in extractors))
 
     return Extractor(
@@ -436,7 +492,7 @@ def into[M](make: Callable[..., M], *extractors: Extractor[object]) -> Extractor
     )
 
 
-def single_body(extractors: tuple[Extractor[object], ...]) -> Body | None:
+def single_body(extractors: tuple[AnyExtractor, ...]) -> Body | None:
     """The at-most-one request body among a group of extractors (a build fault if more)."""
     bodies = [extractor.request_body for extractor in extractors if extractor.request_body is not None]
     if len(bodies) > 1:

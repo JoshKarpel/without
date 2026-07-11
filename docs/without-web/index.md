@@ -106,15 +106,26 @@ registry to register it in.
 
 ## Reading the request: extractors
 
-An `Extractor[V]` is parsing-as-a-value: a pure `RequestHead -> V` paired with the
-OpenAPI fragment it contributes. `path_param`, `query_param`, `header_param`,
-`body`, `catch_all`, `http_scope`, and `websocket_scope` build them. An
-extractor that raises *rejects* the request, mapped to a 4xx by the exception
-handlers; it never decides which handler runs. `http_scope()`/`websocket_scope()`
-hand back the unparsed scope, so "pass the scope down" and "parse parts of it"
-compose instead of competing. The same `query_param`/`header_param`/`path_param` tokens
-serve both HTTP and websocket handlers (`RequestHead.scope` is
-`HttpScope | WebsocketScope`).
+An `Extractor[C, V]` is parsing-as-a-value: a pure `C -> V` (from the request
+context `C` it reads) paired with the OpenAPI fragment it contributes.
+`path_param`, `query_param`, `header_param`, `body`, `catch_all`, `http_scope`,
+and `websocket_scope` build them. An extractor that raises *rejects* the request,
+mapped to a 4xx by the exception handlers; it never decides which handler runs.
+`http_scope()`/`websocket_scope()` hand back the unparsed scope, so "pass the
+scope down" and "parse parts of it" compose instead of competing.
+
+The context `C` is what makes the wrong extractor on the wrong route a *static*
+error rather than a runtime guard. It is a small lattice of request-head types:
+the permissive `RequestHead` (`scope` is `HttpScope | WebsocketScope`), which
+`path_param`/`query_param`/`header_param`/`catch_all` read, so those tokens serve
+any route; `HttpRequestHead` (`scope` narrowed to `HttpScope`), which `http_scope`
+needs; `WebsocketRequestHead` (`scope` is `WebsocketScope`), which `websocket_scope`
+needs; and `BufferedRequest` (an `HttpRequestHead` plus the buffered `body`), which
+`body` needs. Because an extractor is *contravariant* in `C`, a permissive
+`Extractor[RequestHead, V]` slots into any handler, while a `body` token
+(`Extractor[BufferedRequest, V]`) on a streaming or websocket route, or an
+`http_scope` on a websocket route, is a mypy error at the call, with no runtime
+check to fail later.
 
 `handle(*extractors, fn=...)` ties the extractor types to `fn`'s parameters via
 an overload ladder, so a `path_param("id", INT)` paired with an `fn` that expects
@@ -131,10 +142,12 @@ the inbound stream untouched and hands it to `fn` as a trailing `Stream[Inbound]
 argument, so `fn` *is* the processor (no inner function), reading the live stream
 as it arrives (a streaming upload, a long poll, a loop driven by request chunks).
 The same overload ladder ties the extractor types, but the extractors are
-scope-only (`path_param`/`query_param`/`header_param`/`http_scope`); a `body`
-extractor is rejected, since buffering the body is exactly what a streaming route
-avoids. The output is free here too (yield to stream, return or await a `Response`
-to buffer), so the **input/output 2×2** is fully covered: input buffering is the
+scope-only (`path_param`/`query_param`/`header_param`/`http_scope`, whose context
+is the streaming route's `HttpRequestHead`); a `body` extractor is a static type
+error, since its `BufferedRequest` context is exactly the buffering a streaming
+route avoids. The output is free here too (yield to stream, return or await a
+`Response` to buffer), so the **input/output 2×2** is fully covered: input
+buffering is the
 one build-time axis (`handle` vs `handle_stream`), output is always the handler's
 return. The inbound stream is deliberately *not* an extractor: an `Extractor`
 reads the parsed-once `RequestHead` *value*, and a live stream is a consume-once
@@ -160,7 +173,7 @@ into a single method map.
 Each method decorator carries a `.stream` form for streaming input:
 `@post.stream(pattern, *extractors)` is to `handle_stream` what `@post` is to
 `handle`. The handler *is* the processor, taking the live inbound stream as its
-trailing argument, and a `body` extractor is rejected. See `integration.todos`'
+trailing argument, and a `body` extractor is a static type error. See `integration.todos`'
 `POST /todos/import`, which folds a newline-delimited stream into the list as it
 arrives, acknowledging each line while later chunks are still in flight.
 
@@ -341,8 +354,10 @@ and `ws_delegate(prefix, app)` mounts an opaque WebSocket app as a black box (se
 
 `@ws(pattern, *extractors)` is the websocket sibling of `@get`/`@post`: it ties
 typed `path_param`/`query_param`/`header_param` tokens to the handler's arguments
-and returns a `WebsocketRoute`. There is no body to buffer (a handshake carries
-none, so a `body` extractor is rejected). The handler *is* the frame processor,
+and returns a `WebsocketRoute`. Its context is `WebsocketRequestHead`, so a `body`
+(or `http_scope`) token is a static type error: a handshake carries no body, and
+its scope is a `WebsocketScope`, not an `HttpScope`. The handler *is* the frame
+processor,
 exactly as `@post.stream`'s is: it takes the live inbound frames as a trailing
 `Stream[WebsocketInbound]` argument and yields `WebsocketOutbound` directly,
 rather than returning a processor. Because the handler is the processor, a

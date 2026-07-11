@@ -48,11 +48,24 @@ def _overload(name: str, typeparams: list[str], params: list[str], return_type: 
     return f"{head}\n{body}\n) -> {return_type}: ..."
 
 
-def _extractor_params(letters: list[str]) -> list[str]:
-    return [f"{letter.lower()}: Extractor[{letter}]," for letter in letters]
+# The request context each route kind provides, which its extractor slots are
+# pinned to. An extractor's context is contravariant, so a permissive
+# `Extractor[RequestHead, ...]` satisfies any of these, while a `body`
+# (`BufferedRequest`) or `http_scope` (`HttpRequestHead`) token is refused by a
+# route whose context does not subtype it. `into` shares one free context `R`
+# across its constituents (the type checker solves it to their meet); `R` avoids
+# the extractor-slot letters (`A`-`K`), which include `C`.
+BUFFERED = "BufferedRequest"
+HTTP = "HttpRequestHead"
+WEBSOCKET = "WebsocketRequestHead"
+INTO_CONTEXT = "R"
 
 
-def _handler_ladder(name: str, *, stream: bool) -> str:
+def _extractor_params(letters: list[str], context: str) -> list[str]:
+    return [f"{letter.lower()}: Extractor[{context}, {letter}]," for letter in letters]
+
+
+def _handler_ladder(name: str, *, context: str, stream: bool) -> str:
     """
     `handle` / `handle_stream`: extractors, then a keyword-only `fn`.
 
@@ -62,7 +75,7 @@ def _handler_ladder(name: str, *, stream: bool) -> str:
     blocks = []
     for arity in range(11):
         letters = list(LETTERS[:arity])
-        params = _extractor_params(letters)
+        params = _extractor_params(letters, context)
         if letters:
             params.append("/,")
         params.append("*,")
@@ -73,7 +86,7 @@ def _handler_ladder(name: str, *, stream: bool) -> str:
     return "\n\n".join(blocks)
 
 
-def _method_ladder(*, stream: bool) -> str:
+def _method_ladder(*, context: str, stream: bool) -> str:
     """
     `_Method.__call__` / `_StreamMethod.__call__`: a leading `pattern`, then extractors.
 
@@ -83,7 +96,7 @@ def _method_ladder(*, stream: bool) -> str:
     blocks = []
     for arity in range(11):
         letters = list(LETTERS[:arity])
-        params = ["self,", "pattern: Pattern,", *_extractor_params(letters), "/,", "*,", *_keywords(stream)]
+        params = ["self,", "pattern: Pattern,", *_extractor_params(letters, context), "/,", "*,", *_keywords(stream)]
         fn_params = ["T", *letters, *(["Stream[Inbound]"] if stream else [])]
         return_type = f"Callable[[Callable[[{', '.join(fn_params)}], Returned]], Route[T]]"
         blocks.append(_overload("__call__", ["T", *letters], params, return_type))
@@ -101,7 +114,7 @@ def _ws_ladder() -> str:
     blocks = []
     for arity in range(11):
         letters = list(LETTERS[:arity])
-        params = ["pattern: Pattern,", *_extractor_params(letters), "/,"]
+        params = ["pattern: Pattern,", *_extractor_params(letters, WEBSOCKET), "/,"]
         fn_params = ["T", *letters, "Stream[WebsocketInbound]"]
         return_type = f"Callable[[Callable[[{', '.join(fn_params)}], WebsocketReturned]], WebsocketRoute[T]]"
         blocks.append(_overload("ws", ["T", *letters], params, return_type))
@@ -113,16 +126,16 @@ def _into_ladder() -> str:
     blocks = []
     for arity in range(1, 11):
         letters = list(LETTERS[:arity])
-        params = [f"make: Callable[[{', '.join(letters)}], M],", *_extractor_params(letters), "/,"]
-        blocks.append(_overload("into", ["M", *letters], params, "Extractor[M]"))
+        params = [f"make: Callable[[{', '.join(letters)}], M],", *_extractor_params(letters, INTO_CONTEXT), "/,"]
+        blocks.append(_overload("into", [INTO_CONTEXT, "M", *letters], params, f"Extractor[{INTO_CONTEXT}, M]"))
     return "\n\n".join(blocks)
 
 
 _LADDERS: dict[str, Callable[[], str]] = {
-    "handle": lambda: _handler_ladder("handle", stream=False),
-    "handle_stream": lambda: _handler_ladder("handle_stream", stream=True),
-    "method": lambda: _method_ladder(stream=False),
-    "stream_method": lambda: _method_ladder(stream=True),
+    "handle": lambda: _handler_ladder("handle", context=BUFFERED, stream=False),
+    "handle_stream": lambda: _handler_ladder("handle_stream", context=HTTP, stream=True),
+    "method": lambda: _method_ladder(context=BUFFERED, stream=False),
+    "stream_method": lambda: _method_ladder(context=HTTP, stream=True),
     "ws": _ws_ladder,
     "into": _into_ladder,
 }
