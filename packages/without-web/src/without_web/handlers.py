@@ -1029,7 +1029,7 @@ def ws[T](
 
     def decorate(fn: Callable[..., WebsocketReturned]) -> WebsocketRoute[T]:
         def endpoint(state: T, match: Match[WebsocketScope]) -> WebsocketHandler:
-            request = Request(scope=match.scope, path_params=match.params, body=b"")
+            request = Request.parsed(scope=match.scope, path_params=match.params, body=b"")
             values = tuple(extractor.extract(request) for extractor in extractors)
 
             def processor(inputs: Stream[WebsocketInbound]) -> Stream[WebsocketOutbound]:
@@ -1081,7 +1081,7 @@ def _build_stream_endpoint(
     )
 
     def endpoint(state: object, match: Match[HttpScope]) -> HttpHandler:
-        request = Request(scope=match.scope, path_params=match.params, body=b"")
+        request = Request.parsed(scope=match.scope, path_params=match.params, body=b"")
         values = tuple(extractor.extract(request) for extractor in extractors)
 
         def processor(inputs: Stream[Inbound]) -> Stream[Outbound]:
@@ -1123,6 +1123,6 @@ async def _reply(
     fn: Callable[..., Returned],
 ) -> AsyncIterator[Outbound]:
     body = await read_body(inputs)
-    request = Request(scope=match.scope, path_params=match.params, body=body)
+    request = Request.parsed(scope=match.scope, path_params=match.params, body=body)
     async for event in _emit(fn(state, *(extractor.extract(request) for extractor in extractors))):
         yield event

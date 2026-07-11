@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
-from dataclasses import field
 from typing import Generic
 from typing import TypeVar
 from typing import cast
@@ -30,11 +29,12 @@ class Request:
 
     `path_params` holds the path parameters the router already parsed during the
     trie walk (typed values, stored as `object`); `query_params` is the query
-    string decoded and parsed *once* (via `parse_qs`) at construction, so a handler
-    declaring N `query_param` tokens shares one parse rather than re-decoding the
-    query string per token. `body` is the fully-buffered request body (empty for a
-    websocket handshake, which has none). One value, built once per request, fed to
-    every extractor a handler declares.
+    string decoded and parsed *once* (via `parse_qs`), so a handler declaring N
+    `query_param` tokens shares one parse rather than re-decoding the query string
+    per token. Both are handed in already-parsed, in the same spirit: the shell
+    parses at the boundary and this value just holds the result. `body` is the
+    fully-buffered request body (empty for a websocket handshake, which has none).
+    One value, built once per request, fed to every extractor a handler declares.
 
     `scope` is `HttpScope | WebsocketScope` so a `query_param`/`header_param`
     token reads either (both carry `query_string` and `headers`). The whole-scope
@@ -44,11 +44,18 @@ class Request:
 
     scope: HttpScope | WebsocketScope
     path_params: Mapping[str, object]
+    query_params: Mapping[str, list[str]]
     body: bytes
-    query_params: Mapping[str, list[str]] = field(init=False)
 
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "query_params", parse_qs(self.scope.query_string.decode()))
+    @classmethod
+    def parsed(cls, scope: HttpScope | WebsocketScope, path_params: Mapping[str, object], body: bytes) -> Request:
+        """Assemble a `Request`, parsing the scope's query string once at the boundary."""
+        return cls(
+            scope=scope,
+            path_params=path_params,
+            query_params=parse_qs(scope.query_string.decode()),
+            body=body,
+        )
 
 
 # Covariant: `V` appears only in `extract`'s return, so `Extractor[int]` is an

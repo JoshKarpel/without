@@ -44,7 +44,7 @@ def _scope(*, query: bytes = b"", headers: RawHeaders = ()) -> HttpScope:
 def _request(
     *, query: bytes = b"", headers: RawHeaders = (), path_params: dict[str, object] | None = None, body: bytes = b""
 ) -> Request:
-    return Request(scope=_scope(query=query, headers=headers), path_params=path_params or {}, body=body)
+    return Request.parsed(scope=_scope(query=query, headers=headers), path_params=path_params or {}, body=body)
 
 
 def test_path_param_reads_the_already_parsed_value_at_its_type() -> None:
@@ -100,7 +100,7 @@ def test_websocket_scope_hands_back_the_unparsed_websocket_scope() -> None:
         subprotocols=(),
         extensions=None,
     )
-    request = Request(scope=scope, path_params={}, body=b"")
+    request = Request.parsed(scope=scope, path_params={}, body=b"")
     assert websocket_scope().extract(request) is scope
 
 
