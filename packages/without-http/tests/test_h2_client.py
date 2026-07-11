@@ -9,6 +9,9 @@ from urllib.parse import urlsplit
 
 import pytest
 import trustme
+from without_asgi import RawScope
+from without_asgi import Receive
+from without_asgi import Send
 from without_http import ConnectionPool
 from without_http import add_headers
 from without_http import serving
@@ -155,6 +158,109 @@ async def test_cleartext_stays_http_1_1_even_with_http2_enabled() -> None:
         async with pool.request("GET", f"http://{HOST}:{server.port}/items") as (_head, body):
             assert await body.read() == b"GET /items test= body="
         assert pool._h2 == {}
+
+
+async def bidi_echo_app(scope: RawScope, receive: Receive, send: Send) -> None:
+    """Uppercase each request-body chunk into a response chunk, interleaved (full duplex)."""
+    if scope["type"] != "http":
+        raise RuntimeError("this app serves only http")
+    await send(
+        {"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"application/octet-stream")]}
+    )
+    while True:
+        message = await receive()
+        if message["type"] == "http.disconnect":  # pragma: no cover - the client here never disconnects abruptly
+            break
+        chunk = message.get("body", b"")
+        assert isinstance(chunk, bytes)
+        if chunk:
+            await send({"type": "http.response.body", "body": chunk.upper(), "more_body": True})
+        if not message.get("more_body", False):
+            break
+    await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+
+async def test_h2_bidirectional_ping_pong_streams_both_ways() -> None:
+    async with serving(bidi_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
+        outbound: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+        async def request_body() -> AsyncIterator[bytes]:
+            while (item := await outbound.get()) is not None:
+                yield item
+
+        await outbound.put(b"one")  # client speaks first, then feeds more per response chunk
+        url = f"http://{HOST}:{server.port}/bidi"
+        received: list[bytes] = []
+        async with pool.request("POST", url, body=request_body()) as (head, body):
+            assert head.status == 200
+            async for chunk in body:
+                if not chunk:  # skip the transport's trailing empty end-of-stream frame
+                    continue
+                received.append(chunk)
+                await outbound.put(f"msg{len(received)}".encode() if len(received) < 3 else None)
+    assert received == [b"ONE", b"MSG1", b"MSG2"]
+
+
+async def test_h2_server_speaks_first_before_the_request_body_is_ready() -> None:
+    async with serving(bidi_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
+        head_seen = asyncio.Event()
+
+        async def request_body() -> AsyncIterator[bytes]:
+            await head_seen.wait()  # withhold the first chunk until the head has arrived
+            yield b"late"
+
+        url = f"http://{HOST}:{server.port}/bidi"
+        async with pool.request("POST", url, body=request_body()) as (head, body):
+            assert head.status == 200  # the head arrives though no body chunk has been produced yet
+            head_seen.set()
+            received = [chunk async for chunk in body if chunk]  # skip the trailing empty end-of-stream frame
+        assert received == [b"LATE"]
+
+
+async def test_h2_abandoning_a_bidi_body_cancels_the_parked_sender() -> None:
+    async with serving(bidi_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
+        outbound: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+        async def request_body() -> AsyncIterator[bytes]:
+            while (
+                item := await outbound.get()
+            ) is not None:  # pragma: no branch - cancelled while parked, never ends via None
+                yield item
+
+        await outbound.put(b"hello")
+        url = f"http://{HOST}:{server.port}/bidi"
+        async with pool.request("POST", url, body=request_body()) as (head, body):
+            assert head.status == 200
+            first = await anext(aiter(body))
+            assert first == b"HELLO"
+            conn = pool._h2[_origin(urlsplit(url))]
+            (stream,) = conn._streams.values()
+            send_task = stream.send_task
+            assert send_task is not None  # parked on outbound.get()
+            assert not send_task.done()
+        assert send_task.done()  # release cancelled it rather than leaking a parked task
+        assert conn._streams == {}  # and the stream was reset
+
+
+async def test_h2_a_request_body_error_after_the_head_resets_the_stream() -> None:
+    release = asyncio.Event()
+
+    async def request_body() -> AsyncIterator[bytes]:
+        yield b"one"
+        await release.wait()  # hold until the caller has the head, then fail
+        raise ValueError("h2 body blew up")
+
+    async def exchange(pool: ConnectionPool, url: str) -> None:
+        async with pool.request("POST", url, body=request_body()) as (head, body):
+            assert head.status == 200  # the head has arrived before the body fails
+            release.set()
+            await body.read()
+
+    async with serving(bidi_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
+        url = f"http://{server.host}:{server.port}/bidi"
+        with pytest.raises(ValueError, match="h2 body blew up"):
+            await exchange(pool, url)
+        assert pool._h2[_origin(urlsplit(url))]._streams == {}  # the failed stream was reset, not stranded
 
 
 def test_pool_holds_one_produced_context_per_alpn_offer() -> None:

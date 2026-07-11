@@ -35,10 +35,11 @@ interchangeably with uvicorn. The server handles TLS, HTTP/2 (by ALPN or prior
 knowledge), keep-alive, WebSockets over the HTTP/1.1 upgrade, per-handler
 isolation, and flow control. The client is a `ConnectionPool` with a `(head,
 body)` response split, buffered and streaming bodies in both directions,
-opt-in trailers, HTTP/2 multiplexing, and `stack`-composed middleware.
+opt-in trailers, HTTP/2 multiplexing, per-host connection bounds, per-phase
+request timeouts, consumer-driven duplex (with bidirectional streaming over
+HTTP/2), and `stack`-composed middleware.
 
 See the
 [`without-http` guide](https://without.help/without-http/)
 (with the [API reference](https://without.help/reference/without_http/))
-for the full surface, including the deferred work (WebSockets over HTTP/2, HTTP/3,
-duplex).
+for the full surface, including the deferred work (WebSockets over HTTP/2, HTTP/3).

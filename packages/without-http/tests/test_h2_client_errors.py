@@ -9,8 +9,10 @@ import h2.config
 import h2.connection
 import h2.errors
 import h2.events
+import h2.settings
 import pytest
 from without_http import ConnectionPool
+from without_http.client import _empty_body
 from without_http.client import _Http2Connection
 from without_http.client import _Stream
 
@@ -105,13 +107,9 @@ async def test_request_on_a_closed_connection_raises() -> None:
     async with _idle_connection() as connection:
         connection._closed.set()
 
-        async def _empty() -> AsyncIterator[bytes]:
-            return
-            yield
-
         with pytest.raises(ConnectionError, match="closed before the request was sent"):
             await connection.request(
-                method=b"GET", target=b"/", scheme="http", authority=b"h", headers=(), body=_empty()
+                method=b"GET", target=b"/", scheme="http", authority=b"h", headers=(), body=_empty_body()
             )
 
 
@@ -204,7 +202,7 @@ async def test_request_raises_when_the_server_violates_the_protocol() -> None:
 async def _slow_body() -> AsyncIterator[bytes]:
     yield b"first"
     await asyncio.sleep(0.1)  # let the read loop observe the server's reset before the next chunk
-    yield b"second"
+    yield b"second"  # pragma: no cover - the reset now cancels this send before the second chunk
 
 
 async def test_uploading_a_streaming_body_to_a_resetting_server_raises() -> None:
@@ -438,3 +436,83 @@ async def test_h2c_reuses_a_pooled_connection_for_a_second_request() -> None:
         async with pool.request("POST", url, body=b"second") as (_head, body):
             assert await body.read() == b"second"
         assert len(pool._h2) == 1
+
+
+async def _raising_body(first: bytes) -> AsyncIterator[bytes]:
+    yield first
+    raise ValueError("boom before head")
+
+
+async def test_h2_a_request_body_error_before_the_head_surfaces_to_the_caller() -> None:
+    # The echo server answers only on end-of-stream, so the head never arrives before the
+    # body raises: this exercises failing a stream whose head has not yet been set.
+    async with (
+        _raw_h2_server(await _echo_h2_server()) as (host, port),
+        ConnectionPool(force_http2_cleartext=True) as pool,
+    ):
+        with pytest.raises(ValueError, match="boom before head"):
+            async with pool.request(
+                "POST", f"http://{host}:{port}/", body=_raising_body(b"partial")
+            ) as _r:  # pragma: no branch
+                pass  # pragma: no cover
+
+
+async def _big_body() -> AsyncIterator[bytes]:
+    for _ in range(64):  # pragma: no branch - cancelled by the reset before the loop finishes
+        yield b"z" * 100_000  # far past the flow-control window, so the send is still in flight on reset
+
+
+async def test_h2_a_reset_during_a_large_upload_surfaces_and_does_not_strand() -> None:
+    async def reset_on_request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        conn = _new_h2()
+        conn.initiate_connection()
+        writer.write(conn.data_to_send())
+        await writer.drain()
+        with suppress(ConnectionResetError, OSError):
+            while chunk := await reader.read(65536):
+                for event in conn.receive_data(chunk):
+                    if isinstance(event, h2.events.RequestReceived):
+                        conn.reset_stream(event.stream_id, error_code=h2.errors.ErrorCodes.INTERNAL_ERROR)
+                writer.write(conn.data_to_send())
+                await writer.drain()
+        writer.close()
+
+    async with _raw_h2_server(reset_on_request) as (host, port), ConnectionPool(force_http2_cleartext=True) as pool:
+        with pytest.raises(ConnectionError, match="reset the HTTP/2 stream"):
+            async with pool.request("POST", f"http://{host}:{port}/", body=_big_body()) as _r:  # pragma: no branch
+                pass  # pragma: no cover
+
+
+async def _head_status(pool: ConnectionPool, url: str) -> int:
+    async with pool.request("GET", url) as (head, _body):
+        return head.status
+
+
+async def test_h2_gates_new_streams_at_the_server_max_concurrent_streams() -> None:
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        conn = _new_h2()
+        conn.initiate_connection()
+        conn.update_settings({h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS: 1})
+        writer.write(conn.data_to_send())
+        await writer.drain()
+        with suppress(ConnectionResetError, OSError):
+            while chunk := await reader.read(65536):
+                for event in conn.receive_data(chunk):
+                    if isinstance(event, h2.events.RequestReceived):
+                        # Head only, no END_STREAM: the stream stays open and keeps its slot.
+                        conn.send_headers(event.stream_id, [(b":status", b"200")])
+                writer.write(conn.data_to_send())
+                await writer.drain()
+        writer.close()
+
+    async with _raw_h2_server(handle) as (host, port), ConnectionPool(force_http2_cleartext=True) as pool:
+        url = f"http://{host}:{port}/"
+        async with pool.request("GET", url) as (head, _body):
+            assert head.status == 200
+            # The server advertised one stream, held open by this request, so a second
+            # cannot be issued until this one's slot frees.
+            second = asyncio.create_task(_head_status(pool, url))
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(second), timeout=0.3)
+        # Leaving the block resets this stream, freeing the slot; the second proceeds.
+        assert await asyncio.wait_for(second, timeout=5) == 200

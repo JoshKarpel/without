@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from collections.abc import Awaitable
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from contextlib import suppress
 from datetime import timedelta
@@ -18,7 +20,19 @@ from without_asgi import make_asgi_app
 from without_asgi.routing import buffered
 from without_http import serving
 from without_http.server import _address
+from without_http.server import _Limits
 from without_http.server import _LiveConnections
+from without_http.server import _serve_h11_connection
+
+type _Endpoint = tuple[asyncio.StreamReader, asyncio.StreamWriter]
+type _StreamPairFactory = Callable[[], Awaitable[tuple[_Endpoint, _Endpoint]]]
+
+_DEFAULT_LIMITS = _Limits(
+    max_concurrent_streams=100,
+    max_stream_resets=200,
+    idle_timeout=None,
+    max_websocket_message_bytes=None,
+)
 
 
 async def echo_app(scope: RawMessage, receive: Receive, send: Send) -> None:
@@ -204,6 +218,32 @@ async def test_a_malformed_request_gets_a_400() -> None:
             await writer.wait_closed()
 
     assert status_line.startswith(b"HTTP/1.1 400")
+
+
+async def test_a_malformed_request_lingers_so_the_client_reads_the_error(
+    stream_pair: _StreamPairFactory,
+) -> None:
+    # Drive the connection loop directly over a socketpair (not through `serving`, whose
+    # shutdown would cancel the connection mid-linger) so the lingering close runs to
+    # completion: the peer must read the whole `400` even though it half-closed while the
+    # server was still parsing, instead of losing it to an `RST`.
+    (server_reader, server_writer), (client_reader, client_writer) = await stream_pair()
+    client_writer.write(b"!!! not a valid request line !!!\r\n\r\n")
+    await client_writer.drain()
+    client_writer.write_eof()  # the peer stops sending; the server's linger drains to EOF
+
+    await _serve_h11_connection(
+        echo_app,
+        server_reader,
+        server_writer,
+        initial=b"",
+        secure=False,
+        server=None,
+        client=None,
+        limits=_DEFAULT_LIMITS,
+    )
+
+    assert (await client_reader.read()).startswith(b"HTTP/1.1 400")
 
 
 async def test_reports_in_flight_connections_while_a_request_is_served() -> None:

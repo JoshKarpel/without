@@ -12,6 +12,26 @@
   full path, so reversing needs no router and holds no hidden prefix: a handler links by referencing
   a route value (immutable), and a websocket handler reverses an HTTP route to link to its resource
   with the same call.
+- **`without-http`**: granular client request timeouts. A `Timeout` value bounds each phase
+  independently (`connect`, `read`, `write`, `pool`), each a `timedelta` and an *inactivity* bound
+  that re-arms on progress, disabled by default (a deadline is the caller's policy, not the
+  transport's). Each axis applies through its own bound (`connecting()`, `reading()`, `writing()`,
+  `pooling()`), so the axis-to-error mapping lives on `Timeout` rather than at every call site. A
+  timeout raises a typed `ConnectTimeout` / `ReadTimeout` / `WriteTimeout` / `PoolTimeout` under
+  `HTTPTimeout` (itself a `TimeoutError`), so a caller can tell how far the request got and retry
+  the right ones. Also: per-host connection bounds and gating of HTTP/2 stream issuance against the
+  server's `SETTINGS_MAX_CONCURRENT_STREAMS`. `max_connections_per_host` bounds concurrent HTTP/1.1
+  connections to one origin (the acquire-wait the `pool` axis guards); `max_keepalive_per_host`
+  bounds how many *idle* connections are retained per origin once a burst subsides, so the pool ramps
+  up under load but settles back down when quiet. Both unbounded by default, and must be `>= 1` when
+  set.
+- **`without-http`**: TCP keepalive on pooled client connections, on by default and configured with a
+  `TCPKeepalive` value on the pool (`idle`/`interval` as `timedelta`s, `count`, or `None` to disable).
+  The kernel probes
+  an otherwise-idle connection and drops it when a peer has vanished *silently* (a crash, a partition, a
+  NAT dropping the flow), which a clean server-side close does not: that sends a `FIN` the pool already
+  detects before reuse. This matters most because request timeouts are disabled by default, so nothing
+  else would notice a dead idle socket until a request hung on it.
 
 ### Changed
 
@@ -24,6 +44,18 @@
   a nested opaque app is trimmed by its full accumulated prefix by construction. Reverse routing is
   now the free `url_for` function rather than a `Router.url_for` method plus a `url_for()` extractor
   injected through `Match`.
+- **`without-http`**: the client sends the request body concurrently with reading the response
+  (consumer-driven duplex) instead of sending it whole first. A server can now answer early (a `413`,
+  a redirect) without deadlocking a large upload, and a caller can drive genuine bidirectional
+  streaming over HTTP/2: the request head is sent before the first body chunk is produced, so both a
+  client-speaks-first duplex (feed a queue-backed body in reaction to the response) and a
+  server-speaks-first one (let the server respond before any body chunk is ready) work. Connection
+  teardown is a single release-exactly-once path shared by the background sender and the response body.
+  Closing an early-answered HTTP/1.1 connection is now a bounded *lingering close* (a half-close `FIN`
+  plus a short, fixed drain window, never draining to end-of-input) rather than a reset that could
+  race ahead of and discard the response the server already sent, and the client stops streaming its
+  body the moment the peer half-closes rather than writing on into a closing connection. See the new
+  [Security](https://without.help/without-http/security/) page.
 
 ## 0.0.1
 

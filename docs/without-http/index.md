@@ -63,7 +63,10 @@ What the server handles:
   per-stream `WINDOW_UPDATE` flow control. The same `without-asgi` server-direction
   codecs carry over; only the wire mapping (`h2_wire`) is new.
 - **Keep-alive.** Sequential requests on one HTTP/1.1 connection reuse it
-  (`h11`'s `start_next_cycle`).
+  (`h11`'s `start_next_cycle`). A connection closed with an unread request body
+  (an early response) is closed *gracefully*, with a bounded lingering `FIN`
+  rather than a reset that could discard the response: see
+  [Security](security.md#early-responses-and-connection-close).
 - **WebSockets** over the HTTP/1.1 `Upgrade`: the handshake is handed to `wsproto`,
   and the connection runs full-duplex (a reader pump feeds inbound frames to the
   app's `receive` while `send` writes outbound frames). A `websocket.close` sent
@@ -195,6 +198,165 @@ async with ConnectionPool(allow_http2=True, ssl_context_factory=make_ctx) as poo
 Open the pool as an async context manager so its connections are closed on exit; a
 directly-constructed `ConnectionPool()` works for short-lived use but does not manage
 the long-lived connections keep-alive retains.
+
+`max_connections_per_host` bounds the concurrent HTTP/1.1 connections to one origin:
+at the bound a checkout *waits* for one to be returned rather than opening another
+(the wait a `pool` timeout guards). It is unbounded by default, mirroring the
+server's choice to let OS backpressure cap connections rather than an in-process
+limit; opt into a bound when you want explicit per-host backpressure. The h2 side has
+an intrinsic sibling: stream issuance is gated against the server's advertised
+`SETTINGS_MAX_CONCURRENT_STREAMS`, so a burst never over-issues streams on the one
+multiplexed connection.
+
+`max_keepalive_per_host` bounds a different axis: how many *idle* HTTP/1.1
+connections are retained per origin once a burst subsides. Where the peak cap governs
+how high the pool climbs under concurrent load, the idle cap governs how much it holds
+onto when quiet: at the cap a returned connection is closed instead of pooled, so the
+pool ramps up to `max_connections_per_host` under load but settles back down to
+`max_keepalive_per_host` afterward rather than leaving every socket open. It is
+unbounded by default (every reusable connection is kept); a value above
+`max_connections_per_host` is never reached, since idle connections cannot outnumber
+concurrent checkouts. Both knobs, when set, must be `>= 1`.
+
+### Duplex and bidirectional streaming
+
+The request body and the response are handled **concurrently**: the body is sent by
+a background task while the response head and body are read, so a server can answer
+before the request body is fully sent. This is what lets a client survive the classic
+large-upload deadlock, where a server rejects a big upload early (a `413`, a redirect)
+and stops reading: the early response is read even though the request-body write is
+still backed up on the wire.
+
+Because the request body is a lazy `Stream[bytes]`, this extends to genuine
+bidirectional streaming: hand `pool.request` a queue-backed generator and feed it
+*in reaction to* the response you are reading (the gRPC ping-pong shape).
+
+```python
+outbound: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+async def request_body() -> AsyncIterator[bytes]:
+    while (chunk := await outbound.get()) is not None:
+        yield chunk
+
+await outbound.put(first_message)          # client speaks first
+async with pool.request("POST", url, body=request_body()) as (head, body):
+    async for message in body:
+        await outbound.put(reply_to(message))   # or None to end the request
+```
+
+The framework provides the *mechanism* (a concurrent duplex transport); you own the
+*policy* (the interleaving protocol, and the knowledge of the server's contract that
+keeps it from deadlocking). It deliberately does not buffer or force the body to
+finish first, since that would defeat the pattern. A `write`/`read` timeout (below) is
+the opt-in safety net that turns a mis-designed interleaving from an eternal hang into
+a typed error you chose to arm.
+
+This is genuinely correct over **HTTP/2**, whose independent per-direction flow
+control is what bidi is built on. The request head is sent immediately, before the
+first body chunk is produced, so both a *client-speaks-first* duplex (send an opening
+chunk, then feed more in reaction to the response) and a *server-speaks-first* one (let
+the server respond before any body chunk is ready) work over one request. Over
+**HTTP/1.1** the same code runs, but real duplex is limited by server and proxy support
+in the wild; there the concurrency buys the deadlock fix rather than a promise of robust
+bidi.
+
+Answering early and closing safely has a security dimension on both sides (the
+client stops sending on the peer's half-close; the server closes with a bounded
+lingering `FIN` rather than an `RST` that could discard its own response). See
+[Security](security.md#early-responses-and-connection-close).
+
+### Timeouts
+
+By default a request has **no timeouts**: a hung connect or a stalled server blocks
+until you cancel it. A timeout is a *policy* keyed to your time budget ("fail rather
+than make slow progress, so my caller can react"), which the transport cannot know,
+so you opt in per phase with a `Timeout` value, on the pool or per request:
+
+```python
+from datetime import timedelta
+
+from without_http import Timeout
+
+async with ConnectionPool(timeout=Timeout(connect=timedelta(seconds=10), read=timedelta(seconds=30))) as pool:
+    async with pool.request("GET", url, timeout=Timeout(read=timedelta(seconds=5))) as (head, body):
+        ...
+```
+
+Each axis is a `timedelta`, so the unit is explicit rather than an ambiguous bare
+number, and an *inactivity* bound (it re-arms on progress), not a total deadline:
+`read`/`write` bound the gap between chunks, so a slow-but-progressing transfer is
+not killed. Every field defaults to `None` (that axis disabled), and there is no
+shared-default scalar, since one duration across four unrelated phases carries no
+meaning. A per-request `Timeout` *replaces* the pool's wholesale (it does not layer
+through middleware; `None` inherits the pool default). For an overall wall-clock cap,
+compose one on the substrate: `async with asyncio.timeout(t): pool.request(...)`.
+
+**What each axis bounds** (what is actually happening on the wire; the thing most
+clients leave you to guess at):
+
+| Axis | Phase it bounds | On the network |
+|---|---|---|
+| `connect` | DNS + TCP connect, and (over TLS) the handshake | one `open_connection` await; ALPN is negotiated here |
+| `write` | making progress sending a request-body chunk | a socket write + `drain`; over h2, waiting for the flow-control window |
+| `read` | waiting for the next response chunk (head, body, trailers) | a socket read; over h2, the next `DATA` for this stream |
+| `pool` | acquiring a connection slot | *nothing on the wire*: the per-host bound or the h2 stream gate |
+
+Over HTTP/2 the read/write axes measure *per-stream* progress, not socket progress:
+a `read` timeout means "no `DATA` for **my** stream in N seconds" even while the
+socket is busy with other streams.
+
+**What to do when one fires.** Each axis raises a typed error under `HTTPTimeout`
+(itself a `TimeoutError`), so a coarse `except TimeoutError` catches any while the
+specific type tells you *how far the request got*, which is what determines the safe
+recovery:
+
+| Fired | Request got as far as | Safe to retry? |
+|---|---|---|
+| `PoolTimeout` | never left the process | **always**; usually the real fix is local backpressure, not retrying the peer |
+| `ConnectTimeout` | no connection established | **always**, even a non-idempotent request, or fail over to another origin |
+| `WriteTimeout` | mid-sending the request | idempotent: yes; otherwise ambiguous. The connection is discarded, so a retry gets a fresh one |
+| `ReadTimeout` | request fully sent, awaiting the response | only if idempotent (the server may already have processed it); if mid-body, decide keep-vs-discard the partial |
+
+### TCP keepalive
+
+Pooled connections outlive the request that opened them, so a kept-alive socket can
+sit idle for a long time between uses. Two things can end it while it waits, and they
+need different handling:
+
+- A server *cleanly* closing its end of an idle keep-alive connection sends a
+  `TCP FIN`, which asyncio surfaces on the event loop. The pool notices it before
+  reuse (the checkout skips a connection that is closing or at EOF) and opens a fresh
+  one, so this common case needs nothing from you.
+- A peer that *silently* vanishes (a crashed server, a network partition, a NAT or
+  firewall dropping the flow) sends no `FIN`. Nothing surfaces on the event loop, so
+  the dead socket looks reusable until a request stalls on it. With no request
+  timeouts armed (the default), that stall has nothing to bound it.
+
+TCP keepalive closes that second gap: the kernel probes an otherwise-idle connection
+and tears it down when the peer stops answering, independent of any request. It is
+**on by default** with modest probe timing, configured with a `TCPKeepalive` value on
+the pool:
+
+```python
+from datetime import timedelta
+
+from without_http import ConnectionPool, TCPKeepalive
+
+# The default: probe after 60s idle, every 10s, drop after 6 unanswered probes.
+async with ConnectionPool() as pool:
+    ...
+
+# Tune the probe timing, or pass None to disable keepalive entirely.
+keepalive = TCPKeepalive(idle=timedelta(seconds=30), interval=timedelta(seconds=5), count=4)
+async with ConnectionPool(tcp_keepalive=keepalive) as pool:
+    ...
+```
+
+`idle` and `interval` are `timedelta`s and MUST be a whole number of seconds (the
+underlying options carry only integer seconds, so a sub-second component is rejected
+at construction rather than silently truncated); `count` is a plain probe count. `SO_KEEPALIVE` is enabled portably; the per-probe
+tuning maps to the Linux `TCP_KEEPIDLE`/`TCP_KEEPINTVL`/`TCP_KEEPCNT` socket options,
+and a platform that lacks one of those knobs keeps its own default for that axis.
 
 ### Client middleware
 

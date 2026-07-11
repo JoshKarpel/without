@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import socket
 import ssl
+from collections.abc import AsyncIterator
+from collections.abc import Awaitable
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -9,6 +14,41 @@ import trustme
 from without_http import server_ssl_context
 
 HOST = "127.0.0.1"
+
+type _Endpoint = tuple[asyncio.StreamReader, asyncio.StreamWriter]
+type _StreamPairFactory = Callable[[], Awaitable[tuple[_Endpoint, _Endpoint]]]
+
+
+@pytest.fixture
+async def stream_pair() -> AsyncIterator[_StreamPairFactory]:
+    """
+    A factory for two connected asyncio stream endpoints over a local socketpair.
+
+    Gives a test both ends of a real connection with nothing in between, so it can drive
+    the exact bytes and (half-)close timing a connection-lifecycle test needs, without a
+    `serving()` accept loop that would cancel the connection out from under it.
+    """
+    writers: list[asyncio.StreamWriter] = []
+
+    async def make() -> tuple[_Endpoint, _Endpoint]:
+        left, right = socket.socketpair()
+        loop = asyncio.get_running_loop()
+
+        async def wrap(sock: socket.socket) -> _Endpoint:
+            reader = asyncio.StreamReader()
+            protocol = asyncio.StreamReaderProtocol(reader)
+            transport, _ = await loop.create_connection(lambda: protocol, sock=sock)
+            writer = asyncio.StreamWriter(transport, protocol, reader, loop)
+            writers.append(writer)
+            return reader, writer
+
+        return await wrap(left), await wrap(right)
+
+    yield make
+    for writer in writers:
+        writer.close()
+        with suppress(OSError):
+            await writer.wait_closed()
 
 
 @pytest.fixture(scope="session")

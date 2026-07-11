@@ -101,6 +101,7 @@ nav:
   - without-http:
       - without-http/index.md
       - without-http/cookies.md
+      - without-http/security.md
       - Reference: without-http/reference.md
   - without-dag:
       - without-dag/index.md

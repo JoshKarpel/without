@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
 from collections.abc import AsyncIterator
+from collections.abc import Awaitable
+from collections.abc import Callable
 from dataclasses import replace
 from urllib.parse import urlsplit
 
+import h11
 import pytest
 from without_asgi import RawScope
 from without_asgi import Receive
@@ -26,6 +30,9 @@ from without_http.client import _REDIRECT_STATUSES
 from without_http.client import _build_request
 from without_http.client import _Http11Connection
 from without_http.client import _origin
+
+type _Endpoint = tuple[asyncio.StreamReader, asyncio.StreamWriter]
+type _StreamPairFactory = Callable[[], Awaitable[tuple[_Endpoint, _Endpoint]]]
 
 
 async def _read_body(receive: Receive) -> bytes:
@@ -178,7 +185,7 @@ async def sized_echo_app(scope: RawScope, receive: Receive, send: Send) -> None:
 
 
 def _only_idle(pool: ConnectionPool) -> list[_Http11Connection]:
-    return list(next(iter(pool._idle_h11.values())))
+    return list(next(iter(pool._h11.values())).idle)
 
 
 async def test_keep_alive_reuses_one_connection_for_sequential_requests() -> None:
@@ -191,6 +198,157 @@ async def test_keep_alive_reuses_one_connection_for_sequential_requests() -> Non
         async with pool.request("GET", url) as (_head, body):
             assert await body.read() == b"GET /items body="
         assert _only_idle(pool) == kept
+
+
+def _idle_count(pool: ConnectionPool) -> int:
+    return sum(len(host_pool.idle) for host_pool in pool._h11.values())
+
+
+async def early_reject_app(scope: RawScope, receive: Receive, send: Send) -> None:
+    """Answer `413` immediately, without ever draining the request body."""
+    if scope["type"] != "http":
+        raise RuntimeError("this app serves only http")
+    await send({"type": "http.response.start", "status": 413, "headers": [(b"content-length", b"0")]})
+    await send({"type": "http.response.body", "body": b""})
+
+
+async def _large_upload() -> AsyncIterator[bytes]:
+    for _ in range(64):  # pragma: no branch - the early response cancels this before the loop finishes
+        yield b"x" * 100_000  # ~6.4 MB, far past any socket buffer, so the write must block
+
+
+async def test_early_response_to_a_large_upload_does_not_deadlock() -> None:
+    async def post_status(pool: ConnectionPool, url: str) -> int:
+        async with pool.request("POST", url, body=_large_upload()) as (head, body):
+            await body.read()
+            return head.status
+
+    async with serving(early_reject_app) as server, ConnectionPool(max_connections_per_host=1) as pool:
+        url = f"http://{server.host}:{server.port}/upload"
+        # Without concurrent send/read this hangs: the body write blocks on backpressure
+        # forever and the early 413 is never read. wait_for bounds the regression.
+        assert await asyncio.wait_for(post_status(pool, url), timeout=10) == 413
+        assert _idle_count(pool) == 0  # the unfinished upload is never a reusable connection
+        # A second request proves the single permit was released, not stranded.
+        assert await asyncio.wait_for(post_status(pool, url), timeout=10) == 413
+
+
+async def test_send_body_stops_at_a_chunk_boundary_when_the_peer_half_closes(
+    stream_pair: _StreamPairFactory,
+) -> None:
+    (client_reader, client_writer), (peer_reader, peer_writer) = await stream_pair()
+    connection = _Http11Connection.new(client_reader, client_writer)
+    url = "http://upstream/upload"
+
+    async def body() -> AsyncIterator[bytes]:
+        yield b"first-chunk"
+        peer_writer.write_eof()  # the peer half-closes after the first chunk
+        assert await client_reader.read() == b""  # ...and the client observes the FIN
+        yield b"second-chunk"  # pulled, but the send stops before writing it
+
+    request = _build_request("POST", url, (), body())
+    await connection.send_head(request, urlsplit(url))
+    await connection.send_body(request)
+    client_writer.write_eof()
+    sent = await peer_reader.read()
+
+    assert b"first-chunk" in sent  # the pre-close chunk went out
+    assert b"second-chunk" not in sent  # the post-close chunk was pulled but never written
+    assert connection._conn.our_state is h11.SEND_BODY  # the body was never framed to its end
+
+
+async def test_send_body_skips_the_end_of_message_when_the_peer_half_closes(
+    stream_pair: _StreamPairFactory,
+) -> None:
+    (client_reader, client_writer), (peer_reader, peer_writer) = await stream_pair()
+    connection = _Http11Connection.new(client_reader, client_writer)
+    url = "http://upstream/upload"
+
+    async def body() -> AsyncIterator[bytes]:
+        yield b"only-chunk"
+        peer_writer.write_eof()  # the peer half-closes just as the body ends
+        assert await client_reader.read() == b""
+
+    request = _build_request("POST", url, (), body())
+    await connection.send_head(request, urlsplit(url))
+    await connection.send_body(request)
+    client_writer.write_eof()
+    sent = await peer_reader.read()
+
+    # The body drains fully, but the trailing EndOfMessage (a chunked `0\r\n\r\n`
+    # terminator) is suppressed by the half-close, leaving the request unfinished.
+    assert b"only-chunk" in sent
+    assert b"0\r\n\r\n" not in sent
+    assert connection._conn.our_state is h11.SEND_BODY
+
+
+async def _raising_body() -> AsyncIterator[bytes]:
+    yield b"first"
+    raise ValueError("body generator blew up")
+
+
+async def test_a_request_body_generator_error_surfaces_to_the_caller() -> None:
+    async with serving(echo_app) as server, ConnectionPool(max_connections_per_host=1) as pool:
+        url = f"http://{server.host}:{server.port}/up"
+        with pytest.raises(ValueError, match="body generator blew up"):
+            # The echo server waits for the whole body, so the head never arrives: the error
+            # surfaces as the request is made, before the response body is ever read.
+            async with pool.request("POST", url, body=_raising_body()) as (_head, body):  # pragma: no branch
+                await body.read()  # pragma: no cover
+        assert _idle_count(pool) == 0  # the broken exchange leaves nothing pooled
+        # The permit was freed despite the error, so the origin is not starved.
+        async with pool.request("GET", url) as (head, _body):
+            assert head.status == 200
+
+
+async def test_max_connections_per_host_serializes_concurrent_requests() -> None:
+    async with serving(sized_echo_app) as server, ConnectionPool(max_connections_per_host=1) as pool:
+        url = f"http://{server.host}:{server.port}/items"
+        async with pool.request("GET", url) as (head, first):
+            assert head.status == 200
+            # `first` holds the origin's only permit until its body is read, so a second
+            # request to the same origin must wait rather than open a second connection.
+            second = asyncio.create_task(_read_one(pool, url))
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(second), timeout=0.2)
+            assert await first.read() == b"GET /items body="  # releases the permit
+        assert await second == b"GET /items body="
+
+
+async def _read_one(pool: ConnectionPool, url: str) -> bytes:
+    async with pool.request("GET", url) as (_head, body):
+        return await body.read()
+
+
+async def test_max_keepalive_per_host_caps_retained_idle_connections() -> None:
+    async with serving(sized_echo_app) as server, ConnectionPool(max_keepalive_per_host=1) as pool:
+        url = f"http://{server.host}:{server.port}/items"
+        # Two overlapping requests force two live connections (no peak bound is set), so the
+        # pool ramps up under load past the idle cap.
+        async with (
+            pool.request("GET", url) as (_first_head, first),
+            pool.request("GET", url) as (_second_head, second),
+        ):
+            assert await first.read() == b"GET /items body="
+            assert await second.read() == b"GET /items body="
+        # Both are reusable on return, but the idle list settles back to the cap: the first
+        # returned is retained and the second is closed rather than pooled.
+        assert _idle_count(pool) == 1
+
+
+@pytest.mark.parametrize(
+    ("knob", "make_pool"),
+    [
+        ("max_connections_per_host", lambda value: ConnectionPool(max_connections_per_host=value)),
+        ("max_keepalive_per_host", lambda value: ConnectionPool(max_keepalive_per_host=value)),
+    ],
+)
+@pytest.mark.parametrize("value", [0, -1])
+def test_non_positive_per_host_bounds_are_rejected(
+    knob: str, make_pool: Callable[[int], ConnectionPool], value: int
+) -> None:
+    with pytest.raises(ValueError, match=f"{knob} must be >= 1 when set, got {value}"):
+        make_pool(value)
 
 
 async def test_a_stale_pooled_connection_is_replaced_with_a_fresh_one() -> None:
@@ -212,7 +370,7 @@ async def test_cleartext_h2c_uses_http_2_by_prior_knowledge() -> None:
             assert head.status == 200
             assert await body.read() == b"GET /items test= body="
         assert len(pool._h2) == 1
-        assert pool._idle_h11 == {}
+        assert pool._h11 == {}
 
 
 async def _chunks(*parts: bytes) -> AsyncIterator[bytes]:
@@ -443,16 +601,17 @@ async def test_follow_redirects_refuses_an_https_to_http_downgrade() -> None:
     assert len(inner.requests) == 1
 
 
-async def test_returning_an_h11_connection_to_a_closed_pool_closes_it() -> None:
+async def test_checking_in_to_a_closed_host_pool_closes_the_connection() -> None:
     async with serving(sized_echo_app) as server, ConnectionPool() as pool:
         url = f"http://{server.host}:{server.port}/items"
         async with pool.request("GET", url) as (_head, body):
             assert await body.read() == b"GET /items body="
-        (connection,) = _only_idle(pool)
-        pool._idle_h11.clear()
-        pool._closed = True
+        host_pool = next(iter(pool._h11.values()))
+        (connection,) = host_pool.idle
+        host_pool.idle.clear()
+        host_pool.closed = True
 
-        pool._return_h11(_origin(urlsplit(url)), connection)
+        await host_pool.checkin(connection, reusable=True)
 
-        assert pool._idle_h11 == {}
+        assert host_pool.idle == []
         assert connection._writer.is_closing()
