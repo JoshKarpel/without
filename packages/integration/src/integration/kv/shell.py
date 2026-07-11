@@ -171,6 +171,8 @@ async def serve[In, Out](
                 await writer.drain()
         except ConnectionError:  # client reset the connection (read or write); this session is simply over
             pass
+        except asyncio.QueueShutDown:  # the drain shut the inbox as this session was still arriving; it just ends
+            pass
         finally:
             writer.close()
 
@@ -192,8 +194,15 @@ async def serve[In, Out](
         server.close()  # stop accepting new connections; in-flight ones keep going
         try:
             async with timeout(settings.drain_timeout):  # ONE global budget for the whole graceful drain
-                if connections:
+                # A connection accepted just before close() registers its session through a
+                # call_soon'd connection_made, so a just-arrived one may not be in `connections`
+                # yet. Yield to surface those callbacks, then wait out every session, re-looping
+                # since one can finish or newly appear across turns. The inbox stays open the whole
+                # time, so a late session's asks are still answered before we signal end-of-stream.
+                await asyncio.sleep(0)
+                while connections:
                     await asyncio.wait(connections)  # each session finishes: its client hangs up, the consumer answers
+                    await asyncio.sleep(0)
                 inbox.shutdown()  # sessions all done, so no more asks; the consumer drains the rest and returns
                 await asyncio.wait([consumer_task])
         except TimeoutError:
