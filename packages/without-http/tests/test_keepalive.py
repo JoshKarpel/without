@@ -111,6 +111,6 @@ def test_pool_enables_keepalive_by_default() -> None:
     [lambda d: TCPKeepalive(idle=d), lambda d: TCPKeepalive(interval=d)],
     ids=["idle", "interval"],
 )
-def test_a_sub_second_probe_duration_is_rejected(make: Callable[[timedelta], TCPKeepalive]) -> None:
+def test_a_fractional_second_probe_duration_is_rejected(make: Callable[[timedelta], TCPKeepalive]) -> None:
     with pytest.raises(ValueError, match="must be a whole number of seconds"):
         make(timedelta(milliseconds=1500))
