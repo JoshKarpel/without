@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from contextlib import AsyncExitStack
+from contextlib import aclosing
 from dataclasses import dataclass
 from typing import assert_never
 
@@ -165,6 +166,8 @@ def make_asgi_app[T](
     scope it calls the matching handler with the state threaded in, wraps
     `receive` into the inbound event stream, runs the returned `Processor`, and
     drains its outbound stream into `send`: the handler only ever sees streams.
+    The inbound stream is closed when the handler exits, so a handler that
+    abandons the request body early does not leave it dangling for GC.
 
     Each protocol's router defaults to one that refuses the connection, so an app
     serves a protocol only by passing its own router (an HTTP-only app passes
@@ -182,9 +185,14 @@ def make_asgi_app[T](
             case LifespanScope():
                 await _drive(lifespan, cell, receive, send)
             case HttpScope() as head:
-                await http_outbound(send)(http(cell.require(), head)(http_inbound(receive)))
+                # `aclosing` closes the inbound stream when the handler exits, so a
+                # handler that abandons the request body early does not leave the
+                # generator (and any resource its `finally` releases) dangling for GC.
+                async with aclosing(http_inbound(receive)) as inbound:
+                    await http_outbound(send)(http(cell.require(), head)(inbound))
             case WebsocketScope() as head:
-                await websocket_outbound(send)(websocket(cell.require(), head)(websocket_inbound(receive)))
+                async with aclosing(websocket_inbound(receive)) as inbound:
+                    await websocket_outbound(send)(websocket(cell.require(), head)(inbound))
             case _ as unreachable:
                 assert_never(unreachable)
 
