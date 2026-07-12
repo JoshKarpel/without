@@ -53,6 +53,15 @@
   `V | None`, `None` when absent). A duplicated value raises `ValueError` in both (a duplicated
   singleton violates RFC 9110 §5.3). Reading a single value stays a policy the call site chooses
   rather than a second extractor.
+- **`without-web`**: `ExtractionError`, a `ValueError` subtype that marks a request rejected *while
+  its typed values were being extracted*. At dispatch the router wraps any `ValueError` an extractor
+  raises (a `once`/`optional` cardinality check, a converter, a `parse` callback, a pydantic
+  `ValidationError`) in this type, chaining the original as `__cause__`. That makes the extraction
+  boundary a single, matchable failure: a `recover` policy maps `case ExtractionError()` to a 4xx,
+  while a plain `ValueError` raised deeper in a handler now surfaces as a 500 rather than
+  masquerading as a client 400. The original (with a body's `ValidationError` detail) stays on
+  `__cause__`, so a policy can still map `case ExtractionError(__cause__=ValidationError())`
+  separately (a 422 for an invalid body versus a 400 for a bad query/header value).
 
 ### Changed
 

@@ -9,6 +9,7 @@ from without_web.exceptions import WebsocketExceptionRecover
 from without_web.exceptions import catching
 from without_web.exceptions import catching_websocket
 from without_web.extractors import BufferedRequest
+from without_web.extractors import ExtractionError
 from without_web.extractors import Extractor
 from without_web.extractors import HttpRequestHead
 from without_web.extractors import RequestHead
@@ -90,6 +91,7 @@ __all__ = [
     "Describable",
     "Endpoint",
     "ExceptionRecover",
+    "ExtractionError",
     "Extractor",
     "HeaderParam",
     "HttpEndpoint",

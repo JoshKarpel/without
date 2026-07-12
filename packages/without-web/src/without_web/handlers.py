@@ -21,6 +21,7 @@ from without_asgi import encode_response
 from without_asgi import read_body
 
 from without_web.extractors import BufferedRequest
+from without_web.extractors import ExtractionError
 from without_web.extractors import Extractor
 from without_web.extractors import HttpRequestHead
 from without_web.extractors import WebsocketRequestHead
@@ -1032,7 +1033,7 @@ def ws[T](
     def decorate(fn: Callable[..., WebsocketReturned]) -> WebsocketRoute[T]:
         def endpoint(state: T, match: Match[WebsocketScope]) -> WebsocketHandler:
             head = WebsocketRequestHead.parsed(scope=match.scope, path_params=match.params)
-            values = tuple(extractor.extract(head) for extractor in extractors)
+            values = _extract_all(extractors, head)
 
             def processor(inputs: Stream[WebsocketInbound]) -> Stream[WebsocketOutbound]:
                 return fn(state, *values, inputs)
@@ -1042,6 +1043,29 @@ def ws[T](
         return WebsocketRoute(_segments(pattern), endpoint)
 
     return decorate
+
+
+def _extract_all[C](extractors: tuple[Extractor[C, object], ...], head: C) -> tuple[object, ...]:
+    """
+    Run every extractor against the request head, turning a rejection into an
+    `ExtractionError` at this one boundary.
+
+    A `ValueError` from any extractor (a `once`/`optional` cardinality check, a
+    converter, a `parse` callback, a pydantic `ValidationError`) is the "reject this
+    request" signal; it is wrapped in `ExtractionError` (original chained as
+    `__cause__`) so a `recover` policy can map extraction failures distinctly from a
+    plain `ValueError` raised deeper in a handler. Any other exception is a bug and
+    propagates untouched.
+    """
+    values: list[object] = []
+    for extractor in extractors:
+        try:
+            values.append(extractor.extract(head))
+        except ExtractionError:
+            raise
+        except ValueError as exc:
+            raise ExtractionError(str(exc)) from exc
+    return tuple(values)
 
 
 async def _emit(result: Returned) -> AsyncIterator[Outbound]:
@@ -1082,7 +1106,7 @@ def _build_stream_endpoint(
 
     def endpoint(state: object, match: Match[HttpScope]) -> HttpHandler:
         head = HttpRequestHead.parsed(scope=match.scope, path_params=match.params)
-        values = tuple(extractor.extract(head) for extractor in extractors)
+        values = _extract_all(extractors, head)
 
         def processor(inputs: Stream[Inbound]) -> Stream[Outbound]:
             return _emit(fn(state, *values, inputs))
@@ -1124,5 +1148,5 @@ async def _reply(
 ) -> AsyncIterator[Outbound]:
     body = await read_body(inputs)
     head = BufferedRequest.buffered(scope=match.scope, path_params=match.params, body=body)
-    async for event in _emit(fn(state, *(extractor.extract(head) for extractor in extractors))):
+    async for event in _emit(fn(state, *_extract_all(extractors, head))):
         yield event

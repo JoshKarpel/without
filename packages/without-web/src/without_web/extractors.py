@@ -162,6 +162,27 @@ class Extractor(Generic[_C_contra, _V_co]):  # noqa: UP046 - PEP 695 infers a fr
     path: PathSpec | None = None
 
 
+class ExtractionError(ValueError):
+    """
+    A request rejected while its typed values were being extracted.
+
+    The router wraps any `ValueError` an extractor raises at dispatch (a `once`/
+    `optional` cardinality check, a converter, a `parse` callback, a pydantic
+    `ValidationError`) in this type, chaining the original as `__cause__`. That
+    makes the extraction boundary a single, matchable failure: a `recover` policy
+    maps `case ExtractionError()` to a 4xx, while a plain `ValueError` raised deeper
+    in a handler still surfaces as a 500 rather than masquerading as a client error.
+    Only `ValueError` is wrapped (the codebase's "reject" signal, the same one a
+    converter raises to backtrack the trie walk); any other exception during
+    extraction is a bug and propagates untouched.
+
+    The original exception (with its own message and, for a body, its
+    `ValidationError` detail) is always available as `__cause__`, so a policy can map
+    `case ExtractionError(__cause__=ValidationError())` distinctly (a 422 for an
+    invalid body versus a 400 for a bad query/header value).
+    """
+
+
 def path_param[V](name: str, converter: Converter[V]) -> Extractor[RequestHead, V]:
     """
     A typed path parameter: one value that is both a pattern segment and a read.
