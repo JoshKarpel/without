@@ -53,15 +53,17 @@
   `V | None`, `None` when absent). A duplicated value raises `ValueError` in both (a duplicated
   singleton violates RFC 9110 §5.3). Reading a single value stays a policy the call site chooses
   rather than a second extractor.
-- **`without-web`**: `ExtractionError`, a `ValueError` subtype that marks a request rejected *while
-  its typed values were being extracted*. At dispatch the router wraps any `ValueError` an extractor
-  raises (a `once`/`optional` cardinality check, a converter, a `parse` callback, a pydantic
-  `ValidationError`) in this type, chaining the original as `__cause__`. That makes the extraction
-  boundary a single, matchable failure: a `recover` policy maps `case ExtractionError()` to a 4xx,
-  while a plain `ValueError` raised deeper in a handler now surfaces as a 500 rather than
-  masquerading as a client 400. The original (with a body's `ValidationError` detail) stays on
-  `__cause__`, so a policy can still map `case ExtractionError(__cause__=ValidationError())`
-  separately (a 422 for an invalid body versus a 400 for a bad query/header value).
+- **`without-web`**: `ExtractionError`, a `ValueError` subtype marking a request rejected *while one
+  of its typed values was being extracted*. The `query_param`/`header_param`/`body` extractors raise
+  it directly when their `parse` rejects (a `once`/`optional` cardinality check, a converter, a
+  pydantic `ValidationError`), gathering at the raise site what a `recover` policy needs: `field`
+  names the request part that failed (the parameter name, or `None` for the body) and `cause` carries
+  the underlying error as a first-class value, so a policy matches
+  `case ExtractionError(cause=ValidationError())` for a 422 versus `case ExtractionError()` for a 400
+  naming the `field`, without reaching into `__cause__`. The router wraps any stray, unattributed
+  `ValueError` (from a custom extractor or an `into` factory) as a backstop. Making the boundary a
+  single matchable type is what lets a plain `ValueError` raised deeper in a handler surface as a 500
+  rather than masquerading as a client 400.
 
 ### Changed
 

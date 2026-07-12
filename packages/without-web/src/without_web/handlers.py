@@ -1047,15 +1047,15 @@ def ws[T](
 
 def _extract_all[C](extractors: tuple[Extractor[C, object], ...], head: C) -> tuple[object, ...]:
     """
-    Run every extractor against the request head, turning a rejection into an
-    `ExtractionError` at this one boundary.
+    Run every extractor against the request head, guaranteeing a rejection crosses
+    this boundary as an `ExtractionError`.
 
-    A `ValueError` from any extractor (a `once`/`optional` cardinality check, a
-    converter, a `parse` callback, a pydantic `ValidationError`) is the "reject this
-    request" signal; it is wrapped in `ExtractionError` (original chained as
-    `__cause__`) so a `recover` policy can map extraction failures distinctly from a
-    plain `ValueError` raised deeper in a handler. Any other exception is a bug and
-    propagates untouched.
+    The extractors already raise a rich, `field`-attributed `ExtractionError` (see
+    `without_web.extractors`); this is the backstop for the rest: a stray `ValueError`
+    from a custom extractor or an `into` factory is wrapped unattributed, and an
+    `ExtractionError` passes through untouched. Any other exception is a bug and
+    propagates, so a plain `ValueError` raised deeper in a handler still surfaces as a
+    500 rather than a client 4xx.
     """
     values: list[object] = []
     for extractor in extractors:
@@ -1064,7 +1064,7 @@ def _extract_all[C](extractors: tuple[Extractor[C, object], ...], head: C) -> tu
         except ExtractionError:
             raise
         except ValueError as exc:
-            raise ExtractionError(str(exc)) from exc
+            raise ExtractionError(str(exc), cause=exc) from exc
     return tuple(values)
 
 

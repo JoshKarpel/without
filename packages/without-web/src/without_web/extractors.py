@@ -164,23 +164,46 @@ class Extractor(Generic[_C_contra, _V_co]):  # noqa: UP046 - PEP 695 infers a fr
 
 class ExtractionError(ValueError):
     """
-    A request rejected while its typed values were being extracted.
+    A request rejected while one of its typed values was being extracted.
 
-    The router wraps any `ValueError` an extractor raises at dispatch (a `once`/
-    `optional` cardinality check, a converter, a `parse` callback, a pydantic
-    `ValidationError`) in this type, chaining the original as `__cause__`. That
-    makes the extraction boundary a single, matchable failure: a `recover` policy
-    maps `case ExtractionError()` to a 4xx, while a plain `ValueError` raised deeper
-    in a handler still surfaces as a 500 rather than masquerading as a client error.
-    Only `ValueError` is wrapped (the codebase's "reject" signal, the same one a
-    converter raises to backtrack the trie walk); any other exception during
-    extraction is a bug and propagates untouched.
+    The reject signal an extractor raises when a `parse` (a `once`/`optional`
+    cardinality check, a converter, a pydantic model) refuses the input. It gathers
+    at the raise site everything a `recover` policy needs to answer well: `field`
+    names the request part that failed (a query/header parameter name, or `None` for
+    the body), and `cause` carries the underlying error as a first-class value, so a
+    policy matches `case ExtractionError(cause=ValidationError())` to answer a 422
+    for an invalid body versus a 400 for a bad query/header value, without reaching
+    into `__cause__`.
 
-    The original exception (with its own message and, for a body, its
-    `ValidationError` detail) is always available as `__cause__`, so a policy can map
-    `case ExtractionError(__cause__=ValidationError())` distinctly (a 422 for an
-    invalid body versus a 400 for a bad query/header value).
+    A `ValueError` is the codebase's "reject" signal (the same one a converter
+    raises to backtrack the trie walk), so the extractors turn one into a rich
+    `ExtractionError`, and the router wraps any stray one left unattributed. Making
+    the boundary a single matchable type is what lets a plain `ValueError` raised
+    deeper in a handler still surface as a 500 rather than masquerading as a client
+    error.
     """
+
+    def __init__(self, message: str, *, field: str | None = None, cause: Exception | None = None) -> None:
+        super().__init__(message)
+        self.field = field
+        self.cause = cause
+
+
+def _parsed[X, V](field: str | None, parse: Callable[[X], V], value: X) -> V:
+    """
+    Apply `parse` to `value`, tagging a rejection with the `field` it came from.
+
+    An extractor names the request part it reads, so it is the layer that can turn a
+    bare `parse` `ValueError` into a `field`-attributed `ExtractionError` (carrying
+    the original as `cause`). An `ExtractionError` a `parse` raises itself is already
+    rich and passes through untouched.
+    """
+    try:
+        return parse(value)
+    except ExtractionError:
+        raise
+    except ValueError as exc:
+        raise ExtractionError(str(exc), field=field, cause=exc) from exc
 
 
 def path_param[V](name: str, converter: Converter[V]) -> Extractor[RequestHead, V]:
@@ -225,11 +248,12 @@ def query_param[V](
 
     `parse` receives the (possibly empty, possibly repeated) values for `name` as an
     immutable tuple and decides what their absence and multiplicity mean, returning
-    `V` or raising to reject. The `schema` is this value's OpenAPI contribution.
+    `V` or raising a `ValueError` to reject, which becomes an `ExtractionError`
+    naming this `name`. The `schema` is this value's OpenAPI contribution.
     """
 
     def extract(head: RequestHead) -> V:
-        return parse(head.query_params.get(name, ()))
+        return _parsed(name, parse, head.query_params.get(name, ()))
 
     return Extractor(extract, query=(QueryParam(name=name, schema=schema, required=required),))
 
@@ -241,12 +265,13 @@ def header_param[V](
     Parse a request header into `V`, given all of its raw values.
 
     Header names are matched case-insensitively; `parse` receives every value sent
-    under `name` as an immutable tuple, in order, and returns `V` or raises.
+    under `name` as an immutable tuple, in order, and returns `V` or raises a
+    `ValueError` to reject, which becomes an `ExtractionError` naming this `name`.
     """
     wanted = name.encode()
 
     def extract(head: RequestHead) -> V:
-        return parse(headers.get_all(head.scope.headers, wanted))
+        return _parsed(name, parse, headers.get_all(head.scope.headers, wanted))
 
     return Extractor(extract, headers=(HeaderParam(name=name, schema=schema, required=required),))
 
@@ -304,7 +329,9 @@ def body[V](
 
     `parse` is injected so `without-web` stays serialization-agnostic: an app
     passes a pydantic model's `model_validate_json`, a dataclass loader, or any
-    `bytes -> V`, and the matching `schema` is this value's OpenAPI request body.
+    `bytes -> V`, and the matching `schema` is this value's OpenAPI request body. A
+    `parse` that raises to reject (a pydantic `ValidationError`, say) becomes an
+    `ExtractionError` with no `field` (the body is unnamed), the original on `cause`.
 
     The buffered body lives on `BufferedRequest`, so that *is* this extractor's
     context: a `body` token on a bodyless streaming or websocket route is a static
@@ -313,7 +340,7 @@ def body[V](
     """
 
     def extract(head: BufferedRequest) -> V:
-        return parse(head.body)
+        return _parsed(None, parse, head.body)
 
     return Extractor(extract, request_body=Body(media_type=media_type, shape=Single(schema)))
 

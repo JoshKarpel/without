@@ -254,15 +254,16 @@ async def _recover(exc: Exception) -> Response | None:
     match exc:
         case TodoNotFound():
             return json_response(404, {"error": str(exc), "id": exc.todo_id})
-        # Extraction rejections arrive wrapped in `ExtractionError`, the original
-        # chained as `__cause__`: a body's pydantic `ValidationError` maps to a 422,
-        # any other bad value (a missing or duplicated `Idempotency-Key`) to a 400. A
-        # plain `ValueError` raised deeper in a handler is *not* an `ExtractionError`,
-        # so it falls through to a 500 rather than masquerading as a client 400.
-        case ExtractionError(__cause__=ValidationError() as invalid):
+        # An extraction rejection carries its underlying error as `cause` and the
+        # request part it came from as `field`: a body's pydantic `ValidationError`
+        # maps to a 422, any other bad value (a missing or duplicated
+        # `Idempotency-Key`) to a 400 naming the field. A plain `ValueError` raised
+        # deeper in a handler is *not* an `ExtractionError`, so it falls through to a
+        # 500 rather than masquerading as a client 400.
+        case ExtractionError(cause=ValidationError() as invalid):
             return json_response(422, {"error": "invalid todo body", "fields": invalid.error_count()})
         case ExtractionError():
-            return json_response(400, {"error": str(exc)})
+            return json_response(400, {"error": str(exc), "field": exc.field})
         case _:
             return None
 

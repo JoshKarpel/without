@@ -111,8 +111,15 @@ context `C` it reads) paired with the OpenAPI fragment it contributes.
 `path_param`, `query_param`, `header_param`, `body`, `catch_all`, `http_scope`,
 and `websocket_scope` build them. An extractor that raises *rejects* the request,
 mapped to a 4xx by the exception handlers; it never decides which handler runs.
-`http_scope()`/`websocket_scope()` hand back the unparsed scope, so "pass the
-scope down" and "parse parts of it" compose instead of competing.
+A rejecting `parse` (a `ValueError`) becomes an `ExtractionError` the extractor
+raises with everything a `recover` policy needs gathered at the raise site: the
+`field` it came from and the underlying error as a first-class `cause`, so a
+policy answers `case ExtractionError(cause=ValidationError())` with a 422 and
+`case ExtractionError()` with a 400 naming the `field`. Because that boundary is
+one matchable type, a plain `ValueError` raised deeper in a handler stays a 500
+instead of masquerading as a client 400. `http_scope()`/`websocket_scope()` hand
+back the unparsed scope, so "pass the scope down" and "parse parts of it" compose
+instead of competing.
 
 The context `C` is what makes the wrong extractor on the wrong route a *static*
 error rather than a runtime guard. It is a small lattice of request-head types:

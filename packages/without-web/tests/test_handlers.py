@@ -22,6 +22,9 @@ from without_asgi import WebsocketOutbound
 from without_asgi import WebsocketScope
 from without_web import INT
 from without_web import Describable
+from without_web import ExtractionError
+from without_web import Extractor
+from without_web import HttpRequestHead
 from without_web import Match
 from without_web import Single
 from without_web import body
@@ -32,6 +35,7 @@ from without_web import post
 from without_web import query_param
 from without_web import ws
 from without_web import ws_route
+from without_web.handlers import _extract_all
 
 
 def _scope(*, query: bytes = b"") -> HttpScope:
@@ -281,6 +285,17 @@ async def test_handle_stream_relays_a_handler_that_emits_nothing() -> None:
     handler = handle_stream(fn=make)("tenant", Match(_scope(), {}))
     events = [event async for event in handler(_chunks(b"ignored"))]
     assert events == []
+
+
+def test_extract_all_wraps_a_stray_value_error_as_an_unattributed_extraction_error() -> None:
+    def reject(head: object) -> object:
+        raise ValueError("deep reject")
+
+    head = HttpRequestHead.parsed(scope=_scope(), path_params={})
+    with pytest.raises(ExtractionError) as caught:
+        _extract_all((Extractor(reject),), head)
+    assert caught.value.field is None
+    assert str(caught.value) == "deep reject"
 
 
 def test_ws_route_wraps_a_pattern_and_endpoint() -> None:

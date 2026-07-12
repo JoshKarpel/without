@@ -185,6 +185,7 @@ async def test_creating_a_todo_without_the_idempotency_key_is_a_400() -> None:
     assert status == 400
     assert isinstance(body, dict)
     assert body["error"] == "expected exactly one value, got none"
+    assert body["field"] == "idempotency-key"
 
 
 async def test_creating_a_todo_with_a_duplicated_idempotency_key_is_a_400() -> None:
@@ -200,6 +201,7 @@ async def test_creating_a_todo_with_a_duplicated_idempotency_key_is_a_400() -> N
     assert status == 400
     assert isinstance(body, dict)
     assert body["error"] == "expected exactly one value, got 2"
+    assert body["field"] == "idempotency-key"
 
 
 async def test_import_echoes_each_todo_as_the_ndjson_stream_arrives() -> None:

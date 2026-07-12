@@ -11,6 +11,7 @@ from without_asgi import WebsocketScope
 from without_web import INT
 from without_web import Body
 from without_web import BufferedRequest
+from without_web import ExtractionError
 from without_web import HeaderParam
 from without_web import HttpRequestHead
 from without_web import QueryParam
@@ -135,9 +136,46 @@ def test_optional_rejects_a_repeated_value() -> None:
         parse((b"one", b"two"))
 
 
+def test_query_param_attributes_a_rejection_to_its_field_and_keeps_the_cause() -> None:
+    request = _request(query=b"count=nope")
+    extractor = query_param("count", once(int), schema={"type": "integer"})
+    with pytest.raises(ExtractionError) as caught:
+        extractor.extract(request)
+    assert caught.value.field == "count"
+    assert isinstance(caught.value.cause, ValueError)
+
+
+def test_header_param_attributes_a_rejection_to_its_field() -> None:
+    request = _request(headers=((b"idempotency-key", b"one"), (b"idempotency-key", b"two")))
+    extractor = header_param("idempotency-key", once(bytes.decode), schema={"type": "string"})
+    with pytest.raises(ExtractionError) as caught:
+        extractor.extract(request)
+    assert caught.value.field == "idempotency-key"
+    assert str(caught.value) == "expected exactly one value, got 2"
+
+
+def test_a_parse_that_raises_its_own_extraction_error_passes_through_unattributed() -> None:
+    request = _request(query=b"tag=x")
+
+    def reject(values: tuple[str, ...]) -> str:
+        raise ExtractionError("bespoke", field="elsewhere")
+
+    with pytest.raises(ExtractionError) as caught:
+        query_param("tag", reject, schema={"type": "string"}).extract(request)
+    assert caught.value.field == "elsewhere"
+
+
 def test_body_parses_the_buffered_bytes() -> None:
     request = BufferedRequest.buffered(scope=_scope(), path_params={}, body=b'{"count": 3}')
     assert body(json.loads, schema={"type": "object"}).extract(request) == {"count": 3}
+
+
+def test_body_attributes_a_rejection_to_no_field_and_keeps_the_cause() -> None:
+    request = BufferedRequest.buffered(scope=_scope(), path_params={}, body=b"not json")
+    with pytest.raises(ExtractionError) as caught:
+        body(json.loads, schema={"type": "object"}).extract(request)
+    assert caught.value.field is None
+    assert isinstance(caught.value.cause, ValueError)
 
 
 def test_http_scope_hands_back_the_unparsed_http_scope() -> None:
