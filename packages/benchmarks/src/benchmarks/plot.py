@@ -23,27 +23,31 @@ _POINT = re.compile(r"-r(\d+)-d(\d+)s$")
 
 # The matrix cells, each keyed by the harness's `{framework}+{server}` result-file
 # prefix but *ordered* and *labelled* server-first, so the plot groups by server
-# then framework: the two pure-Python `without-http` cells lead, the uvloop variant
-# bridges, then the two C-stack `uvicorn` cells. Reading top to bottom then walks
-# the server axis from slowest transport to fastest. A cell with no results is
+# then framework: the two pure-Python `without-http` cells lead, the two uvloop
+# variants bridge, then the two C-stack `uvicorn` cells. Reading top to bottom then
+# walks the server axis from slowest transport to fastest. A cell with no results is
 # skipped, so a plain two-server run still draws four series.
 _STACKS = (
     "without+without-http",
     "fastapi+without-http",
     "without+without-http-uvloop",
+    "fastapi+without-http-uvloop",
     "without+uvicorn",
     "fastapi+uvicorn",
 )
 
-# Five validated CVD-safe hues from the data-viz palette (worst adjacent ΔE 47.2 in
-# this order). Colour follows the cell, never its position, so a missing cell never
-# repaints the others. Aqua and yellow are sub-3:1 on the light surface, so the
-# legend supplies the visible labels the relief rule requires; identity never rests
-# on colour alone.
+# Six validated CVD-safe hues from the data-viz palette's categorical slots, in this
+# order: worst adjacent CVD ΔE 9.1 (protan), worst adjacent normal-vision ΔE 20.8.
+# Slot 8's red is the categorical step, distinct from the reserved status red
+# (`#d03b3b`); this chart encodes no status, so it carries no "bad" meaning. Colour
+# follows the cell, never its position, so a missing cell never repaints the others.
+# Aqua and yellow are sub-3:1 on the light surface, so the legend supplies the
+# visible labels the relief rule requires; identity never rests on colour alone.
 _COLOR = {
     "without+without-http": "#2a78d6",
     "fastapi+without-http": "#008300",
     "without+without-http-uvloop": "#4a3aa7",
+    "fastapi+without-http-uvloop": "#e34948",
     "without+uvicorn": "#eda100",
     "fastapi+uvicorn": "#1baf7a",
 }
@@ -51,6 +55,7 @@ _LABEL = {
     "without+without-http": "without-http + without-web",
     "fastapi+without-http": "without-http + fastapi",
     "without+without-http-uvloop": "without-http (uvloop) + without-web",
+    "fastapi+without-http-uvloop": "without-http (uvloop) + fastapi",
     "without+uvicorn": "uvicorn + without-web",
     "fastapi+uvicorn": "uvicorn + fastapi",
 }
