@@ -10,9 +10,11 @@ from without_asgi.types import RawHeaders
 # rather than wrapping it: no type to construct at reads or unwrap at writes, and the
 # hot path keeps handing the same immutable tuple through untouched. HTTP field names
 # are case-insensitive (RFC 9110), so every lookup lower-cases both sides, and the
-# functions that produce headers store names lower-cased (valid on the wire, required
-# by HTTP/2). Duplicates are preserved: `get_all` returns every value under a name,
-# the reason `Set-Cookie` can't collapse to one comma-joined value.
+# functions that *introduce* a name (`add`, `replace`) lower-case it (valid on the
+# wire, required by HTTP/2); the ones that only pass existing pairs through (`remove`,
+# `subset`, `merge`) preserve their casing. Duplicates are preserved: `get_all`
+# returns every value under a name, the reason `Set-Cookie` can't collapse to one
+# comma-joined value.
 
 __all__ = [
     "add",
