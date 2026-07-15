@@ -1,0 +1,31 @@
+[build-system]
+requires = ["uv_build>=0.11.26,<0.12"]
+build-backend = "uv_build"
+
+[project]
+name = "without-dag"
+version = "0.0.0"
+description = "Bounded-concurrency execution of DAG-shaped async workflows for without, liftable into a Processor."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Josh Karpel", email = "josh.karpel@gmail.com" },
+]
+requires-python = ">=3.14"
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+dependencies = [
+    "without-core",
+]
+
+[tool.uv.sources]
+without-core = { workspace = true }

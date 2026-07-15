@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from dataclasses import field
+from types import AsyncGeneratorType
 
 import pytest
 from without import Processor
@@ -16,6 +17,8 @@ from without_asgi import Inbound
 from without_asgi import Lifespan
 from without_asgi import Outbound
 from without_asgi import RawMessage
+from without_asgi import ResponseBody
+from without_asgi import ResponseStart
 from without_asgi import make_asgi_app
 
 
@@ -134,6 +137,52 @@ async def test_requests_are_handed_the_lifespan_state() -> None:
     await task
 
 
+async def test_inbound_stream_is_closed_when_a_handler_abandons_the_body() -> None:
+    captured: list[Stream[Inbound]] = []
+
+    def router(state: str, scope: HttpScope) -> Processor[Inbound, Outbound]:
+        async def abandon_after_first_chunk(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
+            captured.append(inputs)
+            await anext(aiter(inputs))  # read one chunk, then leave the rest of the body unread
+            yield ResponseStart(status=204)
+            yield ResponseBody(body=b"", more_body=False)
+
+        return abandon_after_first_chunk
+
+    wrapped = make_asgi_app(_lifespan(Trace(), "state"), router)
+    inbox, outbox, task = _start_lifespan(wrapped)
+    await inbox.put({"type": "lifespan.startup"})
+    await outbox.get()
+
+    async def receive() -> RawMessage:
+        return {"type": "http.request", "body": b"first", "more_body": True}
+
+    async def send(message: RawMessage) -> None:
+        pass
+
+    await wrapped(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "path": "/",
+            "query_string": b"",
+            "headers": [],
+        },
+        receive,
+        send,
+    )
+
+    (inbound,) = captured
+    assert isinstance(inbound, AsyncGeneratorType)
+    assert inbound.ag_frame is None  # the abandoned generator was closed, not left for GC
+
+    await inbox.put({"type": "lifespan.shutdown"})
+    await outbox.get()
+    await task
+
+
 async def test_a_request_before_startup_fails_loud() -> None:
     seen: list[str] = []
     router = _recording_router(seen)
@@ -194,7 +243,7 @@ async def test_an_unserved_http_scope_is_refused_with_501() -> None:
         {
             "type": "http.response.start",
             "status": 501,
-            "headers": [[b"content-type", b"text/plain; charset=utf-8"]],
+            "headers": ((b"content-type", b"text/plain; charset=utf-8"),),
         },
         {"type": "http.response.body", "body": b"this application does not serve http\n", "more_body": False},
     ]

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["uv_build>=0.11,<0.12"]
+requires = ["uv_build>=0.11.26,<0.12"]
 build-backend = "uv_build"
 
 [project]
@@ -14,17 +14,22 @@ authors = [
 requires-python = ">=3.14"
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
+    "Framework :: AsyncIO",
     "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
     "Typing :: Typed",
 ]
 dependencies = [
-    "without",
+    "without-core",
     "without-asgi",
 ]
 
 [tool.uv.sources]
-without = { workspace = true }
+without-core = { workspace = true }
 without-asgi = { workspace = true }

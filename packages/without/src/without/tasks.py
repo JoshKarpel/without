@@ -8,6 +8,24 @@ from collections.abc import Coroutine
 from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from contextlib import suppress
+from datetime import timedelta
+
+
+@asynccontextmanager
+async def timeout(duration: timedelta | None) -> AsyncIterator[None]:
+    """
+    Bound the `with` block by `duration`, or leave it unbounded when `None`.
+
+    A `timedelta`-typed, nullable wrapper over `asyncio.timeout`: `None` disables the
+    bound (an always-open context), and a duration raises `TimeoutError` if the block
+    outlives it. Modelling "no limit" as `None` keeps that choice a first-class value at
+    the call site, rather than a sentinel float threaded through the same parameter.
+    """
+    if duration is None:
+        yield
+        return
+    async with asyncio.timeout(duration.total_seconds()):
+        yield
 
 
 async def sleep_forever() -> None:

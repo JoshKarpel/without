@@ -132,7 +132,17 @@ async def test_create_echoes_the_new_todo_with_the_next_id(stack: Stack) -> None
             "POST",
             "/todos",
             body=body,
-            headers=[(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())],
+            headers=[
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+                (b"idempotency-key", b"bench-abc-123"),
+            ],
         )
     assert status == 201
-    assert payload == {"id": 4, "title": "review the draft", "done": True}
+    assert payload == {
+        "id": 4,
+        "title": "review the draft",
+        "done": True,
+        "url": "/todos/4",
+        "idempotency_key": "bench-abc-123",
+    }

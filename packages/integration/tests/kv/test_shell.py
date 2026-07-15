@@ -2,6 +2,7 @@ import asyncio
 import gc
 import socket
 import struct
+from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 
 from integration.kv import EMPTY_STORE
@@ -19,10 +20,11 @@ from integration.kv import apply
 from integration.kv import make_keyspace
 from integration.kv import make_session
 from integration.kv import serve
+from pytest_mock import MockerFixture
 from without import Fold
 from without import Stream
 from without import from_fold
-from without import stream
+from without import stream_from_iterable
 from without_env import EnvContext
 
 
@@ -48,7 +50,7 @@ async def test_keyspace_sends_each_reply_on_the_events_own_channel() -> None:
         Connected(send=send, payload=Get(key="missing")),
     ]
 
-    final = await make_keyspace()(stream(events))
+    final = await make_keyspace()(stream_from_iterable(events))
 
     assert sent == [Stored(), Value(value="blue"), Nil()]
     assert final.entries == {"color": "blue"}
@@ -132,6 +134,53 @@ async def test_shutdown_drains_inflight_requests() -> None:
     assert replies == ["1 OK", "2 OK", "3 OK"]
     writer.close()
     await writer.wait_closed()
+
+
+async def test_a_connection_that_spawns_after_the_inbox_closes_ends_cleanly(mocker: MockerFixture) -> None:
+    # A connection accepted just before shutdown whose session registers so late that the drain
+    # has already closed the inbox: its first ask hits the shut-down queue. That must end the
+    # session cleanly (writer closed, no reply) rather than crash the handle task with an
+    # unretrieved QueueShutDown and leak its transport. Defer the server-side spawn past the
+    # drain to force the race deterministically.
+    loop = asyncio.get_running_loop()
+    real_start_server = asyncio.start_server
+
+    async def deferring_start_server(
+        connected: Callable[[asyncio.StreamReader, asyncio.StreamWriter], None],
+        *args: object,
+        **kwargs: object,
+    ) -> asyncio.Server:
+        def spawn_late(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            def hop(remaining: int) -> None:
+                if remaining:
+                    loop.call_soon(hop, remaining - 1)
+                else:
+                    connected(reader, writer)
+
+            hop(50)  # lands well after the drain's single yield and inbox.shutdown()
+
+        return await real_start_server(spawn_late, *args, **kwargs)  # type: ignore[arg-type]
+
+    mocker.patch.object(asyncio, "start_server", deferring_start_server)
+
+    loop_errors: list[dict[str, object]] = []
+    loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+    try:
+        async with _serve(drain_timeout=0.2) as running:
+            host, port = running.sockets[0].getsockname()[:2]
+            reader, writer = await asyncio.open_connection(host, port)
+            writer.write(b"SET k v\n")
+            await writer.drain()
+            writer.write_eof()
+
+        assert await reader.read() == b""  # the late session drops its reply and closes: the client sees EOF
+        writer.close()
+        await writer.wait_closed()
+        gc.collect()  # force any unretrieved session-task exception to reach the loop handler
+    finally:
+        loop.set_exception_handler(None)
+
+    assert loop_errors == []
 
 
 async def test_a_client_reset_does_not_disturb_other_connections() -> None:

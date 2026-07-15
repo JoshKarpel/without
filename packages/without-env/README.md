@@ -25,6 +25,7 @@ config = EnvContext.load(Settings)   # reads os.environ once, validates
 config.current().default_mode        # the parsed value, same every call
 ```
 
-A missing required field or a value that fails validation raises from
-`pydantic-settings` at `load` time, so misconfiguration fails loudly at startup
-rather than at first use.
+See the
+[`without-env` guide](https://without.help/without-env/)
+(with the [API reference](https://without.help/reference/without_env/))
+for the full surface.

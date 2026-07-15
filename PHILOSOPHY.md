@@ -97,7 +97,7 @@ contained inside a step. The one discipline an effect must keep: it MUST complet
 within the step and MUST NOT escape the entrypoint. A processor awaits its I/O to
 completion and never hands a half-open resource (an open socket, a task it does
 not own) back to the runtime. Testing then needs no mocks: inject fake `Context`
-values and feed a `stream(...)` of inputs.
+values and feed a `stream_from_iterable(...)` of inputs.
 
 ## Values over places, and where state goes
 
@@ -155,6 +155,21 @@ distinction matters: an early framing called the model an "async reducer," but
 the per-event processor is an async *scan*. The fold is the serial owner of
 shared state; the scan is the per-connection processor.
 
+The 2x2 fixes output cardinality at one-per-event (or a terminal collapse), but
+the `Processor` protocol itself imposes no such bound: a step is free to emit
+zero or many. Two builders take up the zero-or-one case, added when a shipped
+package (`without-logging`) needed to filter a stream: `from_selector(keep)`
+re-emits the events matching a predicate and `from_filter(reject)` drops them,
+polarity-duals of each other. They carry no new machinery (no queue, no
+background task), which is why they are builders and not wiring; dropping an event
+needs neither. Their predicate is `async` like every other builder step, keeping
+one color of function throughout: a decision that must `await` I/O composes with a
+pure one that never does. Emitting *several* outputs per event is the other
+direction, and it stays deliberately a wiring concern, because splitting one input
+across many consumers is where the queue-and-background-task complexity lives:
+fanning a stream out to several terminal sinks ships as `tee`, and the mid-stream
+fan-out/fan-in family stays in issue #13.
+
 ## How processors connect
 
 Wiring (`without.wiring`) is deliberately small. The load-bearing event-edge
@@ -162,7 +177,7 @@ connector is `compose`: it chains one processor into the next and is pure
 composition, the only connector that needs nothing running. The other half of the
 model is the **behavior edge**, `sample`, which exposes a stream's latest value as
 a `Context` (latest-wins, no backpressure). Around those sit the source and
-terminal adapters: `stream` lifts a fixed iterable into a `Stream`, `collect`
+terminal adapters: `stream_from_iterable` lifts a fixed iterable into a `Stream`, `collect`
 drains one to a list, and `stream_from_queue` adapts a push source (an accept
 loop, a callback client) into the pull-based stream the rest of the system
 consumes.
@@ -174,11 +189,14 @@ canonical one: it is where a stream becomes readable state. Closability is
 signalled structurally: shutting down a queue (`queue.shutdown()`) ends the
 stream it feeds, which lets a downstream fold return its final value.
 
-Wiring deliberately stops there. A cluster of fan-out/fan-in connectors
-(`distribute`, `tee`, `broadcast`, `route`, `merge`) is *not* part of the core: no
-shipped package needs them, so they would be speculative surface carrying real
-queue-and-background-task complexity. The design is recorded for when a concrete
-fan-out/fan-in need calls for them (see `issues/`).
+One fan-out connector earns its place: `tee` splits a stream across several
+terminal `Sink` branches, each with its own tail, so a shared prefix runs once and
+every branch consumes its own copy. `without-logging`'s need to drive a console and
+a file at once is the concrete use case that motivates it. The rest of the
+fan-out/fan-in cluster (`distribute`, `broadcast`, `route`, `merge`) stays out of
+the core: no shipped package needs it, so it would be speculative surface carrying
+real queue-and-background-task complexity, and the design is recorded for when a
+concrete need calls for it (see issue #13).
 
 ## Lifespan as a variable: a connection's lifecycle is a stream's
 
@@ -222,8 +240,9 @@ producing the typed value and push the decision out, or make it injectable.
 Alexis King's principle runs through `without-web`. A `Converter` is a `str ->
 value` parser paired with the JSON Schema it parses into; rejecting a segment
 (raising `ValueError`) makes the trie walk backtrack rather than erroring a
-handler. An `Extractor[V]` is parsing-as-a-value: a pure `Request -> V` paired
-with the OpenAPI fragment it contributes. Path params arrive at a handler already
+handler. An `Extractor[C, V]` is parsing-as-a-value: a pure `C -> V` (from the
+request context `C` it reads) paired with the OpenAPI fragment it contributes.
+Path params arrive at a handler already
 typed (`user_id: int`), with no `assert isinstance` and no runtime introspection;
 the extractor types are tied to the handler's parameters through an overload
 ladder, so a mismatch is a mypy error.

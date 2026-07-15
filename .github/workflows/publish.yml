@@ -13,32 +13,48 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/without
+      # This monorepo publishes the whole `without*` family from one run, so no
+      # single PyPI project is "the" project; the repo name (`without`) is not a
+      # project (the core distributes as `without-core`). Trusted publishing is
+      # many-to-many, so this one workflow uploads the whole `without*` family:
+      # register the same trusted publisher on each project.
+      url: https://pypi.org/p/without-core
     permissions:
       id-token: write # trusted publishing exchanges this OIDC token for a PyPI upload credential
       contents: read
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v7.0.0
+
       - name: Install uv
         uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
 
       - name: Derive shared version from release tag
         id: version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
         run: |
-          tag="${{ github.event.release.tag_name }}"
-          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # Lockstep versioning: stamp every publishable member with the one shared
+      # version and pin each intra-workspace dependency to it, so a built wheel
+      # (which strips `[tool.uv.sources]`) requires exactly the siblings it was
+      # built against instead of an unbounded bare name.
+      - name: Stamp the shared version and pin intra-workspace dependencies
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: uv run --script scripts/prepare_release.py "$VERSION"
 
       # The publishable packages are exactly the `without*` workspace members
-      # (the core `without` plus its `without-` plugins); the `integration`
-      # aggregator is deliberately named outside that family so this glob skips
-      # it. Each member's directory basename is its package name.
-      - name: Stamp the shared version and build every publishable package
+      # (the core `without-core` plus its `without-` plugins); the `integration`
+      # aggregator is named outside that family, so this glob skips it.
+      - name: Build every publishable package
         run: |
           for dir in packages/without*; do
-            pkg="$(basename "$dir")"
-            uv version --no-sync --package "$pkg" "${{ steps.version.outputs.version }}"
-            uv build --package "$pkg"
+            uv build "$dir" --out-dir dist
           done
 
       - name: Publish to PyPI

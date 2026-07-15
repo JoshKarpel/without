@@ -3,12 +3,13 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from contextlib import AsyncExitStack
+from contextlib import aclosing
 from dataclasses import dataclass
 from typing import assert_never
 
 from without import Processor
 from without import Stream
-from without import stream
+from without import stream_from_iterable
 
 from without_asgi.inbound import Inbound
 from without_asgi.inbound import Shutdown
@@ -135,7 +136,7 @@ def refuse_http(state: object, head: HttpScope) -> HttpHandler:
     """An `HttpRouter` that refuses every request with `501 Not Implemented`."""
 
     def handler(inputs: Stream[Inbound]) -> Stream[Outbound]:
-        return stream(encode_response(_HTTP_UNSUPPORTED))
+        return stream_from_iterable(encode_response(_HTTP_UNSUPPORTED))
 
     return handler
 
@@ -144,7 +145,7 @@ def refuse_websocket(state: object, head: WebsocketScope) -> WebsocketHandler:
     """A `WebsocketRouter` that refuses every connection by closing before `accept` (a `403`)."""
 
     def handler(inputs: Stream[WebsocketInbound]) -> Stream[WebsocketOutbound]:
-        return stream((_WEBSOCKET_UNSUPPORTED,))
+        return stream_from_iterable((_WEBSOCKET_UNSUPPORTED,))
 
     return handler
 
@@ -165,6 +166,8 @@ def make_asgi_app[T](
     scope it calls the matching handler with the state threaded in, wraps
     `receive` into the inbound event stream, runs the returned `Processor`, and
     drains its outbound stream into `send`: the handler only ever sees streams.
+    The inbound stream is closed when the handler exits, so a handler that
+    abandons the request body early does not leave it dangling for GC.
 
     Each protocol's router defaults to one that refuses the connection, so an app
     serves a protocol only by passing its own router (an HTTP-only app passes
@@ -182,9 +185,14 @@ def make_asgi_app[T](
             case LifespanScope():
                 await _drive(lifespan, cell, receive, send)
             case HttpScope() as head:
-                await http_outbound(send)(http(cell.require(), head)(http_inbound(receive)))
+                # `aclosing` closes the inbound stream when the handler exits, so a
+                # handler that abandons the request body early does not leave the
+                # generator (and any resource its `finally` releases) dangling for GC.
+                async with aclosing(http_inbound(receive)) as inbound:
+                    await http_outbound(send)(http(cell.require(), head)(inbound))
             case WebsocketScope() as head:
-                await websocket_outbound(send)(websocket(cell.require(), head)(websocket_inbound(receive)))
+                async with aclosing(websocket_inbound(receive)) as inbound:
+                    await websocket_outbound(send)(websocket(cell.require(), head)(inbound))
             case _ as unreachable:
                 assert_never(unreachable)
 

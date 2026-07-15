@@ -4,19 +4,25 @@ import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
 
+import pytest
 from without import Stream
-from without import stream
+from without import stream_from_iterable
 from without_asgi import Asgi
+from without_asgi import Disconnect
 from without_asgi import HttpHandler
 from without_asgi import HttpScope
 from without_asgi import Inbound
 from without_asgi import Outbound
+from without_asgi import RequestBody
 from without_asgi import Response
 from without_asgi import ResponseBody
 from without_asgi import ResponseStart
 from without_asgi.outbound import encode_response
+from without_asgi.routing import _BodyTooLarge
 from without_asgi.routing import limit_concurrent_requests
+from without_asgi.routing import limit_request_body
 
 
 @dataclass(slots=True)
@@ -55,7 +61,7 @@ def _scope() -> HttpScope:
 
 
 async def _collect(handler: HttpHandler) -> list[Outbound]:
-    return [event async for event in handler(stream(()))]
+    return [event async for event in handler(stream_from_iterable(()))]
 
 
 def _status(events: list[Outbound]) -> int:
@@ -149,3 +155,108 @@ async def test_releases_the_slot_when_a_request_finishes() -> None:
     finally:
         gate.release.set()
         await second
+
+
+@dataclass(slots=True)
+class _Started:
+    hit: bool = False
+
+
+def _draining_handler(started: _Started | None = None) -> HttpHandler:
+    """Consume the whole input stream, then reply 200. Records that it ran if given a flag."""
+
+    async def handler(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
+        if started is not None:
+            started.hit = True
+        async for _event in inputs:
+            pass
+        for event in encode_response(Response(status=200, headers=((b"content-type", b"text/plain"),), body=b"ok")):
+            yield event
+
+    return handler
+
+
+def _early_start_handler() -> HttpHandler:
+    """Emit the response start *before* reading the body, so an overflow trips mid-response."""
+
+    async def handler(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
+        yield ResponseStart(status=200, headers=((b"content-type", b"text/plain"),))
+        async for _event in inputs:
+            pass
+        yield ResponseBody(body=b"done", more_body=False)
+
+    return handler
+
+
+def _scope_with_headers(headers: tuple[tuple[bytes, bytes], ...]) -> HttpScope:
+    return replace(_scope(), headers=headers)
+
+
+async def _collect_over(handler: HttpHandler, events: tuple[Inbound, ...]) -> list[Outbound]:
+    return [event async for event in handler(stream_from_iterable(events))]
+
+
+@pytest.mark.security("an over-cap Content-Length is rejected with 413 before the body is read")
+async def test_rejects_up_front_when_content_length_exceeds_the_cap() -> None:
+    started = _Started()
+    middleware = limit_request_body(10)
+    handler = middleware(_draining_handler(started), object(), _scope_with_headers(((b"content-length", b"100"),)))
+
+    events = await _collect_over(handler, (RequestBody(body=b"x" * 100, more_body=False),))
+
+    assert _status(events) == 413
+    assert not started.hit  # the inner handler was never invoked
+
+
+async def test_admits_a_body_whose_content_length_is_within_the_cap() -> None:
+    started = _Started()
+    middleware = limit_request_body(10)
+    scope = _scope_with_headers(((b"accept", b"*/*"), (b"content-length", b"5")))
+    handler = middleware(_draining_handler(started), object(), scope)
+
+    events = await _collect_over(handler, (RequestBody(body=b"hello", more_body=False),))
+
+    assert _status(events) == 200
+    assert started.hit  # the inner handler ran for an in-cap request
+
+
+async def test_ignores_a_non_integer_content_length() -> None:
+    middleware = limit_request_body(10)
+    handler = middleware(_draining_handler(), object(), _scope_with_headers(((b"content-length", b"not-a-number"),)))
+
+    events = await _collect_over(handler, (RequestBody(body=b"tiny", more_body=False),))
+
+    assert _status(events) == 200
+
+
+@pytest.mark.security("a chunked body that lies about or omits its length is capped at 413")
+async def test_rejects_a_chunked_body_that_passes_the_cap() -> None:
+    middleware = limit_request_body(10)
+    handler = middleware(_draining_handler(), object(), _scope())
+
+    events = await _collect_over(
+        handler,
+        (RequestBody(body=b"x" * 6, more_body=True), RequestBody(body=b"x" * 8, more_body=False)),
+    )
+
+    assert _status(events) == 413
+
+
+async def test_passes_a_chunked_body_within_the_cap() -> None:
+    middleware = limit_request_body(100)
+    handler = middleware(_draining_handler(), object(), _scope())
+
+    events = await _collect_over(handler, (RequestBody(body=b"abc", more_body=True), Disconnect()))
+
+    assert _status(events) == 200
+
+
+async def test_surfaces_an_overflow_after_the_handler_has_started() -> None:
+    middleware = limit_request_body(10)
+    handler = middleware(_early_start_handler(), object(), _scope())
+
+    with pytest.raises(_BodyTooLarge):
+        await _collect_over(
+            handler,
+            (RequestBody(body=b"x" * 6, more_body=True), RequestBody(body=b"x" * 8, more_body=False)),
+        )

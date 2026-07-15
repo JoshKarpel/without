@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from typing import assert_never
 
 from without import Sink
@@ -27,13 +27,17 @@ from without_asgi.types import Receive
 from without_asgi.types import Send
 
 
-async def http_inbound(receive: Receive) -> AsyncIterator[Inbound]:
+async def http_inbound(receive: Receive) -> AsyncGenerator[Inbound]:
     """
     An `http` request's inbound events as a stream.
 
     The stream ends when the request is fully received (the last body chunk, or
     a disconnect), so a downstream processor's input runs dry exactly when the
     request does: the request's lifecycle *is* this stream's lifecycle.
+
+    A handler that abandons the body early leaves this generator suspended at its
+    `yield`; `make_asgi_app` wraps it in `aclosing`, so closing it there runs any
+    `finally` deterministically rather than deferring to garbage collection.
     """
     while True:
         event = parse_inbound(await receive())
@@ -60,16 +64,16 @@ async def read_body(events: Stream[Inbound]) -> bytes:
     Raises `ClientDisconnect` if the client goes away before the final chunk,
     so a truncated body fails loudly rather than passing for a complete one.
     """
-    chunks = bytearray()
+    chunks: list[bytes] = []
     async for event in events:
         match event:
             case RequestBody(body=body):
-                chunks.extend(body)
+                chunks.append(body)
             case Disconnect():
                 raise ClientDisconnect
             case _ as unreachable:
                 assert_never(unreachable)
-    return bytes(chunks)
+    return b"".join(chunks)
 
 
 def http_outbound(send: Send) -> Sink[Outbound]:
@@ -81,7 +85,7 @@ def http_outbound(send: Send) -> Sink[Outbound]:
     return from_sink(write)
 
 
-async def websocket_inbound(receive: Receive) -> AsyncIterator[WebsocketInbound]:
+async def websocket_inbound(receive: Receive) -> AsyncGenerator[WebsocketInbound]:
     """
     A websocket connection's inbound events as a stream.
 
@@ -104,7 +108,7 @@ def websocket_outbound(send: Send) -> Sink[WebsocketOutbound]:
     return from_sink(write)
 
 
-async def lifespan_inbound(receive: Receive) -> AsyncIterator[LifespanEvent]:
+async def lifespan_inbound(receive: Receive) -> AsyncGenerator[LifespanEvent]:
     """The `lifespan` protocol's events as a stream, ending after shutdown."""
     while True:
         event = parse_lifespan_event(await receive())

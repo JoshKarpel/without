@@ -1,5 +1,5 @@
 [build-system]
-requires = ["uv_build>=0.11,<0.12"]
+requires = ["uv_build>=0.11.26,<0.12"]
 build-backend = "uv_build"
 
 [project]
@@ -11,13 +11,13 @@ license = "MIT"
 authors = [
     { name = "Josh Karpel", email = "josh.karpel@gmail.com" },
 ]
+requires-python = ">=3.14"
 # Never published: the name sits outside the `without*` family the publish
 # workflow globs, and this classifier makes PyPI reject an upload if it ever
 # slips through.
 classifiers = ["Private :: Do Not Upload"]
-requires-python = ">=3.14"
 dependencies = [
-    "without",
+    "without-core",
     "without-env",
     "without-configmap",
     "without-asgi",
@@ -29,7 +29,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-without = { workspace = true }
+without-core = { workspace = true }
 without-env = { workspace = true }
 without-configmap = { workspace = true }
 without-asgi = { workspace = true }

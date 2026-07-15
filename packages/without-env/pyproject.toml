@@ -1,5 +1,5 @@
 [build-system]
-requires = ["uv_build>=0.11,<0.12"]
+requires = ["uv_build>=0.11.26,<0.12"]
 build-backend = "uv_build"
 
 [project]
@@ -15,15 +15,17 @@ requires-python = ">=3.14"
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries",
     "Typing :: Typed",
 ]
 dependencies = [
-    "without",
+    "without-core",
     "pydantic-settings>=2.7",
 ]
 
 [tool.uv.sources]
-without = { workspace = true }
+without-core = { workspace = true }

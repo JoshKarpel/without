@@ -13,7 +13,10 @@ that layer as a narrow contract, so the pieces compose. It is meant to feel like
 a library (your control flow stays visible) rather than a framework.
 
 See [`PHILOSOPHY.md`](PHILOSOPHY.md) for the design rationale: the narrow-waist
-bet, functional-core/imperative-shell, and values-over-places.
+bet, functional-core/imperative-shell, and values-over-places. The full
+documentation, narrative guides, an API reference recovered from the source
+docstrings, and the derived package dependency graph, lives at
+<https://without.help/>.
 
 ## Layout
 
@@ -22,7 +25,9 @@ packages). Each package is its own top-level import.
 
 - `packages/without` — the core: the contracts every plugin speaks
   (`without.contracts`), the stream edge connectors (`without.wiring`), and a
-  `with`-scoped background task helper (`without.tasks`). Imported as `without`.
+  `with`-scoped background task helper (`without.tasks`). Distributed on PyPI as
+  `without-core` (the bare `without` name is unavailable there); imported as
+  `without`.
 - `packages/without-env` — first plugin: a static `Context` parsed from
   environment variables (`pydantic-settings`). Imported as `without_env`.
 - `packages/without-configmap` — config from a Kubernetes mount (`watchfiles` +
@@ -39,29 +44,21 @@ packages). Each package is its own top-level import.
   on the sans-IO `h11`/`h2`/`wsproto` state machines: `serving(app)` owns the socket
   and the wire protocol (HTTP/1.1, HTTP/2, and WebSockets) and drives any ASGI app.
   Imported as `without_http`.
+- `packages/without-dag` — bounded-concurrency execution of DAG-shaped async
+  workflows: a `Graph` builder threads value types through the wiring, and a
+  single-input graph is an async callable that `from_map` lifts straight into a
+  `Processor`. Imported as `without_dag`.
+- `packages/without-logging` — a logging pipeline: stdlib log records parsed into
+  immutable `Record` values at a `capture` boundary, filtered and enriched as
+  processors, drained to a sink the app owns. Imported as `without_logging`.
 - `packages/integration` — not a real package (and never published: its name
   sits outside the `without*` family, so the publish workflow skips it): depends
   on `without` and every plugin so they can be exercised together in
   cross-package tests. Imported as `integration`.
 
-The package dependency graph (each arrow is "depends on"):
-
-```mermaid
-graph TD
-    without_env[without-env] --> without
-    without_configmap[without-configmap] --> without
-    without_asgi[without-asgi] --> without
-    without_web[without-web] --> without
-    without_web --> without_asgi
-    without_http[without-http] --> without
-    without_http --> without_asgi
-    integration --> without
-    integration --> without_env
-    integration --> without_configmap
-    integration --> without_asgi
-    integration --> without_web
-    integration --> without_http
-```
+The [package dependency graph](https://without.help/architecture/package-graph/)
+(each arrow is "depends on") is derived from the declared dependencies and
+rendered on the documentation site.
 
 Planned plugins, in the order they should be attempted:
 
@@ -79,5 +76,7 @@ Planned plugins, in the order they should be attempted:
 
 ```bash
 uv sync
-just test    # mypy + pytest
+just test        # mypy + pytest
+just durations   # profile the suite (slowest fixtures, setup, calls, teardown)
+just docs        # serve the documentation site with live reload
 ```

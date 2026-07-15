@@ -12,6 +12,9 @@ from contextlib import suppress
 from dataclasses import dataclass
 from dataclasses import field
 from dataclasses import replace
+from datetime import UTC
+from datetime import datetime
+from email.utils import parsedate_to_datetime
 from typing import NamedTuple
 from typing import Self
 from urllib.parse import SplitResult
@@ -31,9 +34,15 @@ from without_asgi import RawHeaders
 
 from without_http.h2_wire import request_headers
 from without_http.h2_wire import response_status_and_headers
+from without_http.keepalive import TCPKeepalive
+from without_http.keepalive import apply_tcp_keepalive
+from without_http.timeouts import Timeout
+from without_http.timeouts import WriteTimeout
 
 _BUFFER = 65536
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_NO_TIMEOUT = Timeout()  # a shared immutable "no timeouts" value, safe as a default
+_DEFAULT_KEEPALIVE = TCPKeepalive()  # likewise: a shared immutable "keepalive on" default
 
 logger = logging.getLogger(__name__)
 
@@ -239,20 +248,6 @@ type ClientMiddleware = Endo[ClientExchange]
 _PASSTHROUGH: ClientMiddleware = stack()
 
 
-async def _peek(body: Stream[bytes]) -> tuple[bytes | None, AsyncIterator[bytes]]:
-    """
-    The first non-empty chunk of a body and the iterator positioned after it.
-
-    `None` means the body is empty, which lets a sender end the request on the headers
-    (no DATA frame, no chunked body) instead of sending an empty body.
-    """
-    iterator = aiter(body)
-    async for chunk in iterator:
-        if chunk:
-            return chunk, iterator
-    return None, iterator
-
-
 def _has(headers: RawHeaders, name: bytes) -> bool:
     return any(existing.lower() == name for existing, _ in headers)
 
@@ -290,23 +285,37 @@ def _build_request(method: str, url: str, headers: RawHeaders, content: bytes | 
     return ClientRequest(method, url, headers, content)
 
 
+_ALPN_H2 = ("h2", "http/1.1")
+_ALPN_HTTP11 = ("http/1.1",)
+
+
 async def _open(
-    host: str, port: int, *, secure: bool, http2: bool, ssl_context: ssl.SSLContext | None
+    host: str,
+    port: int,
+    *,
+    ssl_context: ssl.SSLContext | None,
+    timeout: Timeout = _NO_TIMEOUT,
+    keepalive: TCPKeepalive | None = None,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, str]:
     """
     Open a connection and report the negotiated wire protocol.
 
-    Over TLS the protocol is settled by ALPN (`h2` when offered and the server
-    selects it, else `http/1.1`). Cleartext has no negotiation, so it is always
-    `http/1.1`; prior-knowledge h2c is opened directly by the pool instead.
+    `ssl_context` is `None` for cleartext, which has no negotiation and is always
+    `http/1.1` (prior-knowledge h2c is opened directly by the pool instead), or a ready
+    context whose ALPN offer the pool has already settled. Over TLS the protocol is
+    whatever ALPN selected: `h2` when the server takes the offer, else `http/1.1`. The
+    `connect` bound covers the TCP connect and, over TLS, the handshake, since both
+    happen in the one `open_connection` await; the ALPN read after it is synchronous.
+
+    When `keepalive` is set, TCP keepalive is enabled on the socket so a peer that vanishes
+    silently is detected even while the connection sits idle in the pool.
     """
-    if not secure:
-        reader, writer = await asyncio.open_connection(host, port)
+    async with timeout.connecting():
+        reader, writer = await asyncio.open_connection(host, port, ssl=ssl_context)
+    if keepalive is not None:
+        apply_tcp_keepalive(writer, keepalive)
+    if ssl_context is None:
         return reader, writer, "http/1.1"
-    context = ssl_context if ssl_context is not None else ssl.create_default_context()
-    if http2:
-        context.set_alpn_protocols(["h2", "http/1.1"])
-    reader, writer = await asyncio.open_connection(host, port, ssl=context)
     ssl_object = writer.get_extra_info("ssl_object")
     negotiated = ssl_object.selected_alpn_protocol() if ssl_object is not None else None
     return reader, writer, "h2" if negotiated == "h2" else "http/1.1"
@@ -315,18 +324,25 @@ async def _open(
 @dataclass(slots=True, eq=False)
 class _Http11Connection:
     """
-    One HTTP/1.1 connection, served one request at a time and kept for reuse.
+    One HTTP/1.1 connection, carrying one exchange at a time and kept for reuse.
 
-    Serial, unlike the multiplexed `_Http2Connection`: a request is sent, its response
-    head read, then its body streamed, then the connection reset for the next request
-    (`h11.start_next_cycle`). `finish` reports whether the completed cycle left the
-    connection reusable (it does not, when the server signalled `Connection: close` or
-    closed the socket), so the pool knows whether to keep or drop it.
+    One exchange at a time, unlike the multiplexed `_Http2Connection`, but its two
+    directions run concurrently: `send_head` writes the request line and headers, then
+    a background task drives `send_body` while `read_head`/`iter_body` read the response
+    on the same connection. This is what lets a server answer early (a `413` or redirect
+    to a large upload) without the request-body write deadlocking the response read. It
+    is safe without a lock because the two directions touch disjoint h11 state: only the
+    send path calls `self._conn.send`, only the read path calls `next_event`/
+    `receive_data`, and every such call is synchronous, so they never interleave
+    mid-call. `finish` reports whether the completed cycle left the connection reusable
+    (it does not, when the server signalled `Connection: close` or closed the socket, or
+    the request body was not fully sent), so the pool knows whether to keep or drop it.
     """
 
     _reader: asyncio.StreamReader
     _writer: asyncio.StreamWriter
     _conn: h11.Connection
+    send_error: BaseException | None = None
 
     @classmethod
     def new(cls, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> _Http11Connection:
@@ -343,22 +359,71 @@ class _Http11Connection:
         """
         return not self._writer.is_closing() and not self._reader.at_eof()
 
-    async def send_request(self, request: ClientRequest, parts: SplitResult) -> None:
+    async def send_head(self, request: ClientRequest, parts: SplitResult) -> None:
+        """Write the request line and headers and flush them, so the server can respond."""
         headers = list(request.headers)
         if not _has(request.headers, b"host"):
             headers.insert(0, (b"host", parts.netloc.encode("ascii")))
         self._writer.write(self._conn.send(h11.Request(method=request.method, target=_target(parts), headers=headers)))
-        async for chunk in request.body:
-            if chunk:
-                self._writer.write(self._conn.send(h11.Data(data=chunk)))
-        self._writer.write(self._conn.send(h11.EndOfMessage()))
         await self._writer.drain()
 
-    async def read_head(self) -> tuple[int, RawHeaders]:
+    async def send_body(self, request: ClientRequest, timeout: Timeout = _NO_TIMEOUT) -> None:
+        """
+        Stream the request body, then end the message, as a background task.
+
+        Draining per chunk gives ordinary write backpressure, and `timeout.writing()`
+        bounds each drain: it bounds write *progress*, not the whole send, so a lazily-fed
+        body that pauses between chunks does not trip it. An `OSError` means the peer
+        stopped reading (the early-response half-close): the response is still valid, so
+        swallow it and let `finish` decide the connection is not reusable. A
+        `CancelledError` (the exchange abandoned the still-running send) propagates so the
+        release path can tear down. A `WriteTimeout`, or the caller's body generator
+        raising, is recorded and the connection closed to unblock a concurrent `read_head`
+        on EOF, so `release` can surface it to the caller. It is recorded rather than
+        re-raised so the teardown that awaits this task never has to catch it. `WriteTimeout`
+        is handled before `OSError` because it is itself an `OSError` subclass.
+
+        The send also stops the moment the peer half-closes (`reader.at_eof()`), the
+        duplex-safe "connection is closing" signal: an early response or connection close
+        means the server is going away, so there is no point streaming the rest of the
+        body, and continuing to write would only trip the socket into a reset that could
+        discard the response the read side is concurrently reading. An unfinished send
+        just leaves the connection non-reusable (see `finish`); the response read owns
+        surfacing the outcome. The arrival of the *response head* is deliberately not the
+        signal: over a duplex exchange a response can begin while the request body is
+        still legitimately in flight.
+        """
+        try:
+            async for chunk in request.body:
+                if self._reader.at_eof():
+                    return
+                if chunk:
+                    self._writer.write(self._conn.send(h11.Data(data=chunk)))
+                    async with timeout.writing():
+                        await self._writer.drain()
+            if self._reader.at_eof():
+                return
+            self._writer.write(self._conn.send(h11.EndOfMessage()))
+            async with timeout.writing():
+                await self._writer.drain()
+        except asyncio.CancelledError:
+            raise
+        except WriteTimeout as exc:
+            self.send_error = exc
+            self.close()
+        except OSError:  # pragma: no cover - defensive: the early-response half-close usually cancels this send first
+            pass
+        except Exception as exc:  # noqa: BLE001 - capture any caller body-generator error to surface it via the read side
+            self.send_error = exc
+            self.close()
+
+    async def read_head(self, timeout: Timeout = _NO_TIMEOUT) -> tuple[int, RawHeaders]:
         while True:
             event = self._conn.next_event()
             if event is h11.NEED_DATA:
-                self._conn.receive_data(await self._reader.read(_BUFFER))
+                async with timeout.reading():
+                    data = await self._reader.read(_BUFFER)
+                self._conn.receive_data(data)
                 continue
             if isinstance(event, h11.InformationalResponse):
                 continue
@@ -370,11 +435,13 @@ class _Http11Connection:
             # defensive backstop against an unexpected h11 event.
             raise ConnectionError("the server closed the connection before sending a response")  # pragma: no cover
 
-    async def iter_body(self) -> AsyncGenerator[bytes | ResponseTrailers]:
+    async def iter_body(self, timeout: Timeout = _NO_TIMEOUT) -> AsyncGenerator[bytes | ResponseTrailers]:
         while True:
             event = self._conn.next_event()
             if event is h11.NEED_DATA:
-                self._conn.receive_data(await self._reader.read(_BUFFER))
+                async with timeout.reading():
+                    data = await self._reader.read(_BUFFER)
+                self._conn.receive_data(data)
                 continue
             if isinstance(event, h11.Data):
                 yield bytes(event.data)
@@ -397,10 +464,14 @@ class _Http11Connection:
             return False
 
     def close(self) -> None:
-        self._writer.close()
+        # Abort rather than gracefully close: every close here discards the connection, and
+        # a graceful close cannot flush a send buffer the peer has stopped reading (an
+        # early-response or write-timeout half-close), so it would deadlock the concurrent
+        # read waiting on the same transport. Aborting drops the buffer and EOFs the reader.
+        self._writer.transport.abort()
 
     async def aclose(self) -> None:
-        self._writer.close()
+        self._writer.transport.abort()
         with suppress(OSError):
             await self._writer.wait_closed()
 
@@ -415,6 +486,8 @@ class _Stream:
     acknowledges flow control only as it reads, keeping the window (and the buffer)
     bounded. `window` gates the *request* body sender on `WINDOW_UPDATE`. `trailers`
     accumulates any trailing header blocks, delivered after the body's last chunk.
+    `send_task` is the background request-body sender, so the release path can cancel it
+    when the response ends or is abandoned while the send is still in flight.
     """
 
     window: asyncio.Event
@@ -424,6 +497,7 @@ class _Stream:
     headers: RawHeaders = ()
     trailers: list[ResponseTrailers] = field(default_factory=list)
     error: BaseException | None = None
+    send_task: asyncio.Task[None] | None = None
 
 
 @dataclass(slots=True, eq=False)
@@ -449,6 +523,7 @@ class _Http2Connection:
     _lock: asyncio.Lock
     _streams: dict[int, _Stream]
     _closed: asyncio.Event
+    _stream_gate: asyncio.Event = field(default_factory=asyncio.Event)
     _task: asyncio.Task[None] | None = None
 
     @classmethod
@@ -476,38 +551,113 @@ class _Http2Connection:
         authority: bytes,
         headers: RawHeaders,
         body: Stream[bytes],
-    ) -> tuple[int, RawHeaders, int, AsyncGenerator[bytes | ResponseTrailers]]:
-        first, rest = await _peek(body)
+        timeout: Timeout = _NO_TIMEOUT,
+    ) -> tuple[int, RawHeaders, int, AsyncGenerator[bytes | ResponseTrailers], asyncio.Task[None] | None]:
+        # Send the head immediately (`end_stream=False`) and stream the body as a background
+        # task, so a slow-to-produce first chunk never delays the headers and the server can
+        # respond, or speak first, while the body is still going out (the h2 mirror of h11's
+        # duplex). The body task ends the stream: for a bodyless request it sends a lone empty
+        # END_STREAM DATA frame, one extra frame in exchange for never blocking the head on the
+        # body. This is what makes both client-speaks-first and server-speaks-first duplex work.
         stream = _Stream(window=asyncio.Event(), head=asyncio.Event(), chunks=asyncio.Queue())
-        async with self._lock:
-            if self._closed.is_set():
-                raise ConnectionError("the HTTP/2 connection closed before the request was sent")
-            stream_id = self._conn.get_next_available_stream_id()
-            self._streams[stream_id] = stream
-            self._conn.send_headers(
-                stream_id, request_headers(method, target, scheme, authority, headers), end_stream=first is None
-            )
-            self._writer.write(self._conn.data_to_send())
-        await self._writer.drain()
-        if first is not None:
-            await self._send_body(stream_id, stream, first, rest)
-        await stream.head.wait()
-        if stream.error is not None:
-            raise stream.error
-        return stream.status, stream.headers, stream_id, self._iter_body(stream_id, stream)
+        stream_id = await self._open_stream(
+            stream,
+            request_headers(method, target, scheme, authority, headers),
+            end_stream=False,
+            timeout=timeout,
+        )
+        # Once the stream is registered, any failure before the head is returned must
+        # cancel the sender and reset the stream, so the slot and the connection are not
+        # stranded (the h2 mirror of h11's pre-body guard).
+        try:
+            async with timeout.writing():
+                await self._writer.drain()
+            stream.send_task = asyncio.create_task(self._send_body(stream_id, stream, body, timeout))
+            async with timeout.reading():
+                await stream.head.wait()
+            if stream.error is not None:
+                raise stream.error
+        except BaseException:
+            await cancel_futures([stream.send_task])
+            await self.abort(stream_id)
+            raise
+        return (
+            stream.status,
+            stream.headers,
+            stream_id,
+            self._iter_body(stream_id, stream, timeout),
+            stream.send_task,
+        )
 
-    async def _send_body(self, stream_id: int, stream: _Stream, first: bytes, rest: AsyncIterator[bytes]) -> None:
-        await self._send_data(stream_id, stream, first, end=False)
-        async for chunk in rest:
-            if chunk:
-                await self._send_data(stream_id, stream, chunk, end=False)
-        await self._send_data(stream_id, stream, b"", end=True)
+    async def _open_stream(
+        self, stream: _Stream, headers: list[tuple[bytes, bytes]], *, end_stream: bool, timeout: Timeout = _NO_TIMEOUT
+    ) -> int:
+        """
+        Register and send a new stream's headers, waiting when at the server's stream limit.
 
-    async def _send_data(self, stream_id: int, stream: _Stream, data: bytes, *, end: bool) -> None:
+        The gate is the h2 sibling of the h11 per-host pool bound: a burst of requests
+        must not over-issue streams past `SETTINGS_MAX_CONCURRENT_STREAMS`. The limit is
+        the server's (effectively unbounded until its SETTINGS arrive), read live from h2
+        under `_lock` so the capacity check and the `send_headers` that consumes a slot
+        are atomic. At capacity the gate is cleared under the lock and awaited outside it;
+        the read loop sets it after a `StreamEnded`/`StreamReset`/settings change frees or
+        raises a slot. Because capacity is re-checked under the lock on each pass, a lost
+        wakeup only costs a re-check, never a stall, the same discipline as `window`. The
+        `pool` bound (`timeout.pooling()`) covers the whole wait for a slot (a `PoolTimeout`).
+        """
+        async with timeout.pooling():
+            while True:
+                async with self._lock:
+                    if self._closed.is_set():
+                        raise ConnectionError("the HTTP/2 connection closed before the request was sent")
+                    if self._conn.open_outbound_streams < self._conn.remote_settings.max_concurrent_streams:
+                        stream_id = self._conn.get_next_available_stream_id()
+                        self._streams[stream_id] = stream
+                        self._conn.send_headers(stream_id, headers, end_stream=end_stream)
+                        self._writer.write(self._conn.data_to_send())
+                        return stream_id
+                    self._stream_gate.clear()
+                await self._stream_gate.wait()
+
+    async def _send_body(
+        self, stream_id: int, stream: _Stream, body: Stream[bytes], timeout: Timeout = _NO_TIMEOUT
+    ) -> None:
+        try:
+            async for chunk in body:
+                if chunk:
+                    await self._send_data(stream_id, stream, chunk, end=False, timeout=timeout)
+            await self._send_data(stream_id, stream, b"", end=True, timeout=timeout)
+        except asyncio.CancelledError:
+            raise
+        except (
+            ConnectionError
+        ):  # pragma: no cover - defensive: the read loop surfaces the close first and cancels this send
+            # The connection/stream went away mid-send; the read side already surfaces
+            # the error to the consumer, so nothing more to do here.
+            pass
+        except Exception as exc:  # noqa: BLE001 - a WriteTimeout or the caller's body error, surfaced via the read side
+            # Fail the stream so a waiting head or body read unblocks and surfaces `exc`,
+            # rather than hanging for a body that will never finish. Recorded (not
+            # re-raised) so the release path that awaits this task never has to catch it.
+            await self._fail_stream(stream_id, stream, exc)
+
+    async def _fail_stream(self, stream_id: int, stream: _Stream, exc: BaseException) -> None:
+        stream.error = exc
+        if not stream.head.is_set():
+            stream.head.set()
+        stream.chunks.put_nowait(None)
+        stream.window.set()
+        await self.abort(stream_id)
+
+    async def _send_data(
+        self, stream_id: int, stream: _Stream, data: bytes, *, end: bool, timeout: Timeout = _NO_TIMEOUT
+    ) -> None:
         remaining = memoryview(data)
         while True:
             async with self._lock:
-                if self._closed.is_set():
+                if (
+                    self._closed.is_set()
+                ):  # pragma: no cover - defensive: a close mid-send is normally surfaced by the read loop first
                     raise ConnectionError("the HTTP/2 connection closed before the request body was sent")
                 try:
                     window = self._conn.local_flow_control_window(stream_id)
@@ -523,7 +673,10 @@ class _Http2Connection:
                     last = end and len(remaining) == 0
                     try:
                         self._conn.send_data(stream_id, chunk, end_stream=last)
-                    except h2.exceptions.ProtocolError, h2.exceptions.StreamClosedError:
+                    except (
+                        h2.exceptions.ProtocolError,
+                        h2.exceptions.StreamClosedError,
+                    ):  # pragma: no cover - defensive: a reset mid-send is normally surfaced by the read loop first
                         return
                     self._writer.write(self._conn.data_to_send())
                     blocked = False
@@ -531,15 +684,20 @@ class _Http2Connection:
                     stream.window.clear()
                     blocked = True
             if blocked:
-                await stream.window.wait()
+                async with timeout.writing():
+                    await stream.window.wait()
                 continue
-            await self._writer.drain()
+            async with timeout.writing():
+                await self._writer.drain()
             if len(remaining) == 0:
                 return
 
-    async def _iter_body(self, stream_id: int, stream: _Stream) -> AsyncGenerator[bytes | ResponseTrailers]:
+    async def _iter_body(
+        self, stream_id: int, stream: _Stream, timeout: Timeout = _NO_TIMEOUT
+    ) -> AsyncGenerator[bytes | ResponseTrailers]:
         while True:
-            item = await stream.chunks.get()
+            async with timeout.reading():
+                item = await stream.chunks.get()
             if item is None:
                 break
             data, length = item
@@ -564,6 +722,9 @@ class _Http2Connection:
                 self._conn.reset_stream(stream_id)
                 self._writer.write(self._conn.data_to_send())
             await self._writer.drain()
+        # A client-side reset frees a stream slot with no server event to notice it, so
+        # wake any request waiting on the stream gate here.
+        self._stream_gate.set()
 
     async def _run(self) -> None:
         try:
@@ -598,6 +759,7 @@ class _Http2Connection:
             stream.chunks.put_nowait(None)
             stream.window.set()
         self._streams.clear()
+        self._stream_gate.set()  # wake any request waiting on a stream slot so it sees the close
 
     def _handle(self, event: h2.events.Event) -> None:
         match event:
@@ -616,12 +778,14 @@ class _Http2Connection:
             case h2.events.StreamEnded(stream_id=stream_id):
                 if (stream := self._streams.pop(stream_id, None)) is not None:
                     stream.chunks.put_nowait(None)
+                self._stream_gate.set()  # a slot freed; wake a request waiting to issue one
             case h2.events.StreamReset(stream_id=stream_id):
                 if (stream := self._streams.pop(stream_id, None)) is not None:
                     stream.error = ConnectionError("the server reset the HTTP/2 stream")
                     stream.head.set()
                     stream.chunks.put_nowait(None)
                     stream.window.set()
+                self._stream_gate.set()  # a slot freed; wake a request waiting to issue one
             case h2.events.WindowUpdated(stream_id=stream_id):
                 if stream_id == 0:
                     for stream in self._streams.values():
@@ -631,6 +795,7 @@ class _Http2Connection:
             case h2.events.RemoteSettingsChanged():
                 for stream in self._streams.values():
                     stream.window.set()
+                self._stream_gate.set()  # the stream limit may have risen; re-check waiters
             case h2.events.ConnectionTerminated():
                 self._closed.set()
             case _:
@@ -639,13 +804,122 @@ class _Http2Connection:
     async def aclose(self) -> None:
         self._closed.set()
         await cancel_futures([self._task])  # `_task` may be None before `start`; skipped
-        with suppress(h2.exceptions.ProtocolError, OSError):
+        # The GOAWAY is best-effort: a closed transport rejects the write with `RuntimeError` under
+        # uvloop (stdlib drops it silently), so tolerate that alongside the h2/OS errors.
+        with suppress(h2.exceptions.ProtocolError, OSError, RuntimeError):
             async with self._lock:
                 self._conn.close_connection()
                 self._writer.write(self._conn.data_to_send())
         self._writer.close()
         with suppress(OSError):
             await self._writer.wait_closed()
+
+
+@dataclass(slots=True)
+class _HostPool:
+    """
+    The per-origin HTTP/1.1 pool: the owner of checkout-or-open and checkin-or-close.
+
+    A caller asks for a connection with `checkout` and unconditionally hands it back with
+    `checkin`; the pool alone decides where each one comes from and goes to. It never
+    opens sockets itself: `open_connection` is injected once at construction (bound to
+    this origin's host, port, and TLS), so every connection the pool opens is opened the
+    same way and this stays pure pool policy while the client keeps the TLS/connect
+    concerns. Three pieces coordinate to bound concurrency *and* retention without
+    conflating them, because a permit tracks a **checkout, not a socket**:
+
+    - `checkout` takes a permit first (blocking, at the bound, until one is freed: the
+      wait a `PoolTimeout` guards), then reuses an idle connection if one is available
+      and calls `open_connection` only if none is. So a permit is held for the whole time
+      a connection is in use, whether reused or freshly opened.
+    - `checkin` frees the permit and, if the connection is still reusable, returns it to
+      `idle` (closing it instead once `idle` is at `max_keepalive`); an idle connection
+      therefore holds **no** permit.
+
+    The `_semaphore` gates *concurrent use* (so a burst waits instead of opening unbounded
+    sockets), and reuse-before-open under a held permit keeps the count of live sockets
+    `<= max_connections`. `max_keepalive` bounds a different axis: how many idle sockets
+    are *retained* once a burst subsides, so the pool ramps up under load and settles back
+    down when quiet. Idle count never exceeds the high-water mark of concurrent checkouts,
+    so `max_keepalive` above `max_connections` is simply never reached. When
+    `max_connections` is `None` the pool is unbounded and permits are no-ops, so the
+    `pool` timeout axis stays inert until a caller opts into a bound; when `max_keepalive`
+    is `None` every reusable connection is retained.
+    """
+
+    open_connection: Callable[[Timeout], Awaitable[_Http11Connection]]
+    max_keepalive: int | None = None
+    idle: list[_Http11Connection] = field(default_factory=list)
+    closed: bool = False
+    _semaphore: asyncio.Semaphore | None = None
+
+    @classmethod
+    def new(
+        cls,
+        open_connection: Callable[[Timeout], Awaitable[_Http11Connection]],
+        max_connections: int | None,
+        max_keepalive: int | None,
+    ) -> _HostPool:
+        semaphore = asyncio.Semaphore(max_connections) if max_connections is not None else None
+        return cls(open_connection=open_connection, max_keepalive=max_keepalive, _semaphore=semaphore)
+
+    async def checkout(self, timeout: Timeout, *, preopened: _Http11Connection | None = None) -> _Http11Connection:
+        """
+        Take a permit (waiting at the bound, under the `pool` timeout) and return a
+        connection to use: `preopened` if the caller already has one in hand (an h2 ALPN
+        fallback), else a reusable idle one, else a freshly opened one (via the injected
+        `open_connection`, under the `connect` timeout). The permit is held until the
+        matching `checkin`; if anything past the permit fails, it is freed here.
+        """
+        try:
+            async with timeout.pooling():
+                if self._semaphore is not None:
+                    await self._semaphore.acquire()
+        except BaseException:
+            # Freeing a preopened fallback here is all but unreachable: that origin's first
+            # permit is essentially always free, so this only guards a cancel or a
+            # concurrent-fallback race.
+            if preopened is not None:  # pragma: no cover
+                preopened.close()
+            raise
+        try:
+            if preopened is not None:
+                return preopened
+            while self.idle:
+                connection = self.idle.pop()
+                if connection.usable:
+                    return connection
+                connection.close()
+            return await self.open_connection(timeout)
+        except BaseException:
+            self._release()
+            raise
+
+    async def checkin(self, connection: _Http11Connection, *, reusable: bool) -> None:
+        """
+        Hand a checked-out connection back and free its permit. The pool retains it as
+        idle only when the caller reports it reusable, the pool is open, and `idle` is
+        below `max_keepalive`; otherwise it is closed. The caller reports connection
+        health only, never pool policy.
+        """
+        try:
+            under_keepalive = self.max_keepalive is None or len(self.idle) < self.max_keepalive
+            if reusable and not self.closed and under_keepalive:
+                self.idle.append(connection)
+            else:
+                await connection.aclose()
+        finally:
+            self._release()
+
+    async def aclose(self) -> None:
+        self.closed = True
+        idle, self.idle = self.idle, []
+        for connection in idle:
+            await connection.aclose()
+
+    def _release(self) -> None:
+        if self._semaphore is not None:
+            self._semaphore.release()
 
 
 @dataclass(slots=True)
@@ -668,6 +942,13 @@ class ConnectionPool:
     `force_http2_cleartext` is set (the caller asserting the server speaks h2c, since
     cleartext cannot negotiate); otherwise the origin speaks HTTP/1.1.
 
+    `ssl_context_factory` produces the TLS client context (default
+    `ssl.create_default_context`). The pool *calls* it to build the contexts it opens
+    with and sets ALPN on them itself, holding one per distinct offer, so it never
+    mutates (nor shares the ALPN of) a context the caller holds. Pass a factory, not a
+    live context, precisely because ALPN can only be set context-wide: a shared context
+    would be mutated out from under other pools or libraries using it.
+
     `middleware` decorates every request through the pool; per-request `middleware` on
     `request` composes inside it. Keep pool-level middleware to *pure* decoration
     (default headers, redirect following, retry): things that are values, not state.
@@ -675,17 +956,48 @@ class ConnectionPool:
     session) belongs in a value you own and pass per request, so that connection reuse
     (a transport concern) and application identity stay independent rather than both
     hiding in the pool.
+
+    `max_connections_per_host` bounds the number of concurrent HTTP/1.1 connections to
+    one origin: at the bound, a checkout *waits* for one to be returned (the wait a
+    `pool` timeout guards). It is unbounded by default, mirroring the server's choice
+    to let OS backpressure cap connections rather than an in-process limit; opt into a
+    bound when a caller wants explicit per-host backpressure.
+
+    `max_keepalive_per_host` bounds a different axis: how many *idle* HTTP/1.1 connections
+    are retained per origin once a burst subsides. At the cap, a returned connection is
+    closed instead of pooled, so the pool ramps up to `max_connections_per_host` under
+    concurrent load but settles back down to `max_keepalive_per_host` when quiet rather
+    than holding every socket open. It is unbounded by default (every reusable connection
+    is kept); a value above `max_connections_per_host` is never reached, since idle
+    connections cannot outnumber concurrent checkouts. Both knobs, when set, MUST be `>=
+    1`.
+
+    `timeout` bounds each phase of a request (see `Timeout`); it defaults to no timeouts,
+    since a deadline is the caller's policy, not the transport's. A per-request `timeout`
+    on `request` replaces it wholesale for that call.
     """
 
     allow_http2: bool = True
     force_http2_cleartext: bool = False
-    ssl_context: ssl.SSLContext | None = None
+    ssl_context_factory: Callable[[], ssl.SSLContext] = ssl.create_default_context
     middleware: ClientMiddleware = _PASSTHROUGH
+    max_connections_per_host: int | None = None
+    max_keepalive_per_host: int | None = None
+    timeout: Timeout = _NO_TIMEOUT
+    tcp_keepalive: TCPKeepalive | None = _DEFAULT_KEEPALIVE
     _h2: dict[Origin, _Http2Connection] = field(default_factory=dict)
-    _idle_h11: dict[Origin, list[_Http11Connection]] = field(default_factory=dict)
+    _h11: dict[Origin, _HostPool] = field(default_factory=dict)
     _h11_only: set[Origin] = field(default_factory=set)
+    _contexts: dict[tuple[str, ...], ssl.SSLContext] = field(default_factory=dict)
     _origin_locks: dict[Origin, asyncio.Lock] = field(default_factory=dict)
-    _closed: bool = False
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("max_connections_per_host", self.max_connections_per_host),
+            ("max_keepalive_per_host", self.max_keepalive_per_host),
+        ):
+            if value is not None and value < 1:
+                raise ValueError(f"{name} must be >= 1 when set, got {value}")
 
     async def __aenter__(self) -> Self:
         return self
@@ -702,6 +1014,7 @@ class ConnectionPool:
         headers: RawHeaders = (),
         body: bytes | Stream[bytes] = b"",
         middleware: ClientMiddleware = _PASSTHROUGH,
+        timeout: Timeout | None = None,
     ) -> AsyncIterator[ClientResponse]:
         """
         Send a request and yield its `ClientResponse` for the block, then release the connection.
@@ -716,113 +1029,198 @@ class ConnectionPool:
         `middleware` is composed inside the pool's own `middleware`, so a single request
         can add decoration (a `CookieJar` via `cookies`, an extra header) on top of the
         pool-wide stack for this call alone.
+
+        `timeout` replaces the pool's own `timeout` for this call (`None` inherits it).
+        It is captured as a value in the transport exchange, so it does not compose through
+        `middleware` the way decoration does; a deadline overrides, it does not layer.
         """
         outgoing = _build_request(method, url, headers, body)
-        exchange = stack(self.middleware, middleware)(self._exchange)
+        effective = self.timeout if timeout is None else timeout
+
+        async def bound(outgoing: ClientRequest) -> ClientResponse:
+            return await self._exchange(outgoing, effective)
+
+        exchange = stack(self.middleware, middleware)(bound)
         response = await exchange(outgoing)
         try:
             yield response
-        finally:
+        except BaseException:
+            # An error is already in flight; still close the body to release the connection,
+            # but suppress any close error (e.g. a surfaced request-body send failure) so it
+            # cannot mask the original exception the caller is trying to debug.
+            with suppress(Exception):
+                await response.body.aclose()
+            raise
+        else:
             await response.body.aclose()
 
-    async def _exchange(self, request: ClientRequest) -> ClientResponse:
+    async def _exchange(self, request: ClientRequest, timeout: Timeout) -> ClientResponse:
         # The bare transport exchange: the inner `ClientExchange` that `request` wraps
         # with `stack(self.middleware, ...)`. Private so callers go through `request`
-        # and never accidentally bypass the pool's configured middleware.
+        # and never accidentally bypass the pool's configured middleware. The effective
+        # `timeout` is threaded in as a value (captured by `bound` above), never stored on
+        # the shared connection objects, so concurrent requests keep their own deadlines.
         parts = urlsplit(request.url)
         origin = _origin(parts)
         if origin.secure and self.allow_http2:
-            return await self._request_secure(origin, request, parts)
+            return await self._request_secure(origin, request, parts, timeout)
         if not origin.secure and self.force_http2_cleartext:
-            return await self._h2_response(await self._acquire_h2c(origin), request, parts)
-        return await self._request_h11(origin, request, parts)
+            return await self._h2_response(await self._acquire_h2c(origin, timeout), request, parts, timeout)
+        return await self._request_h11(origin, request, parts, timeout)
 
-    async def _request_secure(self, origin: Origin, request: ClientRequest, parts: SplitResult) -> ClientResponse:
+    def _context_for_connection(self, *, http2: bool) -> ssl.SSLContext:
+        """
+        The TLS context to open a secure connection with, advertising `h2` via ALPN only when `http2`.
+
+        Produces one context per distinct ALPN offer from `ssl_context_factory` and caches it, so
+        connections wanting the same offer share a pool-owned context while those wanting different
+        offers never mutate a shared one. Construction is synchronous (no `await`), so concurrent
+        opens can't race on the cache.
+        """
+        protocols = _ALPN_H2 if http2 else _ALPN_HTTP11
+        context = self._contexts.get(protocols)
+        if context is None:
+            context = self.ssl_context_factory()
+            context.set_alpn_protocols(list(protocols))
+            self._contexts[protocols] = context
+        return context
+
+    async def _request_secure(
+        self, origin: Origin, request: ClientRequest, parts: SplitResult, timeout: Timeout
+    ) -> ClientResponse:
         connection = self._reusable_h2(origin)
+        fallback: _Http11Connection | None = None
         if connection is None and origin not in self._h11_only:
             async with self._lock_for(origin):
                 connection = self._reusable_h2(origin)
                 if connection is None and origin not in self._h11_only:
                     reader, writer, protocol = await _open(
-                        origin.host, origin.port, secure=True, http2=True, ssl_context=self.ssl_context
+                        origin.host,
+                        origin.port,
+                        ssl_context=self._context_for_connection(http2=True),
+                        timeout=timeout,
+                        keepalive=self.tcp_keepalive,
                     )
                     if protocol == "h2":
                         connection = _Http2Connection.start(reader, writer)
                         self._h2[origin] = connection
                     else:
                         # ALPN fell back to HTTP/1.1; remember it so future requests
-                        # skip the h2 handshake, and pool this connection for reuse.
+                        # skip the h2 handshake, and reuse this already-open connection.
                         self._h11_only.add(origin)
-                        self._return_h11(origin, _Http11Connection.new(reader, writer))
+                        fallback = _Http11Connection.new(reader, writer)
         if connection is not None:
-            return await self._h2_response(connection, request, parts)
-        return await self._request_h11(origin, request, parts)
+            return await self._h2_response(connection, request, parts, timeout)
+        if fallback is not None:
+            # The fallback connection was opened during the h2 handshake; hand it to
+            # `checkout` as preopened so it takes a permit for this already-open socket
+            # (closing it if the permit cannot be taken) and its checkin balances exactly.
+            return await self._request_h11(origin, request, parts, timeout, preopened=fallback)
+        return await self._request_h11(origin, request, parts, timeout)
 
-    async def _acquire_h2c(self, origin: Origin) -> _Http2Connection:
+    async def _acquire_h2c(self, origin: Origin, timeout: Timeout) -> _Http2Connection:
         connection = self._reusable_h2(origin)
         if connection is None:
             async with self._lock_for(origin):
                 connection = self._reusable_h2(origin)
                 if connection is None:
                     reader, writer, _ = await _open(
-                        origin.host, origin.port, secure=False, http2=False, ssl_context=self.ssl_context
+                        origin.host,
+                        origin.port,
+                        ssl_context=None,
+                        timeout=timeout,
+                        keepalive=self.tcp_keepalive,
                     )
                     connection = _Http2Connection.start(reader, writer)
                     self._h2[origin] = connection
         return connection
 
     async def _h2_response(
-        self, connection: _Http2Connection, request: ClientRequest, parts: SplitResult
+        self, connection: _Http2Connection, request: ClientRequest, parts: SplitResult, timeout: Timeout
     ) -> ClientResponse:
-        status, headers, stream_id, body = await connection.request(
+        status, headers, stream_id, body, send_task = await connection.request(
             method=request.method.encode("ascii"),
             target=_target(parts).encode("ascii"),
             scheme=parts.scheme,
             authority=parts.netloc.encode("ascii"),
             headers=request.headers,
             body=request.body,
+            timeout=timeout,
         )
 
         async def release(fully_read: bool) -> None:
+            # Cancel the still-running body sender first: it may be parked indefinitely
+            # pulling a lazy (queue-fed) body, so it will not end on its own.
+            await cancel_futures([send_task])
             if not fully_read:
                 await connection.abort(stream_id)
 
         return ClientResponse(ResponseHead(status, headers), ResponseBody(await _releasing(body, release)))
 
-    async def _request_h11(self, origin: Origin, request: ClientRequest, parts: SplitResult) -> ClientResponse:
-        connection = self._checkout_h11(origin)
-        if connection is None:
-            reader, writer, _ = await _open(
-                origin.host, origin.port, secure=origin.secure, http2=False, ssl_context=self.ssl_context
-            )
-            connection = _Http11Connection.new(reader, writer)
-        await connection.send_request(request, parts)
-        status, headers = await connection.read_head()
+    async def _request_h11(
+        self,
+        origin: Origin,
+        request: ClientRequest,
+        parts: SplitResult,
+        timeout: Timeout,
+        preopened: _Http11Connection | None = None,
+    ) -> ClientResponse:
+        pool = self._host_pool(origin)
+        connection = await pool.checkout(timeout, preopened=preopened)
+        send_task: asyncio.Task[None] | None = None
+        try:
+            await connection.send_head(request, parts)
+            send_task = asyncio.create_task(connection.send_body(request, timeout))
+            status, headers = await connection.read_head(timeout)
+        except BaseException:
+            # The response body (which owns checkin) is not armed yet, so hand the
+            # connection back here, unreusable, so the pool closes it and frees the permit
+            # exactly once. A caller-body error (recorded on the connection) is preferred
+            # over the read failure it caused.
+            await cancel_futures([send_task])
+            await pool.checkin(connection, reusable=False)
+            if connection.send_error is not None:
+                raise connection.send_error from None
+            raise
 
         async def release(fully_read: bool) -> None:
-            if fully_read and connection.finish() and connection.usable and not self._closed:
-                self._return_h11(origin, connection)
-            else:
-                await connection.aclose()
+            await cancel_futures([send_task])  # cancel-and-await the writer before deciding
+            # This conjunction is the barrier against handing a desync'd connection back to the
+            # pool: a half-sent request or half-read response cannot reach h11 DONE, so
+            # `connection.finish()` fails and the connection is closed rather than reused. Do not
+            # loosen it (e.g. trusting `fully_read` alone) — that reopens request smuggling.
+            reusable = (
+                fully_read
+                and send_task is not None
+                and not send_task.cancelled()
+                and connection.finish()
+                and connection.usable
+            )
+            await pool.checkin(connection, reusable=reusable)
+            if connection.send_error is not None:
+                raise connection.send_error
 
         return ClientResponse(
-            ResponseHead(status, headers), ResponseBody(await _releasing(connection.iter_body(), release))
+            ResponseHead(status, headers), ResponseBody(await _releasing(connection.iter_body(timeout), release))
         )
 
-    def _checkout_h11(self, origin: Origin) -> _Http11Connection | None:
-        idle = self._idle_h11.get(origin)
-        while idle:
-            connection = idle.pop()
-            if connection.usable:
-                return connection
-            connection.close()
-        return None
+    def _host_pool(self, origin: Origin) -> _HostPool:
+        pool = self._h11.get(origin)
+        if pool is None:
+            pool = _HostPool.new(
+                lambda timeout: self._open_h11(origin, timeout),
+                self.max_connections_per_host,
+                self.max_keepalive_per_host,
+            )
+            self._h11[origin] = pool
+        return pool
 
-    def _return_h11(self, origin: Origin, connection: _Http11Connection) -> None:
-        if self._closed:
-            connection.close()
-            return
-        self._idle_h11.setdefault(origin, []).append(connection)
+    async def _open_h11(self, origin: Origin, timeout: Timeout) -> _Http11Connection:
+        ssl_context = self._context_for_connection(http2=False) if origin.secure else None
+        reader, writer, _ = await _open(
+            origin.host, origin.port, ssl_context=ssl_context, timeout=timeout, keepalive=self.tcp_keepalive
+        )
+        return _Http11Connection.new(reader, writer)
 
     def _reusable_h2(self, origin: Origin) -> _Http2Connection | None:
         connection = self._h2.get(origin)
@@ -839,15 +1237,14 @@ class ConnectionPool:
         return lock
 
     async def aclose(self) -> None:
-        self._closed = True
         multiplexed = list(self._h2.values())
-        idle = [connection for connections in self._idle_h11.values() for connection in connections]
+        host_pools = list(self._h11.values())
         self._h2.clear()
-        self._idle_h11.clear()
+        self._h11.clear()
         for multiplexed_connection in multiplexed:
             await multiplexed_connection.aclose()
-        for idle_connection in idle:
-            await idle_connection.aclose()
+        for host_pool in host_pools:
+            await host_pool.aclose()
 
 
 def wrap(
@@ -897,6 +1294,14 @@ def add_headers(*headers: tuple[bytes, bytes]) -> ClientMiddleware:
     return wrap(request=lambda request: replace(request, headers=extra + request.headers))
 
 
+_SENSITIVE_REDIRECT_HEADERS = frozenset({b"authorization", b"cookie", b"proxy-authorization"})
+_BODY_FRAMING_HEADERS = frozenset({b"content-length", b"content-type", b"transfer-encoding"})
+
+
+def _strip_headers(headers: RawHeaders, drop: frozenset[bytes]) -> RawHeaders:
+    return tuple((name, value) for name, value in headers if name.lower() not in drop)
+
+
 def follow_redirects(max_hops: int = 5) -> ClientMiddleware:
     """
     Client middleware that follows `3xx` redirects, up to `max_hops`.
@@ -905,6 +1310,12 @@ def follow_redirects(max_hops: int = 5) -> ClientMiddleware:
     released. The follow re-issues the same request body, so redirects with a
     one-shot streaming body are not replayable; in practice redirects follow bodyless
     requests.
+
+    Credentials are not replayed across an origin boundary: when a hop's target has a
+    different scheme, host, or port, `Authorization`, `Cookie`, and
+    `Proxy-Authorization` are dropped before the request is re-issued. A hop that
+    would downgrade `https` to `http` is refused outright (the `3xx` is returned
+    unfollowed) so nothing is replayed over cleartext.
     """
 
     def middleware(inner: ClientExchange) -> ClientExchange:
@@ -916,8 +1327,21 @@ def follow_redirects(max_hops: int = 5) -> ClientMiddleware:
                 location = next((value for name, value in response.head.headers if name.lower() == b"location"), None)
                 if location is None:
                     return response
+                source = urlsplit(request.url)
+                target = urlsplit(urljoin(request.url, location.decode("ascii")))
+                if source.scheme == "https" and target.scheme == "http":
+                    return response
+                headers = request.headers
+                if _origin(target) != _origin(source):
+                    headers = _strip_headers(headers, _SENSITIVE_REDIRECT_HEADERS)
+                method, body = request.method, request.body
+                if response.head.status == 303 and request.method not in ("GET", "HEAD"):
+                    # RFC 7231 §6.4.4: a 303 tells the client to fetch the target with GET,
+                    # so the original method and body (and their framing headers) are dropped.
+                    method, body = "GET", _empty_body()
+                    headers = _strip_headers(headers, _BODY_FRAMING_HEADERS)
                 await response.body.aclose()
-                request = replace(request, url=urljoin(request.url, location.decode("ascii")))
+                request = replace(request, url=target.geturl(), headers=headers, method=method, body=body)
                 response = await inner(request)
             return response
 
@@ -943,6 +1367,7 @@ class _Cookie:
     path: str
     secure: bool
     host_only: bool
+    expires: datetime | None
 
 
 def _default_path(request_path: str) -> str:
@@ -969,6 +1394,21 @@ def _path_matches(request_path: str, cookie: _Cookie) -> bool:
     return cookie.path.endswith("/") or request_path[len(cookie.path)] == "/"
 
 
+def _domain_acceptable(host: str, domain: str) -> bool:
+    """
+    Whether a response from `host` may set a cookie scoped to `Domain=domain`.
+
+    Enforces RFC 6265 §5.3: the host must equal `domain` or be a subdomain of it, so
+    `evil.example` cannot set a cookie for `victim.com`. A `domain` with no internal
+    dot (a bare TLD like `com`, or `localhost`) is a stand-in for the public-suffix
+    check and is rejected outright, blocking a domain-wide supercookie. Full
+    public-suffix-list coverage (rejecting e.g. `co.uk`) is not yet implemented.
+    """
+    if "." not in domain:
+        return False
+    return host == domain or host.endswith(f".{domain}")
+
+
 def _deletes(max_age: str | None) -> bool:
     if max_age is None:
         return False
@@ -978,13 +1418,32 @@ def _deletes(max_age: str | None) -> bool:
         return False
 
 
+def _as_utc(when: datetime) -> datetime:
+    """Normalize a datetime to an aware UTC value, assuming UTC for a naive input."""
+    return when.replace(tzinfo=UTC) if when.tzinfo is None else when.astimezone(UTC)
+
+
+def _parse_expires(value: str | None) -> datetime | None:
+    """Parse a `Set-Cookie` `Expires` value into an aware UTC datetime, or `None`."""
+    if value is None:
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+    except ValueError, TypeError:
+        return None
+    return _as_utc(parsed)
+
+
 def _parse_set_cookie(header: str, host: str, request_path: str) -> tuple[_Cookie, bool] | None:
     """
     Parse one `Set-Cookie` value into a `_Cookie` and whether it deletes one.
 
-    `None` for a header with no `name=value`. A `Max-Age` of zero or less marks the
-    cookie for deletion (the second tuple element); `Expires` is not parsed, so
-    date-based expiry is not yet honored.
+    `None` for a header with no `name=value`, or one whose `Domain` the response host is
+    not allowed to set (see `_domain_acceptable`). A `Max-Age` of zero or less marks the
+    cookie for deletion (the second tuple element); an `Expires` in the past is handled
+    the same way by the jar. `Max-Age` takes precedence over `Expires`, so `Expires` is
+    parsed onto the cookie only when no `Max-Age` is present. Whether a `Secure` cookie
+    is admitted at all depends on the response transport, which the jar checks at store.
     """
     pair, _, rest = header.partition(";")
     name, sep, value = pair.partition("=")
@@ -998,6 +1457,9 @@ def _parse_set_cookie(header: str, host: str, request_path: str) -> tuple[_Cooki
         if key:
             attributes[key] = val.strip()
     domain = attributes.get("domain", "").lstrip(".").lower()
+    if domain and not _domain_acceptable(host, domain):
+        return None
+    max_age = attributes.get("max-age")
     path = attributes.get("path", "")
     cookie = _Cookie(
         name=name,
@@ -1006,8 +1468,13 @@ def _parse_set_cookie(header: str, host: str, request_path: str) -> tuple[_Cooki
         path=path if path.startswith("/") else _default_path(request_path),
         secure="secure" in attributes,
         host_only=not domain,
+        expires=_parse_expires(attributes.get("expires")) if max_age is None else None,
     )
-    return cookie, _deletes(attributes.get("max-age"))
+    return cookie, _deletes(max_age)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
 
 
 @dataclass(slots=True)
@@ -1022,15 +1489,59 @@ class CookieJar:
     session regardless of how connections are pooled.
 
     Supports host-only and `Domain` (subdomain) matching, `Path` matching, the `Secure`
-    attribute, and deletion via `Max-Age<=0`. Not yet: `Expires` date-based expiry.
+    attribute, and expiry via `Max-Age<=0` or a past `Expires`. A `Set-Cookie` whose
+    `Domain` the response host is not allowed to set, or a `Secure` cookie offered over a
+    cleartext response, is rejected at store time. `_now` supplies the clock for expiry
+    (injectable for tests). Not yet: full public-suffix-list rejection of `Domain` values
+    like `co.uk`, and forward expiry of a positive `Max-Age`.
+
+    Two ways in: `store`, which parses `Set-Cookie` off an (untrusted) response and so
+    applies the origin guards above; and `add`, which places a hand-written cookie the
+    caller vouches for, skipping those guards.
     """
 
     _cookies: dict[tuple[str, str, str], _Cookie] = field(default_factory=dict)
+    _now: Callable[[], datetime] = field(default=_utcnow)
+
+    def add(
+        self,
+        name: str,
+        value: str,
+        *,
+        domain: str,
+        path: str = "/",
+        secure: bool = False,
+        subdomains: bool = False,
+        expires: datetime | None = None,
+    ) -> None:
+        """
+        Add a hand-written cookie directly, without a `Set-Cookie` response.
+
+        The trusted counterpart to `store`: because the caller vouches for the cookie
+        (a session token already in hand, a test fixture), the origin checks `store`
+        applies to an untrusted response, the `Domain` scope check and the
+        `Secure`-over-cleartext rejection, do not apply here. `subdomains=True` sends it
+        to `domain` and its subdomains; the default sends it only to the exact `domain`
+        host. An entry with the same `(domain, path, name)` identity is replaced.
+        """
+        cookie = _Cookie(
+            name=name,
+            value=value,
+            domain=domain.lower(),
+            path=path,
+            secure=secure,
+            host_only=not subdomains,
+            expires=_as_utc(expires) if expires is not None else None,
+        )
+        self._cookies[(cookie.domain, cookie.path, cookie.name)] = cookie
 
     def store(self, url: str, headers: RawHeaders) -> None:
         """Fold every `Set-Cookie` in a response into the jar."""
         parts = urlsplit(url)
         host = (parts.hostname or "").lower()
+        secure_request = parts.scheme == "https"
+        now = self._now()
+        self._prune_expired(now)
         for name, value in headers:
             if name.lower() != b"set-cookie":
                 continue
@@ -1038,11 +1549,19 @@ class CookieJar:
             if parsed is None:
                 continue
             cookie, deletes = parsed
+            if cookie.secure and not secure_request:
+                continue  # a Secure cookie may only be set over a secure transport
             key = (cookie.domain, cookie.path, cookie.name)
-            if deletes:
+            if deletes or (cookie.expires is not None and cookie.expires <= now):
                 self._cookies.pop(key, None)
             else:
                 self._cookies[key] = cookie
+
+    def _prune_expired(self, now: datetime) -> None:
+        """Drop cookies whose `Expires` has passed so a long-lived jar stays bounded."""
+        expired = [key for key, cookie in self._cookies.items() if cookie.expires is not None and cookie.expires <= now]
+        for key in expired:
+            del self._cookies[key]
 
     def header_for(self, url: str) -> bytes | None:
         """The `Cookie` header value for a request to `url`, or `None` if none match."""
@@ -1050,10 +1569,14 @@ class CookieJar:
         host = (parts.hostname or "").lower()
         path = parts.path or "/"
         secure = parts.scheme == "https"
+        now = self._now()
         matched = [
             cookie
             for cookie in self._cookies.values()
-            if _domain_matches(host, cookie) and _path_matches(path, cookie) and (secure or not cookie.secure)
+            if _domain_matches(host, cookie)
+            and _path_matches(path, cookie)
+            and (secure or not cookie.secure)
+            and (cookie.expires is None or cookie.expires > now)
         ]
         if not matched:
             return None

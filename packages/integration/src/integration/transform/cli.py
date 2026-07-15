@@ -85,7 +85,7 @@ async def serve(config: Context[CliSettings], lines: Stream[str], emit: Callable
 
     The imperative shell, with its I/O injected so it stays testable: `main`
     passes the prompting stdin source and `print`, a test passes a fixed
-    `stream(...)` and a list's `append`. It snapshots the config once (the CLI's
+    `stream_from_iterable(...)` and a list's `append`. It snapshots the config once (the CLI's
     whole session is one connection, like the ASGI app's per-request snapshot)
     and runs the processor built from the domain half over the lines.
     """

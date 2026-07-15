@@ -12,7 +12,7 @@ from integration.todos.app import todos_openapi
 from integration.todos.core import Todo
 from integration.todos.core import TodoList
 from without import collect
-from without import stream
+from without import stream_from_iterable
 from without_asgi import ASGIApp
 from without_asgi import RawMessage
 from without_asgi import WebsocketAccept
@@ -87,7 +87,7 @@ async def _request(
     status = start["status"]
     assert isinstance(status, int)
     raw_headers = start["headers"]
-    assert isinstance(raw_headers, list)
+    assert isinstance(raw_headers, (list, tuple))
     collected: dict[str, list[bytes]] = {}
     for name, value in raw_headers:
         collected.setdefault(name.decode(), []).append(value)
@@ -167,12 +167,41 @@ async def test_a_missing_todo_is_a_mapped_404() -> None:
     assert body == {"error": "no todo with id 99", "id": 99}
 
 
-async def test_creating_a_todo_echoes_the_next_id() -> None:
+async def test_creating_a_todo_echoes_it_with_its_url_and_idempotency_key() -> None:
+    app = todos_app(_todos())
+    async with _running(app):
+        status, _headers, body = await _request(
+            app, "POST", "/todos", body=b'{"title": "deploy"}', headers=[(b"idempotency-key", b"abc-123")]
+        )
+    assert status == 201
+    # The body carries the new todo plus its URL, reversed from the `show_todo` route.
+    assert body == {"id": 3, "title": "deploy", "done": False, "url": "/todos/3", "idempotency_key": "abc-123"}
+
+
+async def test_creating_a_todo_without_the_idempotency_key_is_a_422() -> None:
     app = todos_app(_todos())
     async with _running(app):
         status, _headers, body = await _request(app, "POST", "/todos", body=b'{"title": "deploy"}')
-    assert status == 201
-    assert body == {"id": 3, "title": "deploy", "done": False}
+    assert status == 422
+    assert isinstance(body, dict)
+    assert body["error"] == "expected exactly one value, got none"
+    assert body["field"] == "idempotency-key"
+
+
+async def test_creating_a_todo_with_a_duplicated_idempotency_key_is_a_422() -> None:
+    app = todos_app(_todos())
+    async with _running(app):
+        status, _headers, body = await _request(
+            app,
+            "POST",
+            "/todos",
+            body=b'{"title": "deploy"}',
+            headers=[(b"idempotency-key", b"one"), (b"idempotency-key", b"two")],
+        )
+    assert status == 422
+    assert isinstance(body, dict)
+    assert body["error"] == "expected exactly one value, got 2"
+    assert body["field"] == "idempotency-key"
 
 
 async def test_import_echoes_each_todo_as_the_ndjson_stream_arrives() -> None:
@@ -222,7 +251,9 @@ async def test_recover_lets_an_unmapped_exception_propagate() -> None:
 async def test_an_invalid_body_is_a_mapped_422() -> None:
     app = todos_app(_todos())
     async with _running(app):
-        status, _headers, body = await _request(app, "POST", "/todos", body=b"{}")
+        status, _headers, body = await _request(
+            app, "POST", "/todos", body=b"{}", headers=[(b"idempotency-key", b"abc-123")]
+        )
     assert status == 422
     assert isinstance(body, dict)
     assert body["error"] == "invalid todo body"
@@ -306,6 +337,10 @@ async def test_openapi_merges_router_and_handler_halves() -> None:
     assert isinstance(properties, dict)
     assert "title" in properties
 
+    post_params = _dig(spec, "paths", "/todos", "post", "parameters")
+    assert isinstance(post_params, list)
+    assert {"name": "idempotency-key", "in": "header", "required": True, "schema": {"type": "string"}} in post_params
+
     list_params = _dig(spec, "paths", "/todos", "get", "parameters")
     assert isinstance(list_params, list)
     assert [param["in"] for param in list_params if isinstance(param, dict)] == ["query"]
@@ -354,9 +389,11 @@ async def test_the_session_folds_each_submission_into_the_running_list() -> None
     assert sent[0]["type"] == "websocket.accept"
     # The second reply's id and total advance past the first, proving the fold's
     # accumulator carries across frames rather than restarting from the seed each time.
+    # Each reply carries the new todo's URL, reversed from the HTTP `show_todo` route
+    # via the injected `url_for()` (the same path `POST /todos` sets as `Location`).
     assert _sent_replies(sent) == [
-        {"ok": True, "todo": {"id": 3, "title": "soon", "done": False}, "total": 3},
-        {"ok": True, "todo": {"id": 4, "title": "later", "done": True}, "total": 4},
+        {"ok": True, "todo": {"id": 3, "title": "soon", "done": False}, "url": "/todos/3", "total": 3},
+        {"ok": True, "todo": {"id": 4, "title": "later", "done": True}, "url": "/todos/4", "total": 4},
     ]
 
 
@@ -393,7 +430,7 @@ async def test_session_closes_on_a_binary_frame_and_returns_when_the_stream_ends
 
     outputs = await collect(
         handler(
-            stream(
+            stream_from_iterable(
                 [
                     WebsocketConnect(),
                     WebsocketReceive(WebsocketText(text='{"title": "soon"}')),

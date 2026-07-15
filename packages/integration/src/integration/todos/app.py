@@ -9,7 +9,7 @@ from typing import assert_never
 from pydantic import BaseModel
 from pydantic import ValidationError
 from without import Stream
-from without import stream
+from without import stream_from_iterable
 from without_asgi import ASGIApp
 from without_asgi import HttpHandler
 from without_asgi import HttpScope
@@ -32,27 +32,34 @@ from without_asgi import WebsocketScope
 from without_asgi import WebsocketSend
 from without_asgi import WebsocketText
 from without_asgi import encode_response
+from without_asgi import headers
 from without_asgi import make_asgi_app
 from without_asgi.routing import HttpMiddleware
 from without_asgi.routing import stack
 from without_asgi.routing import wrap
 from without_web import INT
 from without_web import Body
+from without_web import ExtractionError
 from without_web import Match
-from without_web import Mount
 from without_web import ResponseSpec
 from without_web import Router
 from without_web import Sequence
 from without_web import WebsocketRouter
 from without_web import body
 from without_web import catching
+from without_web import delegate
 from without_web import get
 from without_web import handle
+from without_web import header_param
 from without_web import http_scope
+from without_web import mount
+from without_web import once
 from without_web import openapi
+from without_web import optional
 from without_web import path_param
 from without_web import post
 from without_web import query_param
+from without_web import url_for
 from without_web import ws
 
 from integration.responses import json_response
@@ -65,10 +72,14 @@ from integration.todos.core import TodoNotFound
 # exercises the whole router design at once. `t"/todos/{todo_id}"` is a typed path
 # parameter (the same `todo_id` token names the segment and is passed as the
 # handler's typed `int` argument); `GET` vs `POST` on `/todos` is method dispatch
-# (so a `PUT` is a 405, not a 404); `?done=` is a typed query filter; `/admin` is
-# a grafted sub-router and `/legacy` an opaque mount; `TodoNotFound`/
-# `ValidationError` are mapped by exception handlers; and the routes describe
-# themselves for OpenAPI.
+# (so a `PUT` is a 405, not a 404); `?done=` is a typed query filter; `POST /todos`
+# also requires an `Idempotency-Key` header, a required singleton read with
+# `header_param` + `once`; `/admin` is a `mount(...)` that bakes its prefix and auth
+# gate into `stats` and `/legacy` an opaque `delegate(...)`; `TodoNotFound`,
+# `ValidationError`, and a malformed `Idempotency-Key` are mapped by exception
+# handlers; `create_todo` and the `/todos/session` websocket both put each new todo's
+# URL in the body with the free `url_for` (the `/todos/session` case reverses an HTTP
+# route from a websocket handler); and the routes describe themselves for OpenAPI.
 #
 # Each handler is a plain function of *parsed values* declared by a `@get`/`@post`
 # decorator that ties typed `Extractor`s to its parameters: `show_todo` takes an
@@ -91,17 +102,16 @@ def _render(todo: Todo) -> dict[str, object]:
     return {"id": todo.id, "title": todo.title, "done": todo.done}
 
 
-def _done(values: list[str]) -> bool | None:
-    """
-    The `done` query filter: `True`/`False` when present, `None` when absent.
-
-    A repeated `?done=` honors the last value, the usual last-wins convention.
-    """
-    return None if not values else values[-1] == "true"
-
-
-done_query = query_param("done", _done, schema={"type": "boolean"})
+# The `done` filter composes out of `optional`: absent yields `None` (no filter), a
+# single `?done=` parses to a bool, and a repeated one is rejected rather than silently
+# last-winning. The one-value parser is all this names; `optional` owns the cardinality.
+done_query = query_param("done", optional(lambda value: value == "true"), schema={"type": "boolean"})
 new_todo_body = body(NewTodo.model_validate_json, schema=NewTodo)
+# `once` adapts a one-value parser into the tuple form `header_param` feeds it, so an
+# idempotency key must appear *exactly once*: absent or duplicated, it raises and maps to
+# a 422. `header_param` gives every value; whether a field is a singleton is the caller's
+# call, declared right here rather than baked into a separate extractor.
+idempotency_key = header_param("idempotency-key", once(bytes.decode), schema={"type": "string"}, required=True)
 # One token, declared once: it is the route's `{id}` segment (matched and schemed
 # through `INT`) *and* the handler's typed `int` argument. No second place to keep
 # "id" or "int" in sync.
@@ -134,10 +144,15 @@ async def list_todos(todos: TodoList, done: bool | None) -> Response:
     return json_response(200, {"todos": [_render(todo) for todo in todos.matching(done)]})
 
 
-@post("/todos", new_todo_body, summary="Create a todo")
-async def create_todo(todos: TodoList, new: NewTodo) -> Response:
+@post("/todos", new_todo_body, idempotency_key, summary="Create a todo")
+async def create_todo(todos: TodoList, new: NewTodo, key: str) -> Response:
     _list, created = todos.added(new)
-    return json_response(201, _render(created))
+    # The `201` body carries the new todo's URL, reversed from the `show_todo` route
+    # value with the free `url_for`: the path a client would `GET` to fetch it, which
+    # follows `t"/todos/{todo_id}"` if it ever changes shape rather than a hand-written string.
+    return json_response(
+        201, {**_render(created), "url": url_for(show_todo, {"id": created.id}), "idempotency_key": key}
+    )
 
 
 @post.stream(
@@ -225,7 +240,9 @@ def legacy(todos: TodoList, head: HttpScope) -> HttpHandler:
     """
 
     def handler(inputs: Stream[Inbound]) -> Stream[Outbound]:
-        return stream(encode_response(json_response(200, {"path": head.path, "root_path": head.root_path})))
+        return stream_from_iterable(
+            encode_response(json_response(200, {"path": head.path, "root_path": head.root_path}))
+        )
 
     return handler
 
@@ -237,8 +254,18 @@ async def _recover(exc: Exception) -> Response | None:
     match exc:
         case TodoNotFound():
             return json_response(404, {"error": str(exc), "id": exc.todo_id})
-        case ValidationError():
-            return json_response(422, {"error": "invalid todo body", "fields": exc.error_count()})
+        # An extraction rejection carries its underlying error as `cause` and the
+        # request part it came from as `field`. Every rejection is a 422 here: the
+        # request parsed as HTTP and only its *contents* were unacceptable. The
+        # `cause` match still picks the body: a pydantic `ValidationError` reports an
+        # error count, while any other bad value (a missing or duplicated
+        # `Idempotency-Key`) names the field it came from. A plain `ValueError` raised
+        # deeper in a handler is *not* an `ExtractionError`, so it falls through to a
+        # 500 rather than masquerading as a client error.
+        case ExtractionError(cause=ValidationError() as invalid):
+            return json_response(422, {"error": "invalid todo body", "fields": invalid.error_count()})
+        case ExtractionError():
+            return json_response(422, {"error": str(exc), "field": exc.field})
         case _:
             return None
 
@@ -246,7 +273,9 @@ async def _recover(exc: Exception) -> Response | None:
 async def _stamp(outputs: Stream[Outbound], _head: HttpScope) -> AsyncIterator[Outbound]:
     async for event in outputs:
         if isinstance(event, ResponseStart):
-            yield ResponseStart(status=event.status, headers=(*event.headers, (b"x-powered-by", b"without-web")))
+            yield ResponseStart(
+                status=event.status, headers=headers.replace(event.headers, b"x-powered-by", b"without-web")
+            )
         else:
             yield event
 
@@ -260,22 +289,24 @@ def require_authorization(handler: HttpHandler, _state: object, scope: HttpScope
     """
     Gate a request on an `Authorization` header, short-circuiting with a 401.
 
-    The point is *where* it applies: it is the `admin` sub-router's own
-    `middleware`, so the mount carries it to every route under `/admin` and nowhere
-    else (the public todo routes stay open). A middleware can replace the handler
-    outright: with no credential it returns one that never reads the request and
-    emits the 401, so the wrapped endpoint never runs.
+    The point is *where* it applies: it is handed to `mount("/admin", ...)`, so it
+    is baked onto every route mounted under `/admin` and nowhere else (the public
+    todo routes stay open). A middleware can replace the handler outright: with no
+    credential it returns one that never reads the request and emits the 401, so the
+    wrapped endpoint never runs.
     """
-    if any(name == b"authorization" for name, _ in scope.headers):
+    if headers.first(scope.headers, b"authorization") is not None:
         return handler
 
     def reject(inputs: Stream[Inbound]) -> Stream[Outbound]:
-        return stream(encode_response(json_response(401, {"error": "admin requires authorization"})))
+        return stream_from_iterable(encode_response(json_response(401, {"error": "admin requires authorization"})))
 
     return reject
 
 
-admin: Router[TodoList] = Router(routes=(stats,), fallback=fallback, middleware=require_authorization)
+# `/admin` is a mount point that bakes its prefix and its auth gate into the routes
+# placed under it; `stats` becomes `/admin/stats` behind `require_authorization`.
+admin = mount("/admin", require_authorization)
 
 todos_router: Router[TodoList] = Router(
     routes=(
@@ -283,8 +314,10 @@ todos_router: Router[TodoList] = Router(
         create_todo,
         import_todos,
         show_todo,
-        Mount("/admin", admin),
-        Mount("/legacy", legacy),
+        admin(stats),
+        # `/legacy` is an opaque app: its routes cannot be seen, so it is delegated
+        # to (handed the prefix-trimmed scope) rather than mounted transparently.
+        delegate("/legacy", legacy),
     ),
     fallback=fallback,
     # `catching` is innermost (last in the stack), so the exception-mapped response
@@ -312,6 +345,12 @@ async def session(todos: TodoList, inputs: Stream[WebsocketInbound]) -> AsyncIte
     the import stream's committed `200`); a binary frame closes, since this
     protocol is text. Nothing persists past the connection, matching `POST /todos`'
     echo stance.
+
+    Reverse routing works in a websocket handler exactly as in an HTTP one: each
+    created todo's reply carries `url_for(show_todo, {"id": ...})`, the path a
+    client would `GET` to fetch it. `url_for` is a plain function of the route
+    value: `show_todo` is an HTTP route, but a route carries its own path, so a
+    websocket handler links to a REST resource without any router involved.
     """
     working = todos
     async for event in inputs:
@@ -340,14 +379,20 @@ def _folded(working: TodoList, frame: str) -> tuple[TodoList, str]:
     except ValidationError as exc:
         return working, json.dumps({"ok": False, "errors": exc.error_count()})
     updated, created = working.added(new)
-    return updated, json.dumps({"ok": True, "todo": _render(created), "total": len(updated.todos)})
+    reply = {
+        "ok": True,
+        "todo": _render(created),
+        "url": url_for(show_todo, {"id": created.id}),
+        "total": len(updated.todos),
+    }
+    return updated, json.dumps(reply)
 
 
 def refuse(todos: TodoList, match: Match[WebsocketScope]) -> WebsocketHandler:
     """The websocket fallback: close an unrouted path without reading any frames."""
 
     def handler(inputs: Stream[WebsocketInbound]) -> Stream[WebsocketOutbound]:
-        return stream((WebsocketClose(),))
+        return stream_from_iterable((WebsocketClose(),))
 
     return handler
 

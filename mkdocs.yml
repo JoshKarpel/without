@@ -1,0 +1,114 @@
+site_name: without
+site_description: >-
+  A decoupled-IO substrate for connecting streams of events to stateful
+  processors backed by contexts, aiming for maximum concurrency from testable,
+  dependency-injected code.
+site_url: https://without.help/
+repo_url: https://github.com/JoshKarpel/without
+repo_name: JoshKarpel/without
+copyright: Copyright &copy; Josh Karpel
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  icon:
+    repo: fontawesome/brands/github
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.instant
+    - navigation.tracking
+    - navigation.indexes
+    - content.code.copy
+    - content.action.edit
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+hooks:
+  - docs/hooks.py
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          inventories:
+            - https://docs.python.org/3/objects.inv
+          options:
+            docstring_style: google
+            show_source: false
+            show_root_heading: true
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            show_if_no_docstring: true
+            members_order: source
+            filters:
+              - "!^_"
+            separate_signature: true
+            show_signature_annotations: true
+            signature_crossrefs: true
+            merge_init_into_class: true
+            docstring_section_style: spacy
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+nav:
+  - Home: index.md
+  - Philosophy: philosophy.md
+  - without:
+      - without/index.md
+      - Reference: without/reference.md
+  - without-env:
+      - without-env/index.md
+      - Reference: without-env/reference.md
+  - without-configmap:
+      - without-configmap/index.md
+      - Reference: without-configmap/reference.md
+  - without-asgi:
+      - without-asgi/index.md
+      - Reference: without-asgi/reference.md
+  - without-web:
+      - without-web/index.md
+      - Reference: without-web/reference.md
+  - without-http:
+      - without-http/index.md
+      - without-http/cookies.md
+      - without-http/security.md
+      - Reference: without-http/reference.md
+  - without-dag:
+      - without-dag/index.md
+      - Reference: without-dag/reference.md
+  - without-logging:
+      - without-logging/index.md
+      - Reference: without-logging/reference.md
+  - Architecture:
+      - architecture/package-graph.md
+  - Changelog: changelog.md

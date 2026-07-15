@@ -9,12 +9,14 @@ authors = [
 ]
 requires-python = ">=3.14"
 dependencies = [
-    "without",
+    "without-core",
     "without-env",
     "without-configmap",
     "without-asgi",
     "without-http",
     "without-web",
+    "without-dag",
+    "without-logging",
 ]
 
 [tool.uv]
@@ -25,12 +27,14 @@ exclude-newer = "7 days"
 members = ["packages/*"]
 
 [tool.uv.sources]
-without = { workspace = true }
+without-core = { workspace = true }
 without-env = { workspace = true }
 without-configmap = { workspace = true }
 without-asgi = { workspace = true }
 without-http = { workspace = true }
 without-web = { workspace = true }
+without-dag = { workspace = true }
+without-logging = { workspace = true }
 integration = { workspace = true }
 benchmarks = { workspace = true }
 
@@ -42,16 +46,25 @@ dev = [
     "pre-commit>=4.4",
     "pytest<10",
     "pytest-cov>=3",
+    "pytest-durations>=1",
     "pytest-xdist>=3",
     "pytest-asyncio>=1",
     "pytest-mock>=3",
     "pytest-randomly>=3",
     "pytest-timeout>=2.3",
     "trustme>=1.1",
-    "hypothesis>=6.155.7",
+    "hypothesis>=6.156.1",
     "mypy>=1",
-    "ruff>=0.15.18",
+    "ruff>=0.15.20",
     "types-pyyaml>=6",
+    "uvloop>=0.22.1 ; sys_platform != 'win32'",  # uvloop has no Windows support; the suite runs asyncio-only there
+]
+docs = [
+    # MkDocs 2.0 is a backward-incompatible rewrite that drops the plugin system
+    # this site relies on (mkdocstrings, the hook), so cap below it deliberately.
+    "mkdocs>=1.6,<2",
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=1.0.4",
 ]
 
 [tool.pytest.ini_options]
@@ -60,7 +73,9 @@ addopts = [
     "-n", "auto",
     "--dist", "worksteal",
     "--strict-markers",
-    "-Werror",
+    # Off by default, like pytest's own --durations: opt in with `just durations`
+    # (or `--pytest-durations=N`) when profiling the suite, so routine runs stay quiet.
+    "--pytest-durations", "0",
 ]
 testpaths = ["packages/**/tests"]
 
@@ -70,7 +85,27 @@ testpaths = ["packages/**/tests"]
 timeout = 30
 timeout_method = "thread"
 
-markers = ["slow"]
+markers = [
+    "slow",
+    # Pass the gap the test closes as the first argument, and any CVE via `cve=`, e.g.
+    # `@pytest.mark.security("strips credentials on a cross-origin redirect", cve="CVE-...")`.
+    # `packages/conftest.py` enforces that every security-marked test carries a description.
+    "security: exercises a security invariant; first arg names the gap it closes (see the note in pyproject)",
+]
+
+# Turn warnings into failures, then carve out narrow exceptions. Later entries win,
+# so the `ignore` overrides the blanket `error` for the one case it matches.
+filterwarnings = [
+    "error",
+    # uvloop's `run_in_executor` calls the deprecated `asyncio.iscoroutinefunction`
+    # (stdlib, slated for removal in 3.16), so any test that hits `asyncio.to_thread`
+    # under the uvloop loop would otherwise fail. This is uvloop's call to make, not ours.
+    "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning",
+    # pytest-durations still reads the pytest-10-deprecated `FixtureDef.has_location`
+    # to key its fixture measurements. Its timing report is a dev tool, not production
+    # behaviour, so ignore its deprecation rather than let it fail the suite.
+    "ignore:FixtureDef.has_location is deprecated:pytest.PytestRemovedIn10Warning",
+]
 
 asyncio_mode = "auto"
 
@@ -92,6 +127,7 @@ omit = [
 [tool.coverage.report]
 show_missing = true
 skip_covered = true
+skip_empty = true
 fail_under = 100
 exclude_also = [
     "assert_never\\(",
@@ -191,4 +227,9 @@ force-single-line = true
     "SLF001",   # tests inspect private internals deliberately (white-box connection-pool checks)
     "ASYNC110", # tests poll observed state (in_flight, started counts) with sleep loops; no Event to await
     "SIM117",   # nested `with` expresses resource scoping (server > pool > request); flattening moves scoped asserts
+]
+"packages/without-http/src/without_http/client.py" = [
+    # `timeout` is a `Timeout` config value threaded to the API boundary (the httpx-parity public name),
+    # not a raw seconds deadline; it is applied via `asyncio.timeout` inside `phase`, so ASYNC109's advice is met.
+    "ASYNC109",
 ]

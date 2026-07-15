@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 import pytest
 from helpers import json_response
 from without import Stream
-from without import stream
+from without import stream_from_iterable
 from without_asgi import Asgi
 from without_asgi import HttpHandler
 from without_asgi import HttpScope
@@ -22,6 +22,9 @@ from without_asgi import WebsocketOutbound
 from without_asgi import WebsocketScope
 from without_web import INT
 from without_web import Describable
+from without_web import ExtractionError
+from without_web import Extractor
+from without_web import HttpRequestHead
 from without_web import Match
 from without_web import Single
 from without_web import body
@@ -32,6 +35,7 @@ from without_web import post
 from without_web import query_param
 from without_web import ws
 from without_web import ws_route
+from without_web.handlers import _extract_all
 
 
 def _scope(*, query: bytes = b"") -> HttpScope:
@@ -146,7 +150,7 @@ def _ws_scope(*, query: bytes = b"") -> WebsocketScope:
 
 
 def _noop_ws(inputs: Stream[WebsocketInbound]) -> Stream[WebsocketOutbound]:
-    return stream(())
+    return stream_from_iterable(())
 
 
 def test_ws_ties_path_and_query_to_the_handler() -> None:
@@ -155,20 +159,15 @@ def test_ws_ties_path_and_query_to_the_handler() -> None:
     since = query_param("since", lambda values: values, schema={"type": "string"})
 
     def make(
-        state: str, room_id: int, since_values: list[str], inputs: Stream[WebsocketInbound]
+        state: str, room_id: int, since_values: tuple[str, ...], inputs: Stream[WebsocketInbound]
     ) -> Stream[WebsocketOutbound]:
         seen.update(state=state, room_id=room_id, since=since_values)
         return _noop_ws(inputs)
 
     route = ws(t"/feed/{room}", room, since)(make)
     processor = route.endpoint("tenant", Match(_ws_scope(query=b"since=5&since=9"), {"room": 7}))
-    processor(stream(()))
-    assert seen == {"state": "tenant", "room_id": 7, "since": ["5", "9"]}
-
-
-def test_ws_rejects_a_body_extractor() -> None:
-    with pytest.raises(ValueError, match="no body"):
-        ws(t"/feed", body(json.loads, schema={"type": "object"}))
+    processor(stream_from_iterable(()))
+    assert seen == {"state": "tenant", "room_id": 7, "since": ("5", "9")}
 
 
 async def _chunks(*payloads: bytes) -> AsyncIterator[Inbound]:
@@ -229,11 +228,6 @@ async def test_handle_stream_buffers_its_output_when_the_handler_returns_a_respo
     assert await _run(handler, b"abcdef") == (201, {"state": "tenant", "received": 6})
 
 
-def test_handle_stream_rejects_a_body_extractor() -> None:
-    with pytest.raises(ValueError, match="cannot take a body extractor"):
-        handle_stream(body(json.loads, schema={"type": "object"}), fn=lambda state, payload, inputs: _empty())
-
-
 def test_handle_stream_recovers_its_openapi_from_the_extractors() -> None:
     endpoint: object = handle_stream(
         query_param("offset", lambda values: values, schema={"type": "integer"}),
@@ -258,7 +252,7 @@ async def test_post_stream_decorator_builds_a_streaming_route() -> None:
         yield ResponseStart(status=200, headers=((b"content-type", b"application/json"),))
         yield ResponseBody(body=json.dumps({"id": target_id, "bytes": total}).encode(), more_body=False)
 
-    route = post.stream(t"/uploads/{id}", requested_id, summary="Stream an upload")(upload)
+    route = post.stream(t"/uploads/{requested_id}", requested_id, summary="Stream an upload")(upload)
     assert tuple(route.methods) == ("POST",)
     handler = route.methods["POST"]("tenant", Match(_scope(), {"id": 3}))
     events = [event async for event in handler(_chunks(b"ab", b"cde"))]
@@ -293,6 +287,17 @@ async def test_handle_stream_relays_a_handler_that_emits_nothing() -> None:
     assert events == []
 
 
+def test_extract_all_wraps_a_stray_value_error_as_an_unattributed_extraction_error() -> None:
+    def reject(head: object) -> object:
+        raise ValueError("deep reject")
+
+    head = HttpRequestHead.parsed(scope=_scope(), path_params={})
+    with pytest.raises(ExtractionError) as caught:
+        _extract_all((Extractor(reject),), head)
+    assert caught.value.field is None
+    assert str(caught.value) == "deep reject"
+
+
 def test_ws_route_wraps_a_pattern_and_endpoint() -> None:
     def endpoint(state: object, match: Match[WebsocketScope]) -> WebsocketHandler:
         raise NotImplementedError
@@ -302,7 +307,7 @@ def test_ws_route_wraps_a_pattern_and_endpoint() -> None:
 
 
 def _empty() -> Stream[Outbound]:
-    return stream(())
+    return stream_from_iterable(())
 
 
 async def _ok(*args: object) -> Response:

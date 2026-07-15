@@ -6,9 +6,12 @@ from without import Transition
 from without import collect
 from without import compose
 from without import from_scan
+from without import from_sink
 from without import sample
-from without import stream
+from without import spool
+from without import stream_from_iterable
 from without import stream_from_queue
+from without import tee
 from without.testing import yield_once
 
 
@@ -21,7 +24,7 @@ async def test_compose_runs_first_then_second() -> None:
 
     chained = compose(from_scan(None, double), from_scan(None, increment))
 
-    assert await collect(chained(stream([6, 7, 8]))) == [13, 15, 17]
+    assert await collect(chained(stream_from_iterable([6, 7, 8]))) == [13, 15, 17]
 
 
 async def test_compose_adapts_the_join_type() -> None:
@@ -33,7 +36,86 @@ async def test_compose_adapts_the_join_type() -> None:
 
     chained = compose(from_scan(None, measure), from_scan(None, label))
 
-    assert await collect(chained(stream(["ab", "cdef"]))) == ["len=2", "len=4"]
+    assert await collect(chained(stream_from_iterable(["ab", "cdef"]))) == ["len=2", "len=4"]
+
+
+async def test_compose_prefixes_a_processor_onto_a_sink() -> None:
+    async def measure(event: str, _: None) -> Transition[None, int]:
+        return Transition(state=None, output=len(event))
+
+    drained: list[int] = []
+
+    async def collect_length(length: int) -> None:
+        drained.append(length)
+
+    lengths_into = compose(from_scan(None, measure), from_sink(collect_length))
+
+    await lengths_into(stream_from_iterable(["ab", "cdef", "x"]))
+
+    assert drained == [2, 4, 1]
+
+
+async def test_tee_delivers_every_value_to_every_sink_in_order() -> None:
+    left: list[int] = []
+    right: list[int] = []
+
+    async def push_left(value: int) -> None:
+        left.append(value)
+
+    async def push_right(value: int) -> None:
+        right.append(value)
+
+    await tee(from_sink(push_left), from_sink(push_right))(stream_from_iterable([5, 6, 7]))
+
+    assert left == [5, 6, 7]
+    assert right == [5, 6, 7]
+
+
+async def test_tee_delivers_every_value_to_a_slower_branch() -> None:
+    fast: list[int] = []
+    slow: list[int] = []
+
+    async def push_fast(value: int) -> None:
+        fast.append(value)
+
+    async def push_slow(value: int) -> None:
+        await yield_once()  # let the fast branch pull ahead before this one records
+        slow.append(value)
+
+    await tee(from_sink(push_fast), from_sink(push_slow), buffer=4)(stream_from_iterable([8, 9, 10]))
+
+    assert fast == [8, 9, 10]
+    assert slow == [8, 9, 10]
+
+
+async def test_tee_requires_at_least_one_sink() -> None:
+    with pytest.raises(ValueError, match="at least one sink"):
+        tee()
+
+
+async def test_tee_rejects_a_nonpositive_buffer() -> None:
+    async def discard(value: int) -> None: ...
+
+    with pytest.raises(ValueError, match="at least 1"):
+        tee(from_sink(discard), buffer=0)
+
+
+async def test_tee_surfaces_a_sink_failure() -> None:
+    class SinkFailed(Exception):
+        pass
+
+    seen: list[int] = []
+
+    async def record(value: int) -> None:
+        seen.append(value)
+
+    async def fail(value: int) -> None:
+        raise SinkFailed("branch broke")
+
+    with pytest.raises(ExceptionGroup) as excinfo:
+        await tee(from_sink(record), from_sink(fail))(stream_from_iterable([1, 2, 3]))
+
+    assert any(isinstance(error, SinkFailed) for error in excinfo.value.exceptions)
 
 
 async def test_stream_from_queue_yields_pushed_values_in_order() -> None:
@@ -48,19 +130,56 @@ async def test_stream_from_queue_yields_pushed_values_in_order() -> None:
     assert received == [5, 6, 7]
 
 
+async def test_spool_yields_every_item_from_the_source() -> None:
+    assert await collect(spool(stream_from_iterable([1, 2, 3]), ahead=2)) == [1, 2, 3]
+
+
+async def test_spool_rejects_a_nonpositive_ahead() -> None:
+    with pytest.raises(ValueError, match="at least 1"):
+        await anext(spool(stream_from_iterable(["x"]), ahead=0))
+
+
+async def test_spool_lets_the_producer_run_ahead_of_the_consumer() -> None:
+    all_produced = asyncio.Event()
+
+    async def source() -> AsyncIterator[str]:
+        for value in ("a", "b", "c"):
+            yield value
+        all_produced.set()
+
+    spooled = spool(source(), ahead=5)
+
+    assert await anext(spooled) == "a"
+    await all_produced.wait()
+
+    assert [item async for item in spooled] == ["b", "c"]
+
+
+async def test_spool_surfaces_a_source_error_after_draining_spooled_items() -> None:
+    async def source() -> AsyncIterator[str]:
+        yield "ok"
+        raise RuntimeError("boom")
+
+    spooled = spool(source(), ahead=5)
+
+    assert await anext(spooled) == "ok"
+    with pytest.raises(RuntimeError, match="boom"):
+        await anext(spooled)
+
+
 async def test_sample_starts_at_the_first_value() -> None:
-    async with sample(stream([11, 22, 33])) as latest:
+    async with sample(stream_from_iterable([11, 22, 33])) as latest:
         assert latest.current() == 11
 
 
 async def test_sample_updated_returns_the_next_published_value() -> None:
-    async with sample(stream([11, 22, 33])) as latest:
+    async with sample(stream_from_iterable([11, 22, 33])) as latest:
         assert await latest.updated() == 22
 
 
 async def test_sample_tracks_the_latest_value() -> None:
     # The synchronous source drains in one go, so one update lands current on the last value.
-    async with sample(stream([11, 22, 33])) as latest:
+    async with sample(stream_from_iterable([11, 22, 33])) as latest:
         await latest.updated()
         assert latest.current() == 33
 
@@ -138,5 +257,5 @@ async def test_updated_fails_fast_after_the_source_has_already_failed() -> None:
 
 async def test_sample_rejects_an_empty_stream() -> None:
     with pytest.raises(ValueError, match="at least one value"):
-        async with sample(stream([])):
+        async with sample(stream_from_iterable([])):
             pass  # pragma: no cover - sample raises on enter, so the body never runs

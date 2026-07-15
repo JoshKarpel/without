@@ -1,41 +1,198 @@
 # How processors connect. `compose` chains one processor into the next on the
-# event edge (pure composition, nothing running). `stack` composes middleware
+# event edge (pure composition, nothing running), or a processor onto a terminal
+# `Sink` to yield a `Sink`. `tee` is the terminal fan-out: it splits one stream
+# across several `Sink` branches, each with its own tail, so a shared prefix runs
+# once and each branch consumes its own copy. `stack` composes middleware
 # (handler-wrapping functions) into one. `sample` is the behavior edge: it
 # exposes a stream's latest value as a Context, which needs a `background_task`
 # running, the thin boundary where the imperative shell shows up.
 # `stream_from_queue` sits at that same boundary from the other side: not a
 # connector between processors but a source adapter that turns a push-based queue
-# into a pull-based stream to feed the rest. `stream` (from a fixed iterable) and
-# `collect` (drain to a list) are the in-memory source and terminal at that edge.
+# into a pull-based stream to feed the rest. `spool` uses that same queue to drive
+# a pull source ahead of its consumer in a background task, decoupling their pace
+# (read-ahead). `stream_from_iterable` (from a fixed iterable) and `collect`
+# (drain to a list) are the in-memory source and terminal at that edge.
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from dataclasses import field
+from typing import cast
+from typing import overload
 
 from without.contracts import Processor
+from without.contracts import Sink
 from without.contracts import Stream
 from without.tasks import background_task
 
 
-def compose[A, B, C](first: Processor[A, B], second: Processor[B, C]) -> Processor[A, C]:
+async def stream_from_iterable[T](values: Iterable[T]) -> AsyncIterator[T]:
+    """
+    Expose a fixed iterable as a `Stream`: the simplest source.
+
+    Turns already-in-hand values into the pull-based `Stream` the rest of
+    `without` consumes, e.g. to emit a fixed reply or to feed a processor under
+    test. `stream_from_queue` is the push-source counterpart.
+    """
+    for value in values:
+        yield value
+
+
+async def stream_from_queue[T](queue: asyncio.Queue[T]) -> AsyncIterator[T]:
+    """
+    Expose a queue as a Stream: the bridge from a push source to a pull stream.
+
+    A source that *pushes* (a server's accept loop, a callback-based client, a
+    pub/sub subscriber) drops values into a queue; this turns that queue into the
+    pull-based `Stream` the rest of `without` consumes. It ends gracefully when
+    the queue is shut down (`queue.shutdown()`): remaining items still drain, then
+    `get` raises `QueueShutDown` and the stream ends, letting a downstream fold
+    return its final value. Shutting the queue down is thus the closable-stream
+    signal; without it the stream never ends on its own and must be driven inside
+    a `background_task` or otherwise cancelled by its consumer.
+    """
+    while True:
+        try:
+            yield await queue.get()
+        except asyncio.QueueShutDown:
+            return
+
+
+async def spool[T](source: Stream[T], ahead: int) -> AsyncIterator[T]:
+    """
+    Drive a source ahead of its consumer through a bounded queue: read-ahead.
+
+    A background task pulls from `source` as fast as backpressure allows and
+    drops each value into a queue of at most `ahead` items; the returned stream
+    yields from that queue. So the source is *driven* independently of how fast
+    the consumer pulls: a pull-based producer (an accept loop, a file's chunks, a
+    DAG's `executed` iterator) keeps making progress while a slower consumer
+    catches up, up to `ahead` items of slack before `put` blocks and backpressure
+    reaches the producer. That overlaps the producer's work with the consumer's,
+    e.g. reading the next file chunk while the current one is still being written
+    to a socket.
+
+    `ahead` must be at least 1: the bound *is* the backpressure, so an unbounded
+    spool (which could let a fast producer grow memory without limit) is a
+    `ValueError` rather than a silent default. When `source` ends the queue is
+    shut down and the stream ends once drained; if `source` raises, the spooled
+    items still drain and then the error surfaces. Closing the stream early
+    cancels the background task, so the producer never outlives its consumer.
+    """
+    if ahead < 1:
+        raise ValueError(f"ahead must be at least 1, but got {ahead}")
+
+    queue: asyncio.Queue[T] = asyncio.Queue(ahead)
+
+    async def pump() -> None:
+        try:
+            async for item in source:
+                await queue.put(item)
+        finally:
+            queue.shutdown()
+
+    async with background_task(pump()):
+        async for item in stream_from_queue(queue):
+            yield item
+
+
+async def collect[T](source: Stream[T]) -> list[T]:
+    """
+    Drain a `Stream` into a list: the terminal that materializes every value.
+
+    The dual of `stream_from_iterable`. It runs until the source ends, so it suits bounded
+    streams (a finished request, a shut-down queue); an endless source never
+    returns.
+    """
+    return [value async for value in source]
+
+
+@overload
+def compose[A, B, C](first: Processor[A, B], second: Processor[B, C]) -> Processor[A, C]: ...
+
+
+@overload
+def compose[A, B](first: Processor[A, B], second: Sink[B]) -> Sink[A]: ...
+
+
+def compose[A, B, C](first: Processor[A, B], second: Processor[B, C] | Sink[B]) -> Processor[A, C] | Sink[A]:
     """
     Compose two processors on the event edge: `first` then `second`.
 
     The join type `B` may differ from `A` and `C`, so this adapts as well as
     chains. Pure composition (the only event-edge connector that needs nothing
-    running); nest for three or more stages.
+    running); nest for three or more stages. When `second` is a `Sink` rather than
+    a `Processor` the result is a `Sink` too: the same wiring, terminated, which is
+    how a middleware chain (a filter, an enrichment) is prefixed onto a terminal
+    consumer such as a writer.
     """
 
-    def composed(inputs: Stream[A]) -> Stream[C]:
+    def composed(inputs: Stream[A]) -> Stream[C] | Awaitable[None]:
         return second(first(inputs))
 
-    return composed
+    return cast("Processor[A, C] | Sink[A]", composed)
+
+
+def tee[T](*sinks: Sink[T], buffer: int = 1) -> Sink[T]:
+    """
+    Fan one stream out to every `sink`: the terminal counterpart to `compose`.
+
+    Where `compose` chains a processor onto a *single* sink, `tee` splits the stream
+    across several, after the Unix tool that writes one input to many destinations.
+    Every sink sees every event, in order, and the input is consumed exactly once.
+    The caller controls the split point purely by placement, since each argument is
+    itself a `Sink`: whatever is composed *before* the `tee` is the shared prefix
+    (parsed and enriched once), and each branch is its own `Sink`, carrying its own
+    filtering, rendering, and terminal. A branch MAY itself be another `tee`, so
+    "one input, several sink groups" nests without new machinery.
+
+    One pump reads the source once and pushes each value onto every branch's bounded
+    queue; each sink drains its own queue concurrently, and when the source ends the
+    queues are shut so each branch's stream ends and its sink returns. Every branch
+    MUST be consumed to completion and concurrently: a sink that stops early leaves
+    its queue to fill and stalls the pump (real sinks, a filter that drops events
+    included, drain every input). A sink failure tears the whole `tee` down and
+    surfaces as an `ExceptionGroup`, so a broken branch fails loud rather than
+    silently starving the rest.
+
+    `buffer` is how far a branch may run ahead: the queues are bounded to it, so the
+    slowest branch gates the pump (and thus backpressure onto the source), while a
+    larger value trades memory for slack so a fast branch need not wait on a slow
+    one. The default `1` keeps memory `O(sinks)`. At least one sink is REQUIRED, and
+    `buffer` MUST be at least 1 (an unbounded branch could grow memory without limit).
+    """
+    if not sinks:
+        raise ValueError("tee requires at least one sink")
+    if buffer < 1:
+        raise ValueError(f"buffer must be at least 1, but got {buffer}")
+
+    async def teeing(inputs: Stream[T]) -> None:
+        queues: list[asyncio.Queue[T]] = [asyncio.Queue(maxsize=buffer) for _ in sinks]
+
+        async def pump() -> None:
+            try:
+                async for value in inputs:
+                    for queue in queues:
+                        await queue.put(value)
+            finally:
+                for queue in queues:
+                    queue.shutdown()
+
+        async def drive(sink: Sink[T], queue: asyncio.Queue[T]) -> None:
+            await sink(stream_from_queue(queue))
+
+        async with asyncio.TaskGroup() as group:
+            group.create_task(pump())
+            for sink, queue in zip(sinks, queues, strict=True):
+                group.create_task(drive(sink, queue))
+
+    return teeing
 
 
 type Endo[T] = Callable[[T], T]
@@ -65,49 +222,6 @@ def stack[H, *Ctx](*middleware: Callable[[H, *Ctx], H]) -> Callable[[H, *Ctx], H
         return handler
 
     return composed
-
-
-async def stream_from_queue[T](queue: asyncio.Queue[T]) -> AsyncIterator[T]:
-    """
-    Expose a queue as a Stream: the bridge from a push source to a pull stream.
-
-    A source that *pushes* (a server's accept loop, a callback-based client, a
-    pub/sub subscriber) drops values into a queue; this turns that queue into the
-    pull-based `Stream` the rest of `without` consumes. It ends gracefully when
-    the queue is shut down (`queue.shutdown()`): remaining items still drain, then
-    `get` raises `QueueShutDown` and the stream ends, letting a downstream fold
-    return its final value. Shutting the queue down is thus the closable-stream
-    signal; without it the stream never ends on its own and must be driven inside
-    a `background_task` or otherwise cancelled by its consumer.
-    """
-    while True:
-        try:
-            yield await queue.get()
-        except asyncio.QueueShutDown:
-            return
-
-
-async def stream[T](values: Iterable[T]) -> AsyncIterator[T]:
-    """
-    Expose a fixed iterable as a `Stream`: the simplest source.
-
-    Turns already-in-hand values into the pull-based `Stream` the rest of
-    `without` consumes, e.g. to emit a fixed reply or to feed a processor under
-    test. `stream_from_queue` is the push-source counterpart.
-    """
-    for value in values:
-        yield value
-
-
-async def collect[T](source: Stream[T]) -> list[T]:
-    """
-    Drain a `Stream` into a list: the terminal that materializes every value.
-
-    The dual of `stream`. It runs until the source ends, so it suits bounded
-    streams (a finished request, a shut-down queue); an endless source never
-    returns.
-    """
-    return [value async for value in source]
 
 
 @dataclass(slots=True)

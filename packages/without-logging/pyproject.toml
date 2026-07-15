@@ -1,0 +1,32 @@
+[build-system]
+requires = ["uv_build>=0.11.26,<0.12"]
+build-backend = "uv_build"
+
+[project]
+name = "without-logging"
+version = "0.0.0"
+description = "A without pipeline for logs: stdlib log records parsed into immutable values, filtered and enriched as processors, drained to a sink."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Josh Karpel", email = "josh.karpel@gmail.com" },
+]
+requires-python = ">=3.14"
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: System :: Logging",
+    "Typing :: Typed",
+]
+dependencies = [
+    "without-core",
+]
+
+[tool.uv.sources]
+without-core = { workspace = true }

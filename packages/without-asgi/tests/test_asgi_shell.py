@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 from without import collect
-from without import stream
+from without import stream_from_iterable
 from without_asgi import ClientDisconnect
 from without_asgi import Disconnect
 from without_asgi import Inbound
@@ -77,7 +77,7 @@ async def test_http_inbound_ends_on_a_disconnect() -> None:
 
 
 async def test_read_body_joins_every_chunk() -> None:
-    events = stream(
+    events = stream_from_iterable(
         [
             RequestBody(body=b"ab", more_body=True),
             RequestBody(body=b"c", more_body=False),
@@ -91,7 +91,7 @@ async def test_read_body_raises_on_a_mid_body_disconnect() -> None:
     inputs: list[Inbound] = [RequestBody(body=b"ab", more_body=True), Disconnect()]
 
     with pytest.raises(ClientDisconnect):
-        await read_body(stream(inputs))
+        await read_body(stream_from_iterable(inputs))
 
 
 async def test_http_outbound_encodes_each_event_to_send() -> None:
@@ -101,10 +101,10 @@ async def test_http_outbound_encodes_each_event_to_send() -> None:
         ResponseBody(body=b"ok", more_body=False),
     ]
 
-    await http_outbound(send)(stream(events))
+    await http_outbound(send)(stream_from_iterable(events))
 
     assert sent == [
-        {"type": "http.response.start", "status": 200, "headers": [[b"content-type", b"text/plain"]]},
+        {"type": "http.response.start", "status": 200, "headers": ((b"content-type", b"text/plain"),)},
         {"type": "http.response.body", "body": b"ok", "more_body": False},
     ]
 
@@ -133,7 +133,7 @@ async def test_websocket_outbound_encodes_each_event_to_send() -> None:
         WebsocketSend(data=WebsocketBinary(data=b"\x01")),
     ]
 
-    await websocket_outbound(send)(stream(events))
+    await websocket_outbound(send)(stream_from_iterable(events))
 
     assert sent == [{"type": "websocket.send", "bytes": b"\x01"}]
 
@@ -150,6 +150,6 @@ async def test_lifespan_outbound_encodes_replies_to_send() -> None:
     send, sent = _capturing()
     replies: list[LifespanReply] = [StartupComplete(), ShutdownComplete()]
 
-    await lifespan_outbound(send)(stream(replies))
+    await lifespan_outbound(send)(stream_from_iterable(replies))
 
     assert sent == [{"type": "lifespan.startup.complete"}, {"type": "lifespan.shutdown.complete"}]

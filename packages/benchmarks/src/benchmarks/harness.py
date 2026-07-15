@@ -139,7 +139,17 @@ async def _attack(base: str, endpoint: str, rate: int, duration: int, connection
         # the h2 preface; a server that only speaks HTTP/1.1 (uvicorn) will refuse.
         attack.append("-h2c")
     if has_body:
-        attack += ["-body", str(_BODY), "-header", "Content-Type: application/json"]
+        # Both create routes require an idempotency key. Vegeta replays one static value
+        # for every request, which is fine here: neither stack persists keys across
+        # requests, so a repeat is still a full create rather than a replayed hit.
+        attack += [
+            "-body",
+            str(_BODY),
+            "-header",
+            "Content-Type: application/json",
+            "-header",
+            "Idempotency-Key: bench-abc-123",
+        ]
     await _run(attack, stdin=target)
     return await _capture(["vegeta", "report", "-type=text", str(out)])
 
