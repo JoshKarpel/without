@@ -39,9 +39,56 @@
   generator: awaiting it runs the `stat` up front, so a missing file raises `FileNotFoundError` before
   any `ResponseStart` is emitted and a handler can still answer a clean `404`. Reads and writes are
   lockstep by default; wrap the result in `spool` for read-ahead.
+- **`without-asgi`**: `headers`, a module of pure functions over the raw ASGI header pairs
+  (`RawHeaders`) rather than a wrapper type. `get_all` returns every value under a name as an
+  immutable tuple and `first` the first (for singleton fields, where a duplicate is a protocol
+  violation); `add`, `replace`,
+  `remove`, `subset`, and `merge` are `RawHeaders -> RawHeaders` transforms. All match field names
+  case-insensitively (RFC 9110) and preserve duplicates, so a multi-valued `Set-Cookie` survives
+  intact. `RawHeaders` is the one representation the ASGI spec fixes on both edges, so operating on
+  it directly keeps reads a scan and writes a straight pass-through, no value to wrap or unwrap.
+- **`without-web`**: `once` and `optional`, parse adapters for singleton request fields. Each
+  lifts a one-value `parse` into the tuple-taking form `query_param`/`header_param` feed: `once`
+  requires the value exactly once (returning `V`), `optional` allows zero or one (returning
+  `V | None`, `None` when absent). A duplicated value raises `ValueError` in both (a duplicated
+  singleton violates RFC 9110 §5.3). Reading a single value stays a policy the call site chooses
+  rather than a second extractor.
+- **`without-web`**: `ExtractionError`, a `ValueError` subtype marking a request rejected *while one
+  of its typed values was being extracted*. The `query_param`/`header_param`/`body` extractors raise
+  it directly when their `parse` rejects (a `once`/`optional` cardinality check, a converter, a
+  pydantic `ValidationError`), gathering at the raise site what a `recover` policy needs: `field`
+  names the request part that failed (the parameter name, or `None` for the body) and `cause` carries
+  the underlying error as a first-class value, so a policy matches
+  `case ExtractionError(cause=ValidationError())` for a 422 versus `case ExtractionError()` for a 400
+  naming the `field`, without reaching into `__cause__`. The router wraps any stray, unattributed
+  `ValueError` (from a custom extractor or an `into` factory) as a backstop. Making the boundary a
+  single matchable type is what lets a plain `ValueError` raised deeper in a handler surface as a 500
+  rather than masquerading as a client 400.
 
 ### Changed
 
+- **`without-web`**: the extractor context type `Request` is renamed `RequestHead` and no longer
+  carries the request body. `RequestHead` is exactly the parsed head an extractor reads (scope,
+  path params, query params), mirroring `without-http`'s `ResponseHead`. It is now the top of a
+  small context lattice each route builds concretely: `HttpRequestHead` (scope narrowed to
+  `HttpScope`) for HTTP routes, `WebsocketRequestHead` (`WebsocketScope`) for websocket routes, and
+  `BufferedRequest` (an `HttpRequestHead` plus the buffered `body`) for the buffered-HTTP path.
+  Custom extractors typed on `Request` become `RequestHead` (or a narrower context if they read the
+  concrete scope or body).
+- **`without-web`**: `Extractor` gains a request-context type parameter, `Extractor[C, V]` (was
+  `Extractor[V]`), contravariant in `C`. This makes the wrong extractor on the wrong route a *static*
+  type error rather than a runtime guard: a `body` token (`Extractor[BufferedRequest, V]`) on a
+  streaming or websocket route, or an `http_scope`/`websocket_scope` on the wrong protocol, no longer
+  type-checks, so the former runtime `TypeError`/`ValueError` guards in `body`/`http_scope`/
+  `websocket_scope`/`handle_stream`/`ws` are removed. Permissive tokens
+  (`path_param`/`query_param`/`header_param`/`catch_all`) are `Extractor[RequestHead, V]` and still
+  serve any route. A custom extractor annotated `Extractor[V]` must add its context:
+  `Extractor[RequestHead, V]` for a scope/path/query read.
+- **`without-web`**: query and header extractor `parse` callbacks now receive an immutable `tuple`
+  of values rather than a `list` (`query_param`, `header_param`, and the `once`/`optional`
+  adapters), and `RequestHead.query_params` values are tuples. The parsed head is a value no
+  consumer can mutate out from under another (values over places); a `parse` typed on `list` must
+  widen to `tuple`.
 - **`without-core`** (imported as `without`): the `buffer` wiring connector is renamed `spool`, and its
   `maxsize` argument renamed `ahead`, so `spool(source, ahead=n)` reads as the read-ahead it is (drive a
   source ahead of its consumer through a bounded queue on a background task). Behavior is unchanged.

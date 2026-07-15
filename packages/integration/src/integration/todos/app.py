@@ -32,12 +32,14 @@ from without_asgi import WebsocketScope
 from without_asgi import WebsocketSend
 from without_asgi import WebsocketText
 from without_asgi import encode_response
+from without_asgi import headers
 from without_asgi import make_asgi_app
 from without_asgi.routing import HttpMiddleware
 from without_asgi.routing import stack
 from without_asgi.routing import wrap
 from without_web import INT
 from without_web import Body
+from without_web import ExtractionError
 from without_web import Match
 from without_web import ResponseSpec
 from without_web import Router
@@ -48,9 +50,12 @@ from without_web import catching
 from without_web import delegate
 from without_web import get
 from without_web import handle
+from without_web import header_param
 from without_web import http_scope
 from without_web import mount
+from without_web import once
 from without_web import openapi
+from without_web import optional
 from without_web import path_param
 from without_web import post
 from without_web import query_param
@@ -67,9 +72,11 @@ from integration.todos.core import TodoNotFound
 # exercises the whole router design at once. `t"/todos/{todo_id}"` is a typed path
 # parameter (the same `todo_id` token names the segment and is passed as the
 # handler's typed `int` argument); `GET` vs `POST` on `/todos` is method dispatch
-# (so a `PUT` is a 405, not a 404); `?done=` is a typed query filter; `/admin` is a
-# `mount(...)` that bakes its prefix and auth gate into `stats` and `/legacy` an
-# opaque `delegate(...)`; `TodoNotFound`/`ValidationError` are mapped by exception
+# (so a `PUT` is a 405, not a 404); `?done=` is a typed query filter; `POST /todos`
+# also requires an `Idempotency-Key` header, a required singleton read with
+# `header_param` + `once`; `/admin` is a `mount(...)` that bakes its prefix and auth
+# gate into `stats` and `/legacy` an opaque `delegate(...)`; `TodoNotFound`,
+# `ValidationError`, and a malformed `Idempotency-Key` are mapped by exception
 # handlers; `create_todo` and the `/todos/session` websocket both put each new todo's
 # URL in the body with the free `url_for` (the `/todos/session` case reverses an HTTP
 # route from a websocket handler); and the routes describe themselves for OpenAPI.
@@ -95,17 +102,16 @@ def _render(todo: Todo) -> dict[str, object]:
     return {"id": todo.id, "title": todo.title, "done": todo.done}
 
 
-def _done(values: list[str]) -> bool | None:
-    """
-    The `done` query filter: `True`/`False` when present, `None` when absent.
-
-    A repeated `?done=` honors the last value, the usual last-wins convention.
-    """
-    return None if not values else values[-1] == "true"
-
-
-done_query = query_param("done", _done, schema={"type": "boolean"})
+# The `done` filter composes out of `optional`: absent yields `None` (no filter), a
+# single `?done=` parses to a bool, and a repeated one is rejected rather than silently
+# last-winning. The one-value parser is all this names; `optional` owns the cardinality.
+done_query = query_param("done", optional(lambda value: value == "true"), schema={"type": "boolean"})
 new_todo_body = body(NewTodo.model_validate_json, schema=NewTodo)
+# `once` adapts a one-value parser into the tuple form `header_param` feeds it, so an
+# idempotency key must appear *exactly once*: absent or duplicated, it raises and maps to
+# a 400. `header_param` gives every value; whether a field is a singleton is the caller's
+# call, declared right here rather than baked into a separate extractor.
+idempotency_key = header_param("idempotency-key", once(bytes.decode), schema={"type": "string"}, required=True)
 # One token, declared once: it is the route's `{id}` segment (matched and schemed
 # through `INT`) *and* the handler's typed `int` argument. No second place to keep
 # "id" or "int" in sync.
@@ -138,13 +144,15 @@ async def list_todos(todos: TodoList, done: bool | None) -> Response:
     return json_response(200, {"todos": [_render(todo) for todo in todos.matching(done)]})
 
 
-@post("/todos", new_todo_body, summary="Create a todo")
-async def create_todo(todos: TodoList, new: NewTodo) -> Response:
+@post("/todos", new_todo_body, idempotency_key, summary="Create a todo")
+async def create_todo(todos: TodoList, new: NewTodo, key: str) -> Response:
     _list, created = todos.added(new)
     # The `201` body carries the new todo's URL, reversed from the `show_todo` route
     # value with the free `url_for`: the path a client would `GET` to fetch it, which
     # follows `t"/todos/{todo_id}"` if it ever changes shape rather than a hand-written string.
-    return json_response(201, {**_render(created), "url": url_for(show_todo, {"id": created.id})})
+    return json_response(
+        201, {**_render(created), "url": url_for(show_todo, {"id": created.id}), "idempotency_key": key}
+    )
 
 
 @post.stream(
@@ -246,8 +254,16 @@ async def _recover(exc: Exception) -> Response | None:
     match exc:
         case TodoNotFound():
             return json_response(404, {"error": str(exc), "id": exc.todo_id})
-        case ValidationError():
-            return json_response(422, {"error": "invalid todo body", "fields": exc.error_count()})
+        # An extraction rejection carries its underlying error as `cause` and the
+        # request part it came from as `field`: a body's pydantic `ValidationError`
+        # maps to a 422, any other bad value (a missing or duplicated
+        # `Idempotency-Key`) to a 400 naming the field. A plain `ValueError` raised
+        # deeper in a handler is *not* an `ExtractionError`, so it falls through to a
+        # 500 rather than masquerading as a client 400.
+        case ExtractionError(cause=ValidationError() as invalid):
+            return json_response(422, {"error": "invalid todo body", "fields": invalid.error_count()})
+        case ExtractionError():
+            return json_response(400, {"error": str(exc), "field": exc.field})
         case _:
             return None
 
@@ -255,7 +271,9 @@ async def _recover(exc: Exception) -> Response | None:
 async def _stamp(outputs: Stream[Outbound], _head: HttpScope) -> AsyncIterator[Outbound]:
     async for event in outputs:
         if isinstance(event, ResponseStart):
-            yield ResponseStart(status=event.status, headers=(*event.headers, (b"x-powered-by", b"without-web")))
+            yield ResponseStart(
+                status=event.status, headers=headers.replace(event.headers, b"x-powered-by", b"without-web")
+            )
         else:
             yield event
 
@@ -275,7 +293,7 @@ def require_authorization(handler: HttpHandler, _state: object, scope: HttpScope
     credential it returns one that never reads the request and emits the 401, so the
     wrapped endpoint never runs.
     """
-    if any(name == b"authorization" for name, _ in scope.headers):
+    if headers.first(scope.headers, b"authorization") is not None:
         return handler
 
     def reject(inputs: Stream[Inbound]) -> Stream[Outbound]:

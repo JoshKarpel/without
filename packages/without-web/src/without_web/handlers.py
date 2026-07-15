@@ -20,8 +20,11 @@ from without_asgi import WebsocketScope
 from without_asgi import encode_response
 from without_asgi import read_body
 
+from without_web.extractors import BufferedRequest
+from without_web.extractors import ExtractionError
 from without_web.extractors import Extractor
-from without_web.extractors import Request
+from without_web.extractors import HttpRequestHead
+from without_web.extractors import WebsocketRequestHead
 from without_web.extractors import single_body
 from without_web.openapi import Body
 from without_web.openapi import ResponseSpec
@@ -71,7 +74,7 @@ def handle[T](
 
 @overload
 def handle[T, A](
-    a: Extractor[A],
+    a: Extractor[BufferedRequest, A],
     /,
     *,
     fn: Callable[[T, A], Returned],
@@ -82,8 +85,8 @@ def handle[T, A](
 
 @overload
 def handle[T, A, B](
-    a: Extractor[A],
-    b: Extractor[B],
+    a: Extractor[BufferedRequest, A],
+    b: Extractor[BufferedRequest, B],
     /,
     *,
     fn: Callable[[T, A, B], Returned],
@@ -94,9 +97,9 @@ def handle[T, A, B](
 
 @overload
 def handle[T, A, B, C](
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
+    a: Extractor[BufferedRequest, A],
+    b: Extractor[BufferedRequest, B],
+    c: Extractor[BufferedRequest, C],
     /,
     *,
     fn: Callable[[T, A, B, C], Returned],
@@ -107,10 +110,10 @@ def handle[T, A, B, C](
 
 @overload
 def handle[T, A, B, C, D](
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
+    a: Extractor[BufferedRequest, A],
+    b: Extractor[BufferedRequest, B],
+    c: Extractor[BufferedRequest, C],
+    d: Extractor[BufferedRequest, D],
     /,
     *,
     fn: Callable[[T, A, B, C, D], Returned],
@@ -121,11 +124,11 @@ def handle[T, A, B, C, D](
 
 @overload
 def handle[T, A, B, C, D, E](
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
+    a: Extractor[BufferedRequest, A],
+    b: Extractor[BufferedRequest, B],
+    c: Extractor[BufferedRequest, C],
+    d: Extractor[BufferedRequest, D],
+    e: Extractor[BufferedRequest, E],
     /,
     *,
     fn: Callable[[T, A, B, C, D, E], Returned],
@@ -136,12 +139,12 @@ def handle[T, A, B, C, D, E](
 
 @overload
 def handle[T, A, B, C, D, E, F](
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
-    f: Extractor[F],
+    a: Extractor[BufferedRequest, A],
+    b: Extractor[BufferedRequest, B],
+    c: Extractor[BufferedRequest, C],
+    d: Extractor[BufferedRequest, D],
+    e: Extractor[BufferedRequest, E],
+    f: Extractor[BufferedRequest, F],
     /,
     *,
     fn: Callable[[T, A, B, C, D, E, F], Returned],
@@ -152,13 +155,13 @@ def handle[T, A, B, C, D, E, F](
 
 @overload
 def handle[T, A, B, C, D, E, F, G](
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
-    f: Extractor[F],
-    g: Extractor[G],
+    a: Extractor[BufferedRequest, A],
+    b: Extractor[BufferedRequest, B],
+    c: Extractor[BufferedRequest, C],
+    d: Extractor[BufferedRequest, D],
+    e: Extractor[BufferedRequest, E],
+    f: Extractor[BufferedRequest, F],
+    g: Extractor[BufferedRequest, G],
     /,
     *,
     fn: Callable[[T, A, B, C, D, E, F, G], Returned],
@@ -169,14 +172,14 @@ def handle[T, A, B, C, D, E, F, G](
 
 @overload
 def handle[T, A, B, C, D, E, F, G, H](
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
-    f: Extractor[F],
-    g: Extractor[G],
-    h: Extractor[H],
+    a: Extractor[BufferedRequest, A],
+    b: Extractor[BufferedRequest, B],
+    c: Extractor[BufferedRequest, C],
+    d: Extractor[BufferedRequest, D],
+    e: Extractor[BufferedRequest, E],
+    f: Extractor[BufferedRequest, F],
+    g: Extractor[BufferedRequest, G],
+    h: Extractor[BufferedRequest, H],
     /,
     *,
     fn: Callable[[T, A, B, C, D, E, F, G, H], Returned],
@@ -187,15 +190,15 @@ def handle[T, A, B, C, D, E, F, G, H](
 
 @overload
 def handle[T, A, B, C, D, E, F, G, H, J](
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
-    f: Extractor[F],
-    g: Extractor[G],
-    h: Extractor[H],
-    j: Extractor[J],
+    a: Extractor[BufferedRequest, A],
+    b: Extractor[BufferedRequest, B],
+    c: Extractor[BufferedRequest, C],
+    d: Extractor[BufferedRequest, D],
+    e: Extractor[BufferedRequest, E],
+    f: Extractor[BufferedRequest, F],
+    g: Extractor[BufferedRequest, G],
+    h: Extractor[BufferedRequest, H],
+    j: Extractor[BufferedRequest, J],
     /,
     *,
     fn: Callable[[T, A, B, C, D, E, F, G, H, J], Returned],
@@ -206,16 +209,16 @@ def handle[T, A, B, C, D, E, F, G, H, J](
 
 @overload
 def handle[T, A, B, C, D, E, F, G, H, J, K](
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
-    f: Extractor[F],
-    g: Extractor[G],
-    h: Extractor[H],
-    j: Extractor[J],
-    k: Extractor[K],
+    a: Extractor[BufferedRequest, A],
+    b: Extractor[BufferedRequest, B],
+    c: Extractor[BufferedRequest, C],
+    d: Extractor[BufferedRequest, D],
+    e: Extractor[BufferedRequest, E],
+    f: Extractor[BufferedRequest, F],
+    g: Extractor[BufferedRequest, G],
+    h: Extractor[BufferedRequest, H],
+    j: Extractor[BufferedRequest, J],
+    k: Extractor[BufferedRequest, K],
     /,
     *,
     fn: Callable[[T, A, B, C, D, E, F, G, H, J, K], Returned],
@@ -224,7 +227,7 @@ def handle[T, A, B, C, D, E, F, G, H, J, K](
 ) -> HttpEndpoint[T]: ...
 # [[[end]]]
 def handle[T](
-    *extractors: Extractor[object],
+    *extractors: Extractor[BufferedRequest, object],
     fn: Callable[..., Returned],
     summary: str = "",
     responses: Mapping[int, ResponseSpec] | None = None,
@@ -236,8 +239,8 @@ def handle[T](
     extractors' types to `fn`'s parameters, so a `path_param(..., INT)` paired
     with an `fn` that expects a `str` is a mypy error, not a runtime surprise.
 
-    At dispatch the *input* body is buffered once, a `Request` is built, every
-    extractor runs (raising to reject, mapped by the router's exception
+    At dispatch the *input* body is buffered once, a `BufferedRequest` is built,
+    every extractor runs (raising to reject, mapped by the router's exception
     handlers), and `fn` is called with the typed values. The handler is always
     `async`; the *output* is free: an `async def` that resolves to a `Response`,
     or an `async def ... yield` that streams `Outbound` events, and `_emit` relays
@@ -263,7 +266,7 @@ def handle_stream[T](
 
 @overload
 def handle_stream[T, A](
-    a: Extractor[A],
+    a: Extractor[HttpRequestHead, A],
     /,
     *,
     fn: Callable[[T, A, Stream[Inbound]], Returned],
@@ -275,8 +278,8 @@ def handle_stream[T, A](
 
 @overload
 def handle_stream[T, A, B](
-    a: Extractor[A],
-    b: Extractor[B],
+    a: Extractor[HttpRequestHead, A],
+    b: Extractor[HttpRequestHead, B],
     /,
     *,
     fn: Callable[[T, A, B, Stream[Inbound]], Returned],
@@ -288,9 +291,9 @@ def handle_stream[T, A, B](
 
 @overload
 def handle_stream[T, A, B, C](
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
+    a: Extractor[HttpRequestHead, A],
+    b: Extractor[HttpRequestHead, B],
+    c: Extractor[HttpRequestHead, C],
     /,
     *,
     fn: Callable[[T, A, B, C, Stream[Inbound]], Returned],
@@ -302,10 +305,10 @@ def handle_stream[T, A, B, C](
 
 @overload
 def handle_stream[T, A, B, C, D](
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
+    a: Extractor[HttpRequestHead, A],
+    b: Extractor[HttpRequestHead, B],
+    c: Extractor[HttpRequestHead, C],
+    d: Extractor[HttpRequestHead, D],
     /,
     *,
     fn: Callable[[T, A, B, C, D, Stream[Inbound]], Returned],
@@ -317,11 +320,11 @@ def handle_stream[T, A, B, C, D](
 
 @overload
 def handle_stream[T, A, B, C, D, E](
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
+    a: Extractor[HttpRequestHead, A],
+    b: Extractor[HttpRequestHead, B],
+    c: Extractor[HttpRequestHead, C],
+    d: Extractor[HttpRequestHead, D],
+    e: Extractor[HttpRequestHead, E],
     /,
     *,
     fn: Callable[[T, A, B, C, D, E, Stream[Inbound]], Returned],
@@ -333,12 +336,12 @@ def handle_stream[T, A, B, C, D, E](
 
 @overload
 def handle_stream[T, A, B, C, D, E, F](
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
-    f: Extractor[F],
+    a: Extractor[HttpRequestHead, A],
+    b: Extractor[HttpRequestHead, B],
+    c: Extractor[HttpRequestHead, C],
+    d: Extractor[HttpRequestHead, D],
+    e: Extractor[HttpRequestHead, E],
+    f: Extractor[HttpRequestHead, F],
     /,
     *,
     fn: Callable[[T, A, B, C, D, E, F, Stream[Inbound]], Returned],
@@ -350,13 +353,13 @@ def handle_stream[T, A, B, C, D, E, F](
 
 @overload
 def handle_stream[T, A, B, C, D, E, F, G](
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
-    f: Extractor[F],
-    g: Extractor[G],
+    a: Extractor[HttpRequestHead, A],
+    b: Extractor[HttpRequestHead, B],
+    c: Extractor[HttpRequestHead, C],
+    d: Extractor[HttpRequestHead, D],
+    e: Extractor[HttpRequestHead, E],
+    f: Extractor[HttpRequestHead, F],
+    g: Extractor[HttpRequestHead, G],
     /,
     *,
     fn: Callable[[T, A, B, C, D, E, F, G, Stream[Inbound]], Returned],
@@ -368,14 +371,14 @@ def handle_stream[T, A, B, C, D, E, F, G](
 
 @overload
 def handle_stream[T, A, B, C, D, E, F, G, H](
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
-    f: Extractor[F],
-    g: Extractor[G],
-    h: Extractor[H],
+    a: Extractor[HttpRequestHead, A],
+    b: Extractor[HttpRequestHead, B],
+    c: Extractor[HttpRequestHead, C],
+    d: Extractor[HttpRequestHead, D],
+    e: Extractor[HttpRequestHead, E],
+    f: Extractor[HttpRequestHead, F],
+    g: Extractor[HttpRequestHead, G],
+    h: Extractor[HttpRequestHead, H],
     /,
     *,
     fn: Callable[[T, A, B, C, D, E, F, G, H, Stream[Inbound]], Returned],
@@ -387,15 +390,15 @@ def handle_stream[T, A, B, C, D, E, F, G, H](
 
 @overload
 def handle_stream[T, A, B, C, D, E, F, G, H, J](
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
-    f: Extractor[F],
-    g: Extractor[G],
-    h: Extractor[H],
-    j: Extractor[J],
+    a: Extractor[HttpRequestHead, A],
+    b: Extractor[HttpRequestHead, B],
+    c: Extractor[HttpRequestHead, C],
+    d: Extractor[HttpRequestHead, D],
+    e: Extractor[HttpRequestHead, E],
+    f: Extractor[HttpRequestHead, F],
+    g: Extractor[HttpRequestHead, G],
+    h: Extractor[HttpRequestHead, H],
+    j: Extractor[HttpRequestHead, J],
     /,
     *,
     fn: Callable[[T, A, B, C, D, E, F, G, H, J, Stream[Inbound]], Returned],
@@ -407,16 +410,16 @@ def handle_stream[T, A, B, C, D, E, F, G, H, J](
 
 @overload
 def handle_stream[T, A, B, C, D, E, F, G, H, J, K](
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
-    f: Extractor[F],
-    g: Extractor[G],
-    h: Extractor[H],
-    j: Extractor[J],
-    k: Extractor[K],
+    a: Extractor[HttpRequestHead, A],
+    b: Extractor[HttpRequestHead, B],
+    c: Extractor[HttpRequestHead, C],
+    d: Extractor[HttpRequestHead, D],
+    e: Extractor[HttpRequestHead, E],
+    f: Extractor[HttpRequestHead, F],
+    g: Extractor[HttpRequestHead, G],
+    h: Extractor[HttpRequestHead, H],
+    j: Extractor[HttpRequestHead, J],
+    k: Extractor[HttpRequestHead, K],
     /,
     *,
     fn: Callable[[T, A, B, C, D, E, F, G, H, J, K, Stream[Inbound]], Returned],
@@ -426,7 +429,7 @@ def handle_stream[T, A, B, C, D, E, F, G, H, J, K](
 ) -> HttpEndpoint[T]: ...
 # [[[end]]]
 def handle_stream[T](
-    *extractors: Extractor[object],
+    *extractors: Extractor[HttpRequestHead, object],
     fn: Callable[..., Returned],
     summary: str = "",
     responses: Mapping[int, ResponseSpec] | None = None,
@@ -442,8 +445,9 @@ def handle_stream[T](
     the typed extractor values, and the live stream, reading it as events arrive
     (a streaming upload, a long poll, a loop driven by request chunks). The
     extractors are scope-only (`path_param`/`query_param`/`header_param`/
-    `http_scope`); a `body` extractor is rejected, since buffering the body is
-    exactly what a streaming route avoids. The *output* is free, exactly as in
+    `http_scope`, whose context is the streaming route's `HttpRequestHead`); a `body`
+    extractor is a static type error, since its `BufferedRequest` context is exactly
+    the buffering a streaming route avoids. The *output* is free, exactly as in
     `handle`: yield `Outbound` to stream the response, or return (or await) a
     `Response` to buffer it.
 
@@ -488,7 +492,7 @@ class _Method:
     def __call__[T, A](
         self,
         pattern: Pattern,
-        a: Extractor[A],
+        a: Extractor[BufferedRequest, A],
         /,
         *,
         summary: str = ...,
@@ -499,8 +503,8 @@ class _Method:
     def __call__[T, A, B](
         self,
         pattern: Pattern,
-        a: Extractor[A],
-        b: Extractor[B],
+        a: Extractor[BufferedRequest, A],
+        b: Extractor[BufferedRequest, B],
         /,
         *,
         summary: str = ...,
@@ -511,9 +515,9 @@ class _Method:
     def __call__[T, A, B, C](
         self,
         pattern: Pattern,
-        a: Extractor[A],
-        b: Extractor[B],
-        c: Extractor[C],
+        a: Extractor[BufferedRequest, A],
+        b: Extractor[BufferedRequest, B],
+        c: Extractor[BufferedRequest, C],
         /,
         *,
         summary: str = ...,
@@ -524,10 +528,10 @@ class _Method:
     def __call__[T, A, B, C, D](
         self,
         pattern: Pattern,
-        a: Extractor[A],
-        b: Extractor[B],
-        c: Extractor[C],
-        d: Extractor[D],
+        a: Extractor[BufferedRequest, A],
+        b: Extractor[BufferedRequest, B],
+        c: Extractor[BufferedRequest, C],
+        d: Extractor[BufferedRequest, D],
         /,
         *,
         summary: str = ...,
@@ -538,11 +542,11 @@ class _Method:
     def __call__[T, A, B, C, D, E](
         self,
         pattern: Pattern,
-        a: Extractor[A],
-        b: Extractor[B],
-        c: Extractor[C],
-        d: Extractor[D],
-        e: Extractor[E],
+        a: Extractor[BufferedRequest, A],
+        b: Extractor[BufferedRequest, B],
+        c: Extractor[BufferedRequest, C],
+        d: Extractor[BufferedRequest, D],
+        e: Extractor[BufferedRequest, E],
         /,
         *,
         summary: str = ...,
@@ -553,12 +557,12 @@ class _Method:
     def __call__[T, A, B, C, D, E, F](
         self,
         pattern: Pattern,
-        a: Extractor[A],
-        b: Extractor[B],
-        c: Extractor[C],
-        d: Extractor[D],
-        e: Extractor[E],
-        f: Extractor[F],
+        a: Extractor[BufferedRequest, A],
+        b: Extractor[BufferedRequest, B],
+        c: Extractor[BufferedRequest, C],
+        d: Extractor[BufferedRequest, D],
+        e: Extractor[BufferedRequest, E],
+        f: Extractor[BufferedRequest, F],
         /,
         *,
         summary: str = ...,
@@ -569,13 +573,13 @@ class _Method:
     def __call__[T, A, B, C, D, E, F, G](
         self,
         pattern: Pattern,
-        a: Extractor[A],
-        b: Extractor[B],
-        c: Extractor[C],
-        d: Extractor[D],
-        e: Extractor[E],
-        f: Extractor[F],
-        g: Extractor[G],
+        a: Extractor[BufferedRequest, A],
+        b: Extractor[BufferedRequest, B],
+        c: Extractor[BufferedRequest, C],
+        d: Extractor[BufferedRequest, D],
+        e: Extractor[BufferedRequest, E],
+        f: Extractor[BufferedRequest, F],
+        g: Extractor[BufferedRequest, G],
         /,
         *,
         summary: str = ...,
@@ -586,14 +590,14 @@ class _Method:
     def __call__[T, A, B, C, D, E, F, G, H](
         self,
         pattern: Pattern,
-        a: Extractor[A],
-        b: Extractor[B],
-        c: Extractor[C],
-        d: Extractor[D],
-        e: Extractor[E],
-        f: Extractor[F],
-        g: Extractor[G],
-        h: Extractor[H],
+        a: Extractor[BufferedRequest, A],
+        b: Extractor[BufferedRequest, B],
+        c: Extractor[BufferedRequest, C],
+        d: Extractor[BufferedRequest, D],
+        e: Extractor[BufferedRequest, E],
+        f: Extractor[BufferedRequest, F],
+        g: Extractor[BufferedRequest, G],
+        h: Extractor[BufferedRequest, H],
         /,
         *,
         summary: str = ...,
@@ -604,15 +608,15 @@ class _Method:
     def __call__[T, A, B, C, D, E, F, G, H, J](
         self,
         pattern: Pattern,
-        a: Extractor[A],
-        b: Extractor[B],
-        c: Extractor[C],
-        d: Extractor[D],
-        e: Extractor[E],
-        f: Extractor[F],
-        g: Extractor[G],
-        h: Extractor[H],
-        j: Extractor[J],
+        a: Extractor[BufferedRequest, A],
+        b: Extractor[BufferedRequest, B],
+        c: Extractor[BufferedRequest, C],
+        d: Extractor[BufferedRequest, D],
+        e: Extractor[BufferedRequest, E],
+        f: Extractor[BufferedRequest, F],
+        g: Extractor[BufferedRequest, G],
+        h: Extractor[BufferedRequest, H],
+        j: Extractor[BufferedRequest, J],
         /,
         *,
         summary: str = ...,
@@ -623,16 +627,16 @@ class _Method:
     def __call__[T, A, B, C, D, E, F, G, H, J, K](
         self,
         pattern: Pattern,
-        a: Extractor[A],
-        b: Extractor[B],
-        c: Extractor[C],
-        d: Extractor[D],
-        e: Extractor[E],
-        f: Extractor[F],
-        g: Extractor[G],
-        h: Extractor[H],
-        j: Extractor[J],
-        k: Extractor[K],
+        a: Extractor[BufferedRequest, A],
+        b: Extractor[BufferedRequest, B],
+        c: Extractor[BufferedRequest, C],
+        d: Extractor[BufferedRequest, D],
+        e: Extractor[BufferedRequest, E],
+        f: Extractor[BufferedRequest, F],
+        g: Extractor[BufferedRequest, G],
+        h: Extractor[BufferedRequest, H],
+        j: Extractor[BufferedRequest, J],
+        k: Extractor[BufferedRequest, K],
         /,
         *,
         summary: str = ...,
@@ -642,7 +646,7 @@ class _Method:
     def __call__(
         self,
         pattern: Pattern,
-        *extractors: Extractor[object],
+        *extractors: Extractor[BufferedRequest, object],
         summary: str = "",
         responses: Mapping[int, ResponseSpec] | None = None,
     ) -> Callable[[Callable[..., Returned]], Route[object]]:
@@ -695,7 +699,7 @@ class _StreamMethod:
     def __call__[T, A](
         self,
         pattern: Pattern,
-        a: Extractor[A],
+        a: Extractor[HttpRequestHead, A],
         /,
         *,
         summary: str = ...,
@@ -707,8 +711,8 @@ class _StreamMethod:
     def __call__[T, A, B](
         self,
         pattern: Pattern,
-        a: Extractor[A],
-        b: Extractor[B],
+        a: Extractor[HttpRequestHead, A],
+        b: Extractor[HttpRequestHead, B],
         /,
         *,
         summary: str = ...,
@@ -720,9 +724,9 @@ class _StreamMethod:
     def __call__[T, A, B, C](
         self,
         pattern: Pattern,
-        a: Extractor[A],
-        b: Extractor[B],
-        c: Extractor[C],
+        a: Extractor[HttpRequestHead, A],
+        b: Extractor[HttpRequestHead, B],
+        c: Extractor[HttpRequestHead, C],
         /,
         *,
         summary: str = ...,
@@ -734,10 +738,10 @@ class _StreamMethod:
     def __call__[T, A, B, C, D](
         self,
         pattern: Pattern,
-        a: Extractor[A],
-        b: Extractor[B],
-        c: Extractor[C],
-        d: Extractor[D],
+        a: Extractor[HttpRequestHead, A],
+        b: Extractor[HttpRequestHead, B],
+        c: Extractor[HttpRequestHead, C],
+        d: Extractor[HttpRequestHead, D],
         /,
         *,
         summary: str = ...,
@@ -749,11 +753,11 @@ class _StreamMethod:
     def __call__[T, A, B, C, D, E](
         self,
         pattern: Pattern,
-        a: Extractor[A],
-        b: Extractor[B],
-        c: Extractor[C],
-        d: Extractor[D],
-        e: Extractor[E],
+        a: Extractor[HttpRequestHead, A],
+        b: Extractor[HttpRequestHead, B],
+        c: Extractor[HttpRequestHead, C],
+        d: Extractor[HttpRequestHead, D],
+        e: Extractor[HttpRequestHead, E],
         /,
         *,
         summary: str = ...,
@@ -765,12 +769,12 @@ class _StreamMethod:
     def __call__[T, A, B, C, D, E, F](
         self,
         pattern: Pattern,
-        a: Extractor[A],
-        b: Extractor[B],
-        c: Extractor[C],
-        d: Extractor[D],
-        e: Extractor[E],
-        f: Extractor[F],
+        a: Extractor[HttpRequestHead, A],
+        b: Extractor[HttpRequestHead, B],
+        c: Extractor[HttpRequestHead, C],
+        d: Extractor[HttpRequestHead, D],
+        e: Extractor[HttpRequestHead, E],
+        f: Extractor[HttpRequestHead, F],
         /,
         *,
         summary: str = ...,
@@ -782,13 +786,13 @@ class _StreamMethod:
     def __call__[T, A, B, C, D, E, F, G](
         self,
         pattern: Pattern,
-        a: Extractor[A],
-        b: Extractor[B],
-        c: Extractor[C],
-        d: Extractor[D],
-        e: Extractor[E],
-        f: Extractor[F],
-        g: Extractor[G],
+        a: Extractor[HttpRequestHead, A],
+        b: Extractor[HttpRequestHead, B],
+        c: Extractor[HttpRequestHead, C],
+        d: Extractor[HttpRequestHead, D],
+        e: Extractor[HttpRequestHead, E],
+        f: Extractor[HttpRequestHead, F],
+        g: Extractor[HttpRequestHead, G],
         /,
         *,
         summary: str = ...,
@@ -800,14 +804,14 @@ class _StreamMethod:
     def __call__[T, A, B, C, D, E, F, G, H](
         self,
         pattern: Pattern,
-        a: Extractor[A],
-        b: Extractor[B],
-        c: Extractor[C],
-        d: Extractor[D],
-        e: Extractor[E],
-        f: Extractor[F],
-        g: Extractor[G],
-        h: Extractor[H],
+        a: Extractor[HttpRequestHead, A],
+        b: Extractor[HttpRequestHead, B],
+        c: Extractor[HttpRequestHead, C],
+        d: Extractor[HttpRequestHead, D],
+        e: Extractor[HttpRequestHead, E],
+        f: Extractor[HttpRequestHead, F],
+        g: Extractor[HttpRequestHead, G],
+        h: Extractor[HttpRequestHead, H],
         /,
         *,
         summary: str = ...,
@@ -819,15 +823,15 @@ class _StreamMethod:
     def __call__[T, A, B, C, D, E, F, G, H, J](
         self,
         pattern: Pattern,
-        a: Extractor[A],
-        b: Extractor[B],
-        c: Extractor[C],
-        d: Extractor[D],
-        e: Extractor[E],
-        f: Extractor[F],
-        g: Extractor[G],
-        h: Extractor[H],
-        j: Extractor[J],
+        a: Extractor[HttpRequestHead, A],
+        b: Extractor[HttpRequestHead, B],
+        c: Extractor[HttpRequestHead, C],
+        d: Extractor[HttpRequestHead, D],
+        e: Extractor[HttpRequestHead, E],
+        f: Extractor[HttpRequestHead, F],
+        g: Extractor[HttpRequestHead, G],
+        h: Extractor[HttpRequestHead, H],
+        j: Extractor[HttpRequestHead, J],
         /,
         *,
         summary: str = ...,
@@ -839,16 +843,16 @@ class _StreamMethod:
     def __call__[T, A, B, C, D, E, F, G, H, J, K](
         self,
         pattern: Pattern,
-        a: Extractor[A],
-        b: Extractor[B],
-        c: Extractor[C],
-        d: Extractor[D],
-        e: Extractor[E],
-        f: Extractor[F],
-        g: Extractor[G],
-        h: Extractor[H],
-        j: Extractor[J],
-        k: Extractor[K],
+        a: Extractor[HttpRequestHead, A],
+        b: Extractor[HttpRequestHead, B],
+        c: Extractor[HttpRequestHead, C],
+        d: Extractor[HttpRequestHead, D],
+        e: Extractor[HttpRequestHead, E],
+        f: Extractor[HttpRequestHead, F],
+        g: Extractor[HttpRequestHead, G],
+        h: Extractor[HttpRequestHead, H],
+        j: Extractor[HttpRequestHead, J],
+        k: Extractor[HttpRequestHead, K],
         /,
         *,
         summary: str = ...,
@@ -859,7 +863,7 @@ class _StreamMethod:
     def __call__(
         self,
         pattern: Pattern,
-        *extractors: Extractor[object],
+        *extractors: Extractor[HttpRequestHead, object],
         summary: str = "",
         responses: Mapping[int, ResponseSpec] | None = None,
         request_body: Body | None = None,
@@ -882,7 +886,7 @@ def ws[T](
 @overload
 def ws[T, A](
     pattern: Pattern,
-    a: Extractor[A],
+    a: Extractor[WebsocketRequestHead, A],
     /,
 ) -> Callable[[Callable[[T, A, Stream[WebsocketInbound]], WebsocketReturned]], WebsocketRoute[T]]: ...
 
@@ -890,8 +894,8 @@ def ws[T, A](
 @overload
 def ws[T, A, B](
     pattern: Pattern,
-    a: Extractor[A],
-    b: Extractor[B],
+    a: Extractor[WebsocketRequestHead, A],
+    b: Extractor[WebsocketRequestHead, B],
     /,
 ) -> Callable[[Callable[[T, A, B, Stream[WebsocketInbound]], WebsocketReturned]], WebsocketRoute[T]]: ...
 
@@ -899,9 +903,9 @@ def ws[T, A, B](
 @overload
 def ws[T, A, B, C](
     pattern: Pattern,
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
+    a: Extractor[WebsocketRequestHead, A],
+    b: Extractor[WebsocketRequestHead, B],
+    c: Extractor[WebsocketRequestHead, C],
     /,
 ) -> Callable[[Callable[[T, A, B, C, Stream[WebsocketInbound]], WebsocketReturned]], WebsocketRoute[T]]: ...
 
@@ -909,10 +913,10 @@ def ws[T, A, B, C](
 @overload
 def ws[T, A, B, C, D](
     pattern: Pattern,
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
+    a: Extractor[WebsocketRequestHead, A],
+    b: Extractor[WebsocketRequestHead, B],
+    c: Extractor[WebsocketRequestHead, C],
+    d: Extractor[WebsocketRequestHead, D],
     /,
 ) -> Callable[[Callable[[T, A, B, C, D, Stream[WebsocketInbound]], WebsocketReturned]], WebsocketRoute[T]]: ...
 
@@ -920,11 +924,11 @@ def ws[T, A, B, C, D](
 @overload
 def ws[T, A, B, C, D, E](
     pattern: Pattern,
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
+    a: Extractor[WebsocketRequestHead, A],
+    b: Extractor[WebsocketRequestHead, B],
+    c: Extractor[WebsocketRequestHead, C],
+    d: Extractor[WebsocketRequestHead, D],
+    e: Extractor[WebsocketRequestHead, E],
     /,
 ) -> Callable[[Callable[[T, A, B, C, D, E, Stream[WebsocketInbound]], WebsocketReturned]], WebsocketRoute[T]]: ...
 
@@ -932,12 +936,12 @@ def ws[T, A, B, C, D, E](
 @overload
 def ws[T, A, B, C, D, E, F](
     pattern: Pattern,
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
-    f: Extractor[F],
+    a: Extractor[WebsocketRequestHead, A],
+    b: Extractor[WebsocketRequestHead, B],
+    c: Extractor[WebsocketRequestHead, C],
+    d: Extractor[WebsocketRequestHead, D],
+    e: Extractor[WebsocketRequestHead, E],
+    f: Extractor[WebsocketRequestHead, F],
     /,
 ) -> Callable[[Callable[[T, A, B, C, D, E, F, Stream[WebsocketInbound]], WebsocketReturned]], WebsocketRoute[T]]: ...
 
@@ -945,13 +949,13 @@ def ws[T, A, B, C, D, E, F](
 @overload
 def ws[T, A, B, C, D, E, F, G](
     pattern: Pattern,
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
-    f: Extractor[F],
-    g: Extractor[G],
+    a: Extractor[WebsocketRequestHead, A],
+    b: Extractor[WebsocketRequestHead, B],
+    c: Extractor[WebsocketRequestHead, C],
+    d: Extractor[WebsocketRequestHead, D],
+    e: Extractor[WebsocketRequestHead, E],
+    f: Extractor[WebsocketRequestHead, F],
+    g: Extractor[WebsocketRequestHead, G],
     /,
 ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, Stream[WebsocketInbound]], WebsocketReturned]], WebsocketRoute[T]]: ...
 
@@ -959,14 +963,14 @@ def ws[T, A, B, C, D, E, F, G](
 @overload
 def ws[T, A, B, C, D, E, F, G, H](
     pattern: Pattern,
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
-    f: Extractor[F],
-    g: Extractor[G],
-    h: Extractor[H],
+    a: Extractor[WebsocketRequestHead, A],
+    b: Extractor[WebsocketRequestHead, B],
+    c: Extractor[WebsocketRequestHead, C],
+    d: Extractor[WebsocketRequestHead, D],
+    e: Extractor[WebsocketRequestHead, E],
+    f: Extractor[WebsocketRequestHead, F],
+    g: Extractor[WebsocketRequestHead, G],
+    h: Extractor[WebsocketRequestHead, H],
     /,
 ) -> Callable[
     [Callable[[T, A, B, C, D, E, F, G, H, Stream[WebsocketInbound]], WebsocketReturned]], WebsocketRoute[T]
@@ -976,15 +980,15 @@ def ws[T, A, B, C, D, E, F, G, H](
 @overload
 def ws[T, A, B, C, D, E, F, G, H, J](
     pattern: Pattern,
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
-    f: Extractor[F],
-    g: Extractor[G],
-    h: Extractor[H],
-    j: Extractor[J],
+    a: Extractor[WebsocketRequestHead, A],
+    b: Extractor[WebsocketRequestHead, B],
+    c: Extractor[WebsocketRequestHead, C],
+    d: Extractor[WebsocketRequestHead, D],
+    e: Extractor[WebsocketRequestHead, E],
+    f: Extractor[WebsocketRequestHead, F],
+    g: Extractor[WebsocketRequestHead, G],
+    h: Extractor[WebsocketRequestHead, H],
+    j: Extractor[WebsocketRequestHead, J],
     /,
 ) -> Callable[
     [Callable[[T, A, B, C, D, E, F, G, H, J, Stream[WebsocketInbound]], WebsocketReturned]], WebsocketRoute[T]
@@ -994,23 +998,23 @@ def ws[T, A, B, C, D, E, F, G, H, J](
 @overload
 def ws[T, A, B, C, D, E, F, G, H, J, K](
     pattern: Pattern,
-    a: Extractor[A],
-    b: Extractor[B],
-    c: Extractor[C],
-    d: Extractor[D],
-    e: Extractor[E],
-    f: Extractor[F],
-    g: Extractor[G],
-    h: Extractor[H],
-    j: Extractor[J],
-    k: Extractor[K],
+    a: Extractor[WebsocketRequestHead, A],
+    b: Extractor[WebsocketRequestHead, B],
+    c: Extractor[WebsocketRequestHead, C],
+    d: Extractor[WebsocketRequestHead, D],
+    e: Extractor[WebsocketRequestHead, E],
+    f: Extractor[WebsocketRequestHead, F],
+    g: Extractor[WebsocketRequestHead, G],
+    h: Extractor[WebsocketRequestHead, H],
+    j: Extractor[WebsocketRequestHead, J],
+    k: Extractor[WebsocketRequestHead, K],
     /,
 ) -> Callable[
     [Callable[[T, A, B, C, D, E, F, G, H, J, K, Stream[WebsocketInbound]], WebsocketReturned]], WebsocketRoute[T]
 ]: ...
 # [[[end]]]
 def ws[T](
-    pattern: Pattern, *extractors: Extractor[object]
+    pattern: Pattern, *extractors: Extractor[WebsocketRequestHead, object]
 ) -> Callable[[Callable[..., WebsocketReturned]], WebsocketRoute[T]]:
     """
     The websocket sibling of `@get`/`@post`, tying extractors to a handler.
@@ -1020,17 +1024,16 @@ def ws[T](
     *is* the frame processor (the same move as `@post.stream`): it takes the live
     inbound frames as a trailing `Stream[WebsocketInbound]` argument and yields
     `WebsocketOutbound`, rather than returning a processor. There is no body to
-    buffer: `path_param`, `query_param`, and `header_param` read the handshake (a
-    `body` extractor is rejected, since a handshake carries none). Returns a
-    `WebsocketRoute` to pass to a `WebsocketRouter`.
+    buffer: `path_param`, `query_param`, and `header_param` read the handshake, and a
+    `body` (or `http_scope`) token is a static type error, its context not the
+    `WebsocketRequestHead` a websocket route provides. Returns a `WebsocketRoute` to
+    pass to a `WebsocketRouter`.
     """
-    if any(extractor.request_body is not None for extractor in extractors):
-        raise ValueError("a websocket route cannot take a body extractor; a handshake has no body")
 
     def decorate(fn: Callable[..., WebsocketReturned]) -> WebsocketRoute[T]:
         def endpoint(state: T, match: Match[WebsocketScope]) -> WebsocketHandler:
-            request = Request.parsed(scope=match.scope, path_params=match.params, body=b"")
-            values = tuple(extractor.extract(request) for extractor in extractors)
+            head = WebsocketRequestHead.parsed(scope=match.scope, path_params=match.params)
+            values = _extract_all(extractors, head)
 
             def processor(inputs: Stream[WebsocketInbound]) -> Stream[WebsocketOutbound]:
                 return fn(state, *values, inputs)
@@ -1040,6 +1043,29 @@ def ws[T](
         return WebsocketRoute(_segments(pattern), endpoint)
 
     return decorate
+
+
+def _extract_all[C](extractors: tuple[Extractor[C, object], ...], head: C) -> tuple[object, ...]:
+    """
+    Run every extractor against the request head, guaranteeing a rejection crosses
+    this boundary as an `ExtractionError`.
+
+    The extractors already raise a rich, `field`-attributed `ExtractionError` (see
+    `without_web.extractors`); this is the backstop for the rest: a stray `ValueError`
+    from a custom extractor or an `into` factory is wrapped unattributed, and an
+    `ExtractionError` passes through untouched. Any other exception is a bug and
+    propagates, so a plain `ValueError` raised deeper in a handler still surfaces as a
+    500 rather than a client 4xx.
+    """
+    values: list[object] = []
+    for extractor in extractors:
+        try:
+            values.append(extractor.extract(head))
+        except ExtractionError:
+            raise
+        except ValueError as exc:
+            raise ExtractionError(str(exc), cause=exc) from exc
+    return tuple(values)
 
 
 async def _emit(result: Returned) -> AsyncIterator[Outbound]:
@@ -1064,14 +1090,12 @@ async def _emit(result: Returned) -> AsyncIterator[Outbound]:
 
 
 def _build_stream_endpoint(
-    extractors: tuple[Extractor[object], ...],
+    extractors: tuple[Extractor[HttpRequestHead, object], ...],
     fn: Callable[..., Returned],
     summary: str,
     responses: Mapping[int, ResponseSpec] | None,
     request_body: Body | None,
 ) -> HttpEndpoint[object]:
-    if any(extractor.request_body is not None for extractor in extractors):
-        raise ValueError("a streaming route cannot take a body extractor; it would buffer the input it streams")
     spec = RouteSpec(
         summary=summary,
         query=tuple(param for extractor in extractors for param in extractor.query),
@@ -1081,8 +1105,8 @@ def _build_stream_endpoint(
     )
 
     def endpoint(state: object, match: Match[HttpScope]) -> HttpHandler:
-        request = Request.parsed(scope=match.scope, path_params=match.params, body=b"")
-        values = tuple(extractor.extract(request) for extractor in extractors)
+        head = HttpRequestHead.parsed(scope=match.scope, path_params=match.params)
+        values = _extract_all(extractors, head)
 
         def processor(inputs: Stream[Inbound]) -> Stream[Outbound]:
             return _emit(fn(state, *values, inputs))
@@ -1093,7 +1117,7 @@ def _build_stream_endpoint(
 
 
 def _build_endpoint(
-    extractors: tuple[Extractor[object], ...],
+    extractors: tuple[Extractor[BufferedRequest, object], ...],
     fn: Callable[..., Returned],
     summary: str,
     responses: Mapping[int, ResponseSpec] | None,
@@ -1119,10 +1143,10 @@ async def _reply(
     inputs: Stream[Inbound],
     state: object,
     match: Match[HttpScope],
-    extractors: tuple[Extractor[object], ...],
+    extractors: tuple[Extractor[BufferedRequest, object], ...],
     fn: Callable[..., Returned],
 ) -> AsyncIterator[Outbound]:
     body = await read_body(inputs)
-    request = Request.parsed(scope=match.scope, path_params=match.params, body=body)
-    async for event in _emit(fn(state, *(extractor.extract(request) for extractor in extractors))):
+    head = BufferedRequest.buffered(scope=match.scope, path_params=match.params, body=body)
+    async for event in _emit(fn(state, *_extract_all(extractors, head))):
         yield event

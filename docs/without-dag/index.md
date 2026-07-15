@@ -36,7 +36,7 @@ async def evaluate(plan: Plan, target: NodeKey, inputs: Mapping[NodeKey, object]
 A `Node` is the seam: a value carrying its `key`, its ordered `dependencies`, and
 an async `run` that takes its dependencies' results as a tuple and returns its
 own. Results cross the seam as `object`, the same honest move `without-web` makes
-when it collects a heterogeneous mix of `Extractor[object]`; the typed frontend
+when it collects a heterogeneous mix of `object`-valued `Extractor`s; the typed frontend
 restores precision above it. There is only the compiled form: a caller runs a
 graph by compiling a `Plan` and reusing it, the way an HTTP client owns one
 pooled session rather than a fresh connection per request. The input-independent
