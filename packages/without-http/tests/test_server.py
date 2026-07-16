@@ -22,6 +22,7 @@ from without_asgi.routing import buffered
 from without_http import serving
 from without_http.server import _address
 from without_http.server import _Limits
+from without_http.server import _lingering_close
 from without_http.server import _LiveConnections
 from without_http.server import _serve_connection
 from without_http.server import _serve_h11_connection
@@ -358,6 +359,40 @@ async def test_a_malformed_request_lingers_so_the_client_reads_the_error(
     )
 
     assert (await client_reader.read()).startswith(b"HTTP/1.1 400")
+
+
+class _HalfCloseRefusingWriter:
+    """A writer that cannot half-close its write side, as a TLS transport cannot."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def can_write_eof(self) -> bool:
+        return False
+
+    def write_eof(self) -> None:
+        raise AssertionError("a transport that cannot half-close must never be asked to")
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+async def test_lingering_over_a_transport_that_cannot_half_close_still_drains_and_closes() -> None:
+    # TLS cannot half-close, so the linger has no `FIN` to send and rests on the bounded
+    # drain alone: it must still read the peer's in-flight bytes off the socket before
+    # closing, or the unread data turns the close into the `RST` the linger exists to avoid.
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"in-flight body the client is still sending")
+    reader.feed_eof()
+    writer = _HalfCloseRefusingWriter()
+
+    await _lingering_close(reader, cast(asyncio.StreamWriter, writer))
+
+    assert reader.at_eof()
+    assert writer.closed
 
 
 async def test_reports_in_flight_connections_while_a_request_is_served() -> None:
