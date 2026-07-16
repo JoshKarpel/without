@@ -34,15 +34,16 @@ from without_asgi import RawHeaders
 
 from without_http.h2_wire import request_headers
 from without_http.h2_wire import response_status_and_headers
-from without_http.keepalive import TCPKeepalive
-from without_http.keepalive import apply_tcp_keepalive
+from without_http.socket_options import SocketOptions
+from without_http.socket_options import apply_socket_options
+from without_http.socket_options import tcp_keepalive
 from without_http.timeouts import Timeout
 from without_http.timeouts import WriteTimeout
 
 _BUFFER = 65536
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _NO_TIMEOUT = Timeout()  # a shared immutable "no timeouts" value, safe as a default
-_DEFAULT_KEEPALIVE = TCPKeepalive()  # likewise: a shared immutable "keepalive on" default
+_DEFAULT_SOCKET_OPTIONS = tcp_keepalive()  # likewise: a shared immutable "keepalive on" default
 
 logger = logging.getLogger(__name__)
 
@@ -295,7 +296,7 @@ async def _open(
     *,
     ssl_context: ssl.SSLContext | None,
     timeout: Timeout = _NO_TIMEOUT,
-    keepalive: TCPKeepalive | None = None,
+    socket_options: SocketOptions = (),
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, str]:
     """
     Open a connection and report the negotiated wire protocol.
@@ -307,13 +308,12 @@ async def _open(
     `connect` bound covers the TCP connect and, over TLS, the handshake, since both
     happen in the one `open_connection` await; the ALPN read after it is synchronous.
 
-    When `keepalive` is set, TCP keepalive is enabled on the socket so a peer that vanishes
-    silently is detected even while the connection sits idle in the pool.
+    `socket_options` is applied to the new socket, already combined by the caller (the
+    pool folds its keepalive in), so this only has to hand one set to the kernel.
     """
     async with timeout.connecting():
         reader, writer = await asyncio.open_connection(host, port, ssl=ssl_context)
-    if keepalive is not None:
-        apply_tcp_keepalive(writer, keepalive)
+    apply_socket_options(writer.get_extra_info("socket"), socket_options)
     if ssl_context is None:
         return reader, writer, "http/1.1"
     ssl_object = writer.get_extra_info("ssl_object")
@@ -975,6 +975,14 @@ class ConnectionPool:
     `timeout` bounds each phase of a request (see `Timeout`); it defaults to no timeouts,
     since a deadline is the caller's policy, not the transport's. A per-request `timeout`
     on `request` replaces it wholesale for that call.
+
+    `socket_options` is applied to every socket the pool opens, as `(level, option, value)`
+    triples. Build it by concatenating the pure producers in `without_http.socket_options`
+    (`tcp_keepalive`, `send_buffer_size`, ...), the way headers concatenate: each describes
+    one concern, and the pool hands the combined set to `setsockopt` in order. It defaults
+    to `tcp_keepalive()`, so a pooled connection is probed for a peer that vanished
+    silently; pass `()` for the kernel's defaults, or include `tcp_keepalive(...)` in a
+    longer set to keep probing while setting more.
     """
 
     allow_http2: bool = True
@@ -984,7 +992,7 @@ class ConnectionPool:
     max_connections_per_host: int | None = None
     max_keepalive_per_host: int | None = None
     timeout: Timeout = _NO_TIMEOUT
-    tcp_keepalive: TCPKeepalive | None = _DEFAULT_KEEPALIVE
+    socket_options: SocketOptions = _DEFAULT_SOCKET_OPTIONS
     _h2: dict[Origin, _Http2Connection] = field(default_factory=dict)
     _h11: dict[Origin, _HostPool] = field(default_factory=dict)
     _h11_only: set[Origin] = field(default_factory=set)
@@ -1099,7 +1107,7 @@ class ConnectionPool:
                         origin.port,
                         ssl_context=self._context_for_connection(http2=True),
                         timeout=timeout,
-                        keepalive=self.tcp_keepalive,
+                        socket_options=self.socket_options,
                     )
                     if protocol == "h2":
                         connection = _Http2Connection.start(reader, writer)
@@ -1129,7 +1137,7 @@ class ConnectionPool:
                         origin.port,
                         ssl_context=None,
                         timeout=timeout,
-                        keepalive=self.tcp_keepalive,
+                        socket_options=self.socket_options,
                     )
                     connection = _Http2Connection.start(reader, writer)
                     self._h2[origin] = connection
@@ -1218,7 +1226,7 @@ class ConnectionPool:
     async def _open_h11(self, origin: Origin, timeout: Timeout) -> _Http11Connection:
         ssl_context = self._context_for_connection(http2=False) if origin.secure else None
         reader, writer, _ = await _open(
-            origin.host, origin.port, ssl_context=ssl_context, timeout=timeout, keepalive=self.tcp_keepalive
+            origin.host, origin.port, ssl_context=ssl_context, timeout=timeout, socket_options=self.socket_options
         )
         return _Http11Connection.new(reader, writer)
 

@@ -25,13 +25,18 @@
   bounds how many *idle* connections are retained per origin once a burst subsides, so the pool ramps
   up under load but settles back down when quiet. Both unbounded by default, and must be `>= 1` when
   set.
-- **`without-http`**: TCP keepalive on pooled client connections, on by default and configured with a
-  `TCPKeepalive` value on the pool (`idle`/`interval` as `timedelta`s, `count`, or `None` to disable).
-  The kernel probes
-  an otherwise-idle connection and drops it when a peer has vanished *silently* (a crash, a partition, a
-  NAT dropping the flow), which a clean server-side close does not: that sends a `FIN` the pool already
-  detects before reuse. This matters most because request timeouts are disabled by default, so nothing
-  else would notice a dead idle socket until a request hung on it.
+- **`without-http`**: socket options on the client pool and on `serving`, as `(level, option, value)`
+  triples built by pure producers and combined by concatenation, the way headers are: `tcp_keepalive`,
+  `send_buffer_size`, and `receive_buffer_size` each describe one concern and know nothing of each
+  other, so `ConnectionPool(socket_options=tcp_keepalive() + send_buffer_size(1 << 16))` needs no
+  merge step that understands what any of them mean. `serving(socket_options=...)` applies them to the
+  *listening* socket, whose buffer sizes every accepted connection inherits.
+  TCP keepalive is the default (`socket_options=tcp_keepalive()`), so the kernel probes an
+  otherwise-idle pooled connection and drops it when a peer has vanished *silently* (a crash, a
+  partition, a NAT dropping the flow), which a clean server-side close does not: that sends a `FIN` the
+  pool already detects before reuse. This matters most because request timeouts are disabled by
+  default, so nothing else would notice a dead idle socket until a request hung on it. Pass `()` for
+  the kernel's own defaults.
 - **`without-asgi`**: `file_response(path)` streams a file as the `ResponseStart` + `ResponseBody` event
   stream a handler yields, with `Content-Type` guessed from the suffix (`mimetypes.guess_file_type`,
   overridable) and `Content-Length` from `stat`, the body read in `chunk_size` pieces off the event loop

@@ -339,29 +339,68 @@ need different handling:
 
 TCP keepalive closes that second gap: the kernel probes an otherwise-idle connection
 and tears it down when the peer stops answering, independent of any request. It is
-**on by default** with modest probe timing, configured with a `TCPKeepalive` value on
-the pool:
+**on by default**, as one entry in the pool's `socket_options`:
 
 ```python
 from datetime import timedelta
 
-from without_http import ConnectionPool, TCPKeepalive
+from without_http import ConnectionPool, tcp_keepalive
 
 # The default: probe after 60s idle, every 10s, drop after 6 unanswered probes.
 async with ConnectionPool() as pool:
     ...
 
-# Tune the probe timing, or pass None to disable keepalive entirely.
-keepalive = TCPKeepalive(idle=timedelta(seconds=30), interval=timedelta(seconds=5), count=4)
-async with ConnectionPool(tcp_keepalive=keepalive) as pool:
+# Tune the probe timing, or pass () to leave the kernel's own defaults alone.
+async with ConnectionPool(
+    socket_options=tcp_keepalive(idle=timedelta(seconds=30), interval=timedelta(seconds=5), count=4)
+) as pool:
     ...
 ```
 
 `idle` and `interval` are `timedelta`s and MUST be a whole number of seconds (the
 underlying options carry only integer seconds, so a sub-second component is rejected
-at construction rather than silently truncated); `count` is a plain probe count. `SO_KEEPALIVE` is enabled portably; the per-probe
-tuning maps to the Linux `TCP_KEEPIDLE`/`TCP_KEEPINTVL`/`TCP_KEEPCNT` socket options,
-and a platform that lacks one of those knobs keeps its own default for that axis.
+rather than silently truncated); `count` is a plain probe count. `SO_KEEPALIVE` is
+enabled portably; the per-probe tuning maps to the Linux
+`TCP_KEEPIDLE`/`TCP_KEEPINTVL`/`TCP_KEEPCNT` socket options, and a platform that lacks
+one of those knobs keeps its own default for that axis.
+
+### Socket options
+
+`tcp_keepalive` is not special: it is one of several **pure producers** of
+`(level, option, value)` triples, and they compose the way headers do. Each describes a
+single concern and knows nothing about the others, so combining them is plain
+concatenation rather than a merge that has to understand what any of them mean:
+
+```python
+from without_http import ConnectionPool, receive_buffer_size, send_buffer_size, serving, tcp_keepalive
+
+async with ConnectionPool(socket_options=tcp_keepalive() + send_buffer_size(1 << 16)) as pool:
+    ...
+
+# On the server, options apply to the *listening* socket.
+async with serving(app, socket_options=receive_buffer_size(1 << 16)) as server:
+    ...
+```
+
+The order is the order they are applied in, and passing `()` sets nothing at all. Note
+that keepalive is the pool's *default*, so a `socket_options` that should keep probing
+has to say so: include `tcp_keepalive()` in the combined set rather than replacing it.
+
+`send_buffer_size` and `receive_buffer_size` pin `SO_SNDBUF`/`SO_RCVBUF`, which is how
+you make a socket's buffer a *known* size: left alone, Linux autotunes each up to the
+`max` of `net.ipv4.tcp_wmem`/`tcp_rmem`, and
+[its documentation](https://docs.kernel.org/networking/ip-sysctl.html) is the guarantee
+being relied on ("Calling `setsockopt()` with `SO_SNDBUF` disables automatic tuning of
+that socket's send buffer size"). Both are bounds rather than exact reservations: per
+[`socket(7)`](https://man7.org/linux/man-pages/man7/socket.7.html) the value is capped
+by `net.core.wmem_max`/`rmem_max`, and the kernel stores (and returns) double what you
+set, for bookkeeping.
+
+A listening socket hands its buffer sizes down to every connection accepted on it, so
+`receive_buffer_size` on `serving` bounds what the server will buffer from a peer whose
+body it has not read yet. Options that are meaningful only per-connection have nothing
+to act on at bind time; `TCP_NODELAY` is the notable one, and asyncio already sets it on
+every TCP transport it creates, in both directions, so there is nothing to configure.
 
 ### Client middleware
 

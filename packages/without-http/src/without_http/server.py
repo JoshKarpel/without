@@ -62,6 +62,8 @@ from without_http.h11_wire import h11_events_from_outbound
 from without_http.h11_wire import inbound_from_event
 from without_http.h11_wire import scope_from_request
 from without_http.lifespan import run_lifespan
+from without_http.socket_options import SocketOptions
+from without_http.socket_options import apply_socket_options
 from without_http.ws_wire import is_websocket_upgrade
 from without_http.ws_wire import websocket_scope_from_request
 from without_http.ws_wire import ws_events_from_outbound
@@ -844,6 +846,7 @@ async def serving(
     ssl_context: ssl.SSLContext | None = None,
     ssl_handshake_timeout: float | None = None,
     ssl_shutdown_timeout: float | None = None,
+    socket_options: SocketOptions = (),
 ) -> AsyncIterator[Server]:
     """
     Serve `app` over HTTP for the duration of the `with` block.
@@ -888,6 +891,14 @@ async def serving(
     one for the common case. `ssl_handshake_timeout` bounds a single TLS handshake
     (asyncio's default is 60s) and `ssl_shutdown_timeout` the closing `close_notify`
     exchange (default 30s); both are meaningful only alongside `ssl_context`.
+
+    `socket_options` is applied to the *listening* socket, as `(level, option, value)`
+    triples built by concatenating the pure producers in `without_http.socket_options`
+    (`receive_buffer_size`, ...), the same way the client pool takes them. The kernel
+    hands a listening socket's buffer sizes down to every connection accepted on it, so
+    `receive_buffer_size` here bounds what the server will buffer from a peer whose body
+    it has not read yet. Options that only make sense per-connection have nothing to act
+    on at bind time; the default (`()`) leaves the kernel's own choices alone.
     """
     limits = _Limits(
         max_concurrent_streams=max_concurrent_streams,
@@ -918,6 +929,8 @@ async def serving(
             ssl_handshake_timeout=ssl_handshake_timeout,
             ssl_shutdown_timeout=ssl_shutdown_timeout,
         )
+        for listening in server.sockets:
+            apply_socket_options(listening, socket_options)
         bound_host, bound_port = server.sockets[0].getsockname()[:2]
         try:
             yield Server(host=bound_host, port=bound_port, _connections=live)

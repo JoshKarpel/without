@@ -362,16 +362,18 @@ async def test_a_malformed_request_lingers_so_the_client_reads_the_error(
 
 
 class _HalfCloseRefusingWriter:
-    """A writer that cannot half-close its write side, as a TLS transport cannot."""
+    """
+    A writer that cannot half-close its write side, as a TLS transport cannot.
+
+    It deliberately has no `write_eof`, so a linger that asks for the `FIN` anyway fails
+    loudly instead of quietly doing the wrong thing to a transport that cannot do it.
+    """
 
     def __init__(self) -> None:
         self.closed = False
 
     def can_write_eof(self) -> bool:
         return False
-
-    def write_eof(self) -> None:
-        raise AssertionError("a transport that cannot half-close must never be asked to")
 
     def close(self) -> None:
         self.closed = True
