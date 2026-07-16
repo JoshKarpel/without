@@ -308,8 +308,8 @@ async def _open(
     `connect` bound covers the TCP connect and, over TLS, the handshake, since both
     happen in the one `open_connection` await; the ALPN read after it is synchronous.
 
-    `socket_options` is applied to the new socket, already combined by the caller (the
-    pool folds its keepalive in), so this only has to hand one set to the kernel.
+    `socket_options` is applied to the new socket exactly as given: one already-combined
+    set to hand to the kernel, with nothing added to it here.
     """
     async with timeout.connecting():
         reader, writer = await asyncio.open_connection(host, port, ssl=ssl_context)

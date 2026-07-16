@@ -6,6 +6,14 @@ from datetime import timedelta
 type SocketOptions = tuple[tuple[int, int, int], ...]
 
 
+def apply_socket_options(sock: socket.socket | None, options: SocketOptions) -> None:
+    """Apply each `(level, option, value)` triple to `sock`."""
+    if sock is None:
+        return
+    for level, option, value in options:
+        sock.setsockopt(level, option, value)
+
+
 def tcp_keepalive(
     *,
     idle: timedelta = timedelta(seconds=60),
@@ -99,17 +107,3 @@ def receive_buffer_size(size: int) -> SocketOptions:
     a server bounds what it will buffer from a peer whose body it has not read yet.
     """
     return ((socket.SOL_SOCKET, socket.SO_RCVBUF, size),)
-
-
-def apply_socket_options(sock: socket.socket | None, options: SocketOptions) -> None:
-    """
-    Apply each `(level, option, value)` triple to `sock`.
-
-    The imperative shell for the pure producers above: they describe *what* to set, this
-    does the `setsockopt` calls. `sock` is `None` when a transport has no underlying socket
-    (a test double), in which case there is nothing to configure.
-    """
-    if sock is None:
-        return
-    for level, option, value in options:
-        sock.setsockopt(level, option, value)
