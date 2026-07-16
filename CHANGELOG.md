@@ -117,6 +117,17 @@
 
 ### Fixed
 
+- **`without-http`**: an HTTP/1.1 connection is no longer dropped after every request whose app never
+  read the body. `h11` advances the client's state only as events are *pulled*, and an ASGI app may
+  ignore `receive` entirely, so a body-less `GET` left its `EndOfMessage` unread and the request was
+  indistinguishable from a peer still owing a body: it failed the keep-alive check and the connection
+  closed. That hit any app that skips the body (FastAPI, on a request with no body parameter) on every
+  request, and under load surfaced as a small fraction of requests never answered, the pooled-connection
+  race of a client writing into a connection the server was concurrently closing. The events the app
+  left unread are now consumed from `h11`'s buffer once it responds. Only *buffered* bytes count: a
+  `NEED_DATA` means the body genuinely has not arrived, so an early response to an in-flight body still
+  correctly declines reuse and takes the lingering close.
+
 - **`without-asgi`**: `make_asgi_app` now closes the inbound stream when a connection handler exits,
   so a handler that abandons the request body early (reads part of it, then returns) has the inbound
   generator's `finally` run deterministically instead of leaving it suspended for garbage collection.

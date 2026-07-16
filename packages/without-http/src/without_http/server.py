@@ -137,6 +137,32 @@ async def _read_request(
         return None
 
 
+def _consume_buffered_request(conn: h11.Connection) -> None:
+    """
+    Pull the request events the app left unread, using only already-buffered bytes.
+
+    An ASGI app is free to ignore `receive` entirely, and h11 advances `their_state`
+    only as events are pulled, so an unread request never reaches `DONE` no matter
+    how much of it arrived. A body-less `GET` is the sharp case: h11 has its
+    `EndOfMessage` buffered the moment the headers land, but an app that never calls
+    `receive` (FastAPI, on any request without a body parameter) leaves it sitting
+    there, and the request looks indistinguishable from a peer still owing us a body,
+    costing the connection its keep-alive.
+
+    Draining only what h11 already holds is what keeps this honest: `NEED_DATA` means
+    the body genuinely has not arrived, and stopping there leaves the connection
+    correctly ineligible for reuse rather than blocking on a peer that owes us bytes.
+    The loop is bounded by `SEND_BODY`, the one state with request events left to
+    pull, so every exit (`Data`, `EndOfMessage`, `NEED_DATA`) terminates it. A
+    malformed buffered body puts h11 in `ERROR`, which fails the keep-alive check on
+    its own; the connection closes rather than crashing the loop.
+    """
+    with suppress(h11.RemoteProtocolError):
+        while conn.their_state is h11.SEND_BODY:
+            if conn.next_event() is h11.NEED_DATA:
+                return
+
+
 async def _run_request(
     app: ASGIApp,
     conn: h11.Connection,
@@ -207,6 +233,7 @@ async def _run_request(
         await _send_simple(conn, writer, 500, b"internal server error\n")
     if crashed:
         return False
+    _consume_buffered_request(conn)
     return conn.our_state is h11.DONE and conn.their_state is h11.DONE
 
 

@@ -63,9 +63,14 @@ What the server handles:
   per-stream `WINDOW_UPDATE` flow control. The same `without-asgi` server-direction
   codecs carry over; only the wire mapping (`h2_wire`) is new.
 - **Keep-alive.** Sequential requests on one HTTP/1.1 connection reuse it
-  (`h11`'s `start_next_cycle`). A connection closed with an unread request body
-  (an early response) is closed *gracefully*, with a bounded lingering `FIN`
-  rather than a reset that could discard the response: see
+  (`h11`'s `start_next_cycle`). Reuse turns on the request being fully
+  *received*, not on the app having read it: an app that ignores `receive`
+  entirely (as FastAPI does on a body-less `GET`) keeps its connection, because
+  the events it left unread are consumed from `h11`'s buffer once it responds.
+  A connection whose peer is *still sending* when the response goes out (an
+  early response, so the body never fully arrived) is closed *gracefully*
+  instead, with a bounded lingering `FIN` rather than a reset that could
+  discard the response: see
   [Security](security.md#early-responses-and-connection-close).
 - **WebSockets** over the HTTP/1.1 `Upgrade`: the handshake is handed to `wsproto`,
   and the connection runs full-duplex (a reader pump feeds inbound frames to the
