@@ -109,7 +109,7 @@ done_query = query_param("done", optional(lambda value: value == "true"), schema
 new_todo_body = body(NewTodo.model_validate_json, schema=NewTodo)
 # `once` adapts a one-value parser into the tuple form `header_param` feeds it, so an
 # idempotency key must appear *exactly once*: absent or duplicated, it raises and maps to
-# a 400. `header_param` gives every value; whether a field is a singleton is the caller's
+# a 422. `header_param` gives every value; whether a field is a singleton is the caller's
 # call, declared right here rather than baked into a separate extractor.
 idempotency_key = header_param("idempotency-key", once(bytes.decode), schema={"type": "string"}, required=True)
 # One token, declared once: it is the route's `{id}` segment (matched and schemed
@@ -255,15 +255,17 @@ async def _recover(exc: Exception) -> Response | None:
         case TodoNotFound():
             return json_response(404, {"error": str(exc), "id": exc.todo_id})
         # An extraction rejection carries its underlying error as `cause` and the
-        # request part it came from as `field`: a body's pydantic `ValidationError`
-        # maps to a 422, any other bad value (a missing or duplicated
-        # `Idempotency-Key`) to a 400 naming the field. A plain `ValueError` raised
+        # request part it came from as `field`. Every rejection is a 422 here: the
+        # request parsed as HTTP and only its *contents* were unacceptable. The
+        # `cause` match still picks the body: a pydantic `ValidationError` reports an
+        # error count, while any other bad value (a missing or duplicated
+        # `Idempotency-Key`) names the field it came from. A plain `ValueError` raised
         # deeper in a handler is *not* an `ExtractionError`, so it falls through to a
-        # 500 rather than masquerading as a client 400.
+        # 500 rather than masquerading as a client error.
         case ExtractionError(cause=ValidationError() as invalid):
             return json_response(422, {"error": "invalid todo body", "fields": invalid.error_count()})
         case ExtractionError():
-            return json_response(400, {"error": str(exc), "field": exc.field})
+            return json_response(422, {"error": str(exc), "field": exc.field})
         case _:
             return None
 

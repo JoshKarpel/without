@@ -3,9 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import assert_never
 
-from without_asgi.narrow import narrow_to_bytes
-from without_asgi.narrow import narrow_to_int
-from without_asgi.narrow import narrow_to_str
+from without_asgi.narrow import narrow
 from without_asgi.types import RawMessage
 from without_asgi.types import WebsocketData
 from without_asgi.types import decode_websocket_data
@@ -59,15 +57,16 @@ type LifespanEvent = Startup | Shutdown
 
 
 def _as_reason(value: object) -> str:
-    return "" if value is None else narrow_to_str(value)
+    return "" if value is None else narrow(value, str)
 
 
 def parse_inbound(message: RawMessage) -> Inbound:
     """Classify one inbound `http` event. An unknown event is a protocol fault, so it raises."""
     match message.get("type"):
         case "http.request":
+            value = message.get("body", b"")
             return RequestBody(
-                body=narrow_to_bytes(message.get("body", b"")),
+                body=narrow(value, bytes),
                 more_body=bool(message.get("more_body", False)),
             )
         case "http.disconnect":
@@ -84,8 +83,9 @@ def parse_websocket_inbound(message: RawMessage) -> WebsocketInbound:
         case "websocket.receive":
             return WebsocketReceive(data=decode_websocket_data(message))
         case "websocket.disconnect":
+            value = message.get("code", 1005)
             return WebsocketDisconnect(
-                code=narrow_to_int(message.get("code", 1005)),
+                code=narrow(value, int),
                 reason=_as_reason(message.get("reason")),
             )
         case other:

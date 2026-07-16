@@ -178,17 +178,17 @@ async def test_creating_a_todo_echoes_it_with_its_url_and_idempotency_key() -> N
     assert body == {"id": 3, "title": "deploy", "done": False, "url": "/todos/3", "idempotency_key": "abc-123"}
 
 
-async def test_creating_a_todo_without_the_idempotency_key_is_a_400() -> None:
+async def test_creating_a_todo_without_the_idempotency_key_is_a_422() -> None:
     app = todos_app(_todos())
     async with _running(app):
         status, _headers, body = await _request(app, "POST", "/todos", body=b'{"title": "deploy"}')
-    assert status == 400
+    assert status == 422
     assert isinstance(body, dict)
     assert body["error"] == "expected exactly one value, got none"
     assert body["field"] == "idempotency-key"
 
 
-async def test_creating_a_todo_with_a_duplicated_idempotency_key_is_a_400() -> None:
+async def test_creating_a_todo_with_a_duplicated_idempotency_key_is_a_422() -> None:
     app = todos_app(_todos())
     async with _running(app):
         status, _headers, body = await _request(
@@ -198,7 +198,7 @@ async def test_creating_a_todo_with_a_duplicated_idempotency_key_is_a_400() -> N
             body=b'{"title": "deploy"}',
             headers=[(b"idempotency-key", b"one"), (b"idempotency-key", b"two")],
         )
-    assert status == 400
+    assert status == 422
     assert isinstance(body, dict)
     assert body["error"] == "expected exactly one value, got 2"
     assert body["field"] == "idempotency-key"

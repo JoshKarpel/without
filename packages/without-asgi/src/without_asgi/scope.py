@@ -5,11 +5,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import assert_never
 
-from without_asgi.narrow import narrow_to_bytes
-from without_asgi.narrow import narrow_to_int
-from without_asgi.narrow import narrow_to_str
+from without_asgi.narrow import narrow
 from without_asgi.types import RawHeaders
 from without_asgi.types import RawScope
+from without_asgi.types import narrow_headers
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,42 +188,32 @@ type ConnectionScope = HttpScope | WebsocketScope
 type Scope = ConnectionScope | LifespanScope
 
 
-def _as_pair(item: object) -> tuple[bytes, bytes]:
-    if isinstance(item, (list, tuple)) and len(item) == 2:
-        return narrow_to_bytes(item[0]), narrow_to_bytes(item[1])
-    raise TypeError(f"expected a (bytes, bytes) pair, got {item!r}")
-
-
-def _as_headers(value: object) -> RawHeaders:
-    if not isinstance(value, Iterable):
-        raise TypeError(f"expected an iterable of bytes pairs, got {type(value).__name__}")
-    return tuple(_as_pair(item) for item in value)
-
-
 def _as_subprotocols(value: object) -> tuple[str, ...]:
     if not isinstance(value, Iterable):
         raise TypeError(f"expected an iterable of subprotocols, got {type(value).__name__}")
-    return tuple(narrow_to_str(item) for item in value)
+    return tuple(narrow(item, str) for item in value)
 
 
 def _as_asgi(value: object, *, default_spec_version: str) -> Asgi:
     if not isinstance(value, Mapping):
         raise TypeError(f"expected an asgi mapping, got {type(value).__name__}")
     return Asgi(
-        version=narrow_to_str(value["version"]),
-        spec_version=narrow_to_str(value.get("spec_version", default_spec_version)),
+        version=narrow(value["version"], str),
+        spec_version=narrow(value.get("spec_version", default_spec_version), str),
     )
 
 
 def _as_optional_bytes(value: object) -> bytes | None:
-    return None if value is None else narrow_to_bytes(value)
+    return None if value is None else narrow(value, bytes)
 
 
 def _as_client(value: object) -> tuple[str, int] | None:
     if value is None:
         return None
     if isinstance(value, (list, tuple)) and len(value) == 2:
-        return narrow_to_str(value[0]), narrow_to_int(value[1])
+        value1 = value[0]
+        value2 = value[1]
+        return narrow(value1, str), narrow(value2, int)
     raise TypeError(f"expected a [host, port] pair, got {value!r}")
 
 
@@ -233,22 +222,22 @@ def _as_server(value: object) -> tuple[str, int | None] | None:
         return None
     if isinstance(value, (list, tuple)) and len(value) == 2:
         host, port = value
-        return narrow_to_str(host), (None if port is None else narrow_to_int(port))
+        return narrow(host, str), (None if port is None else narrow(port, int))
     raise TypeError(f"expected a [host, port] pair, got {value!r}")
 
 
 def _as_optional_str(value: object) -> str | None:
-    return None if value is None else narrow_to_str(value)
+    return None if value is None else narrow(value, str)
 
 
 def _as_optional_int(value: object) -> int | None:
-    return None if value is None else narrow_to_int(value)
+    return None if value is None else narrow(value, int)
 
 
 def _as_cert_chain(value: object) -> tuple[str, ...]:
     if not isinstance(value, Iterable):
         raise TypeError(f"expected an iterable of certificates, got {type(value).__name__}")
-    return tuple(narrow_to_str(cert) for cert in value)
+    return tuple(narrow(cert, str) for cert in value)
 
 
 def _as_extensions(value: object) -> Mapping[str, Mapping[str, object]] | None:
@@ -260,7 +249,7 @@ def _as_extensions(value: object) -> Mapping[str, Mapping[str, object]] | None:
     for name, options in value.items():
         if not isinstance(options, Mapping):
             raise TypeError(f"expected an options mapping for extension {name!r}, got {type(options).__name__}")
-        parsed[narrow_to_str(name)] = options
+        parsed[narrow(name, str)] = options
     return parsed
 
 
@@ -268,14 +257,14 @@ def parse_http_scope(scope: RawScope) -> HttpScope:
     """Read an `http` scope into the typed connection facts, validating at the boundary."""
     return HttpScope(
         asgi=_as_asgi(scope["asgi"], default_spec_version="2.0"),
-        http_version=narrow_to_str(scope["http_version"]),
-        method=narrow_to_str(scope["method"]),
-        scheme=narrow_to_str(scope.get("scheme", "http")),
-        path=narrow_to_str(scope["path"]),
+        http_version=narrow(scope["http_version"], str),
+        method=narrow(scope["method"], str),
+        scheme=narrow(scope.get("scheme", "http"), str),
+        path=narrow(scope["path"], str),
         raw_path=_as_optional_bytes(scope.get("raw_path")),
-        query_string=narrow_to_bytes(scope["query_string"]),
-        root_path=narrow_to_str(scope.get("root_path", "")),
-        headers=_as_headers(scope["headers"]),
+        query_string=narrow(scope["query_string"], bytes),
+        root_path=narrow(scope.get("root_path", ""), str),
+        headers=narrow_headers(scope["headers"]),
         client=_as_client(scope.get("client")),
         server=_as_server(scope.get("server")),
         extensions=_as_extensions(scope.get("extensions")),
@@ -286,13 +275,13 @@ def parse_websocket_scope(scope: RawScope) -> WebsocketScope:
     """Read a `websocket` scope into the typed handshake facts, validating at the boundary."""
     return WebsocketScope(
         asgi=_as_asgi(scope["asgi"], default_spec_version="2.0"),
-        http_version=narrow_to_str(scope.get("http_version", "1.1")),
-        scheme=narrow_to_str(scope.get("scheme", "ws")),
-        path=narrow_to_str(scope["path"]),
+        http_version=narrow(scope.get("http_version", "1.1"), str),
+        scheme=narrow(scope.get("scheme", "ws"), str),
+        path=narrow(scope["path"], str),
         raw_path=_as_optional_bytes(scope.get("raw_path")),
-        query_string=narrow_to_bytes(scope.get("query_string", b"")),
-        root_path=narrow_to_str(scope.get("root_path", "")),
-        headers=_as_headers(scope["headers"]),
+        query_string=narrow(scope.get("query_string", b""), bytes),
+        root_path=narrow(scope.get("root_path", ""), str),
+        headers=narrow_headers(scope["headers"]),
         client=_as_client(scope.get("client")),
         server=_as_server(scope.get("server")),
         subprotocols=_as_subprotocols(scope.get("subprotocols", ())),
@@ -302,7 +291,7 @@ def parse_websocket_scope(scope: RawScope) -> WebsocketScope:
 
 def parse_scope(scope: RawScope) -> Scope:
     """Classify any scope by its `type` discriminator. An unknown type is a protocol fault, so it raises."""
-    match narrow_to_str(scope["type"]):
+    match narrow(scope["type"], str):
         case "http":
             return parse_http_scope(scope)
         case "websocket":

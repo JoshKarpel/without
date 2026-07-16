@@ -1,0 +1,45 @@
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[project]
+name = "benchmarks"
+version = "0.0.0"
+description = "Whole-stack load benchmarks: the without stack vs framework peers over the same core, driven by an external load generator."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Josh Karpel", email = "josh.karpel@gmail.com" },
+]
+# Never published: like `integration`, the name sits outside the `without*`
+# family the publish workflow globs, and this classifier makes PyPI reject an
+# upload if it ever slips through.
+classifiers = ["Private :: Do Not Upload"]
+requires-python = ">=3.14"
+dependencies = [
+    # The without stack under test, plus the shared todo core the peer shells reuse.
+    "integration",
+    "without-http",
+    "without-asgi",
+    # The peer stack: FastAPI over the *same* core, served by uvicorn as deployed
+    # (uvloop + httptools), so the delta is framework + server, not domain logic.
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    # uvloop is pulled in transitively by uvicorn[standard], but `servers.py`
+    # imports it directly to run the without-http server on uvloop, so it is a
+    # direct dependency in its own right. It has no Windows support (see the same
+    # marker in the workspace root), which costs the uvloop-backed cells there.
+    "uvloop>=0.21 ; sys_platform != 'win32'",
+    # Converts austin's native sample stream to speedscope for a flamegraph. The
+    # austin sampler binary itself is a system install (C), not a Python package.
+    "austin-python>=1.7",
+    # Plots the vegeta latency/throughput sweep results.
+    "matplotlib>=3.9",
+    # Reads the server process's CPU time to report utilization per rate.
+    "psutil>=5.9",
+]
+
+[tool.uv.sources]
+integration = { workspace = true }
+without-http = { workspace = true }
+without-asgi = { workspace = true }
