@@ -213,8 +213,17 @@ async def early_reject_app(scope: RawScope, receive: Receive, send: Send) -> Non
 
 
 async def _large_upload() -> AsyncIterator[bytes]:
-    for _ in range(64):  # pragma: no branch - the early response cancels this before the loop finishes
-        yield b"x" * 100_000  # ~6.4 MB, far past any socket buffer, so the write must block
+    # To block, the upload must outrun the sender's send buffer *plus* the receiver's
+    # receive buffer, since a peer that never reads still absorbs both. Linux autotunes
+    # each up to `net.ipv4.tcp_wmem`/`tcp_rmem` (~10 MB combined on default kernels, and
+    # more on a tuned host), so a cap sized against one buffer is a race the kernel wins:
+    # the whole body lands in the buffers, nothing blocks, and the test hangs.
+    #
+    # The cap is generous rather than tuned because it costs nothing to raise: the
+    # generator is lazy, so a consumer that blocks (or is cancelled by an early response)
+    # only ever pays for the chunks it actually wrote.
+    for _ in range(512):  # pragma: no branch - the early response cancels this before the loop finishes
+        yield b"x" * 100_000
 
 
 async def test_early_response_to_a_large_upload_does_not_deadlock() -> None:

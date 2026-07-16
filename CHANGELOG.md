@@ -25,13 +25,18 @@
   bounds how many *idle* connections are retained per origin once a burst subsides, so the pool ramps
   up under load but settles back down when quiet. Both unbounded by default, and must be `>= 1` when
   set.
-- **`without-http`**: TCP keepalive on pooled client connections, on by default and configured with a
-  `TCPKeepalive` value on the pool (`idle`/`interval` as `timedelta`s, `count`, or `None` to disable).
-  The kernel probes
-  an otherwise-idle connection and drops it when a peer has vanished *silently* (a crash, a partition, a
-  NAT dropping the flow), which a clean server-side close does not: that sends a `FIN` the pool already
-  detects before reuse. This matters most because request timeouts are disabled by default, so nothing
-  else would notice a dead idle socket until a request hung on it.
+- **`without-http`**: socket options on the client pool and on `serving`, as `(level, option, value)`
+  triples built by pure producers and combined by concatenation, the way headers are: `tcp_keepalive`,
+  `send_buffer_size`, and `receive_buffer_size` each describe one concern and know nothing of each
+  other, so `ConnectionPool(socket_options=tcp_keepalive() + send_buffer_size(1 << 16))` needs no
+  merge step that understands what any of them mean. `serving(socket_options=...)` applies them to the
+  *listening* socket, whose buffer sizes every accepted connection inherits.
+  TCP keepalive is the default (`socket_options=tcp_keepalive()`), so the kernel probes an
+  otherwise-idle pooled connection and drops it when a peer has vanished *silently* (a crash, a
+  partition, a NAT dropping the flow), which a clean server-side close does not: that sends a `FIN` the
+  pool already detects before reuse. This matters most because request timeouts are disabled by
+  default, so nothing else would notice a dead idle socket until a request hung on it. Pass `()` for
+  the kernel's own defaults.
 - **`without-asgi`**: `file_response(path)` streams a file as the `ResponseStart` + `ResponseBody` event
   stream a handler yields, with `Content-Type` guessed from the suffix (`mimetypes.guess_file_type`,
   overridable) and `Content-Length` from `stat`, the body read in `chunk_size` pieces off the event loop
@@ -116,6 +121,17 @@
   [Security](https://without.help/without-http/security/) page.
 
 ### Fixed
+
+- **`without-http`**: an HTTP/1.1 connection is no longer dropped after every request whose app never
+  read the body. `h11` advances the client's state only as events are *pulled*, and an ASGI app may
+  ignore `receive` entirely, so a body-less `GET` left its `EndOfMessage` unread and the request was
+  indistinguishable from a peer still owing a body: it failed the keep-alive check and the connection
+  closed. That hit any app that skips the body (FastAPI, on a request with no body parameter) on every
+  request, and under load surfaced as a small fraction of requests never answered, the pooled-connection
+  race of a client writing into a connection the server was concurrently closing. The events the app
+  left unread are now consumed from `h11`'s buffer once it responds. Only *buffered* bytes count: a
+  `NEED_DATA` means the body genuinely has not arrived, so an early response to an in-flight body still
+  correctly declines reuse and takes the lingering close.
 
 - **`without-asgi`**: `make_asgi_app` now closes the inbound stream when a connection handler exits,
   so a handler that abandons the request body early (reads part of it, then returns) has the inbound

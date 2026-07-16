@@ -20,11 +20,14 @@ from without_http.h2_wire import scope_from_h2_headers
 from without_http.h11_wire import h11_events_from_outbound
 from without_http.h11_wire import inbound_from_event
 from without_http.h11_wire import scope_from_request
-from without_http.keepalive import TCPKeepalive
 from without_http.lifespan import LifespanError
 from without_http.lifespan import run_lifespan
 from without_http.server import Server
 from without_http.server import serving
+from without_http.socket_options import SocketOptions
+from without_http.socket_options import receive_buffer_size
+from without_http.socket_options import send_buffer_size
+from without_http.socket_options import tcp_keepalive
 from without_http.timeouts import ConnectTimeout
 from without_http.timeouts import HTTPTimeout
 from without_http.timeouts import PoolTimeout
@@ -54,7 +57,7 @@ __all__ = [
     "ResponseHead",
     "ResponseTrailers",
     "Server",
-    "TCPKeepalive",
+    "SocketOptions",
     "Timeout",
     "WriteTimeout",
     "add_headers",
@@ -64,15 +67,18 @@ __all__ = [
     "h11_events_from_outbound",
     "inbound_from_event",
     "is_websocket_upgrade",
+    "receive_buffer_size",
     "request_headers",
     "response_headers",
     "response_status_and_headers",
     "run_lifespan",
     "scope_from_h2_headers",
     "scope_from_request",
+    "send_buffer_size",
     "server_ssl_context",
     "serving",
     "stack",
+    "tcp_keepalive",
     "websocket_scope_from_request",
     "wrap",
     "ws_events_from_outbound",

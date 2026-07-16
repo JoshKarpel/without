@@ -62,6 +62,8 @@ from without_http.h11_wire import h11_events_from_outbound
 from without_http.h11_wire import inbound_from_event
 from without_http.h11_wire import scope_from_request
 from without_http.lifespan import run_lifespan
+from without_http.socket_options import SocketOptions
+from without_http.socket_options import apply_socket_options
 from without_http.ws_wire import is_websocket_upgrade
 from without_http.ws_wire import websocket_scope_from_request
 from without_http.ws_wire import ws_events_from_outbound
@@ -137,6 +139,32 @@ async def _read_request(
         return None
 
 
+def _consume_buffered_request(conn: h11.Connection) -> None:
+    """
+    Pull the request events the app left unread, using only already-buffered bytes.
+
+    An ASGI app is free to ignore `receive` entirely, and h11 advances `their_state`
+    only as events are pulled, so an unread request never reaches `DONE` no matter
+    how much of it arrived. A body-less `GET` is the sharp case: h11 has its
+    `EndOfMessage` buffered the moment the headers land, but an app that never calls
+    `receive` (FastAPI, on any request without a body parameter) leaves it sitting
+    there, and the request looks indistinguishable from a peer still owing us a body,
+    costing the connection its keep-alive.
+
+    Draining only what h11 already holds is what keeps this honest: `NEED_DATA` means
+    the body genuinely has not arrived, and stopping there leaves the connection
+    correctly ineligible for reuse rather than blocking on a peer that owes us bytes.
+    The loop is bounded by `SEND_BODY`, the one state with request events left to
+    pull, so every exit (`Data`, `EndOfMessage`, `NEED_DATA`) terminates it. A
+    malformed buffered body puts h11 in `ERROR`, which fails the keep-alive check on
+    its own; the connection closes rather than crashing the loop.
+    """
+    with suppress(h11.RemoteProtocolError):
+        while conn.their_state is h11.SEND_BODY:
+            if conn.next_event() is h11.NEED_DATA:
+                return
+
+
 async def _run_request(
     app: ASGIApp,
     conn: h11.Connection,
@@ -207,6 +235,7 @@ async def _run_request(
         await _send_simple(conn, writer, 500, b"internal server error\n")
     if crashed:
         return False
+    _consume_buffered_request(conn)
     return conn.our_state is h11.DONE and conn.their_state is h11.DONE
 
 
@@ -817,6 +846,7 @@ async def serving(
     ssl_context: ssl.SSLContext | None = None,
     ssl_handshake_timeout: float | None = None,
     ssl_shutdown_timeout: float | None = None,
+    socket_options: SocketOptions = (),
 ) -> AsyncIterator[Server]:
     """
     Serve `app` over HTTP for the duration of the `with` block.
@@ -861,6 +891,14 @@ async def serving(
     one for the common case. `ssl_handshake_timeout` bounds a single TLS handshake
     (asyncio's default is 60s) and `ssl_shutdown_timeout` the closing `close_notify`
     exchange (default 30s); both are meaningful only alongside `ssl_context`.
+
+    `socket_options` is applied to the *listening* socket, as `(level, option, value)`
+    triples built by concatenating the pure producers in `without_http.socket_options`
+    (`receive_buffer_size`, ...), the same way the client pool takes them. The kernel
+    hands a listening socket's buffer sizes down to every connection accepted on it, so
+    `receive_buffer_size` here bounds what the server will buffer from a peer whose body
+    it has not read yet. Options that only make sense per-connection have nothing to act
+    on at bind time; the default (`()`) leaves the kernel's own choices alone.
     """
     limits = _Limits(
         max_concurrent_streams=max_concurrent_streams,
@@ -891,6 +929,8 @@ async def serving(
             ssl_handshake_timeout=ssl_handshake_timeout,
             ssl_shutdown_timeout=ssl_shutdown_timeout,
         )
+        for listening in server.sockets:
+            apply_socket_options(listening, socket_options)
         bound_host, bound_port = server.sockets[0].getsockname()[:2]
         try:
             yield Server(host=bound_host, port=bound_port, _connections=live)

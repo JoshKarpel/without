@@ -22,6 +22,7 @@ from without_asgi.routing import buffered
 from without_http import serving
 from without_http.server import _address
 from without_http.server import _Limits
+from without_http.server import _lingering_close
 from without_http.server import _LiveConnections
 from without_http.server import _serve_connection
 from without_http.server import _serve_h11_connection
@@ -56,6 +57,21 @@ async def echo_app(scope: RawMessage, receive: Receive, send: Send) -> None:
     payload = f"{method} {path} {body.decode()}".encode()
     await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
     await send({"type": "http.response.body", "body": payload})
+
+
+_UNREAD_BODY = b"answered without reading"
+
+
+async def unread_app(scope: RawMessage, receive: Receive, send: Send) -> None:
+    """A raw ASGI app that answers without ever calling `receive`, as FastAPI does on a GET."""
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"text/plain"), (b"content-length", str(len(_UNREAD_BODY)).encode())],
+        }
+    )
+    await send({"type": "http.response.body", "body": _UNREAD_BODY})
 
 
 def configured_app() -> ASGIApp:
@@ -137,6 +153,62 @@ async def test_keep_alive_serves_sequential_requests_on_one_connection() -> None
 
     assert first.text == "GET /one "
     assert second.text == "GET /two "
+
+
+async def test_keep_alive_survives_an_app_that_never_reads_the_request() -> None:
+    # h11 advances the client's state only as events are pulled, so an app that
+    # ignores `receive` (FastAPI, on any request with no body parameter) leaves the
+    # request's EndOfMessage unread and the connection looks unfinished. Driven over
+    # a raw socket because httpx would transparently reconnect and hide the drop.
+    async with serving(unread_app) as server:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        statuses = []
+        for path in (b"/one", b"/two"):
+            writer.write(b"GET " + path + b" HTTP/1.1\r\nhost: test\r\n\r\n")
+            await writer.drain()
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+            statuses.append(head.split(b"\r\n")[0])
+            await asyncio.wait_for(reader.readexactly(len(_UNREAD_BODY)), timeout=5)
+        writer.close()
+        with suppress(OSError):
+            await writer.wait_closed()
+
+    assert statuses == [b"HTTP/1.1 200 ", b"HTTP/1.1 200 "]
+
+
+async def test_an_unread_partial_body_is_not_kept_alive() -> None:
+    # The other side of consuming what the app never read: only h11's buffered bytes
+    # count. A peer that promised 100 bytes and sent 10 still owes us a body, so the
+    # connection must close rather than be reused for whatever it sends next.
+    async with serving(unread_app) as server:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        writer.write(b"POST /x HTTP/1.1\r\nhost: test\r\ncontent-length: 100\r\n\r\n" + b"a" * 10)
+        await writer.drain()
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+        await asyncio.wait_for(reader.readexactly(len(_UNREAD_BODY)), timeout=5)
+        assert head.split(b"\r\n")[0] == b"HTTP/1.1 200 "
+        assert await asyncio.wait_for(reader.read(), timeout=5) == b""
+        writer.close()
+        with suppress(OSError):
+            await writer.wait_closed()
+
+
+async def test_an_unread_malformed_body_closes_the_connection_without_crashing() -> None:
+    # Draining what the app never read can meet a malformed chunk header, which puts
+    # h11 in ERROR. The response we already sent must still stand and the connection
+    # must close quietly, rather than the parse error escaping the connection task.
+    async with serving(unread_app) as server:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        writer.write(b"POST /x HTTP/1.1\r\nhost: test\r\ntransfer-encoding: chunked\r\n\r\nZZZZ\r\n")
+        await writer.drain()
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+        body = await asyncio.wait_for(reader.readexactly(len(_UNREAD_BODY)), timeout=5)
+        assert head.split(b"\r\n")[0] == b"HTTP/1.1 200 "
+        assert body == _UNREAD_BODY
+        assert await asyncio.wait_for(reader.read(), timeout=5) == b""
+        writer.close()
+        with suppress(OSError):
+            await writer.wait_closed()
 
 
 async def test_threads_lifespan_state_into_the_handler() -> None:
@@ -287,6 +359,42 @@ async def test_a_malformed_request_lingers_so_the_client_reads_the_error(
     )
 
     assert (await client_reader.read()).startswith(b"HTTP/1.1 400")
+
+
+class _HalfCloseRefusingWriter:
+    """
+    A writer that cannot half-close its write side, as a TLS transport cannot.
+
+    It deliberately has no `write_eof`, so a linger that asks for the `FIN` anyway fails
+    loudly instead of quietly doing the wrong thing to a transport that cannot do it.
+    """
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def can_write_eof(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+async def test_lingering_over_a_transport_that_cannot_half_close_still_drains_and_closes() -> None:
+    # TLS cannot half-close, so the linger has no `FIN` to send and rests on the bounded
+    # drain alone: it must still read the peer's in-flight bytes off the socket before
+    # closing, or the unread data turns the close into the `RST` the linger exists to avoid.
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"in-flight body the client is still sending")
+    reader.feed_eof()
+    writer = _HalfCloseRefusingWriter()
+
+    await _lingering_close(reader, cast(asyncio.StreamWriter, writer))
+
+    assert reader.at_eof()
+    assert writer.closed
 
 
 async def test_reports_in_flight_connections_while_a_request_is_served() -> None:
