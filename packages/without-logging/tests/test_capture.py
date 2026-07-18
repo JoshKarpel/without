@@ -3,6 +3,7 @@ import logging
 from datetime import UTC
 from datetime import datetime
 
+from pytest_mock import MockerFixture
 from without import Sink
 from without import compose
 from without import from_selector
@@ -159,3 +160,31 @@ async def test_offer_counts_a_record_dropped_after_the_queue_is_shut_down() -> N
     handler._offer(a_record("too late"))
 
     assert handler.dropped == 1
+
+
+async def test_offer_counts_each_dropped_record_separately() -> None:
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[Record] = asyncio.Queue(1)
+    handler = CaptureHandler(loop, queue, parse_record)
+    queue.put_nowait(a_record("kept"))
+
+    handler._offer(a_record("first overflow"))
+    handler._offer(a_record("second overflow"))
+
+    assert handler.dropped == 2
+
+
+async def test_emit_on_the_loop_thread_takes_the_cheap_call_soon(mocker: MockerFixture) -> None:
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[Record] = asyncio.Queue(4)
+    handler = CaptureHandler(loop, queue, parse_record)
+    cheap = mocker.spy(loop, "call_soon")
+    threadsafe = mocker.spy(loop, "call_soon_threadsafe")
+    log_record = logging.LogRecord(
+        name="svc.test", level=logging.WARNING, pathname=__file__, lineno=7, msg="on loop", args=(), exc_info=None
+    )
+
+    handler.emit(log_record)  # emit runs on the loop thread, so it must skip the cross-thread wakeup
+
+    cheap.assert_called_once()
+    threadsafe.assert_not_called()

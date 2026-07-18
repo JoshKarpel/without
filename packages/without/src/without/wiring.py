@@ -136,10 +136,10 @@ def compose[A, B, C](first: Processor[A, B], second: Processor[B, C] | Sink[B]) 
     def composed(inputs: Stream[A]) -> Stream[C] | Awaitable[None]:
         return second(first(inputs))
 
-    return cast("Processor[A, C] | Sink[A]", composed)
+    return cast("Processor[A, C] | Sink[A]", composed)  # pragma: no mutate - cast is a runtime no-op
 
 
-def tee[T](*sinks: Sink[T], buffer: int = 1) -> Sink[T]:
+def tee[T](*sinks: Sink[T], buffer: int = 1) -> Sink[T]:  # pragma: no mutate - default depth; effect is timing-only
     """
     Fan one stream out to every `sink`: the terminal counterpart to `compose`.
 
@@ -189,7 +189,7 @@ def tee[T](*sinks: Sink[T], buffer: int = 1) -> Sink[T]:
 
         async with asyncio.TaskGroup() as group:
             group.create_task(pump())
-            for sink, queue in zip(sinks, queues, strict=True):
+            for sink, queue in zip(sinks, queues, strict=True):  # pragma: no mutate - lengths always equal
                 group.create_task(drive(sink, queue))
 
     return teeing

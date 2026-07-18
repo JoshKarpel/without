@@ -10,9 +10,32 @@ from without import Processor
 from without import collect
 from without import stream_from_iterable
 from without_logging import Record
+from without_logging import exception_to_dict
 from without_logging import exception_to_text
 from without_logging import render_console
 from without_logging import render_json
+
+
+def a_simple_traceback() -> TracebackException:
+    try:
+        raise ValueError("plain")
+    except ValueError as exc:
+        return TracebackException.from_exception(exc)
+
+
+def a_syntax_error_traceback() -> TracebackException:
+    try:
+        compile("x =", "probe", "exec")
+    except SyntaxError as exc:
+        return TracebackException.from_exception(exc)
+    raise AssertionError("compile should have raised")  # pragma: no cover - guards the helper
+
+
+def a_traceback_from(exception: Exception) -> TracebackException:
+    try:
+        raise exception
+    except Exception as exc:  # noqa: BLE001 - the test wants whatever it was handed, as a traceback
+        return TracebackException.from_exception(exc)
 
 
 def a_record(
@@ -179,3 +202,61 @@ async def test_render_console_uses_an_injected_timestamp_format() -> None:
     line = await rendered(render_console(timestamp=lambda when: when.strftime("%H:%M:%S")), a_record())
 
     assert line.startswith('14:56:09 INFO svc.billing "charge accepted"')
+
+
+def test_exception_to_dict_omits_the_cause_key_for_an_unchained_exception() -> None:
+    assert "cause" not in exception_to_dict(a_simple_traceback())
+
+
+def test_exception_to_dict_names_each_frame_field() -> None:
+    frame = exception_to_dict(a_simple_traceback())["frames"][0]  # type: ignore[index]
+
+    assert set(frame) == {"file", "line", "function", "code"}
+
+
+def test_exception_to_dict_joins_a_multiline_message_without_a_separator() -> None:
+    message = exception_to_dict(a_syntax_error_traceback())["message"]
+
+    assert isinstance(message, str)
+    # A SyntaxError's `format_exception_only` yields several already-newlined parts; joining them with
+    # anything but "" would splice a separator onto the final line.
+    assert message.splitlines()[-1] == "SyntaxError: invalid syntax"
+
+
+def test_exception_to_text_ends_on_the_exception_message_with_no_trailing_newline() -> None:
+    text = exception_to_text(a_chained_traceback())
+
+    assert not text.endswith("\n")
+    # The parts of `format()` are joined with no separator, so the last line is the message itself.
+    assert text.splitlines()[-1] == "ValueError: token expired"
+
+
+def test_exception_to_text_strips_only_trailing_newlines_leaving_a_trailing_space() -> None:
+    text = exception_to_text(a_traceback_from(ValueError("trailing space ")))
+
+    assert text.endswith("ValueError: trailing space ")
+
+
+def test_exception_to_text_does_not_strip_a_trailing_letter_from_the_message() -> None:
+    text = exception_to_text(a_traceback_from(ValueError("code X")))
+
+    assert text.endswith("ValueError: code X")
+
+
+async def test_render_console_leaves_non_ascii_in_the_message_unescaped() -> None:
+    line = await rendered(render_console(), a_record(message="café ☕"))
+
+    assert '"café ☕"' in line
+
+
+async def test_render_console_separates_traceback_lines_with_real_newlines() -> None:
+    line = await rendered(render_console(), a_record(exception=a_chained_traceback()))
+
+    assert "\n  ValueError: token expired" in line
+
+
+async def test_render_console_keeps_a_blank_traceback_line_blank() -> None:
+    line = await rendered(render_console(), a_record(exception=a_chained_traceback()))
+
+    # The blank line between the chained tracebacks stays blank (not filled with a placeholder).
+    assert "\n\n" in line

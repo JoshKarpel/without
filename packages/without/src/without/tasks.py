@@ -119,7 +119,7 @@ async def limit_concurrency[T](
     if limit < 1:
         raise ValueError(f"limit must be at least 1, but got {limit}")
     source = as_async_iterator(aws)
-    ended = False
+    ended = False  # pragma: no mutate - only ever read as a bool, never identity-compared
     pending: set[asyncio.Future[T]] = set()
     try:
         while pending or not ended:
