@@ -45,6 +45,14 @@ _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _NO_TIMEOUT = Timeout()  # a shared immutable "no timeouts" value, safe as a default
 _DEFAULT_SOCKET_OPTIONS = tcp_keepalive()  # likewise: a shared immutable "keepalive on" default
 
+# Wire codecs, named once. Request/response tokens are ASCII; Set-Cookie / Cookie header text
+# is latin-1 (the byte-transparent superset h11 uses). Hoisting the codec names keeps mutmut's
+# codec-name mutations on these two lines rather than every call site: an invalid `"XXasciiXX"`
+# crashes and is killed, a case-swapped `"ASCII"` is an equivalent alias documented once (see
+# docs/contributing/mutation-testing.md).
+_ASCII = "ascii"
+_LATIN1 = "latin-1"
+
 logger = logging.getLogger(__name__)
 
 
@@ -279,8 +287,7 @@ def _build_request(method: str, url: str, headers: RawHeaders, content: bytes | 
         if not content:
             return ClientRequest(method, url, headers, _empty_body())  # pragma: no mutate - equals _empty_body()
         if not _has(headers, b"content-length"):
-            content_length = str(len(content)).encode("ascii")  # pragma: no mutate - ascii/ASCII codec alias
-            headers = (*headers, (b"content-length", content_length))
+            headers = (*headers, (b"content-length", str(len(content)).encode(_ASCII)))
         return ClientRequest(method, url, headers, _single(content))
     if not _has(headers, b"content-length") and not _has(headers, b"transfer-encoding"):
         headers = (*headers, (b"transfer-encoding", b"chunked"))
@@ -364,7 +371,7 @@ class _Http11Connection:
         """Write the request line and headers and flush them, so the server can respond."""
         headers = list(request.headers)
         if not _has(request.headers, b"host"):
-            headers.insert(0, (b"host", parts.netloc.encode("ascii")))
+            headers.insert(0, (b"host", parts.netloc.encode(_ASCII)))
         self._writer.write(self._conn.send(h11.Request(method=request.method, target=_target(parts), headers=headers)))
         await self._writer.drain()
 
@@ -1148,10 +1155,10 @@ class ConnectionPool:
         self, connection: _Http2Connection, request: ClientRequest, parts: SplitResult, timeout: Timeout
     ) -> ClientResponse:
         status, headers, stream_id, body, send_task = await connection.request(
-            method=request.method.encode("ascii"),
-            target=_target(parts).encode("ascii"),
+            method=request.method.encode(_ASCII),
+            target=_target(parts).encode(_ASCII),
             scheme=parts.scheme,
-            authority=parts.netloc.encode("ascii"),
+            authority=parts.netloc.encode(_ASCII),
             headers=request.headers,
             body=request.body,
             timeout=timeout,
@@ -1337,8 +1344,7 @@ def follow_redirects(max_hops: int = 5) -> ClientMiddleware:
                 if location is None:
                     return response
                 source = urlsplit(request.url)
-                decoded_location = location.decode("ascii")  # pragma: no mutate - ascii/ASCII codec alias
-                target = urlsplit(urljoin(request.url, decoded_location))
+                target = urlsplit(urljoin(request.url, location.decode(_ASCII)))
                 if source.scheme == "https" and target.scheme == "http":
                     return response
                 headers = request.headers
@@ -1556,7 +1562,7 @@ class CookieJar:
         for name, value in headers:
             if name.lower() != b"set-cookie":
                 continue
-            parsed = _parse_set_cookie(value.decode("latin-1"), host, parts.path)
+            parsed = _parse_set_cookie(value.decode(_LATIN1), host, parts.path)
             if parsed is None:
                 continue
             cookie, deletes = parsed
@@ -1592,7 +1598,7 @@ class CookieJar:
         if not matched:
             return None
         matched.sort(key=lambda cookie: len(cookie.path), reverse=True)
-        return "; ".join(f"{cookie.name}={cookie.value}" for cookie in matched).encode("latin-1")
+        return "; ".join(f"{cookie.name}={cookie.value}" for cookie in matched).encode(_LATIN1)
 
 
 def _with_cookie(headers: RawHeaders, value: bytes) -> RawHeaders:

@@ -221,3 +221,6 @@ __marimo__/
 # both under whichever package is being tested
 mutants/
 packages/*/setup.cfg
+
+# Claude Code harness-managed agent worktrees (transient, auto-removed)
+.claude/worktrees/

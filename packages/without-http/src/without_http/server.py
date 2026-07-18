@@ -70,6 +70,11 @@ from without_http.ws_wire import ws_events_from_outbound
 
 _BUFFER = 65536
 
+# The WebSocket handshake target is latin-1 (h11 keeps request bytes as latin-1 text). Naming
+# the codec once keeps mutmut's codec-name mutations on this line rather than the call site
+# (see docs/contributing/mutation-testing.md).
+_LATIN1 = "latin-1"
+
 logger = logging.getLogger(__name__)
 
 
@@ -231,7 +236,7 @@ async def _run_request(
         await app(encode_http_scope(scope), receive, send)
     except Exception:  # noqa: BLE001 - isolate a crashing app from the connection loop; turned into a 500 below
         crashed = True
-    if not response_done and conn.our_state is h11.SEND_RESPONSE:  # pragma: no mutate - and/or equivalent here
+    if not response_done and conn.our_state is h11.SEND_RESPONSE:
         await _send_simple(conn, writer, 500, b"internal server error\n")
     if crashed:
         return False
@@ -267,7 +272,7 @@ async def _serve_websocket(
     """
     ws = WSConnection(ConnectionType.SERVER)  # pragma: no mutate - upgrade path sets server role
     handshake = [(bytes(name), bytes(value)) for name, value in request.headers]
-    ws.initiate_upgrade_connection(handshake, request.target.decode("latin-1"))  # pragma: no mutate - codec case
+    ws.initiate_upgrade_connection(handshake, request.target.decode(_LATIN1))
     for _ in ws.events():
         pass  # discard wsproto's Request; the scope is built from the h11 request
     scope = encode_websocket_scope(websocket_scope_from_request(request, scheme=scheme, server=server, client=client))

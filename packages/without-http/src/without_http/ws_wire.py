@@ -23,6 +23,11 @@ from wsproto.events import TextMessage
 
 from without_http.h11_wire import ASGI
 
+# The handshake is ASCII: subprotocol tokens and the request line decode with it. Naming the
+# codec once keeps mutmut's codec-name mutations on this line rather than every call site
+# (see docs/contributing/mutation-testing.md and without_http.h11_wire._ASCII).
+_ASCII = "ascii"
+
 
 def is_websocket_upgrade(request: h11.Request) -> bool:
     """Whether an `h11.Request` is a WebSocket handshake (`Upgrade: websocket`)."""
@@ -32,8 +37,7 @@ def is_websocket_upgrade(request: h11.Request) -> bool:
 def _subprotocols(request: h11.Request) -> tuple[str, ...]:
     for name, value in request.headers:
         if name.lower() == b"sec-websocket-protocol":
-            tokens = [token.strip() for token in value.split(b",") if token.strip()]
-            return tuple(token.decode("ascii") for token in tokens)  # pragma: no mutate - codec case
+            return tuple(token.strip().decode(_ASCII) for token in value.split(b",") if token.strip())
     return ()
 
 
@@ -47,13 +51,11 @@ def websocket_scope_from_request(
     """Build the typed `WebsocketScope` an ASGI app expects from the handshake `h11.Request`."""
     raw_path, _, query_string = request.target.partition(b"?")
     headers = tuple((bytes(name), bytes(value)) for name, value in request.headers)
-    http_version = request.http_version.decode("ascii")  # pragma: no mutate - codec case
-    path = unquote(raw_path.decode("ascii"))  # pragma: no mutate - codec case
     return WebsocketScope(
         asgi=ASGI,
-        http_version=http_version,
+        http_version=request.http_version.decode(_ASCII),
         scheme=scheme,
-        path=path,
+        path=unquote(raw_path.decode(_ASCII)),
         raw_path=raw_path,
         query_string=query_string,
         root_path="",

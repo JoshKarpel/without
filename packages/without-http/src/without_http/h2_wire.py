@@ -19,6 +19,11 @@ H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 # carries them, which is why the h11 path keeps them.
 _HOP_BY_HOP = frozenset({b"connection", b"keep-alive", b"proxy-connection", b"transfer-encoding", b"upgrade", b"te"})
 
+# The wire is ASCII: the request/response pseudo-headers decode/encode with it. Naming the
+# codec once keeps mutmut's codec-name mutations on this line rather than every call site
+# (see docs/contributing/mutation-testing.md and without_http.h11_wire._ASCII).
+_ASCII = "ascii"
+
 
 def scope_from_h2_headers(
     headers: Iterable[tuple[bytes, bytes]],
@@ -57,14 +62,12 @@ def scope_from_h2_headers(
     if authority and not has_host:
         ordinary.insert(0, (b"host", bytes(authority)))
     raw_path, _, query_string = target.partition(b"?")
-    decoded_method = method.decode("ascii")  # pragma: no mutate - ascii/ASCII codec alias
-    decoded_path = unquote(raw_path.decode("ascii"))  # pragma: no mutate - ascii/ASCII codec alias
     return HttpScope(
         asgi=ASGI,
         http_version="2",
-        method=decoded_method,
+        method=method.decode(_ASCII),
         scheme=scheme,
-        path=decoded_path,
+        path=unquote(raw_path.decode(_ASCII)),
         raw_path=raw_path,
         query_string=query_string,
         root_path="",
@@ -83,8 +86,7 @@ def response_headers(status: int, headers: RawHeaders) -> list[tuple[bytes, byte
     are illegal over h2 are dropped, so a response written for HTTP/1.1 round-trips
     over HTTP/2 without tripping hpack.
     """
-    status_bytes = str(status).encode("ascii")  # pragma: no mutate - ascii/ASCII codec alias
-    block = [(b":status", status_bytes)]
+    block = [(b":status", str(status).encode(_ASCII))]
     block.extend((name.lower(), value) for name, value in headers if name.lower() not in _HOP_BY_HOP)
     return block
 
@@ -110,11 +112,10 @@ def request_headers(
     hop-by-hop headers illegal over h2 are dropped, so a request written for
     HTTP/1.1 round-trips over HTTP/2 without tripping hpack.
     """
-    scheme_bytes = scheme.encode("ascii")  # pragma: no mutate - ascii/ASCII codec alias
     block = [
         (b":method", method),
         (b":path", target),
-        (b":scheme", scheme_bytes),
+        (b":scheme", scheme.encode(_ASCII)),
         (b":authority", authority),
     ]
     block.extend(

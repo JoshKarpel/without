@@ -106,6 +106,18 @@ def _param_precedence(item) -> int:
 Others in this class: `authority = b"" -> None` when `authority` is only read as `if authority`;
 `request_done = True -> None` / `more_body=False -> None` where the flag feeds only an `if`.
 
+### Codec-name case swaps
+
+The wire codecs are named once per module (`_ASCII = "ascii"`, `_LATIN1 = "latin-1"`) rather than
+repeated at each `.encode`/`.decode` call. mutmut's `operator_string` mutates that one literal three
+ways: the `"XXasciiXX"` wrap is an invalid codec (`LookupError`) and the `.decode(None)` at each call
+site is a `TypeError`, both killed by any test that exercises the path. Only the *case swap*
+(`"ascii"` → `"ASCII"`) survives, because codec lookup is case-insensitive so the emitted bytes are
+identical. That leaves one survivor per constant, in `h11_wire`, `h2_wire`, `ws_wire`, `server`, and
+`client` (`without-http`) and `files` (`without-asgi`). Hoisting the name is what keeps this to one
+documented survivor per module instead of a `# pragma: no mutate` on every call site (which would
+also blind the killable `LookupError`/`TypeError` mutants).
+
 ### Unobservable defensive-path mutations
 
 Defensive code can carry mutations that produce no observable difference. From `without-http`'s
@@ -127,6 +139,14 @@ HTTP/2 server:
   timing-free kill.
 - **Unreachable defaults.** `next((v for n, v in headers if n == b":method"), b"")` — the default
   is unreachable because h2 rejects a request with no `:method` before this code runs.
+- **`and` → `or` on the crash-to-500 guard.** `without-http`'s `_run_request` ends with
+  `if not response_done and conn.our_state is h11.SEND_RESPONSE:`. The `or` mutant differs only when
+  the app already sent response headers (state `SEND_BODY`, so the `is` clause is false): it then
+  calls `_send_simple`, whose `suppress(h11.ProtocolError, OSError)` swallows the illegal
+  second-response send, writing nothing. `_send_simple` can only emit when the state *is*
+  `SEND_RESPONSE`, exactly when `and` also fires, so `or` never produces an observable 500 that `and`
+  would not. (The `is` → `is not` and `not response_done` → `response_done` mutants on the same line
+  are real behavior changes, killed by the crash tests.)
 
 ### Killing test excluded by the trampoline
 
@@ -163,9 +183,9 @@ produces a type error as caught, without running it against the suite. It is del
 enabled** here, for two reasons.
 
 It removes none of the suppression machinery. Every `# pragma: no mutate` in this codebase guards
-a mutation that is *type-valid but behavior-equivalent*: codec-name case (`"ascii"` → `"ASCII"`),
-truthiness (`bool(msg.get(k, False))` → `None`), a value that equals a field default, a
-timing-only buffer depth, `zip(strict=True)` where lengths are always equal. mypy sees no error in
+a mutation that is *type-valid but behavior-equivalent*: truthiness (`bool(msg.get(k, False))` →
+`None`), a value that equals a field default, a timing-only buffer depth, `zip(strict=True)` where
+lengths are always equal. mypy sees no error in
 any of these, so the pragmas stay. The filter only catches *type-invalid* mutations (assigning
 `None` into a non-optional slot, `cast(T, x)` → `cast(None, x)`), a set almost disjoint from what
 the pragmas suppress. It would auto-catch a few hand-documented equivalent survivors (the

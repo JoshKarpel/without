@@ -318,6 +318,14 @@ def test_parse_outbound_defaults_response_body_to_empty_bytes() -> None:
     assert parse_outbound({"type": "http.response.body"}) == ResponseBody(body=b"", more_body=False)
 
 
+def test_parse_outbound_defaults_zerocopysend_more_body_to_false() -> None:
+    fd = _FileDescriptor()
+
+    assert parse_outbound({"type": "http.response.zerocopysend", "file": fd}) == ZeroCopySend(
+        file=fd, offset=None, count=None, more_body=False
+    )
+
+
 def test_parse_outbound_defaults_server_push_headers_to_empty() -> None:
     assert parse_outbound({"type": "http.response.push", "path": "/main.js"}) == ServerPush(path="/main.js", headers=())
 

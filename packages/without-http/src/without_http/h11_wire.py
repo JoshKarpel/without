@@ -24,6 +24,12 @@ from without_asgi import ZeroCopySend
 # the corresponding `Outbound` events.
 ASGI = Asgi(version="3.0", spec_version="2.4")
 
+# The wire is ASCII: request/response tokens (method, path, version) decode with it.
+# Naming the codec once keeps mutmut's codec-name mutations (an invalid `"XXasciiXX"`
+# crashes; a case-swapped `"ASCII"` is an equivalent alias) on this single line rather
+# than every call site. See docs/contributing/mutation-testing.md.
+_ASCII = "ascii"
+
 
 def scope_from_request(
     request: h11.Request,
@@ -41,15 +47,12 @@ def scope_from_request(
     """
     raw_path, _, query_string = request.target.partition(b"?")
     headers = tuple((bytes(name), bytes(value)) for name, value in request.headers)
-    http_version = request.http_version.decode("ascii")  # pragma: no mutate - codec name case-insensitive
-    method = request.method.decode("ascii")  # pragma: no mutate - codec name case-insensitive
-    path = unquote(raw_path.decode("ascii"))  # pragma: no mutate - codec name case-insensitive
     return HttpScope(
         asgi=ASGI,
-        http_version=http_version,
-        method=method,
+        http_version=request.http_version.decode(_ASCII),
+        method=request.method.decode(_ASCII),
         scheme=scheme,
-        path=path,
+        path=unquote(raw_path.decode(_ASCII)),
         raw_path=raw_path,
         query_string=query_string,
         root_path="",
@@ -76,7 +79,7 @@ def inbound_from_event(event: h11.Event) -> Inbound | None:
         case h11.ConnectionClosed():
             return Disconnect()
         case _:
-            return None  # pragma: no mutate - implicit fall-through return is identical
+            return None
 
 
 def h11_events_from_outbound(outbound: Outbound) -> list[h11.Event]:
