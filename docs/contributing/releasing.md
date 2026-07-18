@@ -1,8 +1,8 @@
 # Releasing
 
 How the `without` workspace is versioned and published. The mechanics live in
-[`.github/workflows/publish.yml`](.github/workflows/publish.yml) and
-[`scripts/prepare_release.py`](scripts/prepare_release.py); this document is the
+[`.github/workflows/publish.yml`](https://github.com/JoshKarpel/without/blob/main/.github/workflows/publish.yml) and
+[`scripts/prepare_release.py`](https://github.com/JoshKarpel/without/blob/main/scripts/prepare_release.py); this document is the
 rationale and the runbook.
 
 ## Versioning: lockstep
@@ -12,7 +12,7 @@ Every `without*` distribution bumps together and depends on its siblings at that
 exact version. The packages are a tightly coupled substrate (a core contract
 plus plugins that speak it), so a single version is simpler to reason about than
 independent cadences, and it matches the single workspace-wide
-[`CHANGELOG.md`](CHANGELOG.md).
+[`CHANGELOG.md`](https://github.com/JoshKarpel/without/blob/main/CHANGELOG.md).
 
 The tradeoff accepted: a plugin with no real changes still gets a version bump
 on every release. That is cheap; drifting, individually-versioned intra-workspace
@@ -40,7 +40,7 @@ packages.
 A built wheel strips `[tool.uv.sources]`, so a sibling dependency declared as a
 bare name (`without-core`) would ship with **no version bound** and could resolve
 against an incompatible release. Before building,
-[`scripts/prepare_release.py`](scripts/prepare_release.py) rewrites each
+[`scripts/prepare_release.py`](https://github.com/JoshKarpel/without/blob/main/scripts/prepare_release.py) rewrites each
 publishable member's own version and pins its sibling dependencies to
 `== <version>`, so every wheel requires exactly the siblings it was built
 against. These edits are made only in the workflow's ephemeral checkout; they are
@@ -49,10 +49,10 @@ workspace sources.
 
 ## The release process
 
-1. Move the `## Unreleased` section of [`CHANGELOG.md`](CHANGELOG.md) under a new
+1. Move the `## Unreleased` section of [`CHANGELOG.md`](https://github.com/JoshKarpel/without/blob/main/CHANGELOG.md) under a new
    `## <version>` heading and commit it.
 2. Create a **GitHub Release** with tag `v<version>` (for example `v0.1.0`).
-3. That fires [`publish.yml`](.github/workflows/publish.yml), which derives the
+3. That fires [`publish.yml`](https://github.com/JoshKarpel/without/blob/main/.github/workflows/publish.yml), which derives the
    version from the tag, stamps and pins with `prepare_release.py`, builds every
    `without*` member, and uploads them with `uv publish` via trusted publishing.
 
@@ -88,9 +88,8 @@ publishers must be unique on `(owner, repo, workflow, environment)`, so the
 `without*` projects sharing one workflow cannot all be pre-registered
 ([warehouse#16920](https://github.com/pypi/warehouse/issues/16920)).
 
-So bootstrap the projects into existence first with
-[`scripts/bootstrap_pypi.py`](scripts/bootstrap_pypi.py), then attach the trusted
-publisher above to each:
+So bootstrap the projects into existence first with the `just bootstrap-pypi`
+recipe, then attach the trusted publisher above to each:
 
 1. Create a short-lived **account-scoped** PyPI API token (Account settings →
    API tokens), and export it: `export UV_PUBLISH_TOKEN=pypi-...`.

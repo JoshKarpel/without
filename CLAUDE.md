@@ -27,8 +27,9 @@ build it locally with `just docs` (serve) or `just docs-build` (strict build).
 
 For how the packages are versioned and shipped (lockstep versioning, the
 `without-core` distribution name, build-time dependency pinning, and the trusted-
-publishing setup), see [`RELEASING.md`](RELEASING.md).
+publishing setup), see [`docs/contributing/releasing.md`](docs/contributing/releasing.md).
 
 For mutation testing (running `just mutate`, telling a real test hole from an
 equivalent mutant, and the known-equivalent survivors that are expected to
-remain), see [`MUTATION.md`](MUTATION.md) and the `mutation-testing` skill.
+remain), see [`docs/contributing/mutation-testing.md`](docs/contributing/mutation-testing.md)
+and the `mutation-testing` skill.

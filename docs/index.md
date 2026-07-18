@@ -71,3 +71,9 @@ uv sync
 just test        # mypy + pytest
 just docs        # serve this site with live reload
 ```
+
+For contributing to `without` itself, see the
+[Releasing](contributing/releasing.md) runbook for how the workspace is
+versioned and published, and the
+[Mutation testing](contributing/mutation-testing.md) guide for driving each
+package's suite to zero surviving mutants.

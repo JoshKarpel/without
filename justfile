@@ -42,7 +42,7 @@ mutate pkg *args='run':
     # the original, unmutated code instead of the mutated copy mutmut builds under ./mutants.
     # -m "not no_mutation" excludes tests marked @pytest.mark.no_mutation: ones that assert an async
     # generator's aclose()-triggered `finally`, which mutmut's function trampoline does not run, so they
-    # fail the mutmut baseline though they pass the real suite (see MUTATION.md).
+    # fail the mutmut baseline though they pass the real suite (see docs/contributing/mutation-testing.md).
     # do_not_mutate_patterns skips exhaustiveness guards: an `assert_never(unreachable)` arm (and its
     # `case _ as unreachable:` header) is unreachable by construction, so no test can ever kill a mutation
     # of it. One alternation regex, since mutmut only splits this list on newlines (indented continuations

@@ -4,9 +4,9 @@
 # dependency graph (from the published `without*` packages' pyproject.toml deps,
 # as Mermaid), one mkdocstrings API-reference page per publishable package
 # (emitted as `<package>/reference.md`, alongside that package's hand-written
-# guide), and the root prose
-# (PHILOSOPHY.md, CHANGELOG.md) copied into the site tree. The nav lists these
-# pages by hand in mkdocs.yml; this hook supplies only their content.
+# guide), and the root prose (PHILOSOPHY.md, CHANGELOG.md) copied into the site
+# tree. The nav lists these pages by hand in mkdocs.yml; this hook supplies only
+# their content.
 
 from __future__ import annotations
 
@@ -149,7 +149,11 @@ def on_files(files: Files, config: MkDocsConfig) -> Files:
             File.generated(config, f"{package_dir(member)}/reference.md", content=render_reference_page(member))
         )
 
-    for source_name, dest_uri in (("PHILOSOPHY.md", "philosophy.md"), ("CHANGELOG.md", "changelog.md")):
+    root_pages = (
+        ("PHILOSOPHY.md", "philosophy.md"),
+        ("CHANGELOG.md", "changelog.md"),
+    )
+    for source_name, dest_uri in root_pages:
         source = REPO_ROOT / source_name
         files.append(File.generated(config, dest_uri, content=source.read_text(encoding="utf-8")))
 
