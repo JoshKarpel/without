@@ -99,7 +99,12 @@ async def test_evaluate_runs_a_shared_ancestor_exactly_once() -> None:
     assert result == (11, 12)
 
 
-async def test_evaluate_releases_an_intermediate_result_after_its_consumer_runs() -> None:
+async def test_drive_releases_an_intermediate_result_once_its_last_consumer_has_read_it() -> None:
+    # A chain of three: `head`'s result must be dropped the moment `middle` (its
+    # only consumer) has captured it, while the run is still in flight. Observing
+    # the release *during* the run, not after `drive` returns, is what pins the
+    # behavior: once the generator is exhausted its `results` dict is gone, so a
+    # post-run weakref check would pass even if nothing pruned mid-run.
     witness: list[weakref.ref[Sentinel]] = []
 
     async def produce(args: tuple[object, ...]) -> object:
@@ -107,20 +112,16 @@ async def test_evaluate_releases_an_intermediate_result_after_its_consumer_runs(
         witness.append(weakref.ref(value))
         return value
 
-    async def consume(args: tuple[object, ...]) -> object:
-        assert isinstance(args[0], Sentinel)
-        return "final"
-
     nodes = [
-        Node("middle", ("in",), produce),
-        Node("out", ("middle",), consume),
+        Node("head", ("in",), produce),
+        Node("middle", ("head",), returning("middle-value")),
+        Node("tail", ("middle",), returning("tail-value")),
     ]
 
-    result = await evaluate(Plan.of(nodes), "out", inputs={"in": None}, limit=2)
-    gc.collect()
-
-    assert result == "final"
-    assert witness[0]() is None
+    async for key, _ in drive(Plan.of(nodes), inputs={"in": None}, limit=4):
+        if key == "tail":
+            gc.collect()
+            assert witness[0]() is None, "head's result was not released after middle consumed it"
 
 
 async def test_evaluate_never_exceeds_the_concurrency_limit() -> None:

@@ -144,7 +144,9 @@ pretty = true
 show_error_codes = true
 
 files = ["."]
-exclude = ["site/"]
+# `mutants/` is mutmut's per-package copy of the source under mutation; type-checking it
+# duplicates every module and just re-checks throwaway mutated code.
+exclude = ["site/", "mutants/"]
 
 check_untyped_defs = true
 disallow_incomplete_defs = true
