@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# mutmut: the mutated-source working copy it builds and the config `just mutate` writes,
+# both under whichever package is being tested
+mutants/
+packages/*/setup.cfg
