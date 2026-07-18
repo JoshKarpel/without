@@ -20,8 +20,18 @@ $ just mutate without-dag results    # list survivors from the last run
 $ just mutate without-dag browse     # interactive TUI
 ```
 
+`just mutate-all` sweeps every package with the same interface (`just mutate-all` to run,
+`just mutate-all results` to list survivors), printing each package under its own header and
+a final ok/FAILED summary table.
+
 The `mutate` recipe writes the per-run mutmut `setup.cfg`; its comments explain each setting
 (why `-n0`, the `no_mutation` marker filter, the `assert_never` skip pattern).
+
+A package whose source is pure pass-through generates no mutants at all (`without-env`, whose
+`EnvContext` has no operators, literals, or branches to mutate). mutmut hardcodes `exit(1)` in
+that case with no config knob to allow it, so the `mutate` recipe absorbs it: a run that mutates
+zero files reports success rather than `FAILED`. A run that *does* build mutants but leaves them
+uncovered still fails, since that is a genuine test hole.
 
 ## Equivalent-mutant categories
 
@@ -144,3 +154,26 @@ Patterns that generalize (the `mutation-testing` skill has the full method):
 - **Use distinct non-default values.** A field set to `0`, `""`, or the first enum member can make
   a broken function pass by coincidence; give each field a different, non-default value so an
   argument swap surfaces.
+
+## Considered and rejected: the type-checker filter
+
+mutmut's [type-checker filter](https://mutmut.readthedocs.io/en/latest/#filter-generated-mutants-with-type-checker)
+(`type_check_command`) runs mypy over the whole mutated tree once and marks any mutant that
+produces a type error as caught, without running it against the suite. It is deliberately **not
+enabled** here, for two reasons.
+
+It removes none of the suppression machinery. Every `# pragma: no mutate` in this codebase guards
+a mutation that is *type-valid but behavior-equivalent*: codec-name case (`"ascii"` → `"ASCII"`),
+truthiness (`bool(msg.get(k, False))` → `None`), a value that equals a field default, a
+timing-only buffer depth, `zip(strict=True)` where lengths are always equal. mypy sees no error in
+any of these, so the pragmas stay. The filter only catches *type-invalid* mutations (assigning
+`None` into a non-optional slot, `cast(T, x)` → `cast(None, x)`), a set almost disjoint from what
+the pragmas suppress. It would auto-catch a few hand-documented equivalent survivors (the
+`multi_segment=False` → `None` on a `bool` parameter, `writer.write(None)`), but that is a small,
+package-specific win, not a reduction in pragmas.
+
+It cannot run on `without` core at all. mutmut's trampoline rewrite of the `@overload` functions in
+`wiring.py` makes mypy report "an overloaded function outside a stub file must have an
+implementation" on a line the filter cannot map back to any mutant, so
+`filter_mutants_with_type_checker` raises and aborts the whole package run. This fires even with
+every pragma intact, so the filter can't be turned on uniformly through the shared `mutate` recipe.

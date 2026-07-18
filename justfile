@@ -56,9 +56,58 @@ mutate pkg *args='run':
         not no_mutation
     do_not_mutate_patterns=assert_never|as unreachable
     CFG
-    uv run mutmut {{ args }}
+    # A package whose source is pure pass-through (without-env) yields no mutants, and mutmut
+    # hardcodes exit(1) in that case with no config knob to allow it. Only `run` hits this, so
+    # only `run` is wrapped (browse's TUI must not be piped). A zero-mutant run is success; a run
+    # that DID build mutants but left them uncovered still fails (files mutated > 0).
+    case "{{ args }}" in
+      run | run\ *)
+        out="$(mktemp)"
+        trap 'rm -f setup.cfg "$out"' EXIT
+        if uv run mutmut {{ args }} 2>&1 | tee "$out"; then exit 0; fi
+        if grep -q '(0 files mutated' "$out" && grep -q 'could not find any test case' "$out"; then
+          echo "no mutants generated for {{ pkg }}; nothing to mutation-test"
+          exit 0
+        fi
+        exit 1
+        ;;
+      *)
+        exec uv run mutmut {{ args }}
+        ;;
+    esac
 
 alias m := mutate
+
+# Mirrors `mutate`'s `*args`: `mutate-all` runs every mutant in each package by default,
+# or `mutate-all results` lists each package's survivors without re-running. The `without*`
+# glob is exactly the mutation targets, so the `benchmarks` and `integration` toys are skipped.
+# One package failing (survivors, or a broken run) does not abort the sweep; a final table
+# reports each package's status so nothing is silently skipped.
+[doc('Mutation-test every package and report each one, e.g. `just mutate-all` or `just mutate-all results`')]
+mutate-all *args='run':
+    #!/usr/bin/env bash
+    set -uo pipefail
+    declare -A status
+    for dir in packages/without*/; do
+      pkg="$(basename "$dir")"
+      echo
+      echo "===== $pkg ====="
+      if just mutate "$pkg" {{ args }}; then
+        status["$pkg"]="ok"
+      else
+        status["$pkg"]="FAILED"
+      fi
+    done
+    echo
+    echo "===== summary ====="
+    rc=0
+    for pkg in "${!status[@]}"; do
+      printf '%-20s %s\n' "$pkg" "${status[$pkg]}"
+      [[ "${status[$pkg]}" == "ok" ]] || rc=1
+    done
+    exit "$rc"
+
+alias ma := mutate-all
 
 [doc('Serve the documentation site with live reload')]
 docs *args:
