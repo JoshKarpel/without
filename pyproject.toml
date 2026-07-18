@@ -54,6 +54,7 @@ dev = [
     "pytest-timeout>=2.3",
     "trustme>=1.1",
     "hypothesis>=6.156.1",
+    "mutmut>=3",
     "mypy>=1",
     "ruff>=0.15.20",
     "types-pyyaml>=6",

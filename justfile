@@ -28,6 +28,28 @@ durations *args:
 
 alias td := durations
 
+# mutmut reads its config only from the working directory and must run inside a package
+# for the src/ layout to resolve, so it can't live in the root pyproject; the recipe
+# writes it per run instead, identically for every package.
+[doc('Mutation-test one package, e.g. `just mutate without-dag`; pass `--help` to see mutmut subcommands (results, browse, ...)')]
+mutate pkg *args='run':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd packages/{{ pkg }}
+    trap 'rm -f setup.cfg' EXIT
+    # -n0 overrides the workspace's `-n auto`: pytest-xdist would re-exec its workers in
+    # subprocesses that never see mutmut's in-process sys.path insert, so they would import
+    # the original, unmutated code instead of the mutated copy mutmut builds under ./mutants.
+    cat > setup.cfg <<'CFG'
+    [mutmut]
+    source_paths=src
+    pytest_add_cli_args_test_selection=tests/
+    pytest_add_cli_args=-n0
+    CFG
+    uv run mutmut {{ args }}
+
+alias m := mutate
+
 [doc('Serve the documentation site with live reload')]
 docs *args:
     uv run --group docs mkdocs serve {{ args }}
