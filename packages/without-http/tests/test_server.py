@@ -564,7 +564,7 @@ async def test_idle_timeout_logs_the_close_reason(caplog: pytest.LogCaptureFixtu
             reader, writer = await asyncio.open_connection(server.host, server.port)
             assert await asyncio.wait_for(reader.read(), timeout=5) == b""
             writer.close()
-            with suppress(OSError):
+            with suppress(OSError):  # pragma: no branch - wait_closed's suppressed-exception arc is unobservable here
                 await writer.wait_closed()
 
     assert "Closing a connection idle beyond the idle timeout" in caplog.messages
@@ -598,8 +598,7 @@ class _WriteRaisingWriter:
     def write(self, _data: bytes) -> None:
         raise OSError(107, "transport endpoint is not connected")
 
-    async def drain(self) -> None:
-        return None
+    async def drain(self) -> None: ...  # never awaited: write raises before drain is reached
 
 
 async def test_send_simple_writes_the_exact_response_on_the_wire() -> None:
@@ -791,7 +790,7 @@ async def _ws_first_text(host: str, port: int, path: str) -> tuple[str | None, t
     text: str | None = None
     while text is None:
         data = await asyncio.wait_for(reader.read(65536), timeout=5)
-        if not data:
+        if not data:  # pragma: no cover - the awaited response arrives before the socket reaches EOF
             break
         conn.receive_data(data)
         for event in conn.events():
@@ -850,7 +849,7 @@ async def _h2c_scope_roundtrip(host: str, port: int, path: str) -> tuple[int, by
     done = False
     while not done:
         data = await asyncio.wait_for(reader.read(65536), timeout=5)
-        if not data:
+        if not data:  # pragma: no cover - the awaited response arrives before the socket reaches EOF
             break
         for event in conn.receive_data(data):
             if isinstance(event, h2.events.ResponseReceived) and event.stream_id == stream_id:
@@ -934,7 +933,7 @@ async def _h2_request_over(
     done = False
     while not done:
         data = await asyncio.wait_for(reader.read(65536), timeout=5)
-        if not data:
+        if not data:  # pragma: no cover - the awaited response arrives before the socket reaches EOF
             break
         for event in conn.receive_data(data):
             if isinstance(event, h2.events.ResponseReceived) and event.stream_id == stream_id:

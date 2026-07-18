@@ -462,7 +462,7 @@ async def test_a_non_ascii_path_becomes_a_400(caplog: pytest.LogCaptureFixture) 
             await writer.drain()
             outcome = await _collect_stream(reader, writer, conn)
             writer.close()
-            with suppress(OSError):
+            with suppress(OSError):  # pragma: no branch - wait_closed's suppressed-exception arc is unobservable here
                 await writer.wait_closed()
 
     assert outcome.status == 400
@@ -517,7 +517,7 @@ async def _collect_stream(
                         ended = True
                     case h2.events.StreamReset():
                         reset = True
-                    case h2.events.WindowUpdated():
+                    case h2.events.WindowUpdated():  # pragma: no cover - no test provokes a window update; the drive asserts it stays absent
                         windowed = True
                     case _:
                         pass
@@ -556,7 +556,7 @@ async def request_flag_reporting_app(scope: RawScope, receive: Receive, send: Se
     flags: list[object] = []
     while True:
         message = await receive()
-        if message["type"] != "http.request":
+        if message["type"] != "http.request":  # pragma: no cover - the test never disconnects mid-body
             break
         flags.append(message["more_body"])
         if not message["more_body"]:
@@ -605,8 +605,11 @@ async def push_then_respond_app(scope: RawScope, receive: Receive, send: Send) -
         await send({"type": "http.response.start", "status": 500, "headers": [(b"content-type", b"text/plain")]})
         await send({"type": "http.response.body", "body": message})
         return
-    await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
-    await send({"type": "http.response.body", "body": b"push silently accepted"})
+    # the push always raises, so this silent-accept fall-through never runs
+    await send(
+        {"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]}
+    )  # pragma: no cover
+    await send({"type": "http.response.body", "body": b"push silently accepted"})  # pragma: no cover
 
 
 async def test_a_server_push_raises_a_named_not_implemented_error() -> None:
@@ -683,10 +686,10 @@ async def test_resets_within_the_budget_leave_the_connection_serving() -> None:
                     elif isinstance(event, h2.events.DataReceived) and event.stream_id == stream_id:
                         body += event.data
                         conn.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
-                    elif isinstance(event, h2.events.StreamEnded) and event.stream_id == stream_id:
+                    elif (isinstance(event, h2.events.StreamEnded) and event.stream_id == stream_id) or isinstance(
+                        event, h2.events.ConnectionTerminated
+                    ):
                         settled = True
-                    elif isinstance(event, h2.events.ConnectionTerminated):
-                        settled = True  # a mutant that miscounts drops the connection instead
                 writer.write(conn.data_to_send())
                 await writer.drain()
         writer.close()
@@ -724,7 +727,7 @@ async def test_a_reset_flood_sends_goaway_enhance_your_calm(caplog: pytest.LogCa
                             error_code = event.error_code
                             terminated = True
             writer.close()
-            with suppress(OSError):
+            with suppress(OSError):  # pragma: no branch - wait_closed's suppressed-exception arc is unobservable here
                 await writer.wait_closed()
 
     assert terminated  # a real GOAWAY frame, not merely a socket EOF
@@ -753,7 +756,7 @@ async def test_a_client_reset_logs_and_cancels_the_stream_task(caplog: pytest.Lo
             async with asyncio.timeout(5):
                 await cancelled.wait()  # the reset cancelled the app task
             writer.close()
-            with suppress(OSError):
+            with suppress(OSError):  # pragma: no branch - wait_closed's suppressed-exception arc is unobservable here
                 await writer.wait_closed()
 
     assert cancelled.is_set()

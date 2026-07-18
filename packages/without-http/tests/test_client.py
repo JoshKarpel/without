@@ -632,6 +632,7 @@ async def test_with_release_primes_with_an_empty_sentinel_chunk() -> None:
 
     armed = _with_release(body(), release)
     assert await anext(armed) == b""  # the priming sentinel is an empty chunk, not real body bytes
+    assert await anext(armed) == b"real-data"  # the real body follows once the sentinel is consumed
     await armed.aclose()
 
 
@@ -748,7 +749,7 @@ async def test_follow_redirects_does_not_downgrade_a_303_for_a_safe_method(metho
 
 async def test_follow_redirects_drops_the_body_when_downgrading_a_303() -> None:
     async def payload() -> AsyncIterator[bytes]:
-        yield b"original-body"
+        yield b"original-body"  # pragma: no cover - the 303 downgrade drops the request body unread
 
     inner = _ScriptedExchange(_redirect_to("https://api.victim.test/done", status=303), _terminal_ok())
     exchange = follow_redirects()(inner)

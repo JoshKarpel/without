@@ -66,18 +66,27 @@ async def test_catching_websocket_maps_an_exception_before_accept_to_a_close() -
     assert events == [WebsocketClose(code=4403, reason="denied")]
 
 
-async def test_catching_websocket_hands_the_raised_exception_to_recover() -> None:
+@pytest.mark.parametrize(
+    ("raised", "expected"),
+    [
+        (HandshakeThrottled("slow down"), WebsocketClose(code=4429, reason="throttled")),
+        (HandshakeDenied("go away"), WebsocketClose(code=4403, reason="denied")),
+    ],
+)
+async def test_catching_websocket_hands_the_raised_exception_to_recover(
+    raised: Exception, expected: WebsocketClose
+) -> None:
     async def handler(state: object, frames: Stream[WebsocketInbound]) -> AsyncIterator[WebsocketOutbound]:
-        throttled = True
-        if throttled:
-            raise HandshakeThrottled("slow down")
+        reject = True
+        if reject:
+            raise raised
         yield WebsocketAccept()  # pragma: no cover - the handler always raises before accepting
 
     built = ws("/feed")(handler).endpoint(object(), Match(_ws_scope(), {}))
     wrapped = catching_websocket(_reject_by_type)(built, object(), _ws_scope())
     events = [event async for event in wrapped(stream_from_iterable(()))]
 
-    assert events == [WebsocketClose(code=4429, reason="throttled")]
+    assert events == [expected]
 
 
 async def test_catching_websocket_propagates_an_exception_raised_after_accept() -> None:

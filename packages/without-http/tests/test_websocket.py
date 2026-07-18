@@ -178,8 +178,8 @@ class DisconnectRecorder:
     reason: object = None
 
 
-def echo_and_record_app(recorder: DisconnectRecorder) -> ASGIApp:
-    """Accept, echo every message, and record the code/reason of the first disconnect."""
+def record_disconnect_app(recorder: DisconnectRecorder) -> ASGIApp:
+    """Accept, then record the code/reason of the first disconnect."""
 
     async def app(scope: RawScope, receive: Receive, send: Send) -> None:
         if scope["type"] != "websocket":
@@ -189,14 +189,7 @@ def echo_and_record_app(recorder: DisconnectRecorder) -> ASGIApp:
             match message["type"]:  # pragma: no branch - tests drive only these message types
                 case "websocket.connect":
                     await send({"type": "websocket.accept"})
-                case "websocket.receive":
-                    text = message.get("text")
-                    data = message.get("bytes")
-                    if isinstance(text, str):
-                        await send({"type": "websocket.send", "text": f"echo:{text}"})
-                    elif isinstance(data, bytes):  # pragma: no branch - a receive is always text or binary
-                        await send({"type": "websocket.send", "bytes": data})
-                case "websocket.disconnect":
+                case "websocket.disconnect":  # pragma: no branch - the app only sees connect then disconnect
                     recorder.code = message["code"]
                     recorder.reason = message["reason"]
                     recorder.seen.set()
@@ -257,8 +250,10 @@ async def test_reassembles_a_fragmented_binary_message() -> None:
 async def test_a_websocket_message_over_the_cap_is_rejected(kind: str, caplog: pytest.LogCaptureFixture) -> None:
     recorder = DisconnectRecorder()
     with caplog.at_level(logging.WARNING, logger="without_http.server"):
-        async with serving(echo_and_record_app(recorder), max_websocket_message_bytes=8) as server:
-            async with ws_session(server.host, server.port, "/live") as client:
+        async with serving(record_disconnect_app(recorder), max_websocket_message_bytes=8) as server:
+            async with ws_session(
+                server.host, server.port, "/live"
+            ) as client:  # pragma: no branch - the async-with exit arc is unobservable across parametrization
                 assert isinstance(await client.next_event(), AcceptConnection)
 
                 if kind == "text":
@@ -271,7 +266,9 @@ async def test_a_websocket_message_over_the_cap_is_rejected(kind: str, caplog: p
                 assert event.code == 1009
                 assert event.reason == "message too big"
 
-                async with asyncio.timeout(5):
+                async with asyncio.timeout(
+                    5
+                ):  # pragma: no branch - the async-with exit arc is unobservable across parametrization
                     await recorder.seen.wait()
 
     assert recorder.code == 1009
@@ -531,11 +528,13 @@ async def test_fragments_accumulate_toward_the_cap(kind: str) -> None:
 @pytest.mark.parametrize(("code", "reason"), [(3001, "shutdown"), (3002, "")])
 async def test_a_client_close_delivers_its_code_and_reason(code: int, reason: str) -> None:
     recorder = DisconnectRecorder()
-    async with serving(echo_and_record_app(recorder)) as server:
+    async with serving(record_disconnect_app(recorder)) as server:
         async with ws_session(server.host, server.port, "/live") as client:
             assert isinstance(await client.next_event(), AcceptConnection)
             await client.send_close(code, reason)
-            async with asyncio.timeout(5):
+            async with asyncio.timeout(
+                5
+            ):  # pragma: no branch - the async-with exit arc is unobservable across parametrization
                 await recorder.seen.wait()
 
     assert recorder.code == code
@@ -547,7 +546,7 @@ async def test_a_close_pipelined_with_the_handshake_delivers_code_and_reason() -
     handshake = WSConnection(ConnectionType.CLIENT).send(Request(host="127.0.0.1", target="/live"))
     close_frame = _client_close_frame(3006, "pipe")
 
-    async with serving(echo_and_record_app(recorder)) as server:
+    async with serving(record_disconnect_app(recorder)) as server:
         _reader, writer = await asyncio.open_connection(server.host, server.port)
         writer.write(handshake + close_frame)
         await writer.drain()
@@ -563,7 +562,7 @@ async def test_a_close_pipelined_with_the_handshake_delivers_code_and_reason() -
 
 async def test_an_abrupt_tcp_close_disconnects_the_app_with_1006() -> None:
     recorder = DisconnectRecorder()
-    async with serving(echo_and_record_app(recorder)) as server:
+    async with serving(record_disconnect_app(recorder)) as server:
         client = await WebSocketClient.connect(server.host, server.port, "/live")
         assert isinstance(await client.next_event(), AcceptConnection)
         await client.aclose()  # abrupt FIN, no WebSocket close frame
@@ -617,7 +616,7 @@ async def test_an_idle_websocket_is_disconnected(caplog: pytest.LogCaptureFixtur
     recorder = DisconnectRecorder()
     idle_timeout = timedelta(milliseconds=100)
     with caplog.at_level(logging.WARNING, logger="without_http.server"):
-        async with serving(echo_and_record_app(recorder), idle_timeout=idle_timeout) as server:
+        async with serving(record_disconnect_app(recorder), idle_timeout=idle_timeout) as server:
             client = await WebSocketClient.connect(server.host, server.port, "/live")
             assert isinstance(await client.next_event(), AcceptConnection)
             # Send nothing: the pump's bounded read should time out and disconnect the app.
