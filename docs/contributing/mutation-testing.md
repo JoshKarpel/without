@@ -51,17 +51,10 @@ Dropping the arm changes behavior only for input that "cannot happen", so it is 
 `assert_never` *expression* mutation — `assert_never(unreachable)` → `assert_never(None)` — is
 suppressed by the recipe's skip pattern; only the whole-case *drop* survives.)
 
-Dropping a *redundant* case is equivalent because the fallthrough does the same thing.
-`http_inbound` in `without-http/server.py` is the clearest example:
-
-```python
-match event:
-    case Disconnect(): return
-    case RequestBody(more_body=False): return
-    case RequestBody(more_body=True):
-        continue        # dropping this: a more_body=True event falls through the match and the
-                        # `while True` loop continues anyway — byte-for-byte identical behavior
-```
+Dropping a *redundant* case is likewise equivalent when the fallthrough does the same thing: a
+trailing case whose body is a no-op (a bare `continue` at the bottom of a loop) behaves identically
+whether present or dropped. Prefer deleting such a case outright, so it falls through to a documented
+comment and mutmut has nothing to drop, rather than leaving it as a survivor to explain here.
 
 ### `suppress()` of a subclass alongside its base
 

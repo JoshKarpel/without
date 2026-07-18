@@ -42,15 +42,13 @@ async def http_inbound(receive: Receive) -> AsyncGenerator[Inbound]:
     while True:
         event = parse_inbound(await receive())
         yield event
+        # Stop when the request is fully received; a RequestBody(more_body=True)
+        # falls through and loops for the next chunk.
         match event:
             case Disconnect():
                 return
             case RequestBody(more_body=False):
                 return
-            case RequestBody(more_body=True):
-                # CPython folds this trailing `continue` into a direct jump to the
-                # loop header, so the arc into this line is never emitted.
-                continue  # pragma: no cover
 
 
 class ClientDisconnect(Exception):
