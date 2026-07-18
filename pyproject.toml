@@ -88,6 +88,10 @@ timeout_method = "thread"
 
 markers = [
     "slow",
+    # Excluded from mutation runs (`just mutate` filters `-m "not no_mutation"`). For a test that
+    # passes in the real suite but fails only under mutmut's function trampoline, whose wrapping of
+    # async generators perturbs `aclose()`/`finally` finalization timing. Use sparingly.
+    "no_mutation: skipped under mutmut; a trampoline-instrumentation artifact, not a real failure",
     # Pass the gap the test closes as the first argument, and any CVE via `cve=`, e.g.
     # `@pytest.mark.security("strips credentials on a cross-origin redirect", cve="CVE-...")`.
     # `packages/conftest.py` enforces that every security-marked test carries a description.

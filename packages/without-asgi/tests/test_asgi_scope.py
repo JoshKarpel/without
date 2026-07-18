@@ -172,11 +172,11 @@ _VALID_HTTP_SCOPE: dict[str, object] = {
     [
         ("headers", [[b"name-without-a-value"]], "expected a \\(bytes, bytes\\) pair"),
         ("headers", 17, "expected an iterable of bytes pairs"),
-        ("asgi", "not-a-mapping", "expected an asgi mapping"),
+        ("asgi", "not-a-mapping", "^expected an asgi mapping, got str$"),
         ("client", ["host-without-a-port"], "expected a \\[host, port\\] pair"),
         ("server", ["host", 8080, "surplus"], "expected a \\[host, port\\] pair"),
-        ("extensions", ["not-a-mapping"], "expected an extensions mapping"),
-        ("extensions", {"tls": "not-a-mapping"}, "expected an options mapping for extension"),
+        ("extensions", ["not-a-mapping"], "^expected an extensions mapping, got list$"),
+        ("extensions", {"tls": "not-a-mapping"}, "^expected an options mapping for extension 'tls', got str$"),
     ],
 )
 def test_parse_http_scope_rejects_a_malformed_field(field: str, value: object, match: str) -> None:
@@ -186,13 +186,32 @@ def test_parse_http_scope_rejects_a_malformed_field(field: str, value: object, m
         parse_http_scope(scope)
 
 
+def test_parse_websocket_scope_rejects_non_iterable_subprotocols() -> None:
+    scope: RawMessage = {
+        "type": "websocket",
+        "asgi": {"version": "3.0"},
+        "path": "/live",
+        "headers": [],
+        "subprotocols": 17,
+    }
+
+    with pytest.raises(TypeError, match=r"^expected an iterable of subprotocols, got int$"):
+        parse_websocket_scope(scope)
+
+
+def test_parse_scope_defaults_lifespan_spec_version() -> None:
+    parsed = parse_scope({"type": "lifespan", "asgi": {"version": "3.0"}})
+
+    assert parsed == LifespanScope(asgi=Asgi(version="3.0", spec_version="1.0"))
+
+
 def test_parse_tls_reads_the_connection_info() -> None:
     extensions: dict[str, dict[str, object]] = {
         "tls": {
             "server_cert": "-----BEGIN CERTIFICATE-----server",
             "client_cert_chain": ["-----BEGIN CERTIFICATE-----client", "-----BEGIN CERTIFICATE-----ca"],
             "client_cert_name": "CN=alice",
-            "client_cert_error": None,
+            "client_cert_error": "unable to get local issuer certificate",
             "tls_version": 0x0304,
             "cipher_suite": 0x1301,
         }
@@ -202,10 +221,24 @@ def test_parse_tls_reads_the_connection_info() -> None:
         server_cert="-----BEGIN CERTIFICATE-----server",
         client_cert_chain=("-----BEGIN CERTIFICATE-----client", "-----BEGIN CERTIFICATE-----ca"),
         client_cert_name="CN=alice",
-        client_cert_error=None,
+        client_cert_error="unable to get local issuer certificate",
         tls_version=0x0304,
         cipher_suite=0x1301,
     )
+
+
+def test_parse_tls_rejects_a_non_iterable_client_cert_chain() -> None:
+    extensions: dict[str, dict[str, object]] = {
+        "tls": {
+            "server_cert": None,
+            "client_cert_chain": 17,
+            "tls_version": None,
+            "cipher_suite": None,
+        }
+    }
+
+    with pytest.raises(TypeError, match=r"^expected an iterable of certificates, got int$"):
+        parse_tls(extensions)
 
 
 def test_parse_tls_defaults_optional_and_nullable_fields() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import AsyncIterator
 
 import pytest
@@ -31,6 +32,7 @@ from without_web import Router
 from without_web import WebsocketEndpoint
 from without_web import WebsocketRouter
 from without_web import buffered
+from without_web import catch_all
 from without_web import catching
 from without_web import delegate
 from without_web import mount
@@ -122,12 +124,29 @@ async def test_dispatch_binds_typed_path_parameters() -> None:
 
 
 def test_a_partial_segment_template_is_a_build_error() -> None:
-    with pytest.raises(ValueError, match="whole segment"):
+    with pytest.raises(ValueError, match=r"^a path parameter must occupy a whole segment$"):
         Router(routes=(route(t"/file.{path_param('ext', INT)}", get=_show),), fallback=_fallback)
 
 
+def test_a_parameter_followed_by_text_in_the_same_segment_is_a_build_error() -> None:
+    with pytest.raises(ValueError, match=r"^a path parameter must occupy a whole segment$"):
+        Router(routes=(route(t"/todos/{path_param('id', INT)}x", get=_show),), fallback=_fallback)
+
+
+def test_a_catch_all_before_another_segment_is_a_build_error() -> None:
+    with pytest.raises(ValueError, match=r"^a catch-all parameter must be the last segment$"):
+        Router(routes=(route(t"/x/{catch_all('rest')}/y", get=_show),), fallback=_fallback)
+
+
+async def test_a_template_without_a_leading_slash_still_binds_its_parameter() -> None:
+    router: Router[object] = Router(routes=(route(t"todos/{path_param('id', INT)}", get=_show),), fallback=_fallback)
+    _start, body = await _run(router.dispatch(object(), _scope("GET", "/todos/42")))
+    assert json.loads(body) == {"id": 42}
+
+
 def test_a_non_path_param_interpolation_is_a_build_error() -> None:
-    with pytest.raises(ValueError, match="path_param"):
+    message = "an interpolation in a route pattern must be a path_param(...) or catch_all(...)"
+    with pytest.raises(ValueError, match=rf"^{re.escape(message)}$"):
         Router(routes=(route(t"/x/{42}", get=_show),), fallback=_fallback)
 
 
@@ -136,6 +155,34 @@ async def test_a_known_path_with_an_unbound_method_is_405_with_an_allow_header()
     start, _body = await _run(router.dispatch(object(), _scope("DELETE", "/todos")))
     assert start.status == 405
     assert (b"allow", b"GET, POST") in start.headers
+
+
+@pytest.mark.parametrize("method", ["HEAD", "PUT", "PATCH", "DELETE", "OPTIONS"])
+async def test_dispatch_routes_each_declared_method_to_its_endpoint(method: str) -> None:
+    router: Router[object] = Router(routes=(route("/r", **{method.lower(): _ok}),), fallback=_fallback)
+    start, body = await _run(router.dispatch(object(), _scope(method, "/r")))
+    assert start.status == 200
+    assert json.loads(body) == {"who": "ok"}
+
+
+async def test_method_not_allowed_carries_content_type_allow_and_body() -> None:
+    router: Router[object] = Router(routes=(route("/todos", get=_ok, post=_created),), fallback=_fallback)
+    start, body = await _run(router.dispatch(object(), _scope("DELETE", "/todos")))
+    assert start.status == 405
+    assert (b"content-type", b"text/plain; charset=utf-8") in start.headers
+    assert (b"allow", b"GET, POST") in start.headers
+    assert body == b"method not allowed\n"
+
+
+@buffered
+def _show_rest(state: object, match: Match[HttpScope], body: bytes) -> Response:
+    return json_response(200, {"rest": match.params["rest"]})
+
+
+async def test_dispatch_binds_a_catch_all_parameter() -> None:
+    router: Router[object] = Router(routes=(route(t"/files/{catch_all('rest')}", get=_show_rest),), fallback=_fallback)
+    _start, body = await _run(router.dispatch(object(), _scope("GET", "/files/a/b/c.txt")))
+    assert json.loads(body) == {"rest": "a/b/c.txt"}
 
 
 async def test_an_unknown_path_falls_back() -> None:
@@ -351,6 +398,65 @@ async def test_router_wide_and_mount_baked_middleware_both_apply() -> None:
     assert (b"x-inner", b"section") in start.headers
 
 
+@buffered
+def _reflect_state_and_path(state: object, match: Match[HttpScope], body: bytes) -> Response:
+    return json_response(200, {"state": state, "path": match.scope.path})
+
+
+def _stamp_state_and_path(handler: HttpHandler, state: object, scope: HttpScope) -> HttpHandler:
+    async def processor(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
+        async for event in handler(inputs):
+            if isinstance(event, ResponseStart):
+                stamped = (*event.headers, (b"x-mw-state", str(state).encode()), (b"x-mw-path", scope.path.encode()))
+                yield ResponseStart(status=event.status, headers=stamped)
+            else:
+                yield event
+
+    return processor
+
+
+async def test_with_middleware_hands_the_state_and_scope_to_endpoint_and_middleware() -> None:
+    guarded = with_middleware(_reflect_state_and_path, _stamp_state_and_path)
+    router: Router[str] = Router(routes=(route("/w", get=guarded),), fallback=_fallback)
+    start, body = await _run(router.dispatch("tenant-9", _scope("GET", "/w")))
+    assert json.loads(body) == {"state": "tenant-9", "path": "/w"}
+    assert (b"x-mw-state", b"tenant-9") in start.headers
+    assert (b"x-mw-path", b"/w") in start.headers
+
+
+def _opaque_reflect(state: object, head: HttpScope) -> HttpHandler:
+    def handler(inputs: Stream[Inbound]) -> Stream[Outbound]:
+        return stream_from_iterable(encode_response(json_response(200, {"state": state, "path": head.path})))
+
+    return handler
+
+
+async def test_mount_middleware_hands_the_state_and_scope_to_a_delegate_and_middleware() -> None:
+    admin = mount("/admin", _stamp_state_and_path)
+    app: Router[str] = Router(routes=(admin(delegate("/legacy", _opaque_reflect)),), fallback=_fallback)
+    start, body = await _run(app.dispatch("tenant-5", _scope("GET", "/admin/legacy/ping")))
+    assert json.loads(body) == {"state": "tenant-5", "path": "/ping"}
+    assert (b"x-mw-state", b"tenant-5") in start.headers
+    assert (b"x-mw-path", b"/ping") in start.headers
+
+
+async def test_a_delegate_at_the_exact_prefix_sees_a_root_only_path() -> None:
+    outer: Router[object] = Router(routes=(delegate("/legacy", _echo),), fallback=_fallback)
+    _start, body = await _run(outer.dispatch(object(), _scope("GET", "/legacy")))
+    assert json.loads(body) == {"path": "/", "root_path": "/legacy"}
+
+
+async def test_a_delegate_trims_a_multi_segment_remainder() -> None:
+    outer: Router[object] = Router(routes=(delegate("/legacy", _echo),), fallback=_fallback)
+    _start, body = await _run(outer.dispatch(object(), _scope("GET", "/legacy/a/b")))
+    assert json.loads(body) == {"path": "/a/b", "root_path": "/legacy"}
+
+
+def test_declaring_one_method_twice_for_a_path_is_a_build_error() -> None:
+    with pytest.raises(ValueError, match=r"^duplicate route: method GET declared twice for one path$"):
+        Router(routes=(route("/todos", get=_ok), route("/todos", get=_created)), fallback=_fallback)
+
+
 def _ws_scope(path: str) -> WebsocketScope:
     return WebsocketScope(
         asgi=Asgi(version="3.0", spec_version="2.0"),
@@ -447,3 +553,28 @@ async def test_ws_mount_wraps_a_nested_delegate_with_its_middleware() -> None:
     # `ws_mount` prepends its prefix to the delegate, so the opaque app sits at
     # `/admin/legacy` and its scope is trimmed by that full prefix.
     assert await _ws_texts(app.dispatch(object(), _ws_scope("/admin/legacy/ping"))) == ["zone", "/ping|/admin/legacy"]
+
+
+def _ws_reflect_state(state: object, scope: WebsocketScope) -> WebsocketHandler:
+    def processor(inputs: Stream[WebsocketInbound]) -> Stream[WebsocketOutbound]:
+        return stream_from_iterable((WebsocketSend(WebsocketText(text=f"{state}|{scope.path}")),))
+
+    return processor
+
+
+def _ws_stamp_state_and_path(handler: WebsocketHandler, state: object, scope: WebsocketScope) -> WebsocketHandler:
+    async def processor(inputs: Stream[WebsocketInbound]) -> AsyncIterator[WebsocketOutbound]:
+        yield WebsocketSend(WebsocketText(text=f"mw:{state}:{scope.path}"))
+        async for event in handler(inputs):
+            yield event
+
+    return processor
+
+
+async def test_ws_mount_middleware_hands_state_and_scope_to_a_delegate_and_middleware() -> None:
+    admin = ws_mount("/admin", _ws_stamp_state_and_path)
+    app: WebsocketRouter[str] = WebsocketRouter(
+        routes=(admin(ws_delegate("/legacy", _ws_reflect_state)),), fallback=_ws_says("fallback")
+    )
+    texts = await _ws_texts(app.dispatch("tenant-3", _ws_scope("/admin/legacy/ping")))
+    assert texts == ["mw:tenant-3:/ping", "tenant-3|/ping"]

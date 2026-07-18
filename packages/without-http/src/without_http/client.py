@@ -277,9 +277,10 @@ def _build_request(method: str, url: str, headers: RawHeaders, content: bytes | 
     """
     if isinstance(content, bytes):
         if not content:
-            return ClientRequest(method, url, headers, _empty_body())
+            return ClientRequest(method, url, headers, _empty_body())  # pragma: no mutate - equals _empty_body()
         if not _has(headers, b"content-length"):
-            headers = (*headers, (b"content-length", str(len(content)).encode("ascii")))
+            content_length = str(len(content)).encode("ascii")  # pragma: no mutate - ascii/ASCII codec alias
+            headers = (*headers, (b"content-length", content_length))
         return ClientRequest(method, url, headers, _single(content))
     if not _has(headers, b"content-length") and not _has(headers, b"transfer-encoding"):
         headers = (*headers, (b"transfer-encoding", b"chunked"))
@@ -1336,7 +1337,8 @@ def follow_redirects(max_hops: int = 5) -> ClientMiddleware:
                 if location is None:
                     return response
                 source = urlsplit(request.url)
-                target = urlsplit(urljoin(request.url, location.decode("ascii")))
+                decoded_location = location.decode("ascii")  # pragma: no mutate - ascii/ASCII codec alias
+                target = urlsplit(urljoin(request.url, decoded_location))
                 if source.scheme == "https" and target.scheme == "http":
                     return response
                 headers = request.headers
@@ -1383,7 +1385,7 @@ def _default_path(request_path: str) -> str:
     The RFC 6265 default-path for a cookie set without a `Path`: the request path up
     to (not including) its last `/`, or `/`.
     """
-    if not request_path.startswith("/") or request_path == "/":
+    if not request_path.startswith("/") or request_path == "/":  # pragma: no mutate - redundant "/" fast-path
         return "/"
     return request_path[: request_path.rindex("/")] or "/"
 
@@ -1468,7 +1470,8 @@ def _parse_set_cookie(header: str, host: str, request_path: str) -> tuple[_Cooki
     if domain and not _domain_acceptable(host, domain):
         return None
     max_age = attributes.get("max-age")
-    path = attributes.get("path", "")
+    absent_path = ""  # pragma: no mutate - absent Path falls to _default_path regardless of value
+    path = attributes.get("path", absent_path)
     cookie = _Cookie(
         name=name,
         value=value,

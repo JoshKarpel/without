@@ -56,12 +56,14 @@ async def file_response(
     """
     stat = await asyncio.to_thread(path.stat)
     resolved = content_type or mimetypes.guess_file_type(path)[0] or _OCTET_STREAM
+    content_type_bytes = resolved.encode("latin-1")  # pragma: no mutate - codec name case-insensitive
+    content_length_bytes = str(stat.st_size).encode("ascii")  # pragma: no mutate - codec name case-insensitive
     start = ResponseStart(
         status=status,
         headers=(
             *headers,
-            (_CONTENT_TYPE, resolved.encode("latin-1")),
-            (_CONTENT_LENGTH, str(stat.st_size).encode("ascii")),
+            (_CONTENT_TYPE, content_type_bytes),
+            (_CONTENT_LENGTH, content_length_bytes),
         ),
     )
     return _stream_file(path, start, chunk_size)
@@ -87,4 +89,4 @@ async def _stream_file(path: Path, start: ResponseStart, chunk_size: int) -> Asy
         # facing many slow clients.
         while chunk := await asyncio.to_thread(handle.read, chunk_size):
             yield ResponseBody(body=chunk, more_body=True)
-    yield ResponseBody(body=b"", more_body=False)
+    yield ResponseBody(body=b"", more_body=False)  # pragma: no mutate - values equal the field defaults

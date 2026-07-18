@@ -4,6 +4,7 @@ import asyncio
 import ssl
 from collections.abc import AsyncIterator
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -15,6 +16,7 @@ from without_asgi import Send
 from without_http import ConnectionPool
 from without_http import add_headers
 from without_http import serving
+from without_http.client import _open
 from without_http.client import _origin
 
 from .conftest import HOST
@@ -29,6 +31,21 @@ def server_context_h11_only(authority: trustme.CA, tmp_path_factory: pytest.Temp
     context.load_cert_chain(pem)
     context.set_alpn_protocols(["http/1.1"])
     return context
+
+
+async def test_open_reports_http_1_1_when_tls_alpn_declines_h2(
+    server_context_h11_only: ssl.SSLContext, trusting_client_context_factory: Callable[[], ssl.SSLContext]
+) -> None:
+    async with serving(echo_app, ssl_context=server_context_h11_only) as server:
+        context = trusting_client_context_factory()
+        context.set_alpn_protocols(["h2", "http/1.1"])
+        _reader, writer, protocol = await _open(HOST, server.port, ssl_context=context)
+        try:
+            assert protocol == "http/1.1"  # the server offers only http/1.1, so h2 is not negotiated
+        finally:
+            writer.close()
+            with suppress(OSError):
+                await writer.wait_closed()
 
 
 async def test_an_https_request_with_http2_disabled_uses_http_1_1(
@@ -217,6 +234,7 @@ async def test_h2_server_speaks_first_before_the_request_body_is_ready() -> None
         assert received == [b"LATE"]
 
 
+@pytest.mark.no_mutation  # teardown-timing assertions below are perturbed by mutmut's trampoline; see pyproject
 async def test_h2_abandoning_a_bidi_body_cancels_the_parked_sender() -> None:
     async with serving(bidi_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
         outbound: asyncio.Queue[bytes | None] = asyncio.Queue()
@@ -238,7 +256,11 @@ async def test_h2_abandoning_a_bidi_body_cancels_the_parked_sender() -> None:
             send_task = stream.send_task
             assert send_task is not None  # parked on outbound.get()
             assert not send_task.done()
-        assert send_task.done()  # release cancelled it rather than leaking a parked task
+        # Exiting the request context cancels the parked sender. Await it to synchronize on the
+        # cancellation landing rather than racing the event loop, then confirm it was cancelled
+        # (not leaked still-parked, and not swallowed into a normal return).
+        with pytest.raises(asyncio.CancelledError):
+            await send_task
         assert conn._streams == {}  # and the stream was reset
 
 

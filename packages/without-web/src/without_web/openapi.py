@@ -169,9 +169,9 @@ def openapi[T](
     paths: dict[str, dict[str, object]] = {}
     for segments, leaf in _flatten(router.routes):
         if not isinstance(leaf, _Methods):
-            continue
+            continue  # pragma: no mutate - delegates are the tail of _flatten; break skips no _Methods
         item = paths.setdefault(_template(segments), {})
-        path_params = _path_parameters(segments, schema_for)
+        path_params = _path_parameters(segments, schema_for)  # pragma: no mutate - schema_for unused there
         for method, endpoint in leaf.methods.items():
             item[method.lower()] = _operation(endpoint, path_params, schema_for)
     return {"openapi": "3.2.0", "info": {"title": title, "version": version}, "paths": paths}

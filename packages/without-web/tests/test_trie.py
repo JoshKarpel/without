@@ -43,6 +43,16 @@ def test_a_typed_parameter_is_tried_before_a_str_sibling() -> None:
     assert numeric.params == {"n": 7}
 
 
+def test_a_typed_parameter_wins_even_when_registered_after_str() -> None:
+    # STR is registered first, so precedence must reorder INT ahead of it; relying
+    # on insertion order alone (or giving both the same precedence) matches str.
+    tree = _tree(((Literal("x"), Param("n", STR)), "str"), ((Literal("x"), Param("n", INT)), "int"))
+    numeric = walk(tree, ("x", "7"))
+    assert numeric is not None
+    assert numeric.leaf == "int"
+    assert numeric.params == {"n": 7}
+
+
 def test_a_rejected_converter_backtracks_to_a_str_sibling() -> None:
     tree = _tree(((Literal("x"), Param("n", INT)), "int"), ((Literal("x"), Param("n", STR)), "str"))
     word = walk(tree, ("x", "abc"))
@@ -90,10 +100,10 @@ def test_an_unmatched_path_returns_none() -> None:
 
 
 def test_a_duplicate_route_is_a_build_error() -> None:
-    with pytest.raises(ValueError, match="duplicate route"):
+    with pytest.raises(ValueError, match=r"^duplicate route: two endpoints resolve to the same path$"):
         _tree(((Literal("todos"),), "first"), ((Literal("todos"),), "second"))
 
 
 def test_a_segment_after_a_catch_all_is_a_build_error() -> None:
-    with pytest.raises(ValueError, match="catch-all must be the last segment"):
+    with pytest.raises(ValueError, match=r"^invalid route: a catch-all must be the last segment$"):
         _tree(((CatchAll("rest", PATH), Literal("more")), "unreachable"))

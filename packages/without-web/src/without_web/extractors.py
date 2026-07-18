@@ -220,7 +220,7 @@ def path_param[V](name: str, converter: Converter[V]) -> Extractor[RequestHead, 
     spec = PathSpec(name=name, converter=converter)
 
     def extract(head: RequestHead) -> V:
-        return cast(V, head.path_params[name])
+        return cast(V, head.path_params[name])  # pragma: no mutate - cast is a runtime no-op
 
     return Extractor(extract, path=spec)
 
@@ -235,7 +235,7 @@ def catch_all(name: str, converter: Converter[str] = PATH) -> Extractor[RequestH
     spec = PathSpec(name=name, converter=converter, catch_all=True)
 
     def extract(head: RequestHead) -> str:
-        return cast(str, head.path_params[name])
+        return cast(str, head.path_params[name])  # pragma: no mutate - cast is a runtime no-op
 
     return Extractor(extract, path=spec)
 

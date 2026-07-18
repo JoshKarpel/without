@@ -40,11 +40,21 @@ mutate pkg *args='run':
     # -n0 overrides the workspace's `-n auto`: pytest-xdist would re-exec its workers in
     # subprocesses that never see mutmut's in-process sys.path insert, so they would import
     # the original, unmutated code instead of the mutated copy mutmut builds under ./mutants.
+    # -m "not no_mutation" excludes tests marked @pytest.mark.no_mutation: ones that assert an async
+    # generator's aclose()-triggered `finally`, which mutmut's function trampoline does not run, so they
+    # fail the mutmut baseline though they pass the real suite (see MUTATION.md).
+    # do_not_mutate_patterns skips exhaustiveness guards: an `assert_never(unreachable)` arm (and its
+    # `case _ as unreachable:` header) is unreachable by construction, so no test can ever kill a mutation
+    # of it. One alternation regex, since mutmut only splits this list on newlines (indented continuations
+    # would bake leading whitespace into each pattern).
     cat > setup.cfg <<'CFG'
     [mutmut]
     source_paths=src
     pytest_add_cli_args_test_selection=tests/
     pytest_add_cli_args=-n0
+        -m
+        not no_mutation
+    do_not_mutate_patterns=assert_never|as unreachable
     CFG
     uv run mutmut {{ args }}
 

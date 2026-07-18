@@ -32,7 +32,8 @@ def is_websocket_upgrade(request: h11.Request) -> bool:
 def _subprotocols(request: h11.Request) -> tuple[str, ...]:
     for name, value in request.headers:
         if name.lower() == b"sec-websocket-protocol":
-            return tuple(token.strip().decode("ascii") for token in value.split(b",") if token.strip())
+            tokens = [token.strip() for token in value.split(b",") if token.strip()]
+            return tuple(token.decode("ascii") for token in tokens)  # pragma: no mutate - codec case
     return ()
 
 
@@ -46,11 +47,13 @@ def websocket_scope_from_request(
     """Build the typed `WebsocketScope` an ASGI app expects from the handshake `h11.Request`."""
     raw_path, _, query_string = request.target.partition(b"?")
     headers = tuple((bytes(name), bytes(value)) for name, value in request.headers)
+    http_version = request.http_version.decode("ascii")  # pragma: no mutate - codec case
+    path = unquote(raw_path.decode("ascii"))  # pragma: no mutate - codec case
     return WebsocketScope(
         asgi=ASGI,
-        http_version=request.http_version.decode("ascii"),
+        http_version=http_version,
         scheme=scheme,
-        path=unquote(raw_path.decode("ascii")),
+        path=path,
         raw_path=raw_path,
         query_string=query_string,
         root_path="",

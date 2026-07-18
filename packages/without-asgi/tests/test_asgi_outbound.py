@@ -290,3 +290,85 @@ def test_parse_websocket_outbound_round_trips_through_encode(event: WebsocketOut
 )
 def test_parse_lifespan_reply_round_trips_through_encode(reply: LifespanReply) -> None:
     assert parse_lifespan_reply(encode_lifespan_reply(reply)) == reply
+
+
+@pytest.mark.parametrize(
+    ("message", "match"),
+    [
+        (
+            {"type": "http.response.zerocopysend", "file": "not-a-file"},
+            r"^expected a file object with fileno\(\), got str$",
+        ),
+        ({"type": "http.response.debug", "info": "not-a-mapping"}, r"^expected a debug info mapping, got str$"),
+        ({"type": "http.response.early_hint", "links": 42}, r"^expected an iterable of link bytes, got int$"),
+    ],
+)
+def test_parse_outbound_type_error_names_the_offending_type(message: RawMessage, match: str) -> None:
+    with pytest.raises(TypeError, match=match):
+        parse_outbound(message)
+
+
+def test_parse_outbound_defaults_response_start_headers_to_empty() -> None:
+    assert parse_outbound({"type": "http.response.start", "status": 207}) == ResponseStart(
+        status=207, headers=(), trailers=False
+    )
+
+
+def test_parse_outbound_defaults_response_body_to_empty_bytes() -> None:
+    assert parse_outbound({"type": "http.response.body"}) == ResponseBody(body=b"", more_body=False)
+
+
+def test_parse_outbound_defaults_server_push_headers_to_empty() -> None:
+    assert parse_outbound({"type": "http.response.push", "path": "/main.js"}) == ServerPush(path="/main.js", headers=())
+
+
+def test_parse_outbound_defaults_early_hint_links_to_empty() -> None:
+    assert parse_outbound({"type": "http.response.early_hint"}) == EarlyHint(links=())
+
+
+def test_parse_outbound_defaults_response_trailers_headers_to_empty() -> None:
+    assert parse_outbound({"type": "http.response.trailers"}) == ResponseTrailers(headers=(), more_trailers=False)
+
+
+def test_parse_outbound_reads_response_trailers_more_trailers_flag() -> None:
+    message: RawMessage = {
+        "type": "http.response.trailers",
+        "headers": [[b"digest", b"sha-256=xyz"]],
+        "more_trailers": True,
+    }
+
+    assert parse_outbound(message) == ResponseTrailers(headers=((b"digest", b"sha-256=xyz"),), more_trailers=True)
+
+
+def test_parse_websocket_outbound_defaults_accept_headers_to_empty() -> None:
+    assert parse_websocket_outbound({"type": "websocket.accept"}) == WebsocketAccept(subprotocol=None, headers=())
+
+
+def test_parse_websocket_outbound_defaults_denial_start_headers_to_empty() -> None:
+    assert parse_websocket_outbound({"type": "websocket.http.response.start", "status": 502}) == WebsocketResponseStart(
+        status=502, headers=()
+    )
+
+
+def test_parse_websocket_outbound_defaults_close_code_and_reason() -> None:
+    assert parse_websocket_outbound({"type": "websocket.close"}) == WebsocketClose(code=1000, reason="")
+
+
+def test_parse_websocket_outbound_defaults_denial_body_to_empty_bytes() -> None:
+    assert parse_websocket_outbound({"type": "websocket.http.response.body"}) == WebsocketResponseBody(
+        body=b"", more_body=False
+    )
+
+
+def test_parse_websocket_outbound_reads_denial_body_more_body_flag() -> None:
+    message: RawMessage = {"type": "websocket.http.response.body", "body": b"partial", "more_body": True}
+
+    assert parse_websocket_outbound(message) == WebsocketResponseBody(body=b"partial", more_body=True)
+
+
+def test_parse_lifespan_reply_defaults_startup_failed_message_to_empty() -> None:
+    assert parse_lifespan_reply({"type": "lifespan.startup.failed"}) == StartupFailed(message="")
+
+
+def test_parse_lifespan_reply_defaults_shutdown_failed_message_to_empty() -> None:
+    assert parse_lifespan_reply({"type": "lifespan.shutdown.failed"}) == ShutdownFailed(message="")

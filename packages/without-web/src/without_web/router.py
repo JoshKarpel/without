@@ -92,12 +92,12 @@ def _template_segments(template: Template) -> tuple[Segment, ...]:
         chunks = static.split("/")
         if after_param and chunks[0] != "":
             raise ValueError("a path parameter must occupy a whole segment")
-        pending += chunks[0]
+        pending += chunks[0]  # pragma: no mutate - pending is always empty here (a param owns a whole segment)
         for chunk in chunks[1:]:
             if pending:
                 segments.append(Literal(pending))
             pending = chunk
-        after_param = False
+        after_param = False  # pragma: no mutate - reset is overwritten below before the next iteration reads it
         if index < len(interpolations):
             if pending != "":
                 raise ValueError("a path parameter must occupy a whole segment")
@@ -342,7 +342,7 @@ def _flatten[T](routes: tuple[Route[T] | Delegate[T], ...]) -> list[tuple[tuple[
                 # The exact prefix and any deeper path both delegate: the catch-all
                 # matches the deeper case, the bare prefix the exact one.
                 delegates.append((head, leaf))
-                delegates.append(((*head, CatchAll("__mount__", PATH)), leaf))
+                delegates.append(((*head, CatchAll("__mount__", PATH)), leaf))  # pragma: no mutate - name unread
             case _ as unreachable:
                 assert_never(unreachable)
     routes_table: list[tuple[tuple[Segment, ...], _HttpLeaf[T]]] = [
@@ -597,7 +597,7 @@ def _flatten_ws[T](
             case WebsocketDelegate(prefix, _target) as leaf:
                 head: tuple[Segment, ...] = tuple(Literal(segment) for segment in split_path(prefix))
                 table.append((head, leaf))
-                table.append(((*head, CatchAll("__mount__", PATH)), leaf))
+                table.append(((*head, CatchAll("__mount__", PATH)), leaf))  # pragma: no mutate - name unread
             case _ as unreachable:
                 assert_never(unreachable)
     return table

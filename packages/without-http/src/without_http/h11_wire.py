@@ -41,12 +41,15 @@ def scope_from_request(
     """
     raw_path, _, query_string = request.target.partition(b"?")
     headers = tuple((bytes(name), bytes(value)) for name, value in request.headers)
+    http_version = request.http_version.decode("ascii")  # pragma: no mutate - codec name case-insensitive
+    method = request.method.decode("ascii")  # pragma: no mutate - codec name case-insensitive
+    path = unquote(raw_path.decode("ascii"))  # pragma: no mutate - codec name case-insensitive
     return HttpScope(
         asgi=ASGI,
-        http_version=request.http_version.decode("ascii"),
-        method=request.method.decode("ascii"),
+        http_version=http_version,
+        method=method,
         scheme=scheme,
-        path=unquote(raw_path.decode("ascii")),
+        path=path,
         raw_path=raw_path,
         query_string=query_string,
         root_path="",
@@ -73,7 +76,7 @@ def inbound_from_event(event: h11.Event) -> Inbound | None:
         case h11.ConnectionClosed():
             return Disconnect()
         case _:
-            return None
+            return None  # pragma: no mutate - implicit fall-through return is identical
 
 
 def h11_events_from_outbound(outbound: Outbound) -> list[h11.Event]:

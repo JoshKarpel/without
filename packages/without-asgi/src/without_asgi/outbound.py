@@ -290,33 +290,37 @@ def parse_outbound(message: RawMessage) -> Outbound:
     """
     match message.get("type"):
         case "http.response.start":
+            trailers = bool(message.get("trailers", False))  # pragma: no mutate - None default is falsy like False
             return ResponseStart(
                 status=narrow(message["status"], int),
                 headers=narrow_headers(message.get("headers", ())),
-                trailers=bool(message.get("trailers", False)),
+                trailers=trailers,
             )
         case "http.response.body":
+            more_body = bool(message.get("more_body", False))  # pragma: no mutate - None default is falsy like False
             return ResponseBody(
                 body=narrow(message.get("body", b""), bytes),
-                more_body=bool(message.get("more_body", False)),
+                more_body=more_body,
             )
         case "http.response.push":
             return ServerPush(path=narrow(message["path"], str), headers=narrow_headers(message.get("headers", ())))
         case "http.response.zerocopysend":
+            more_body = bool(message.get("more_body", False))  # pragma: no mutate - None default is falsy like False
             return ZeroCopySend(
                 file=_as_fileno(message["file"]),
                 offset=None if message.get("offset") is None else narrow(message["offset"], int),
                 count=None if message.get("count") is None else narrow(message["count"], int),
-                more_body=bool(message.get("more_body", False)),
+                more_body=more_body,
             )
         case "http.response.pathsend":
             return PathSend(path=narrow(message["path"], str))
         case "http.response.early_hint":
             return EarlyHint(links=_as_links(message.get("links", ())))
         case "http.response.trailers":
+            more_trailers = bool(message.get("more_trailers", False))  # pragma: no mutate - None default is falsy
             return ResponseTrailers(
                 headers=narrow_headers(message.get("headers", ())),
-                more_trailers=bool(message.get("more_trailers", False)),
+                more_trailers=more_trailers,
             )
         case "http.response.debug":
             return ResponseDebug(info=_as_info(message["info"]))
@@ -346,9 +350,10 @@ def parse_websocket_outbound(message: RawMessage) -> WebsocketOutbound:
                 headers=narrow_headers(message.get("headers", ())),
             )
         case "websocket.http.response.body":
+            more_body = bool(message.get("more_body", False))  # pragma: no mutate - None default is falsy like False
             return WebsocketResponseBody(
                 body=narrow(message.get("body", b""), bytes),
-                more_body=bool(message.get("more_body", False)),
+                more_body=more_body,
             )
         case other:
             raise ValueError(f"unexpected websocket event type: {other!r}")

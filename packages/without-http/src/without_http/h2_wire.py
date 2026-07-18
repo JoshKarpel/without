@@ -40,7 +40,7 @@ def scope_from_h2_headers(
     target = b""
     authority = b""
     ordinary: list[tuple[bytes, bytes]] = []
-    has_host = False
+    has_host = False  # pragma: no mutate - only read in boolean context (not has_host)
     for name, value in headers:
         if name == b":method":
             method = value
@@ -57,12 +57,14 @@ def scope_from_h2_headers(
     if authority and not has_host:
         ordinary.insert(0, (b"host", bytes(authority)))
     raw_path, _, query_string = target.partition(b"?")
+    decoded_method = method.decode("ascii")  # pragma: no mutate - ascii/ASCII codec alias
+    decoded_path = unquote(raw_path.decode("ascii"))  # pragma: no mutate - ascii/ASCII codec alias
     return HttpScope(
         asgi=ASGI,
         http_version="2",
-        method=method.decode("ascii"),
+        method=decoded_method,
         scheme=scheme,
-        path=unquote(raw_path.decode("ascii")),
+        path=decoded_path,
         raw_path=raw_path,
         query_string=query_string,
         root_path="",
@@ -81,7 +83,8 @@ def response_headers(status: int, headers: RawHeaders) -> list[tuple[bytes, byte
     are illegal over h2 are dropped, so a response written for HTTP/1.1 round-trips
     over HTTP/2 without tripping hpack.
     """
-    block = [(b":status", str(status).encode("ascii"))]
+    status_bytes = str(status).encode("ascii")  # pragma: no mutate - ascii/ASCII codec alias
+    block = [(b":status", status_bytes)]
     block.extend((name.lower(), value) for name, value in headers if name.lower() not in _HOP_BY_HOP)
     return block
 
@@ -107,10 +110,11 @@ def request_headers(
     hop-by-hop headers illegal over h2 are dropped, so a request written for
     HTTP/1.1 round-trips over HTTP/2 without tripping hpack.
     """
+    scheme_bytes = scheme.encode("ascii")  # pragma: no mutate - ascii/ASCII codec alias
     block = [
         (b":method", method),
         (b":path", target),
-        (b":scheme", scheme.encode("ascii")),
+        (b":scheme", scheme_bytes),
         (b":authority", authority),
     ]
     block.extend(

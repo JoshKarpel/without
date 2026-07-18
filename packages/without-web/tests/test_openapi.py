@@ -151,5 +151,43 @@ def test_openapi_renders_a_response_without_a_body() -> None:
     assert _operation(openapi(router), "/empty", "get") == {"responses": {"204": {"description": "no content"}}}
 
 
+def test_openapi_defaults_the_document_title_and_version() -> None:
+    router: Router[object] = Router(routes=(route("/x", get=_fallback),), fallback=_fallback)
+    assert openapi(router)["info"] == {"title": "without-web", "version": "0.0.0"}
+
+
+def test_openapi_threads_schema_for_through_query_header_and_response() -> None:
+    described = describe(
+        RouteSpec(
+            query=(QueryParam(name="filter", schema=_QueryType, required=True),),
+            headers=(HeaderParam(name="X-Kind", schema=_HeaderType),),
+            responses={200: ResponseSpec(description="stream", body=Body("application/x-ndjson", Sequence(_ItemType)))},
+        )
+    )(_fallback)
+    router: Router[object] = Router(routes=(route("/resolved", get=described),), fallback=_fallback)
+    spec = openapi(router, schema_for=lambda annotation: {"kind": annotation.__name__})
+    assert _operation(spec, "/resolved", "get") == {
+        "parameters": [
+            {"name": "filter", "in": "query", "required": True, "schema": {"kind": "_QueryType"}},
+            {"name": "X-Kind", "in": "header", "required": False, "schema": {"kind": "_HeaderType"}},
+        ],
+        "responses": {
+            "200": {"description": "stream", "content": {"application/x-ndjson": {"itemSchema": {"kind": "_ItemType"}}}}
+        },
+    }
+
+
 class _Payload:
+    pass
+
+
+class _QueryType:
+    pass
+
+
+class _HeaderType:
+    pass
+
+
+class _ItemType:
     pass

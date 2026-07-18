@@ -3,11 +3,14 @@ from __future__ import annotations
 import asyncio
 import ssl
 from contextlib import suppress
+from pathlib import Path
 
 import httpx
+import trustme
 from without_asgi import RawScope
 from without_asgi import Receive
 from without_asgi import Send
+from without_http import server_ssl_context
 from without_http import serving
 from wsproto.events import AcceptConnection
 from wsproto.events import TextMessage
@@ -132,3 +135,21 @@ async def test_h2_round_trips_a_body_larger_than_the_flow_control_window(
 
     assert response.http_version == "HTTP/2"
     assert response.text == "POST /big " + payload.decode()
+
+
+async def test_loads_the_key_from_a_separate_keyfile(
+    authority: trustme.CA, trusting_client_context: ssl.SSLContext, tmp_path: Path
+) -> None:
+    leaf = authority.issue_cert("127.0.0.1")
+    certfile = tmp_path / "cert.pem"
+    keyfile = tmp_path / "key.pem"
+    leaf.cert_chain_pems[0].write_to_path(certfile)
+    leaf.private_key_pem.write_to_path(keyfile)
+    context = server_ssl_context(certfile, keyfile)
+
+    async with serving(scheme_app, ssl_context=context) as server:
+        async with httpx.AsyncClient(verify=trusting_client_context) as client:
+            response = await client.get(f"https://{server.host}:{server.port}/where")
+
+    assert response.status_code == 200
+    assert response.text == "https"
