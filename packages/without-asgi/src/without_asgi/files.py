@@ -14,6 +14,11 @@ _DEFAULT_CHUNK_SIZE = 65536
 _OCTET_STREAM = "application/octet-stream"
 _CONTENT_TYPE = b"content-type"
 _CONTENT_LENGTH = b"content-length"
+# Header codecs, named once: the content type is latin-1 (byte-transparent), the length ASCII
+# digits. Hoisting the codec names keeps mutmut's codec-name mutations on these lines rather
+# than the call site (see docs/contributing/mutation-testing.md).
+_LATIN1 = "latin-1"
+_ASCII = "ascii"
 
 
 async def file_response(
@@ -60,8 +65,8 @@ async def file_response(
         status=status,
         headers=(
             *headers,
-            (_CONTENT_TYPE, resolved.encode("latin-1")),
-            (_CONTENT_LENGTH, str(stat.st_size).encode("ascii")),
+            (_CONTENT_TYPE, resolved.encode(_LATIN1)),
+            (_CONTENT_LENGTH, str(stat.st_size).encode(_ASCII)),
         ),
     )
     return _stream_file(path, start, chunk_size)
@@ -87,4 +92,4 @@ async def _stream_file(path: Path, start: ResponseStart, chunk_size: int) -> Asy
         # facing many slow clients.
         while chunk := await asyncio.to_thread(handle.read, chunk_size):
             yield ResponseBody(body=chunk, more_body=True)
-    yield ResponseBody(body=b"", more_body=False)
+    yield ResponseBody(body=b"", more_body=False)  # pragma: no mutate - values equal the field defaults

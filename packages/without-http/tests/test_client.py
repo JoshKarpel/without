@@ -5,7 +5,9 @@ from collections.abc import AsyncGenerator
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import replace
+from datetime import UTC
 from urllib.parse import urlsplit
 
 import h11
@@ -27,9 +29,20 @@ from without_http import follow_redirects
 from without_http import serving
 from without_http import wrap
 from without_http.client import _REDIRECT_STATUSES
+from without_http.client import Origin
 from without_http.client import _build_request
+from without_http.client import _Cookie
+from without_http.client import _deletes
+from without_http.client import _domain_matches
 from without_http.client import _Http11Connection
+from without_http.client import _open
 from without_http.client import _origin
+from without_http.client import _parse_set_cookie
+from without_http.client import _path_matches
+from without_http.client import _target
+from without_http.client import _utcnow
+from without_http.client import _with_cookie
+from without_http.client import _with_release
 
 type _Endpoint = tuple[asyncio.StreamReader, asyncio.StreamWriter]
 type _StreamPairFactory = Callable[[], Awaitable[tuple[_Endpoint, _Endpoint]]]
@@ -608,6 +621,223 @@ async def test_follow_redirects_refuses_an_https_to_http_downgrade() -> None:
 
     assert response.head.status == 302
     assert len(inner.requests) == 1
+
+
+async def test_with_release_primes_with_an_empty_sentinel_chunk() -> None:
+    async def body() -> AsyncGenerator[bytes | ResponseTrailers]:
+        yield b"real-data"
+
+    async def release(fully_read: bool) -> None:
+        return
+
+    armed = _with_release(body(), release)
+    assert await anext(armed) == b""  # the priming sentinel is an empty chunk, not real body bytes
+    assert await anext(armed) == b"real-data"  # the real body follows once the sentinel is consumed
+    await armed.aclose()
+
+
+@pytest.mark.no_mutation  # asserts aclose()-triggered `finally`, which mutmut's trampoline skips; see pyproject
+async def test_with_release_reports_not_read_and_closes_the_body_on_early_close() -> None:
+    body_closed = asyncio.Event()
+
+    async def body() -> AsyncGenerator[bytes | ResponseTrailers]:
+        try:
+            yield b"unread-chunk"
+        finally:
+            body_closed.set()
+
+    reported: list[bool] = []
+
+    async def release(fully_read: bool) -> None:
+        reported.append(fully_read)
+
+    armed = _with_release(body(), release)
+    assert await anext(armed) == b""  # consume the priming sentinel
+    assert await anext(armed) == b"unread-chunk"  # enter the body, suspending it mid-iteration
+    await armed.aclose()  # abandon before draining the body
+
+    assert reported == [False]  # release runs with fully_read=False on an early close
+    assert body_closed.is_set()  # and the underlying body is closed
+
+
+@pytest.mark.parametrize(
+    ("url", "expected_port"),
+    [
+        ("https://api.example.test/data", 443),
+        ("http://api.example.test/data", 80),
+        ("https://api.example.test:8443/data", 8443),
+        ("http://api.example.test:8080/data", 8080),
+    ],
+)
+def test_origin_derives_the_default_port_from_the_scheme(url: str, expected_port: int) -> None:
+    parts = urlsplit(url)
+    assert _origin(parts) == Origin(scheme=parts.scheme, host="api.example.test", port=expected_port)
+
+
+def test_target_defaults_an_empty_path_to_slash() -> None:
+    assert _target(urlsplit("http://api.example.test")) == "/"
+
+
+def test_build_request_adds_content_length_for_a_buffered_body() -> None:
+    request = _build_request("POST", "http://api.example.test/x", (), b"payload")
+
+    assert request.headers == ((b"content-length", b"7"),)
+
+
+async def test_build_request_keeps_content_length_for_a_streaming_body() -> None:
+    stream = _chunks(b"ab", b"cd")
+    request = _build_request("POST", "http://api.example.test/x", ((b"content-length", b"4"),), stream)
+
+    assert request.headers == ((b"content-length", b"4"),)  # no chunked framing added over an explicit length
+
+
+async def test_build_request_adds_chunked_transfer_encoding_for_an_unframed_streaming_body() -> None:
+    stream = _chunks(b"payload")
+    request = _build_request("POST", "http://api.example.test/x", (), stream)
+
+    assert request.headers == ((b"transfer-encoding", b"chunked"),)
+
+
+async def test_open_reports_http_1_1_for_a_cleartext_connection() -> None:
+    async with serving(echo_app) as server:
+        _reader, writer, protocol = await _open(server.host, server.port, ssl_context=None)
+        try:
+            assert protocol == "http/1.1"
+        finally:
+            writer.close()
+            with suppress(OSError):
+                await writer.wait_closed()
+
+
+async def test_follow_redirects_defaults_to_five_hops() -> None:
+    async with serving(chain_app) as server, ConnectionPool(middleware=follow_redirects()) as pool:
+        async with pool.request("GET", f"http://{server.host}:{server.port}/hop/6") as (head, _body):
+            # A six-hop chain needs six follows; the default of five stops one short, still on a redirect.
+            assert head.status == 302
+
+
+async def test_follow_redirects_preserves_the_method_on_a_302() -> None:
+    inner = _ScriptedExchange(_redirect_to("https://api.victim.test/next", status=302), _terminal_ok())
+    exchange = follow_redirects()(inner)
+
+    request = ClientRequest(
+        method="POST",
+        url="https://api.victim.test/submit",
+        headers=((b"content-type", b"application/json"),),
+    )
+    await exchange(request)
+
+    assert inner.requests[1].method == "POST"  # only a 303 downgrades the method, not a 302
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+async def test_follow_redirects_does_not_downgrade_a_303_for_a_safe_method(method: str) -> None:
+    inner = _ScriptedExchange(_redirect_to("https://api.victim.test/done", status=303), _terminal_ok())
+    exchange = follow_redirects()(inner)
+
+    request = ClientRequest(
+        method=method,
+        url="https://api.victim.test/thing",
+        headers=((b"content-type", b"application/json"),),
+    )
+    await exchange(request)
+
+    followed = inner.requests[1]
+    assert followed.method == method  # a safe method survives a 303 unchanged
+    assert followed.headers == ((b"content-type", b"application/json"),)  # ...and keeps its framing headers
+
+
+async def test_follow_redirects_drops_the_body_when_downgrading_a_303() -> None:
+    async def payload() -> AsyncIterator[bytes]:
+        yield b"original-body"  # pragma: no cover - the 303 downgrade drops the request body unread
+
+    inner = _ScriptedExchange(_redirect_to("https://api.victim.test/done", status=303), _terminal_ok())
+    exchange = follow_redirects()(inner)
+
+    request = ClientRequest(
+        method="POST",
+        url="https://api.victim.test/submit",
+        headers=((b"content-length", b"13"),),
+        body=payload(),
+    )
+    await exchange(request)
+
+    followed = inner.requests[1]
+    followed_body = b"".join([chunk async for chunk in followed.body])
+    assert followed.method == "GET"
+    assert followed_body == b""  # the original body is dropped, not replayed on the GET
+
+
+def test_domain_matches_rejects_an_unrelated_host_for_a_domain_cookie() -> None:
+    cookie = _Cookie(
+        name="sid", value="v", domain="example.test", path="/", secure=False, host_only=False, expires=None
+    )
+
+    assert _domain_matches("other.test", cookie) is False
+    assert _domain_matches("example.test", cookie) is True
+    assert _domain_matches("sub.example.test", cookie) is True
+
+
+@pytest.mark.parametrize(
+    ("cookie_path", "request_path", "expected"),
+    [("/foo", "/foobar", False), ("/foo", "/foo/bar", True)],
+)
+def test_path_matches_requires_a_slash_boundary(cookie_path: str, request_path: str, expected: bool) -> None:
+    cookie = _Cookie(
+        name="sid", value="v", domain="h.test", path=cookie_path, secure=False, host_only=True, expires=None
+    )
+
+    assert _path_matches(request_path, cookie) is expected
+
+
+@pytest.mark.parametrize(("max_age", "expected"), [("1", False), ("0", True), ("-3", True)])
+def test_deletes_marks_only_non_positive_max_age(max_age: str, expected: bool) -> None:
+    assert _deletes(max_age) is expected
+
+
+def test_parse_set_cookie_splits_name_value_on_the_first_equals() -> None:
+    result = _parse_set_cookie("sid=a=b; Path=/", "h.test", "/")
+
+    assert result is not None
+    cookie, _deletes_flag = result
+    assert (cookie.name, cookie.value) == ("sid", "a=b")
+
+
+@pytest.mark.parametrize(
+    ("domain_attr", "host", "expected_domain"),
+    [
+        (".example.test", "example.test", "example.test"),
+        ("X.example.test", "x.example.test", "x.example.test"),
+    ],
+)
+def test_parse_set_cookie_strips_only_a_leading_dot_from_domain(
+    domain_attr: str, host: str, expected_domain: str
+) -> None:
+    result = _parse_set_cookie(f"sid=v; Domain={domain_attr}", host, "/")
+
+    assert result is not None
+    cookie, _deletes_flag = result
+    assert cookie.domain == expected_domain
+
+
+def test_parse_set_cookie_keeps_an_explicit_path() -> None:
+    result = _parse_set_cookie("sid=v; Path=/admin", "h.test", "/section/page")
+
+    assert result is not None
+    cookie, _deletes_flag = result
+    assert cookie.path == "/admin"
+
+
+def test_utcnow_returns_an_aware_utc_datetime() -> None:
+    assert _utcnow().tzinfo == UTC
+
+
+def test_with_cookie_merges_a_value_into_an_existing_cookie_header() -> None:
+    headers = ((b"accept", b"text/html"), (b"cookie", b"first=1"))
+
+    result = _with_cookie(headers, b"second=2")
+
+    assert result == ((b"accept", b"text/html"), (b"cookie", b"first=1; second=2"))
 
 
 async def test_checking_in_to_a_closed_host_pool_closes_the_connection() -> None:

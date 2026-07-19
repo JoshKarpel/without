@@ -37,6 +37,14 @@ def test_is_websocket_upgrade_is_false_for_a_plain_request() -> None:
     assert is_websocket_upgrade(plain) is False
 
 
+def test_is_websocket_upgrade_is_false_when_upgrade_is_not_websocket() -> None:
+    other_upgrade = h11.Request(
+        method="GET", target="/", headers=[("host", "t"), ("upgrade", "h2c")], http_version="1.1"
+    )
+
+    assert is_websocket_upgrade(other_upgrade) is False
+
+
 def test_websocket_scope_reads_the_handshake() -> None:
     scope = websocket_scope_from_request(
         _handshake("/live?room=lobby", protocols="chat, superchat"),
@@ -45,16 +53,41 @@ def test_websocket_scope_reads_the_handshake() -> None:
         client=("198.51.100.7", 5000),
     )
 
+    assert scope.http_version == "1.1"
     assert scope.path == "/live"
+    assert scope.raw_path == b"/live"
     assert scope.query_string == b"room=lobby"
+    assert scope.root_path == ""
     assert scope.subprotocols == ("chat", "superchat")
     assert scope.client == ("198.51.100.7", 5000)
+    assert scope.server == ("example.test", 80)
+
+
+def test_websocket_scope_splits_the_query_at_the_first_question_mark() -> None:
+    scope = websocket_scope_from_request(
+        _handshake("/live?room=lobby?ignored=1"),
+        scheme="ws",
+        server=("example.test", 80),
+        client=("198.51.100.7", 5000),
+    )
+
+    assert scope.raw_path == b"/live"
+    assert scope.query_string == b"room=lobby?ignored=1"
+    assert scope.path == "/live"
 
 
 def test_ws_events_from_outbound_renders_an_accept() -> None:
     events = ws_events_from_outbound(WebsocketAccept(subprotocol="chat"), accepted=False)
 
     assert events == [AcceptConnection(subprotocol="chat", extensions=[], extra_headers=[])]
+
+
+def test_ws_events_from_outbound_carries_accept_extra_headers() -> None:
+    events = ws_events_from_outbound(
+        WebsocketAccept(subprotocol="chat", headers=((b"x-token", b"abc"),)), accepted=False
+    )
+
+    assert events == [AcceptConnection(subprotocol="chat", extensions=[], extra_headers=[(b"x-token", b"abc")])]
 
 
 @pytest.mark.parametrize(
@@ -88,7 +121,11 @@ def test_ws_events_from_outbound_renders_a_rejection_response_start() -> None:
     assert events == [RejectConnection(status_code=404, headers=[(b"x-reason", b"nope")], has_body=True)]
 
 
-def test_ws_events_from_outbound_renders_a_rejection_response_body() -> None:
-    events = ws_events_from_outbound(WebsocketResponseBody(body=b"denied", more_body=False), accepted=False)
+@pytest.mark.parametrize(
+    ("more_body", "body_finished"),
+    [(False, True), (True, False)],
+)
+def test_ws_events_from_outbound_renders_a_rejection_response_body(more_body: bool, body_finished: bool) -> None:
+    events = ws_events_from_outbound(WebsocketResponseBody(body=b"denied", more_body=more_body), accepted=False)
 
-    assert events == [RejectData(data=b"denied", body_finished=True)]
+    assert events == [RejectData(data=b"denied", body_finished=body_finished)]

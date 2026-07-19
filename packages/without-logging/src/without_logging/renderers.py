@@ -124,11 +124,12 @@ def render_console(
     """
 
     async def render(record: Record) -> str:
+        quoted = json.dumps(record.message, ensure_ascii=False)  # pragma: no mutate - None acts as False here
         parts = [
             timestamp(record.timestamp),
             record.level_name,
             record.logger,
-            json.dumps(record.message, ensure_ascii=False),
+            quoted,
         ]
         if record.fields:
             fields = ", ".join(f"{key}={value!r}" for key, value in record.fields.items())

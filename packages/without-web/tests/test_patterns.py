@@ -13,3 +13,7 @@ def test_split_path_of_root_is_empty() -> None:
 
 def test_split_path_keeps_interior_segments_in_order() -> None:
     assert split_path("/todos/42/events") == ("todos", "42", "events")
+
+
+def test_split_path_only_strips_slashes_not_other_characters() -> None:
+    assert split_path("/Xbox/") == ("Xbox",)

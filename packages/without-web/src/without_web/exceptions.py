@@ -87,7 +87,7 @@ def _guarding[In, Out](
     # the protocol's commit event has gone out. An exception before the commit is
     # offered to `recover`; once committed (or unrecognized) it propagates.
     async def processor(inputs: Stream[In]) -> AsyncIterator[Out]:
-        committed = False
+        committed = False  # pragma: no mutate - only read as a bool, None is falsy too
         try:
             async for event in handler(inputs):
                 committed = committed or commits(event)

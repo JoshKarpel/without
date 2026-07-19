@@ -157,6 +157,37 @@ async def test_limit_concurrency_runs_every_awaitable_and_yields_its_result() ->
     assert sorted(results) == [10, 20, 30, 40, 50]
 
 
+async def test_limit_concurrency_accepts_a_limit_of_one() -> None:
+    async def work(value: int) -> int:
+        return (await resolved_next_turn(value)) * 10
+
+    results = [future.result() async for future in limit_concurrency((work(n) for n in range(1, 4)), limit=1)]
+
+    assert sorted(results) == [10, 20, 30]
+
+
+async def test_limit_concurrency_yields_each_awaitable_the_moment_it_finishes() -> None:
+    release_slow = asyncio.Event()
+
+    async def fast() -> str:
+        return "fast"
+
+    async def slow() -> str:
+        await release_slow.wait()
+        return "slow"
+
+    # Both run under the limit, but only `fast` can finish. A driver that waited
+    # for *all* in-flight awaitables (ALL_COMPLETED) would block here until `slow`
+    # is released; yielding as-completed (FIRST_COMPLETED) surfaces `fast` at once.
+    results = limit_concurrency([slow(), fast()], limit=2)
+    first = await asyncio.wait_for(anext(results), timeout=timedelta(seconds=5).total_seconds())
+    assert first.result() == "fast"
+
+    release_slow.set()
+    second = await anext(results)
+    assert second.result() == "slow"
+
+
 async def test_limit_concurrency_keeps_at_most_limit_in_flight() -> None:
     active = 0
     peak = 0

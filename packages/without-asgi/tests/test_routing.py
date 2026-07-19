@@ -251,6 +251,37 @@ async def test_passes_a_chunked_body_within_the_cap() -> None:
     assert _status(events) == 200
 
 
+async def test_passes_the_request_stream_to_an_admitted_handler() -> None:
+    started = _Started()
+    middleware = limit_concurrent_requests(2)
+    handler = middleware(_draining_handler(started), object(), _scope())
+
+    events = await _collect_over(handler, (RequestBody(body=b"payload", more_body=False),))
+
+    assert _status(events) == 200
+    assert started.hit  # the handler consumed the real input stream, not None
+
+
+async def test_admits_a_chunked_body_of_exactly_the_cap() -> None:
+    middleware = limit_request_body(10)
+    handler = middleware(_draining_handler(), object(), _scope())
+
+    events = await _collect_over(handler, (RequestBody(body=b"x" * 10, more_body=False),))
+
+    assert _status(events) == 200  # total == max_bytes is within the cap, not over it
+
+
+async def test_admits_a_declared_length_equal_to_the_cap() -> None:
+    started = _Started()
+    middleware = limit_request_body(10)
+    handler = middleware(_draining_handler(started), object(), _scope_with_headers(((b"content-length", b"10"),)))
+
+    events = await _collect_over(handler, (RequestBody(body=b"y" * 10, more_body=False),))
+
+    assert _status(events) == 200  # a declared length equal to the cap is not rejected up front
+    assert started.hit
+
+
 async def test_surfaces_an_overflow_after_the_handler_has_started() -> None:
     middleware = limit_request_body(10)
     handler = middleware(_early_start_handler(), object(), _scope())

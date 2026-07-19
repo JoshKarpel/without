@@ -70,6 +70,11 @@ from without_http.ws_wire import ws_events_from_outbound
 
 _BUFFER = 65536
 
+# The WebSocket handshake target is latin-1 (h11 keeps request bytes as latin-1 text). Naming
+# the codec once keeps mutmut's codec-name mutations on this line rather than the call site
+# (see docs/contributing/mutation-testing.md).
+_LATIN1 = "latin-1"
+
 logger = logging.getLogger(__name__)
 
 
@@ -180,8 +185,8 @@ async def _run_request(
     """Drive one request/response exchange. Returns whether the connection may keep alive."""
     scope = scope_from_request(request, scheme=scheme, server=server, client=client)
     method = scope.method
-    request_done = False
-    response_done = False
+    request_done = False  # pragma: no mutate - initial sentinel, read only as a bool
+    response_done = False  # pragma: no mutate - initial sentinel, read only as a bool
 
     async def receive() -> RawMessage:
         nonlocal request_done
@@ -220,13 +225,13 @@ async def _run_request(
             ):  # pragma: no branch - h11.send returns None only for ConnectionClosed, never sent here
                 writer.write(chunk)
             if isinstance(event, h11.EndOfMessage):
-                response_done = True
+                response_done = True  # pragma: no mutate - redundant with the our_state check below
         await writer.drain()
 
     # An ASGI server isolates a single request's failure from the connection loop:
     # a crashing app must not take the server down, so its exception is contained
     # here and turned into a 500 when no response has gone out yet.
-    crashed = False
+    crashed = False  # pragma: no mutate - initial sentinel, read only as a bool
     try:
         await app(encode_http_scope(scope), receive, send)
     except Exception:  # noqa: BLE001 - isolate a crashing app from the connection loop; turned into a 500 below
@@ -265,9 +270,9 @@ async def _serve_websocket(
     read is bounded by `limits.idle_timeout`, so an idle peer that sends no frames is
     eventually disconnected.
     """
-    ws = WSConnection(ConnectionType.SERVER)
+    ws = WSConnection(ConnectionType.SERVER)  # pragma: no mutate - upgrade path sets server role
     handshake = [(bytes(name), bytes(value)) for name, value in request.headers]
-    ws.initiate_upgrade_connection(handshake, request.target.decode("latin-1"))
+    ws.initiate_upgrade_connection(handshake, request.target.decode(_LATIN1))
     for _ in ws.events():
         pass  # discard wsproto's Request; the scope is built from the h11 request
     scope = encode_websocket_scope(websocket_scope_from_request(request, scheme=scheme, server=server, client=client))
@@ -276,7 +281,7 @@ async def _serve_websocket(
     inbound: asyncio.Queue[RawMessage] = asyncio.Queue()
     inbound.put_nowait(encode_websocket_inbound(WebsocketConnect()))
     finished = asyncio.Event()
-    accepted = False
+    accepted = False  # pragma: no mutate - read only in boolean context
     text_parts: list[str] = []
     binary_parts = bytearray()
     pending_bytes = 0
@@ -287,7 +292,7 @@ async def _serve_websocket(
         await writer.drain()
         await inbound.put(encode_websocket_inbound(WebsocketDisconnect(code=1009, reason="message too big")))
         finished.set()
-        return False
+        return False  # pragma: no mutate - finished already set; return value unobservable
 
     async def drain_events() -> bool:
         nonlocal pending_bytes
@@ -324,7 +329,7 @@ async def _serve_websocket(
                     await writer.drain()
                     await inbound.put(encode_websocket_inbound(WebsocketDisconnect(code=code, reason=reason or "")))
                     finished.set()
-                    return False
+                    return False  # pragma: no mutate - finished already set; return value unobservable
                 case _:  # pragma: no cover - post-handshake wsproto emits only the events handled above
                     logger.warning(f"Discarding unexpected WebSocket event from wsproto: {event!r}")
         return True
@@ -437,7 +442,7 @@ async def _serve_connection(
                 app, reader, writer, initial=b"", secure=secure, server=server, client=client, limits=limits
             )
             return
-        initial = b""
+        initial = b""  # pragma: no mutate - only read when truthy; b"" and None both skip
         if alpn is None:
             initial = await _read(reader, limits.idle_timeout)
             if initial.startswith(H2_PREFACE):
@@ -571,7 +576,8 @@ async def _serve_h2_connection(
     inbound flow-control window bounds buffered body rather than reopening on receipt.
     """
     scheme = "https" if secure else "http"
-    conn = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=False, header_encoding=None))
+    config = h2.config.H2Configuration(client_side=False, header_encoding=None)  # pragma: no mutate - default is None
+    conn = h2.connection.H2Connection(config=config)
     lock = asyncio.Lock()
     streams: dict[int, _H2Stream] = {}
     resets = 0
@@ -598,7 +604,7 @@ async def _serve_h2_connection(
                     except h2.exceptions.ProtocolError, h2.exceptions.StreamClosedError:
                         return
                     writer.write(conn.data_to_send())
-                    blocked = False
+                    blocked = False  # pragma: no mutate - only ever read as a bool, never identity-compared
                 else:
                     stream.window.clear()
                     blocked = True
@@ -621,7 +627,7 @@ async def _serve_h2_connection(
             case ResponseBody(body, more_body):
                 await send_body(stream_id, stream, body, end=not more_body)
                 if not more_body:
-                    stream.response_done = True
+                    stream.response_done = True  # pragma: no mutate - finalize no-ops on the ended stream
             case EarlyHint(links):
                 async with lock:
                     conn.send_headers(stream_id, early_hint_headers(links))
@@ -662,7 +668,7 @@ async def _serve_h2_connection(
                 await send_bad_request(stream_id)
                 stream.response_done = True
                 return
-            request_done = False
+            request_done = False  # pragma: no mutate - only ever read as a bool, never identity-compared
 
             async def receive() -> RawMessage:
                 nonlocal request_done

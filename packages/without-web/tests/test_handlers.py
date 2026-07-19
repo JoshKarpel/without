@@ -21,15 +21,20 @@ from without_asgi import WebsocketInbound
 from without_asgi import WebsocketOutbound
 from without_asgi import WebsocketScope
 from without_web import INT
+from without_web import Body
 from without_web import Describable
 from without_web import ExtractionError
 from without_web import Extractor
+from without_web import HeaderParam
 from without_web import HttpRequestHead
 from without_web import Match
+from without_web import ResponseSpec
+from without_web import Sequence
 from without_web import Single
 from without_web import body
 from without_web import handle
 from without_web import handle_stream
+from without_web import header_param
 from without_web import path_param
 from without_web import post
 from without_web import query_param
@@ -123,6 +128,35 @@ def test_handle_recovers_its_openapi_from_the_extractors() -> None:
     assert spec.request_body.shape == Single(schema={"type": "object"})
 
 
+def test_handle_carries_default_summary_headers_and_responses_into_its_spec() -> None:
+    endpoint: object = handle(
+        header_param("x-trace", lambda values: values, schema={"type": "string"}),
+        fn=_ok,
+        responses={201: ResponseSpec(description="created")},
+    )
+    assert isinstance(endpoint, Describable)
+    spec = endpoint.describe()
+    assert spec.summary == ""
+    assert spec.headers == (HeaderParam(name="x-trace", schema={"type": "string"}),)
+    assert spec.responses == {201: ResponseSpec(description="created")}
+
+
+def test_handle_stream_carries_default_summary_headers_body_and_responses_into_its_spec() -> None:
+    request_body = Body(media_type="application/x-ndjson", shape=Sequence(item_schema={"type": "object"}))
+    endpoint: object = handle_stream(
+        header_param("x-trace", lambda values: values, schema={"type": "string"}),
+        fn=lambda state, trace, inputs: _empty(),
+        request_body=request_body,
+        responses={202: ResponseSpec(description="accepted")},
+    )
+    assert isinstance(endpoint, Describable)
+    spec = endpoint.describe()
+    assert spec.summary == ""
+    assert spec.headers == (HeaderParam(name="x-trace", schema={"type": "string"}),)
+    assert spec.request_body == request_body
+    assert spec.responses == {202: ResponseSpec(description="accepted")}
+
+
 def test_handle_rejects_more_than_one_body_extractor() -> None:
     with pytest.raises(ValueError, match="more than one body"):
         handle(
@@ -168,6 +202,22 @@ def test_ws_ties_path_and_query_to_the_handler() -> None:
     processor = route.endpoint("tenant", Match(_ws_scope(query=b"since=5&since=9"), {"room": 7}))
     processor(stream_from_iterable(()))
     assert seen == {"state": "tenant", "room_id": 7, "since": ("5", "9")}
+
+
+def test_ws_passes_the_live_inbound_stream_to_the_handler() -> None:
+    captured: list[object] = []
+
+    room = path_param("room", INT)
+
+    def make(state: str, room_id: int, inputs: Stream[WebsocketInbound]) -> Stream[WebsocketOutbound]:
+        captured.append(inputs)
+        return _noop_ws(inputs)
+
+    route = ws(t"/feed/{room}", room)(make)
+    processor = route.endpoint("tenant", Match(_ws_scope(), {"room": 7}))
+    frames: Stream[WebsocketInbound] = stream_from_iterable(())
+    processor(frames)
+    assert captured == [frames]
 
 
 async def _chunks(*payloads: bytes) -> AsyncIterator[Inbound]:
@@ -296,6 +346,8 @@ def test_extract_all_wraps_a_stray_value_error_as_an_unattributed_extraction_err
         _extract_all((Extractor(reject),), head)
     assert caught.value.field is None
     assert str(caught.value) == "deep reject"
+    assert caught.value.cause is caught.value.__cause__
+    assert isinstance(caught.value.cause, ValueError)
 
 
 def test_ws_route_wraps_a_pattern_and_endpoint() -> None:

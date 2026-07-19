@@ -234,7 +234,7 @@ def limit_request_body(max_bytes: int, *, too_large: Response = _TOO_LARGE) -> H
             yield event
 
     async def gated(handler: HttpHandler, inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
-        started = False
+        started = False  # pragma: no mutate - only read as a truthiness flag, never identity-compared
         try:
             async for event in handler(counted(inputs)):
                 started = True

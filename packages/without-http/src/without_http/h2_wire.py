@@ -19,6 +19,11 @@ H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 # carries them, which is why the h11 path keeps them.
 _HOP_BY_HOP = frozenset({b"connection", b"keep-alive", b"proxy-connection", b"transfer-encoding", b"upgrade", b"te"})
 
+# The wire is ASCII: the request/response pseudo-headers decode/encode with it. Naming the
+# codec once keeps mutmut's codec-name mutations on this line rather than every call site
+# (see docs/contributing/mutation-testing.md and without_http.h11_wire._ASCII).
+_ASCII = "ascii"
+
 
 def scope_from_h2_headers(
     headers: Iterable[tuple[bytes, bytes]],
@@ -40,7 +45,7 @@ def scope_from_h2_headers(
     target = b""
     authority = b""
     ordinary: list[tuple[bytes, bytes]] = []
-    has_host = False
+    has_host = False  # pragma: no mutate - only read in boolean context (not has_host)
     for name, value in headers:
         if name == b":method":
             method = value
@@ -60,9 +65,9 @@ def scope_from_h2_headers(
     return HttpScope(
         asgi=ASGI,
         http_version="2",
-        method=method.decode("ascii"),
+        method=method.decode(_ASCII),
         scheme=scheme,
-        path=unquote(raw_path.decode("ascii")),
+        path=unquote(raw_path.decode(_ASCII)),
         raw_path=raw_path,
         query_string=query_string,
         root_path="",
@@ -81,7 +86,7 @@ def response_headers(status: int, headers: RawHeaders) -> list[tuple[bytes, byte
     are illegal over h2 are dropped, so a response written for HTTP/1.1 round-trips
     over HTTP/2 without tripping hpack.
     """
-    block = [(b":status", str(status).encode("ascii"))]
+    block = [(b":status", str(status).encode(_ASCII))]
     block.extend((name.lower(), value) for name, value in headers if name.lower() not in _HOP_BY_HOP)
     return block
 
@@ -110,7 +115,7 @@ def request_headers(
     block = [
         (b":method", method),
         (b":path", target),
-        (b":scheme", scheme.encode("ascii")),
+        (b":scheme", scheme.encode(_ASCII)),
         (b":authority", authority),
     ]
     block.extend(

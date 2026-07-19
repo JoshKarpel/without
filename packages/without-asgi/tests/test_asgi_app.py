@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from dataclasses import field
@@ -10,6 +11,7 @@ from types import AsyncGeneratorType
 import pytest
 from without import Processor
 from without import Stream
+from without_asgi import Asgi
 from without_asgi import ASGIApp
 from without_asgi import HttpRouter
 from without_asgi import HttpScope
@@ -19,6 +21,11 @@ from without_asgi import Outbound
 from without_asgi import RawMessage
 from without_asgi import ResponseBody
 from without_asgi import ResponseStart
+from without_asgi import WebsocketInbound
+from without_asgi import WebsocketOutbound
+from without_asgi import WebsocketReceive
+from without_asgi import WebsocketScope
+from without_asgi import WebsocketSend
 from without_asgi import make_asgi_app
 
 
@@ -131,6 +138,178 @@ async def test_requests_are_handed_the_lifespan_state() -> None:
         send,
     )
     assert seen == ["the-state"]
+
+    await inbox.put({"type": "lifespan.shutdown"})
+    await outbox.get()
+    await task
+
+
+async def test_the_http_router_is_handed_the_parsed_scope() -> None:
+    captured: list[HttpScope] = []
+
+    def router(state: str, scope: HttpScope) -> Processor[Inbound, Outbound]:
+        captured.append(scope)
+
+        async def silent(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
+            nothing: tuple[Outbound, ...] = ()
+            for event in nothing:
+                yield event  # pragma: no cover
+
+        return silent
+
+    wrapped = make_asgi_app(_lifespan(Trace(), "state"), router)
+    inbox, outbox, task = _start_lifespan(wrapped)
+    await inbox.put({"type": "lifespan.startup"})
+    await outbox.get()
+
+    async def receive() -> RawMessage:
+        raise AssertionError("this handler reads no events")  # pragma: no cover
+
+    async def send(message: RawMessage) -> None:
+        raise AssertionError("this handler sends nothing")  # pragma: no cover
+
+    await wrapped(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "PATCH",
+            "scheme": "https",
+            "path": "/widgets/7",
+            "raw_path": b"/widgets/7",
+            "query_string": b"colour=teal",
+            "root_path": "/api",
+            "headers": [[b"x-trace", b"abc"]],
+            "client": ["203.0.113.7", 54321],
+            "server": ["example.test", 443],
+        },
+        receive,
+        send,
+    )
+
+    assert captured == [
+        HttpScope(
+            asgi=Asgi(version="3.0", spec_version="2.3"),
+            http_version="1.1",
+            method="PATCH",
+            scheme="https",
+            path="/widgets/7",
+            raw_path=b"/widgets/7",
+            query_string=b"colour=teal",
+            root_path="/api",
+            headers=((b"x-trace", b"abc"),),
+            client=("203.0.113.7", 54321),
+            server=("example.test", 443),
+            extensions=None,
+        )
+    ]
+
+    await inbox.put({"type": "lifespan.shutdown"})
+    await outbox.get()
+    await task
+
+
+async def test_the_websocket_router_is_handed_the_state_and_parsed_scope() -> None:
+    captured_state: list[str] = []
+    captured_scope: list[WebsocketScope] = []
+
+    def router(state: str, scope: WebsocketScope) -> Processor[WebsocketInbound, WebsocketOutbound]:
+        captured_state.append(state)
+        captured_scope.append(scope)
+
+        async def silent(inputs: Stream[WebsocketInbound]) -> AsyncIterator[WebsocketOutbound]:
+            nothing: tuple[WebsocketOutbound, ...] = ()
+            for event in nothing:
+                yield event  # pragma: no cover
+
+        return silent
+
+    wrapped = make_asgi_app(_lifespan(Trace(), "socket-state"), websocket=router)
+    inbox, outbox, task = _start_lifespan(wrapped)
+    await inbox.put({"type": "lifespan.startup"})
+    await outbox.get()
+
+    async def receive() -> RawMessage:
+        raise AssertionError("this handler reads no events")  # pragma: no cover
+
+    async def send(message: RawMessage) -> None:
+        raise AssertionError("this handler sends nothing")  # pragma: no cover
+
+    await wrapped(
+        {
+            "type": "websocket",
+            "asgi": {"version": "3.0", "spec_version": "2.4"},
+            "http_version": "1.1",
+            "scheme": "wss",
+            "path": "/chat/lobby",
+            "raw_path": b"/chat/lobby",
+            "query_string": b"room=42",
+            "root_path": "/ws",
+            "headers": [[b"origin", b"https://example.test"]],
+            "client": ["198.51.100.9", 12345],
+            "server": ["example.test", 8443],
+            "subprotocols": ["chat.v1"],
+        },
+        receive,
+        send,
+    )
+
+    assert captured_state == ["socket-state"]
+    assert captured_scope == [
+        WebsocketScope(
+            asgi=Asgi(version="3.0", spec_version="2.4"),
+            http_version="1.1",
+            scheme="wss",
+            path="/chat/lobby",
+            raw_path=b"/chat/lobby",
+            query_string=b"room=42",
+            root_path="/ws",
+            headers=((b"origin", b"https://example.test"),),
+            client=("198.51.100.9", 12345),
+            server=("example.test", 8443),
+            subprotocols=("chat.v1",),
+            extensions=None,
+        )
+    ]
+
+    await inbox.put({"type": "lifespan.shutdown"})
+    await outbox.get()
+    await task
+
+
+async def test_the_websocket_handler_echoes_inbound_frames_through_the_wired_streams() -> None:
+    def router(state: str, scope: WebsocketScope) -> Processor[WebsocketInbound, WebsocketOutbound]:
+        async def echo(inputs: Stream[WebsocketInbound]) -> AsyncIterator[WebsocketOutbound]:
+            async for event in inputs:
+                if isinstance(event, WebsocketReceive):
+                    yield WebsocketSend(data=event.data)
+
+        return echo
+
+    wrapped = make_asgi_app(_lifespan(Trace(), "state"), websocket=router)
+    inbox, outbox, task = _start_lifespan(wrapped)
+    await inbox.put({"type": "lifespan.startup"})
+    await outbox.get()
+
+    incoming: Iterator[RawMessage] = iter(
+        [
+            {"type": "websocket.connect"},
+            {"type": "websocket.receive", "text": "ping-value"},
+            {"type": "websocket.disconnect", "code": 1000, "reason": ""},
+        ]
+    )
+
+    async def receive() -> RawMessage:
+        return next(incoming)
+
+    sent: list[RawMessage] = []
+
+    async def send(message: RawMessage) -> None:
+        sent.append(message)
+
+    await wrapped({"type": "websocket", "asgi": {"version": "3.0"}, "path": "/ws", "headers": []}, receive, send)
+
+    assert sent == [{"type": "websocket.send", "text": "ping-value"}]
 
     await inbox.put({"type": "lifespan.shutdown"})
     await outbox.get()

@@ -4,6 +4,7 @@ import h11
 import pytest
 from without_asgi import Disconnect
 from without_asgi import EarlyHint
+from without_asgi import Outbound
 from without_asgi import PathSend
 from without_asgi import RequestBody
 from without_asgi import ResponseBody
@@ -28,6 +29,7 @@ def test_scope_from_request_reads_the_request_line() -> None:
     assert scope.path == "/items"
     assert scope.raw_path == b"/items"
     assert scope.query_string == b"page=2"
+    assert scope.root_path == ""
     assert scope.http_version == "1.1"
     assert scope.scheme == "https"
     assert scope.server == ("example.test", 443)
@@ -92,12 +94,16 @@ def test_h11_events_from_outbound_renders_early_hints_as_informational() -> None
     hint = events[0]
     assert isinstance(hint, h11.InformationalResponse)
     assert hint.status_code == 103
+    assert list(hint.headers.raw_items()) == [(b"link", b"</style.css>; rel=preload")]
 
 
 @pytest.mark.parametrize(
-    "outbound",
-    [ServerPush(path="/x", headers=()), PathSend(path="/var/www/big.iso")],
+    ("outbound", "type_name"),
+    [
+        (ServerPush(path="/x", headers=()), "ServerPush"),
+        (PathSend(path="/var/www/big.iso"), "PathSend"),
+    ],
 )
-def test_h11_events_from_outbound_rejects_an_unsupported_extension(outbound: object) -> None:
-    with pytest.raises(NotImplementedError, match="not supported"):
-        h11_events_from_outbound(outbound)  # type: ignore[arg-type]
+def test_h11_events_from_outbound_rejects_an_unsupported_extension(outbound: Outbound, type_name: str) -> None:
+    with pytest.raises(NotImplementedError, match=rf"^{type_name} is not supported over HTTP/1\.1$"):
+        h11_events_from_outbound(outbound)

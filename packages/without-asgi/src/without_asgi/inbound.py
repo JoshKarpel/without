@@ -65,9 +65,10 @@ def parse_inbound(message: RawMessage) -> Inbound:
     match message.get("type"):
         case "http.request":
             value = message.get("body", b"")
+            more_body = bool(message.get("more_body", False))  # pragma: no mutate - None default is falsy like False
             return RequestBody(
                 body=narrow(value, bytes),
-                more_body=bool(message.get("more_body", False)),
+                more_body=more_body,
             )
         case "http.disconnect":
             return Disconnect()

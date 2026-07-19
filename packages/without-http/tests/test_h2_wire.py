@@ -44,6 +44,41 @@ def test_scope_from_h2_headers_keeps_an_explicit_host_over_the_authority() -> No
     assert scope.headers == ((b"host", b"explicit.test"),)
 
 
+def test_scope_from_h2_headers_defaults_to_empty_when_pseudo_headers_are_absent() -> None:
+    scope = scope_from_h2_headers([(b"x-trace", b"abc")], scheme="https", server=None, client=None)
+
+    assert scope.method == ""
+    assert scope.path == ""
+    assert scope.raw_path == b""
+    assert scope.query_string == b""
+    assert scope.root_path == ""
+    assert scope.headers == ((b"x-trace", b"abc"),)
+
+
+def test_scope_from_h2_headers_drops_unknown_pseudo_headers() -> None:
+    headers = [(b":method", b"GET"), (b":path", b"/"), (b":scheme", b"http"), (b"accept", b"text/html")]
+
+    scope = scope_from_h2_headers(headers, scheme="https", server=None, client=None)
+
+    assert scope.headers == ((b"accept", b"text/html"),)
+
+
+def test_scope_from_h2_headers_puts_the_synthesized_host_first() -> None:
+    headers = [(b":method", b"GET"), (b":path", b"/"), (b":authority", b"api.example.test"), (b"accept", b"text/html")]
+
+    scope = scope_from_h2_headers(headers, scheme="https", server=None, client=None)
+
+    assert scope.headers == ((b"host", b"api.example.test"), (b"accept", b"text/html"))
+
+
+def test_scope_from_h2_headers_synthesizes_no_host_without_an_authority() -> None:
+    headers = [(b":method", b"GET"), (b":path", b"/"), (b"accept", b"text/html")]
+
+    scope = scope_from_h2_headers(headers, scheme="https", server=None, client=None)
+
+    assert scope.headers == ((b"accept", b"text/html"),)
+
+
 def test_scope_from_h2_headers_percent_decodes_the_path() -> None:
     headers = [(b":method", b"GET"), (b":path", b"/caf%C3%A9"), (b":authority", b"t")]
 
@@ -111,6 +146,13 @@ def test_response_status_and_headers_split_the_status_from_the_rest() -> None:
     status, headers = response_status_and_headers([(b":status", b"404"), (b"content-type", b"text/plain")])
 
     assert status == 404
+    assert headers == ((b"content-type", b"text/plain"),)
+
+
+def test_response_status_and_headers_defaults_the_status_to_zero_when_absent() -> None:
+    status, headers = response_status_and_headers([(b"content-type", b"text/plain")])
+
+    assert status == 0
     assert headers == ((b"content-type", b"text/plain"),)
 
 

@@ -24,6 +24,12 @@ from without_asgi import ZeroCopySend
 # the corresponding `Outbound` events.
 ASGI = Asgi(version="3.0", spec_version="2.4")
 
+# The wire is ASCII: request/response tokens (method, path, version) decode with it.
+# Naming the codec once keeps mutmut's codec-name mutations (an invalid `"XXasciiXX"`
+# crashes; a case-swapped `"ASCII"` is an equivalent alias) on this single line rather
+# than every call site. See docs/contributing/mutation-testing.md.
+_ASCII = "ascii"
+
 
 def scope_from_request(
     request: h11.Request,
@@ -43,10 +49,10 @@ def scope_from_request(
     headers = tuple((bytes(name), bytes(value)) for name, value in request.headers)
     return HttpScope(
         asgi=ASGI,
-        http_version=request.http_version.decode("ascii"),
-        method=request.method.decode("ascii"),
+        http_version=request.http_version.decode(_ASCII),
+        method=request.method.decode(_ASCII),
         scheme=scheme,
-        path=unquote(raw_path.decode("ascii")),
+        path=unquote(raw_path.decode(_ASCII)),
         raw_path=raw_path,
         query_string=query_string,
         root_path="",

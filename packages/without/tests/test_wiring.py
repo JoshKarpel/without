@@ -89,7 +89,7 @@ async def test_tee_delivers_every_value_to_a_slower_branch() -> None:
 
 
 async def test_tee_requires_at_least_one_sink() -> None:
-    with pytest.raises(ValueError, match="at least one sink"):
+    with pytest.raises(ValueError, match=r"^tee requires at least one sink$"):
         tee()
 
 
@@ -132,6 +132,10 @@ async def test_stream_from_queue_yields_pushed_values_in_order() -> None:
 
 async def test_spool_yields_every_item_from_the_source() -> None:
     assert await collect(spool(stream_from_iterable([1, 2, 3]), ahead=2)) == [1, 2, 3]
+
+
+async def test_spool_accepts_an_ahead_of_one() -> None:
+    assert await collect(spool(stream_from_iterable([1, 2, 3]), ahead=1)) == [1, 2, 3]
 
 
 async def test_spool_rejects_a_nonpositive_ahead() -> None:

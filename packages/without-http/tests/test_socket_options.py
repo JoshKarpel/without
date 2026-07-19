@@ -97,13 +97,42 @@ def test_pool_enables_keepalive_by_default() -> None:
 
 
 @pytest.mark.parametrize(
-    "make",
-    [lambda d: tcp_keepalive(idle=d), lambda d: tcp_keepalive(interval=d)],
+    ("make", "axis"),
+    [
+        (lambda d: tcp_keepalive(idle=d), "idle"),
+        (lambda d: tcp_keepalive(interval=d), "interval"),
+    ],
     ids=["idle", "interval"],
 )
-def test_a_fractional_second_probe_duration_is_rejected(make: Callable[[timedelta], SocketOptions]) -> None:
-    with pytest.raises(ValueError, match="must be a whole number of seconds"):
+def test_a_fractional_second_probe_duration_is_rejected_naming_the_axis(
+    make: Callable[[timedelta], SocketOptions], axis: str
+) -> None:
+    # Anchor on the axis name so a mutated label (e.g. "IDLE"/"INTERVAL") is not accepted
+    # by a loose substring match.
+    with pytest.raises(ValueError, match=rf"^{axis} must be a whole number of seconds"):
         make(timedelta(milliseconds=1500))
+
+
+def test_a_platform_missing_every_probe_knob_enables_only_so_keepalive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An old-Windows-like platform that exposes none of the per-probe constants: each knob is
+    # dropped and only the portable SO_KEEPALIVE remains (a missing constant resolves to None
+    # via getattr's default, never raising).
+    for name in ("TCP_KEEPIDLE", "TCP_KEEPALIVE", "TCP_KEEPINTVL", "TCP_KEEPCNT"):
+        monkeypatch.delattr(socket, name, raising=False)
+    assert tcp_keepalive() == ((socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),)
+
+
+def test_the_idle_knob_falls_back_to_the_macos_keepalive_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    # macOS has no TCP_KEEPIDLE; the idle knob is spelled TCP_KEEPALIVE and used the same way.
+    monkeypatch.delattr(socket, "TCP_KEEPIDLE", raising=False)
+    macos_idle_option = 0x1234
+    monkeypatch.setattr(socket, "TCP_KEEPALIVE", macos_idle_option, raising=False)
+
+    options = tcp_keepalive(idle=timedelta(seconds=45))
+
+    assert options[1] == (socket.IPPROTO_TCP, macos_idle_option, 45)
 
 
 @pytest.mark.parametrize(
