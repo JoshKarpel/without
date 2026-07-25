@@ -23,7 +23,7 @@ dependencies = [
     "without-asgi",
     # The peer stack: FastAPI over the *same* core, served by uvicorn as deployed
     # (uvloop + httptools), so the delta is framework + server, not domain logic.
-    "fastapi>=0.115",
+    "fastapi>=0.139.2",
     "uvicorn[standard]>=0.34",
     # uvloop is pulled in transitively by uvicorn[standard], but `servers.py`
     # imports it directly to run the without-http server on uvloop, so it is a
