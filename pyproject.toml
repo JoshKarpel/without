@@ -46,17 +46,17 @@ dev = [
     "pre-commit>=4.4",
     "pytest<10",
     "pytest-cov>=3",
-    "pytest-durations>=1",
+    "pytest-durations>=1.7.0",
     "pytest-xdist>=3",
     "pytest-asyncio>=1",
     "pytest-mock>=3",
     "pytest-randomly>=3",
     "pytest-timeout>=2.3",
     "trustme>=1.1",
-    "hypothesis>=6.156.1",
+    "hypothesis>=6.156.6",
     "mutmut>=3",
-    "mypy>=1",
-    "ruff>=0.15.20",
+    "mypy>=2.3.0",
+    "ruff>=0.15.22",
     "types-pyyaml>=6",
     "uvloop>=0.22.1 ; sys_platform != 'win32'",  # uvloop has no Windows support; the suite runs asyncio-only there
 ]
@@ -64,8 +64,8 @@ docs = [
     # MkDocs 2.0 is a backward-incompatible rewrite that drops the plugin system
     # this site relies on (mkdocstrings, the hook), so cap below it deliberately.
     "mkdocs>=1.6,<2",
-    "mkdocs-material>=9.5",
-    "mkdocstrings[python]>=1.0.4",
+    "mkdocs-material>=9.7.7",
+    "mkdocstrings[python]>=1.0.6",
 ]
 
 [tool.pytest.ini_options]
