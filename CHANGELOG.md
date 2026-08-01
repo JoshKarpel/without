@@ -24,6 +24,18 @@
   tests run against a real server: the `test` recipe starts the new `compose.yaml` with podman,
   hands pytest each published address, and takes the stack down from an exit trap. They carry a
   `compose` mark and skip where podman is not installed.
+- **`integration`**: `durable.stepwise`, the same durability without the graph, sharing the one
+  `Checkpoints` seam. A workflow is an ordinary async function whose effects are named
+  (`await run.step("charged", ...)`); resuming calls it again and each step hands back what is
+  recorded. It asks one thing in return, because the code *between* steps re-runs: effects live in
+  steps, the code around them is pure (Temporal and DBOS state the same rule as workflow
+  determinism). Keying by name rather than by position is what keeps it that mild, since reordering
+  or inserting a step changes nothing. Two things follow that a fixed graph cannot express, both in
+  `durable.payout`: a fan-out whose width comes from a step's *result*, one key per item so a crash
+  resumes item by item; and `Suspended`, raised by a step that cannot finish now, which is what
+  makes a settlement window (`run.sleep` records the deadline, so a crash mid-wait does not restart
+  the clock) and a human approval (`run.awaiting`, satisfied by another process writing one field
+  into the workflow's hash) ordinary lines of code.
 - **`without-web`**: reverse routing. `url_for(route, values)` renders a route back to a concrete
   path from the values for its path parameters, the inverse of the trie walk. It is a plain
   function of the route *value* (routes are identified by value, no registry), each value fed back

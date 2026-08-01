@@ -22,18 +22,23 @@ from without_dag import NodeKey
 
 class Checkpoints(Protocol):
     """
-    Where a workflow's completed steps are kept, keyed by workflow.
+    Where a workflow's completed work is kept, keyed by workflow.
 
-    The narrow seam the durable runner talks through, so the store is injected
+    The narrow seam a durable runner talks through, so the store is injected
     rather than reached for: a Redis hash in production (`store.RedisCheckpoints`),
-    a plain dict in a test. `load` MUST return the results recorded for that
+    a plain dict in a test. `load` MUST return the values recorded for that
     workflow so far, an empty mapping for one that has never run, and `record`
-    MUST make one result durable before it returns.
+    MUST make one value durable before it returns.
+
+    Its keys are plain names rather than this module's `NodeKey`, because the store
+    is the piece the two mechanisms here share: a graph records under its node names
+    (`run_durably`) and an ordinary function under its step names (`stepwise`), and
+    the store cannot tell, nor should it.
     """
 
-    async def load(self, workflow: str) -> dict[NodeKey, object]: ...
+    async def load(self, workflow: str) -> dict[str, object]: ...
 
-    async def record(self, workflow: str, key: NodeKey, value: object) -> None: ...
+    async def record(self, workflow: str, key: str, value: object) -> None: ...
 
 
 async def run_durably[*Ins, Out](

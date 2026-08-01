@@ -4,14 +4,20 @@ import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from dataclasses import field
+from datetime import timedelta
 from uuid import uuid4
 
 import pytest
 from integration.durable import Order
+from integration.durable import Payouts
 from integration.durable import Reached
 from integration.durable import RedisCheckpoints
+from integration.durable import Run
 from integration.durable import Services
+from integration.durable import Suspended
 from integration.durable import fulfilment
+from integration.durable import pay_out
+from integration.durable import resume
 from integration.durable import run_saga
 from integration.durable import unwinding
 from redis.asyncio import Redis
@@ -127,3 +133,61 @@ async def test_a_compensation_is_recorded_under_its_own_key(redis: Redis, workfl
         "unwound": {"refunded": "rf-ch-o-42", "released": "rl-rs-gizmo"},
     }
     assert sorted(gateway.calls[-2:]) == ["refund", "release"]
+
+
+def paying(calls: list[str]) -> Payouts:
+    """A payout's effects, recording each one so a test can see what a pass performed."""
+
+    async def items(order_id: str) -> dict[str, int]:
+        calls.append("items")
+        return {"piano": 90_000, "stool": 4_000}
+
+    async def capture(sku: str, amount: int) -> str:
+        calls.append(f"capture:{sku}")
+        return f"cap-{sku}"
+
+    async def pay(order_id: str, total: int) -> str:
+        calls.append("pay")
+        return f"pay-{total}"
+
+    return Payouts(items=items, capture=capture, pay=pay)
+
+
+async def test_a_workflow_suspended_on_an_approval_resumes_when_another_process_records_it(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # The stepwise mechanism end to end, and the thing a signal usually needs a server
+    # for: the pass that asked for the approval is gone, and what resumes the workflow
+    # is one field written into its hash by something that shares nothing with it.
+    suspended = RedisCheckpoints(redis=redis)
+    asked: list[str] = []
+
+    async def body(run: Run) -> dict[str, object]:
+        return await pay_out(run, "ord-42", paying(asked), settling=timedelta(), approval_over=10_000)
+
+    with pytest.raises(Suspended) as suspension:
+        await resume(workflow, suspended, body)
+
+    assert suspension.value.key == "approved-by"
+    assert set(await redis.hkeys(f"workflow:{workflow}")) == {
+        b"items",
+        b"captured:piano",
+        b"captured:stool",
+        b"settling",
+    }
+    assert asked == ["items", "capture:piano", "capture:stool"], "the money moved, the payout did not"
+
+    approvals = RedisCheckpoints(redis=redis)
+    await approvals.record(workflow, "approved-by", "auditor-7")
+
+    answered: list[str] = []
+
+    async def resumed(run: Run) -> dict[str, object]:
+        return await pay_out(run, "ord-42", paying(answered), settling=timedelta(), approval_over=10_000)
+
+    payout = await resume(workflow, RedisCheckpoints(redis=redis), resumed)
+
+    assert payout["approved_by"] == "auditor-7"
+    assert payout["captures"] == {"piano": "cap-piano", "stool": "cap-stool"}
+    assert answered == ["pay"], "everything before the approval was read back out of Redis"
