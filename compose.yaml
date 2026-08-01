@@ -1,0 +1,25 @@
+# The backing services the tests drive for real, rather than against a fake. The
+# `just test` recipe brings this stack up before the suite and takes it down from an
+# EXIT trap afterwards, and passes each published address to pytest through the
+# environment; a test that finds its service unset skips.
+services:
+  redis:
+    # Fully qualified: podman refuses a short name unless the machine happens to
+    # configure an unqualified-search registry, and naming the registry is the
+    # honest form for either engine anyway.
+    image: docker.io/library/redis:8-alpine
+    # No persistence: a checkpoint here lives for one test, and an RDB dump or an
+    # append-only file would only add fsyncs and a stale-state risk between runs.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    # The engine picks the host port, so this can never collide with a Redis the
+    # developer already runs, nor with another checkout running the suite. The tests
+    # ask `compose port` for the address rather than assuming one.
+    ports:
+      - "6379"
+    # What `up --wait` waits on: the recipe holds until this passes, so no test can
+    # race a server that is up but not yet listening.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 30

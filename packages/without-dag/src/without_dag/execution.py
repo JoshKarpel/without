@@ -6,7 +6,6 @@ from collections import deque
 from collections.abc import AsyncGenerator
 from collections.abc import Awaitable
 from collections.abc import Callable
-from collections.abc import Hashable
 from collections.abc import Iterable
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -14,7 +13,11 @@ from graphlib import TopologicalSorter
 
 from without import cancel_futures
 
-type NodeKey = Hashable
+# A *name*, not an identity. Any hashable would do to key a run in memory, but a
+# key that outlives the process is what lets a run's `(key, value)` completions be
+# sunk to a store and handed back as a checkpoint, so the seam is narrowed to the
+# one shape every store can hold. A frontend wanting richer keys encodes them.
+type NodeKey = str
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,9 +75,18 @@ async def drive(
 
     The streaming core, and the *events* half of the model. Yields completions in
     whatever order nodes finish; the only ordering guarantee is the causal one, a
-    node after the dependencies it consumed. `inputs` pre-supplies the values of
-    source keys, marked done without running and never yielded. `limit` caps how
-    many nodes run concurrently (`None` is unbounded).
+    node after the dependencies it consumed. `limit` caps how many nodes run
+    concurrently (`None` is unbounded).
+
+    `inputs` pre-supplies values by key: a key found there is marked done without
+    running and is never yielded, and its value is fed to its dependents as if it
+    had just been computed. A source key the graph is opened over and a node whose
+    result was captured by an earlier run are the same thing to the scheduler,
+    which is what makes a run resumable from a checkpoint of the `(key, value)`
+    pairs a previous one yielded. Only a node's own key is consulted, so a node
+    absent from `inputs` runs even when a dependent of it is already supplied; a
+    checkpoint captured from a run is closed under ancestry anyway, since a node
+    completes only after its dependencies did.
 
     Scheduling drains completions off an `asyncio.Queue` that each spawned future
     feeds via a done-callback attached once at spawn, rather than
@@ -117,6 +129,12 @@ async def drive(
                 future = asyncio.ensure_future(node.run(args))
                 running[future] = key
                 future.add_done_callback(completed.put_nowait)
+            if not running:
+                # Everything the sorter had ready was already supplied, so nothing is
+                # in flight and no completion is coming: awaiting one would hang the
+                # run forever. Re-testing `is_active` ends it instead, which is what a
+                # checkpoint covering a graph's last nodes reaches.
+                continue
             done = await completed.get()
             key = running.pop(done)
             value = done.result()

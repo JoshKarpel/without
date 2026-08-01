@@ -4,6 +4,26 @@
 
 ### Added
 
+- **`without-dag`**: resuming a graph from a checkpoint. `run(...)` and `run.stream(...)` take a
+  `checkpoint` of `{node key: result}`, the same mapping `stream` emits, and a node named in it is
+  not run: its result is taken as given and fed to its dependents, so a run picks up where an
+  interrupted one stopped and a checkpoint covering the whole graph performs no effects at all. The
+  execution seam already treated a pre-supplied key as done; what was missing was a key worth
+  storing, so `node` now takes one as its first argument (`graph.node("charged", charge, order)`)
+  and `NodeKey` is a `str`. A name chosen in the source means the same thing on the other side of a
+  crash, where an `object()` minted at build time does not, and it must be distinct from every other
+  key in the graph (entries are keyed by position, `input:0`). A checkpoint key that names no node
+  is rejected rather than ignored, since that is the shape of one written by a different version of
+  the graph. `stream` being pull-driven makes the store write a barrier: nothing downstream of a
+  completed step starts until the consumer asks for the next result.
+- **`integration`**: `durable`, a durable workflow and its saga, sinking to Redis. An order
+  fulfilment graph (charge and reserve concurrently, ship, render) whose completions are recorded to
+  a Redis hash under the workflow's idempotency key and read back to resume, plus `run_saga`, which
+  on failure parses the checkpoint into how far the run got and drives a compensation graph that is
+  itself checkpointed, so an interrupted rollback resumes rather than refunding twice. Its Redis
+  tests run against a real server: the `test` recipe starts the new `compose.yaml` with podman,
+  hands pytest each published address, and takes the stack down from an exit trap. They carry a
+  `compose` mark and skip where podman is not installed.
 - **`without-web`**: reverse routing. `url_for(route, values)` renders a route back to a concrete
   path from the values for its path parameters, the inverse of the trie walk. It is a plain
   function of the route *value* (routes are identified by value, no registry), each value fed back

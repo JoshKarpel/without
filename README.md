@@ -76,7 +76,11 @@ Planned plugins, in the order they should be attempted:
 
 ```bash
 uv sync
-just test        # mypy + pytest
+just test        # start the services in compose.yaml, then mypy + pytest
 just durations   # profile the suite (slowest fixtures, setup, calls, teardown)
 just docs        # serve the documentation site with live reload
 ```
+
+A few tests drive a real backing service rather than a fake. `just test` starts the
+services in [`compose.yaml`](compose.yaml) with [podman](https://podman.io) and stops
+them again when it exits; install podman to run them, or let them skip.

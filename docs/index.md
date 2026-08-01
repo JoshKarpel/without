@@ -68,9 +68,13 @@ pip install without-web       # plus whichever plugins you need
 
 ```bash
 uv sync
-just test        # mypy + pytest
+just test        # start the services in compose.yaml, then mypy + pytest
 just docs        # serve this site with live reload
 ```
+
+A few tests drive a real backing service rather than a fake. `just test` starts the
+services in `compose.yaml` with [podman](https://podman.io) and stops them again when
+it exits; install podman to run them, or let them skip.
 
 For contributing to `without` itself, see the
 [Releasing](contributing/releasing.md) runbook for how the workspace is

@@ -15,6 +15,28 @@ render a reply) and `kv.shell` (a generic line-server transport plus the wiring
 that runs the core over it), a small demonstration that `without` is a principled
 way to write an imperative shell.
 
+`durable` is a durable workflow built on `without-dag`, and the demonstration that
+resumption needs an engine no more than routing did. Fulfilling an order charges
+the card and reserves the stock concurrently, ships, and renders a receipt;
+`durable.core` is that graph plus the compensations, with every effect injected as
+a `Services` callable and every node named in the source, so a result is stored
+under a key that means the same thing after a crash. `durable.shell` is the whole
+runner: `run_durably` loads a workflow's checkpoint, streams the graph, records
+each `(key, result)` before pulling the next, and returns the output, so re-running
+a finished workflow performs no effects at all. `run_saga` adds the compensating
+half: on failure it parses the checkpoint into how far the run got (`Reached`) and
+drives a rollback graph under its own key, itself checkpointed, so an interrupted
+rollback resumes instead of refunding twice. `durable.store` is the one module that
+knows Redis and JSON, a workflow being one hash and a completed step one field in
+it, which is what makes the checkpoint readable with `redis-cli` and writable by a
+process that shares nothing with the one that crashed.
+
+Its Redis tests drive a real server rather than a fake: `just test` starts the
+services in `compose.yaml` with podman, hands each published address to pytest
+through the environment, and takes the stack down again from an exit trap. They
+carry a `compose` mark and skip when that address is unset (no podman on the
+machine, or pytest run directly), so `-m "not compose"` opts out up front.
+
 `transform` is a text-transform service built on the `without-asgi` adapters.
 `POST /transform` reads the request body, uppercases/lowercases/title-cases it
 per a `?mode=` query override, and caps the size, with the default mode and the
