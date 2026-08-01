@@ -16,19 +16,19 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import timedelta
+from typing import cast
 
 from redis.asyncio import Redis
-from without_dag import NodeKey
-
-
-def node_key(field: bytes | str) -> NodeKey:
-    return field.decode() if isinstance(field, bytes) else field
 
 
 @dataclass(frozen=True, slots=True)
 class RedisCheckpoints:
     """
     A workflow's completed steps, as one Redis hash per workflow.
+
+    The client MUST be built with `decode_responses=True`. That is this app's choice
+    to make (it owns both ends of this hash), and making it once here is what keeps
+    every read from carrying a bytes-or-text branch it would never take.
 
     `namespace` keeps the workflow keys clear of whatever else shares the database,
     and `ttl` is the answer to the question a checkpoint store cannot dodge: these
@@ -45,14 +45,13 @@ class RedisCheckpoints:
     def hash_key(self, workflow: str) -> str:
         return f"{self.namespace}:{workflow}"
 
-    async def load(self, workflow: str) -> dict[NodeKey, object]:
-        recorded: dict[bytes | str, bytes | str] = await self.redis.hgetall(self.hash_key(workflow))
-        # Whether a field comes back as bytes or text is the injected client's
-        # `decode_responses` setting, which is the app's to choose; `json.loads`
-        # takes either, so only the node's name has to be normalized.
-        return {node_key(field): json.loads(value) for field, value in recorded.items()}
+    async def load(self, workflow: str) -> dict[str, object]:
+        # The cast *is* `decode_responses=True`: redis-py types every read as
+        # bytes-or-text because the flag is a runtime choice its types cannot see.
+        recorded = cast(dict[str, str], await self.redis.hgetall(self.hash_key(workflow)))
+        return {field: json.loads(value) for field, value in recorded.items()}
 
-    async def record(self, workflow: str, key: NodeKey, value: object) -> None:
+    async def record(self, workflow: str, key: str, value: object) -> None:
         # One round trip, and the expiry is re-armed on every write, so a workflow
         # that keeps making progress keeps its checkpoint alive.
         async with self.redis.pipeline() as pipeline:

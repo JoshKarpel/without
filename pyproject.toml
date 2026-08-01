@@ -152,6 +152,7 @@ omit = [
     # where the compose-marked tests skip (no podman, as on the macOS and Windows CI
     # legs) then leaves the gate reporting the suite rather than the environment.
     "${WITHOUT_COMPOSE_AVAILABLE-}*/integration/durable/store.py",
+    "${WITHOUT_COMPOSE_AVAILABLE-}*/integration/durable/wakeups.py",
     "${WITHOUT_COMPOSE_AVAILABLE-}*/tests/durable/test_durable_redis.py",
 ]
 

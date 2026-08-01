@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import UTC
@@ -8,6 +7,7 @@ from datetime import datetime
 from datetime import timedelta
 
 import pytest
+from doubles import MemoryCheckpoints
 from integration.durable import Payouts
 from integration.durable import Run
 from integration.durable import Suspended
@@ -24,19 +24,6 @@ BIG_ITEMS = {"piano": 90_000, "stool": 4_000}
 SETTLING = timedelta(days=3)
 APPROVAL_OVER = 10_000
 STARTED_AT = datetime(2026, 3, 14, 9, 30, tzinfo=UTC)
-
-
-@dataclass(frozen=True, slots=True)
-class MemoryCheckpoints:
-    """A `Checkpoints` in a dict: the same seam the Redis one implements, no container."""
-
-    hashes: dict[str, dict[str, object]] = field(default_factory=lambda: defaultdict(dict))
-
-    async def load(self, workflow: str) -> dict[str, object]:
-        return dict(self.hashes[workflow])
-
-    async def record(self, workflow: str, key: str, value: object) -> None:
-        self.hashes[workflow][key] = value
 
 
 @dataclass(slots=True)

@@ -51,10 +51,84 @@ signal without a mailbox: the wait outlives the process that was waiting). What 
 graph keeps in exchange is the eager check, since it knows every key before it runs
 anything, and a structure you can diagram.
 
-Neither half has the piece that is genuinely a service: something to notice a
-suspension with a deadline and come back. That wants a query for workflows due now and
-at-least-once wakeup delivery, which is a stream and a processor, and is the next thing
-these toys should try.
+`durable.api` and `durable.worker` are the piece that is genuinely a service: something
+that notices a suspension and comes back. They are an API server and a queue worker,
+deployed separately, sharing only Redis, and between them they are about a hundred
+lines.
+
+The API never runs a workflow. Submitting an order and confirming a payout are the
+same two-line move, `record` one value then `make_ready`, because both are values the
+workflow is waiting on and `Run.awaiting` cannot tell which is which. That is what
+replaces a client library talking to a workflow server, and it is why the API holds
+nothing and can be restarted or scaled at will. The workflow id is the request's
+`Idempotency-Key`, so a resubmitted order is the same workflow rather than a second
+one, and `GET /orders/{id}` renders the checkpoint as the progress view, since the
+durable state *is* the state.
+
+The worker is a `Sink` over a `Stream` plus a timer, which is `without`'s own
+vocabulary doing the work:
+
+```text
+deliveries ──▶ pool of N passes ──▶ Suspended with a due?  ──▶ wake_at (a clock)
+      ▲                         │  Suspended without one? ──▶ nothing to do
+      │                         └─▶ done (this wakeup is answered for)
+reclaim one, else read one
+timer ──▶ wake_due (one move, in the store)
+```
+
+The two arms of that branch are the two ways a workflow waits, and `Suspended` says
+which: a deadline the workflow chose gets scheduled, a value the world owes it does
+not, because the API's confirmation is what will queue it. Nothing polls a workflow to
+ask whether it can proceed. `durable.wakeups` is those two structures, a Redis stream
+of ready ids and a sorted set scored by deadline, and it is the direct answer to
+"surely this is what Temporal's server does": yes, and once the state is a checkpoint
+anyone can read, the rest is a stream, a sorted set, and one small Lua script.
+
+That script is `wake_due`, and it earns its place twice. Taking a workflow off the
+sleepers and queueing it are durable only *together*: a timer that did them as two
+calls would lose the workflow whenever it died in between, leaving it in neither
+structure and asleep forever. Running the move in the server closes that, and because
+the script is serialized against itself it also decides which of several timers owns a
+wakeup, so every worker can run one and none needs to be elected.
+
+A *stream* rather than a list for the same reason. `BLPOP` hands an id over and forgets
+it, so a worker that dies mid-pass takes the wakeup with it; `XREADGROUP` moves the
+entry into that consumer's pending list, where it stays until acknowledged and where
+`XAUTOCLAIM` can hand it to another worker. That is why a delivery is a value with a
+receipt rather than a bare id, and why the acknowledgement comes after the pass and its
+error handling, on every path the process observed. Cancellation is the one path that
+skips the ack, deliberately: a worker shutting down mid-pass has not finished, so
+leaving the delivery outstanding is what lets someone else reclaim it.
+
+Concurrency falls out of the same pull-driven shape. A worker runs up to `POOL` passes
+at once through `without`'s `limit_concurrency`, which advances a lazy source only when
+a slot frees, and every pull takes exactly one delivery: a reclaimed one if some
+workflow was abandoned, otherwise a fresh read. So "pull one at a time" and "run twenty
+at a time" are the same sentence, and a worker holds precisely as many wakeups as it is
+working on. At capacity it simply stops reading, and the work stays in the stream where
+another worker can take it, which is backpressure without a mechanism for it.
+
+Deploying the pair is two entrypoints over the same two stores:
+
+```python
+redis = Redis(host=..., decode_responses=True)
+checkpoints, wakeups = RedisCheckpoints(redis=redis), RedisWakeups(redis=redis)
+
+# the API process
+async with serving(payments_app(Payments(checkpoints=checkpoints, wakeups=wakeups))):
+    await asyncio.Event().wait()
+
+# the worker process, however many of them
+await work(checkpoints, wakeups)
+```
+
+What a real one adds, and this deliberately does not: a lease per *workflow*, so a
+confirmation landing mid-pass cannot start a second pass beside the first (reclaiming
+bounds that risk for a crashed worker, but nothing bounds it for a racing wakeup, and
+the pool widens the window by running twenty passes at once); a retry policy, since a
+workflow whose step raises is logged and acknowledged rather than backed off; and a job
+that trims the stream by `MINID` behind what has been acknowledged, since capping its
+*length* instead would drop the oldest entries, which are the ones nobody has run yet.
 
 The Redis tests drive a real server rather than a fake: `just test` starts the
 services in `compose.yaml` with podman, hands each published address to pytest

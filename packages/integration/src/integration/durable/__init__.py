@@ -1,3 +1,7 @@
+from integration.durable.api import Confirmation
+from integration.durable.api import Payments
+from integration.durable.api import SubmittedOrder
+from integration.durable.api import payments_app
 from integration.durable.core import Order
 from integration.durable.core import Reached
 from integration.durable.core import Receipt
@@ -23,31 +27,51 @@ from integration.durable.stepwise import now_utc
 from integration.durable.stepwise import parse_deadline
 from integration.durable.stepwise import resume
 from integration.durable.store import RedisCheckpoints
+from integration.durable.wakeups import Delivery
+from integration.durable.wakeups import RedisWakeups
+from integration.durable.wakeups import Wakeups
+from integration.durable.worker import passes
+from integration.durable.worker import ready
+from integration.durable.worker import submitting
+from integration.durable.worker import waking
+from integration.durable.worker import work
 
 __all__ = [
     "Cents",
     "Checkpoints",
+    "Confirmation",
+    "Delivery",
     "Order",
+    "Payments",
     "Payout",
     "Payouts",
     "Reached",
     "Receipt",
     "RedisCheckpoints",
+    "RedisWakeups",
     "Rollback",
     "Run",
     "Services",
     "StepKey",
+    "SubmittedOrder",
     "Suspended",
+    "Wakeups",
     "fulfilment",
     "now_utc",
     "parse_approver",
     "parse_deadline",
     "parse_items",
+    "passes",
     "pay_out",
+    "payments_app",
+    "ready",
     "recorded_id",
     "render",
     "resume",
     "run_durably",
     "run_saga",
+    "submitting",
     "unwinding",
+    "waking",
+    "work",
 ]

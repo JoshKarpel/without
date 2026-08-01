@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import timedelta
 from uuid import uuid4
 
+import httpx
 import pytest
 from integration.durable import Order
 from integration.durable import Payouts
@@ -20,7 +24,13 @@ from integration.durable import pay_out
 from integration.durable import resume
 from integration.durable import run_saga
 from integration.durable import unwinding
+from integration.durable.api import Payments
+from integration.durable.api import payments_app
+from integration.durable.wakeups import RedisWakeups
+from integration.durable.worker import work
 from redis.asyncio import Redis
+from redis.exceptions import ResponseError
+from without_http import serving
 
 # `just test` starts the services in compose.yaml and publishes each address; these
 # tests drive the real server it started rather than a fake, and skip when it did not
@@ -40,7 +50,10 @@ async def redis() -> AsyncIterator[Redis]:
     # it is published on (`0.0.0.0:32768`), which is a wildcard a client cannot dial.
     # Either way the loopback address is where the port is reachable.
     host, _, port = published.strip().rpartition(":")
-    client = Redis(host=host or "127.0.0.1", port=int(port))
+    # `decode_responses=True` is the app's call to make, and this app makes it: it owns
+    # both ends of every key it touches, so nothing downstream has to ask whether a
+    # value came back as bytes.
+    client = Redis(host=host or "127.0.0.1", port=int(port), decode_responses=True)
     try:
         yield client
     finally:
@@ -101,8 +114,8 @@ async def test_a_workflow_resumes_from_a_checkpoint_left_in_redis_by_a_dead_proc
 
     # What an operator sees with `redis-cli`: one hash per workflow, one field per
     # completed step, each holding that step's result as JSON.
-    assert set(await redis.hkeys(f"workflow:{workflow}")) == {b"charged", b"reserved"}
-    assert await redis.hget(f"workflow:{workflow}", "charged") == b'"ch-o-42"'
+    assert set(await redis.hkeys(f"workflow:{workflow}")) == {"charged", "reserved"}
+    assert await redis.hget(f"workflow:{workflow}", "charged") == '"ch-o-42"'
     assert await redis.ttl(f"workflow:{workflow}") > 0, "a checkpoint expires on its own rather than being swept"
 
     recovered = Gateway()
@@ -171,10 +184,10 @@ async def test_a_workflow_suspended_on_an_approval_resumes_when_another_process_
 
     assert suspension.value.key == "approved-by"
     assert set(await redis.hkeys(f"workflow:{workflow}")) == {
-        b"items",
-        b"captured:piano",
-        b"captured:stool",
-        b"settling",
+        "items",
+        "captured:piano",
+        "captured:stool",
+        "settling",
     }
     assert asked == ["items", "capture:piano", "capture:stool"], "the money moved, the payout did not"
 
@@ -191,3 +204,88 @@ async def test_a_workflow_suspended_on_an_approval_resumes_when_another_process_
     assert payout["approved_by"] == "auditor-7"
     assert payout["captures"] == {"piano": "cap-piano", "stool": "cap-stool"}
     assert answered == ["pay"], "everything before the approval was read back out of Redis"
+
+
+# The pair, end to end, over a real one-second wait: an API process that only writes,
+# a worker process that only reads, and Redis holding everything between them. Its
+# budget is generous because the workflow really does sleep for a second.
+@pytest.mark.timeout(30)
+async def test_an_order_submitted_to_the_api_is_carried_to_payout_by_the_worker(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    checkpoints = RedisCheckpoints(redis=redis)
+    # The queue is namespaced per test so parallel runs do not pop each other's work,
+    # which a deployment would not do: there, sharing one queue *is* how work spreads.
+    wakeups = RedisWakeups(redis=redis, namespace=workflow)
+    worker = asyncio.create_task(work(checkpoints, wakeups))
+
+    try:
+        async with (
+            serving(payments_app(Payments(checkpoints=checkpoints, wakeups=wakeups))) as server,
+            httpx.AsyncClient(base_url=f"http://{server.host}:{server.port}") as client,
+        ):
+            submitted = await client.post(
+                "/orders",
+                json={"items": {"piano": 90_000, "stool": 4_000}},
+                headers={"idempotency-key": workflow},
+            )
+            assert submitted.status_code == 202
+
+            # The captures happen at once; the payout then waits out its settlement
+            # window, and the worker is the only thing that knows the window exists.
+            recorded = await until(client, workflow, lambda state: "settling" in state["recorded"])
+            assert set(recorded) == {"order", "items", "captured:piano", "captured:stool", "settling"}
+
+            # Past the deadline the timer makes it ready again, the pass runs, and it
+            # stops on the confirmation, where nothing but a person can move it.
+            await asyncio.sleep(1.5)
+            held = await client.get(f"/orders/{workflow}")
+            assert json.loads(held.text)["done"] is False
+
+            confirmed = await client.post(f"/orders/{workflow}/confirmation", json={"approved_by": "auditor-7"})
+            assert confirmed.status_code == 202
+
+            paid = await until(client, workflow, lambda state: state["done"])
+
+        assert paid["approved-by"] == "auditor-7"
+        assert paid["paid"] == f"pay-{workflow}-94000"
+    finally:
+        worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await worker
+
+
+async def until(client: httpx.AsyncClient, workflow: str, reached: object) -> dict[str, object]:
+    """Watch a workflow the way a UI would: poll its status until it says what we want."""
+    while True:
+        state = json.loads((await client.get(f"/orders/{workflow}")).text)
+        if reached(state):  # type: ignore[operator]
+            recorded: dict[str, object] = state["recorded"]
+            return recorded
+        await asyncio.sleep(0.05)
+
+
+async def test_a_second_worker_preparing_the_same_queue_is_not_an_error(redis: Redis, workflow: str) -> None:
+    # Every worker prepares the queue at boot, so all but the first find the consumer
+    # group already there. Redis reports that as an error; here it is the normal case.
+    wakeups = RedisWakeups(redis=redis, namespace=workflow)
+    await wakeups.prepare()
+    await wakeups.prepare()
+
+    await wakeups.make_ready("wf-after-two-prepares")
+    delivered = await wakeups.next_ready(timedelta(seconds=1))
+
+    assert delivered is not None
+    assert delivered.workflow == "wf-after-two-prepares"
+    assert await wakeups.next_ready(timedelta(milliseconds=50)) is None, "and nothing is delivered twice"
+
+
+async def test_a_queue_key_holding_something_other_than_a_stream_fails_loudly(redis: Redis, workflow: str) -> None:
+    # `prepare` forgives exactly one error, the one that means "another worker got here
+    # first". Anything else is a real problem with the queue and must not be swallowed.
+    await redis.set(f"{workflow}:ready", "not a stream at all")
+    wakeups = RedisWakeups(redis=redis, namespace=workflow)
+
+    with pytest.raises(ResponseError, match="WRONGTYPE"):
+        await wakeups.prepare()

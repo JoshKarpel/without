@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
 from dataclasses import dataclass
 from dataclasses import field
 
 import pytest
+from doubles import MemoryCheckpoints
 from integration.durable import Order
 from integration.durable import Reached
 from integration.durable import Services
@@ -14,28 +14,8 @@ from integration.durable import recorded_id
 from integration.durable import run_durably
 from integration.durable import run_saga
 from integration.durable import unwinding
-from without_dag import NodeKey
 
 ORDER = Order(order_id="o-7", sku="widget", cents=2500)
-
-
-@dataclass(frozen=True, slots=True)
-class MemoryCheckpoints:
-    """
-    A `Checkpoints` that keeps the hashes in a dict: the same seam, no container.
-
-    A test double rather than a mock, so the durable runner is exercised for real
-    (the load, the record, the resume) and only the storage is swapped, which is
-    what injecting the store buys.
-    """
-
-    hashes: dict[str, dict[NodeKey, object]] = field(default_factory=lambda: defaultdict(dict))
-
-    async def load(self, workflow: str) -> dict[NodeKey, object]:
-        return dict(self.hashes[workflow])
-
-    async def record(self, workflow: str, key: NodeKey, value: object) -> None:
-        self.hashes[workflow][key] = value
 
 
 @dataclass(slots=True)

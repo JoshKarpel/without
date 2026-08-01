@@ -36,6 +36,27 @@
   makes a settlement window (`run.sleep` records the deadline, so a crash mid-wait does not restart
   the clock) and a human approval (`run.awaiting`, satisfied by another process writing one field
   into the workflow's hash) ordinary lines of code.
+- **`integration`**: `durable.api` and `durable.worker`, an API server and a queue worker that make
+  the durable mechanism a running service, sharing only Redis. The API runs no workflow: submitting
+  an order and confirming a payout are the same two lines (record the value the workflow is waiting
+  on, then make it ready), because `Run.awaiting` cannot tell an initial payload from a human's
+  answer, and the workflow id is the request's `Idempotency-Key`, so resubmitting addresses the same
+  workflow rather than starting a second. The worker is a `Sink` over the queue plus a timer:
+  `Suspended` carrying a deadline is scheduled into a sorted set, `Suspended` without one is left
+  for the API's confirmation to enqueue, and nothing polls a workflow to ask whether it can proceed.
+  `durable.wakeups` is the two structures that take (a Redis stream of ready ids read as a consumer
+  group, and a deadline-scored sorted set) plus the one Lua script that moves a workflow between
+  them, since taking it off the sleepers and queueing it are durable only together: as two calls, a
+  timer that died in between would leave the workflow in neither structure and asleep forever.
+  Running the move in the server closes that gap and settles which of several timers owns a wakeup,
+  so every worker can run one. A stream rather than a list because a list loses work: a delivery
+  stays pending until acknowledged, so a worker that dies mid-pass leaves it to be reclaimed rather
+  than taking it to the grave, and the ack lands after the pass on every path but cancellation. A
+  worker runs up to `POOL` passes at once through `without`'s `limit_concurrency`, and every pull
+  takes exactly one delivery (a reclaimed one if any workflow was abandoned, otherwise a fresh read),
+  so it holds precisely as many wakeups as it is working on and stops reading at capacity. The
+  end-to-end test submits over HTTP, waits out a real one-second window, confirms, and reads the
+  payout back.
 - **`without-web`**: reverse routing. `url_for(route, values)` renders a route back to a concrete
   path from the values for its path parameters, the inverse of the trie walk. It is a plain
   function of the route *value* (routes are identified by value, no registry), each value fed back
