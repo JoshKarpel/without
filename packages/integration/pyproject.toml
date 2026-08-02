@@ -28,6 +28,7 @@ dependencies = [
     "pydantic-settings>=2.7",
     "httpx>=0.28",
     "redis>=8.0.1",
+    "psycopg[binary,pool]>=3.2",
 ]
 
 [tool.uv.sources]

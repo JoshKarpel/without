@@ -1,0 +1,483 @@
+# The same two seams as `store.py` and `schedule.py`, over one Postgres instead of one
+# Redis. It is the other half of the argument the Redis store makes, and putting the two
+# side by side is the point: `Checkpoints` and `Wakeups` state the guarantees, and a
+# store says how it reaches them, so a family of stores is not one good implementation
+# and one compromise.
+#
+# What is worth reading this file *for* is how little of it is mechanism. Every write in
+# `store.py` that had to be a Lua script is one statement here, or one transaction, and
+# neither is a thing this app supplies: a transaction is what a relational database is
+# for. Redis needed scripts because it has no way to say "check this, then write that,
+# and let nobody in between"; SQL says it by default. So the interesting comparison is
+# not "which store is better" but *where the atomic unit came from*, and here it came
+# with the database.
+#
+# Three tables, one database:
+#
+#   workflow_checkpoint   one row per (workflow, step), the value as jsonb
+#   workflow_claim        one row per workflow: whose pass it is, and until when
+#   workflow_queue        one row per (namespace, workflow), scored by when it is visible
+#
+# The third is what makes this a real alternative rather than half of one. The Redis
+# deployment is one server holding two unrelated structures; this is one database holding
+# three tables, which means the queue write and the checkpoint write *could* be one
+# commit. Nothing here does that, because the worker and the API are written against the
+# two protocols and neither knows they share a datastore, but it is the reason "you need
+# no second system" is a claim Postgres can make and Redis-plus-something cannot.
+#
+# Two consequences fall out of SQL that are worth naming, because both were live
+# questions in the Redis store and neither survives the move.
+#
+# A workflow id is a *parameter* here, never part of a key. `RedisCheckpoints` documents
+# a contract on ids (no braces, bounded length) purely because it builds key names by
+# interpolation; this store binds the id as a query parameter, so there is nothing to
+# say. That is the tell the Redis store's own docstring predicted: the contract was a
+# property of building keys by concatenation, not of workflow ids.
+#
+# Nothing expires. Redis re-arms a TTL on every write, which sweeps finished workflows
+# for free and costs the sharp edge that a workflow suspended longer than the TTL loses
+# its checkpoint while its wakeup survives. Here the rows stay until something deletes
+# them, so that failure is gone and a control-plane sweep is now homework (see the
+# package README's gaps). It also lets the fencing token be an ordinary counter rather
+# than the hybrid logical clock `store.py` needs: a token can only rewind if a claim row
+# disappears, and here that happens only if a sweep deletes it, which is a policy this
+# app chooses rather than a lifetime the store imposes.
+#
+# Namespacing is the connection's job, not the key's. `RedisCheckpoints` carries a
+# `namespace` because a Redis keyspace is one flat namespace; a table name is already
+# scoped by its schema and database, so two deployments sharing a server are two
+# databases (or two `search_path`s in the DSN) rather than two prefixes. The queue keeps
+# a `namespace` *column* because there the namespace separates queues rather than
+# deployments, and as a column it is data, which is the same move as the workflow id.
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime
+from datetime import timedelta
+from time import monotonic
+from typing import cast
+
+from psycopg import AsyncCursor
+from psycopg.rows import TupleRow
+from psycopg.types.json import Jsonb
+from psycopg_pool import AsyncConnectionPool
+
+from integration.durable.shell import Fenced
+from integration.durable.shell import Pass
+from integration.durable.stepwise import now_utc
+from integration.durable.wakeups import Delivery
+
+# The same two numbers `schedule.py` documents at length, and for the same reasons: a
+# taken workflow is invisible for `LEASE`, and a worker with nothing to do asks again
+# every `POLL`. They are restated rather than imported so that running this store pulls
+# in no Redis client at all, which is the whole shape of the offer.
+LEASE = timedelta(minutes=1)
+POLL = timedelta(milliseconds=50)
+
+# One DDL for one database, because it *is* one database. `value` is `jsonb` rather than
+# `json` so it is stored parsed: the codec decision `store.py` makes with `json.dumps` is
+# made here by the column type, and psycopg hands back ordinary Python values on the way
+# out. It carries the same cost, that a step result must be JSON-native, and the same
+# consolation, that an operator with `psql` can read a workflow's whole history.
+#
+# `NOT NULL` on `value` is not decoration: it is what keeps "no row" and "a row holding
+# JSON null" distinguishable, so a step that legitimately records `None` is not read back
+# as a step that never ran.
+#
+# The index is the one query that matters for throughput, `next_ready`'s scan for the
+# oldest visible row in a namespace. The other two tables are read by primary key.
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS workflow_checkpoint (
+    workflow text NOT NULL,
+    step text NOT NULL,
+    value jsonb NOT NULL,
+    PRIMARY KEY (workflow, step)
+);
+
+CREATE TABLE IF NOT EXISTS workflow_claim (
+    workflow text PRIMARY KEY,
+    token bigint NOT NULL,
+    held_until timestamptz NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS workflow_queue (
+    namespace text NOT NULL,
+    workflow text NOT NULL,
+    visible_at timestamptz NOT NULL,
+    PRIMARY KEY (namespace, workflow)
+);
+
+CREATE INDEX IF NOT EXISTS workflow_queue_visible_at ON workflow_queue (namespace, visible_at);
+"""
+
+# An arbitrary constant, and the only thing about it that matters is that every process
+# running this migration picks the same one. `CREATE TABLE IF NOT EXISTS` is not safe
+# against itself: two of them racing on a fresh database is a duplicate-key error in the
+# catalog rather than a no-op, and every worker runs the migration at boot.
+MIGRATION_LOCK = 0x77_0F_10_2026
+
+# Take the workflow if nobody holds it, and stamp the taking with the next number up.
+#
+# One statement, and every part of the Lua script it replaces is a clause of it. The
+# `WHERE` on `DO UPDATE` is the "is it free" check: a conflicting row whose lease has not
+# elapsed fails the predicate, so the update does not happen and `RETURNING` yields no
+# row, which is how a lost race is reported. The insert arm covers a workflow nobody has
+# ever claimed, and Postgres serializes two of those against each other on the primary
+# key, so the loser waits and then takes the `DO UPDATE` path rather than both winning.
+#
+# The clock is `now()`, which is the server's and is the transaction's start time. The
+# reasoning is the Redis store's: a lease compared against the claimant's own clock is
+# only as good as the agreement between the two, which is exactly what fails when a
+# machine is unhealthy enough to stall mid-pass.
+CLAIM = """
+INSERT INTO workflow_claim AS held (workflow, token, held_until)
+VALUES (%(workflow)s, 1, now() + %(lease)s)
+ON CONFLICT (workflow) DO UPDATE
+    SET token = held.token + 1, held_until = now() + %(lease)s
+    WHERE held.held_until <= now()
+RETURNING token
+"""
+
+# The fenced, conditional write, and the whole of `record` in one statement.
+#
+# The `FOR UPDATE` is doing real work rather than being belt-and-braces. Without it the
+# fence is read from the statement's snapshot, so a claim committing a microsecond after
+# the statement began would go unseen and a superseded pass's write would land. Taking
+# the row lock makes this statement queue behind any claim in flight and then re-read the
+# row it locked, so the token compared against is the newest one.
+#
+# The rest is `HSETNX` and its read-back, as one upsert. `DO UPDATE SET value = the value
+# already there` is a write that changes nothing and therefore returns the row that was
+# already stored, which is how a caller that lost the race learns the winner's value
+# instead of carrying on with its own. A plain `DO NOTHING` would return no row at all
+# and force a second read that a concurrent inserter could still beat.
+#
+#   returns  the value stored after the call, or no row at all when the pass is fenced
+RECORD = """
+WITH fence AS (
+    SELECT token FROM workflow_claim WHERE workflow = %(workflow)s FOR UPDATE
+)
+INSERT INTO workflow_checkpoint AS recorded (workflow, step, value)
+SELECT %(workflow)s, %(step)s, %(value)s FROM fence WHERE fence.token <= %(token)s
+ON CONFLICT (workflow, step) DO UPDATE SET value = recorded.value
+RETURNING recorded.value
+"""
+
+# The same conditional write without the fence, for a value that comes from outside any
+# pass. Deliberately not gated on a claim: an approval must not fail because a worker
+# happens to be mid-pass, and first-writer-wins is the whole guarantee it needs.
+SUPPLY = """
+INSERT INTO workflow_checkpoint AS recorded (workflow, step, value)
+VALUES (%(workflow)s, %(step)s, %(value)s)
+ON CONFLICT (workflow, step) DO UPDATE SET value = recorded.value
+RETURNING recorded.value
+"""
+
+# The three statements `transact` runs between `BEGIN` and `COMMIT`, with the effect's own
+# work in the middle. They are separate strings rather than one because the effect is
+# arbitrary application SQL that this store cannot see, which is precisely what makes the
+# transaction worth having.
+FENCE = "SELECT token FROM workflow_claim WHERE workflow = %s FOR UPDATE"
+ALREADY = "SELECT value FROM workflow_checkpoint WHERE workflow = %s AND step = %s"
+WRITE = "INSERT INTO workflow_checkpoint (workflow, step, value) VALUES (%s, %s, %s) RETURNING value"
+
+LOAD = "SELECT step, value FROM workflow_checkpoint WHERE workflow = %s"
+# Hand the workflow back early, but keep the token, so the next claim gets the next
+# number up and a pass that comes back from the dead still loses. Conditional on the
+# token for the same reason `release` is in the Redis store: a superseded pass letting go
+# must not hand away a claim someone else is holding.
+RELEASE = "UPDATE workflow_claim SET held_until = now() WHERE workflow = %s AND token = %s"
+
+# What an effect is for a store whose datastore is a Postgres database: an async callback
+# handed a cursor that is already inside `transact`'s transaction. The Redis store's is a
+# Lua script and the in-memory double's is a function over its own dict; nothing is shared
+# between the three but the position in `transact`.
+#
+# A callback rather than a statement-and-parameters pair, because the transaction is the
+# unit and a caller may need several statements in it, may need to read before it writes,
+# and may want ordinary Python between them. Whatever it returns is recorded as the step's
+# value, so it MUST be JSON-native, and it MUST confine itself to the cursor it is handed:
+# opening another connection puts the work outside the transaction and gives back exactly
+# the at-least-once gap `transact` exists to close.
+type SqlEffect = Callable[[AsyncCursor[TupleRow]], Awaitable[object]]
+
+
+async def migrate(pool: AsyncConnectionPool) -> None:
+    """
+    Create the three tables, from every process, as often as it likes.
+
+    Idempotent by `IF NOT EXISTS` and safe against itself by the advisory lock, which is
+    the part that is easy to skip: concurrent `CREATE TABLE IF NOT EXISTS` is a
+    duplicate-key error on the system catalog rather than a no-op, and a fleet of workers
+    booting together is exactly a race. `pg_advisory_xact_lock` is held to the end of the
+    surrounding transaction and released by the commit, so there is nothing to unlock.
+
+    Schema migration as a whole is not what this is. There is no versioning and no path
+    from one shape of these tables to another, which is the ordinary thing a deployment
+    would want and the ordinary tool (Alembic, sqitch, plain numbered SQL files) is where
+    it belongs.
+    """
+    async with pool.connection() as connection:
+        await connection.execute("SELECT pg_advisory_xact_lock(%s)", (MIGRATION_LOCK,))
+        await connection.execute(SCHEMA)
+
+
+@dataclass(frozen=True, slots=True)
+class PostgresCheckpoints:
+    """
+    A workflow's completed steps as rows in one table, and its claim as a row in another.
+
+    The `Checkpoints` implementation for the deployment that already has a Postgres, and
+    the one that can co-commit with the application's own tables, which is the capability
+    the whole `Effect` parameter exists for. `SqlEffect` is a callback over `transact`'s
+    open transaction, so a step whose effect is a write to *this* database happens exactly
+    once rather than at least once.
+
+    It holds a pool rather than a connection, because a pass is one short transaction and
+    several passes run at once: a worker with a pool of ten runs ten passes without them
+    queueing behind each other, and `next_ready`'s poll is not blocking a connection while
+    it waits. Call `migrate` once against the same pool before anything else, at the
+    entrypoint that built it.
+
+    The durability question `RedisCheckpoints` has to hedge on does not arise here.
+    `record` returning means the transaction committed, and a default Postgres has
+    `synchronous_commit` on, so the write is on disk and survives a crash of the server
+    rather than only of the client. That is the property `run_durably`'s reasoning about
+    the window between an effect and its record assumes, and the reason this store can be
+    read at its word where the Redis one asks for a configuration review first.
+
+    A workflow id carries no contract here at all. It is bound as a query parameter, so
+    it is never parsed as key structure, and the only constraint that survives is the one
+    `run_saga` states about any store: an id ending in `:unwind` addresses another
+    workflow's rollback.
+    """
+
+    pool: AsyncConnectionPool
+
+    async def load(self, workflow: str) -> dict[str, object]:
+        async with self.pool.connection() as connection, connection.cursor() as cursor:
+            await cursor.execute(LOAD, (workflow,))
+            # `jsonb` comes back already parsed, so the decode that `store.py` spends a
+            # `json.loads` on per field is the column type's job here.
+            return dict(await cursor.fetchall())
+
+    async def claim(self, workflow: str, lease: timedelta) -> Pass | None:
+        async with self.pool.connection() as connection, connection.cursor() as cursor:
+            await cursor.execute(CLAIM, {"workflow": workflow, "lease": lease})
+            taken = await cursor.fetchone()
+        if taken is None:
+            return None
+        return Pass(workflow=workflow, token=cast(int, taken[0]))
+
+    async def record(self, holder: Pass, key: str, value: object) -> object:
+        async with self.pool.connection() as connection, connection.cursor() as cursor:
+            await cursor.execute(
+                RECORD,
+                {"workflow": holder.workflow, "step": key, "value": Jsonb(value), "token": holder.token},
+            )
+            stored = await cursor.fetchone()
+        if stored is None:
+            # The statement wrote nothing, which happens for exactly one reason: the
+            # `WHERE` that guards the insert compared this pass's token against the fence
+            # and refused it. (A missing claim row would land here too, and a `Pass` is
+            # only ever handed out by a `claim` that wrote one.)
+            raise Fenced(f"{holder.workflow!r} moved on while this pass held it")
+        return stored[0]
+
+    async def transact(self, holder: Pass, key: str, effect: SqlEffect) -> object:
+        """
+        Run `effect` and record it in one transaction, so the step happens once.
+
+        The order is the Lua script's, for the same reasons: fence first, because a
+        superseded pass must not act; then the *existence* check, because a step already
+        recorded must not run again, which is what makes a replay perform nothing at all;
+        then the effect; then the record. What differs is that none of it needed a
+        mechanism. `BEGIN` and `COMMIT` are the atomicity, the connection pool's context
+        manager is what issues them, and an exception anywhere inside (the fence, the
+        effect's own SQL, a constraint the effect violated) rolls the whole thing back
+        including the record.
+
+        The effect's result is written and read back through the column rather than
+        returned as it came, so it round-trips through the codec exactly as a later pass
+        will see it. A step that returns something `jsonb` renders differently (a tuple,
+        which comes back a list) then does so on the first pass rather than surprising the
+        second.
+        """
+        async with self.pool.connection() as connection, connection.cursor() as cursor:
+            await cursor.execute(FENCE, (holder.workflow,))
+            fence = await cursor.fetchone()
+            if fence is None or holder.token < fence[0]:
+                raise Fenced(f"{holder.workflow!r} moved on while this pass held it")
+            await cursor.execute(ALREADY, (holder.workflow, key))
+            recorded = await cursor.fetchone()
+            if recorded is not None:
+                return recorded[0]
+            await cursor.execute(WRITE, (holder.workflow, key, Jsonb(await effect(cursor))))
+            return cast(tuple[object], await cursor.fetchone())[0]
+
+    async def supply(self, workflow: str, key: str, value: object) -> object:
+        async with self.pool.connection() as connection, connection.cursor() as cursor:
+            await cursor.execute(SUPPLY, {"workflow": workflow, "step": key, "value": Jsonb(value)})
+            return cast(tuple[object], await cursor.fetchone())[0]
+
+    async def release(self, holder: Pass) -> None:
+        async with self.pool.connection() as connection:
+            await connection.execute(RELEASE, (holder.workflow, holder.token))
+
+
+# Take the oldest workflow that is visible and push it a lease into the future, in one
+# statement, so two workers polling at the same instant cannot both take it.
+#
+# `FOR UPDATE SKIP LOCKED` is the whole of the distribution: the row the first worker is
+# updating is locked, and the second does not queue behind it but passes over it to the
+# next visible row. Without `SKIP LOCKED` a pool of workers polling one queue serializes
+# on its head; with it, they fan out. It is also why nothing here needs a consumer group.
+#
+# The new `visible_at` is returned because it *is* the receipt, which is the trick
+# `RedisSchedule` documents at length: a workflow appears once, so a wakeup arriving
+# mid-pass lands on top of the entry that pass is holding, and finishing has to be
+# conditional on the value being unchanged or it throws the wakeup away.
+#
+#   returns  the workflow and its new visibility, or no row when nothing is visible yet
+TAKE = """
+UPDATE workflow_queue AS entry
+SET visible_at = now() + %(lease)s
+FROM (
+    SELECT workflow FROM workflow_queue
+    WHERE namespace = %(namespace)s AND visible_at <= now()
+    ORDER BY visible_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+) AS due
+WHERE entry.namespace = %(namespace)s AND entry.workflow = due.workflow
+RETURNING entry.workflow, entry.visible_at
+"""
+
+# Make the workflow visible at `visible_at`, whatever it was waiting for before. A plain
+# upsert rather than a conditional one, including over a pass in flight: landing on top of
+# a running pass's lease is what keeps the wakeup alive, since that pass will now decline
+# to remove the row.
+SCHEDULE = """
+INSERT INTO workflow_queue (namespace, workflow, visible_at)
+VALUES (%(namespace)s, %(workflow)s, %(visible_at)s)
+ON CONFLICT (namespace, workflow) DO UPDATE SET visible_at = EXCLUDED.visible_at
+"""
+
+# Finish, but only if nothing asked for another pass in the meantime. Anything that did
+# wrote a different `visible_at`, so the equality is the whole check.
+FINISH = "DELETE FROM workflow_queue WHERE namespace = %s AND workflow = %s AND visible_at = %s"
+
+
+@dataclass(frozen=True, slots=True)
+class PostgresSchedule:
+    """
+    `Wakeups` as one table, each row scored by when its workflow becomes visible.
+
+    A drop-in for `RedisWakeups` and `RedisSchedule`: the same protocol, the same worker,
+    the same API. It is modelled on `RedisSchedule` rather than on the stream, and not
+    because a table cannot do better: queued now is a `visible_at` in the past, sleeping
+    is one in the future, and being worked on is one a lease ahead, so `wake_due`,
+    `reclaim`, and `prepare`'s queue half all have nothing to do, exactly as they do
+    there.
+
+    What Postgres adds over the sorted set is `SKIP LOCKED`, which is what lets several
+    workers poll one queue without serializing on its head, and what a `ZRANGEBYSCORE` in
+    a Lua script gets instead by being the only thing running.
+
+    What it does not add is the blocking read. This polls on `poll`, so an idle worker
+    costs a round trip per interval and a submitted order waits up to one interval to be
+    picked up, which is the same regression `RedisSchedule` takes and the same knob to
+    turn. Postgres can close it (`LISTEN`/`NOTIFY` on a dedicated connection, woken by a
+    trigger or by the writer) and this does not, which is the honest state of it rather
+    than a claim that a table cannot wait.
+
+    `namespace` separates queues rather than deployments, and it is a column rather than
+    part of a table name, so a queue name is data here as a workflow id is.
+    """
+
+    pool: AsyncConnectionPool
+    namespace: str = "workflow"
+    lease: timedelta = LEASE
+    poll: timedelta = POLL
+    # Only `make_ready` reads it: "visible now" is the one time a caller names, where the
+    # lease is measured by the server (in `TAKE`) and a deadline was chosen by the
+    # workflow itself. Injected so a test can place a wakeup in a clock it controls.
+    now: Callable[[], datetime] = now_utc
+
+    async def prepare(self) -> None:
+        """
+        Create the tables, which every worker does at boot and all but the first find done.
+
+        It creates the *checkpoint* tables too, because there is one database and one DDL
+        for it. That is a little more than this seam is asked for, and it is the right
+        place anyway: the worker already calls `prepare` before reading a queue, so a
+        deployment gets its schema from the same call whichever queue it runs, and an
+        entrypoint that would rather be explicit calls `migrate` itself.
+        """
+        await migrate(self.pool)
+
+    async def make_ready(self, workflow: str) -> None:
+        await self.schedule(workflow, self.now())
+
+    async def wake_at(self, workflow: str, when: datetime) -> None:
+        await self.schedule(workflow, when)
+
+    async def schedule(self, workflow: str, visible_at: datetime) -> None:
+        async with self.pool.connection() as connection:
+            await connection.execute(
+                SCHEDULE,
+                {"namespace": self.namespace, "workflow": workflow, "visible_at": visible_at},
+            )
+
+    async def wake_due(self, now: datetime) -> tuple[str, ...]:
+        """Nothing to do: a workflow whose `visible_at` has passed is already visible."""
+        return ()
+
+    async def next_ready(self, within: timedelta) -> Delivery | None:
+        """
+        The next visible workflow, waiting up to `within` for one to appear.
+
+        Polling, because nothing here is listening. `within` bounds how long a cancelled
+        worker sits in this call before it can notice, but unlike a blocking read it is
+        spent in round trips rather than in one parked call, which is the cost of the
+        design and the reason `poll` is a knob.
+        """
+        deadline = monotonic() + within.total_seconds()
+        while True:
+            async with self.pool.connection() as connection, connection.cursor() as cursor:
+                await cursor.execute(TAKE, {"namespace": self.namespace, "lease": self.lease})
+                taken = await cursor.fetchone()
+            if taken is not None:
+                workflow, visible_at = taken
+                # The receipt is the visibility this take wrote, rendered so it is a value
+                # rather than a place: `done` compares it back and declines to remove a row
+                # anything else has since rescheduled.
+                return Delivery(workflow=workflow, receipt=cast(datetime, visible_at).isoformat())
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return None
+            await asyncio.sleep(min(self.poll.total_seconds(), remaining))
+
+    async def reclaim(self, idle: timedelta) -> Delivery | None:
+        """Nothing to take over by hand: an abandoned workflow becomes visible on its own."""
+        return None
+
+    async def done(self, delivery: Delivery) -> None:
+        """
+        Drop the workflow, unless something asked for another pass while this one ran.
+
+        The receipt is the visibility this pass took, so anything that rescheduled the
+        workflow meanwhile (a confirmation, this pass's own `wake_at`, another worker
+        taking over an overrun) wrote a different one and this leaves it alone. That is why
+        a worker may call `wake_at` and then `done` in that order without the second
+        undoing the first.
+        """
+        async with self.pool.connection() as connection:
+            await connection.execute(
+                FINISH,
+                (self.namespace, delivery.workflow, datetime.fromisoformat(delivery.receipt)),
+            )

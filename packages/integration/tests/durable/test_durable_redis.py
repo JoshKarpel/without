@@ -8,23 +8,22 @@ from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Mapping
 from contextlib import suppress
-from dataclasses import dataclass
-from dataclasses import field
 from datetime import timedelta
 from uuid import uuid4
 
 import httpx
 import pytest
+from gateways import Gateway
+from gateways import paying
+from gateways import until
 from integration.durable import Contended
 from integration.durable import Fenced
 from integration.durable import LuaEffect
 from integration.durable import Order
-from integration.durable import Payouts
 from integration.durable import Reached
 from integration.durable import RedisCheckpoints
 from integration.durable import RedisSchedule
 from integration.durable import Run
-from integration.durable import Services
 from integration.durable import Suspended
 from integration.durable import Wakeups
 from integration.durable import claimed
@@ -108,36 +107,6 @@ def workflow() -> str:
     return f"test-{uuid4().hex}"
 
 
-@dataclass(slots=True)
-class Gateway:
-    calls: list[str] = field(default_factory=list)
-    broken: set[str] = field(default_factory=set)
-
-    async def perform(self, effect: str, result: str) -> str:
-        self.calls.append(effect)
-        if effect in self.broken:
-            raise RuntimeError(f"{effect} is down")
-        return result
-
-    def services(self) -> Services:
-        async def charge(order: Order) -> str:
-            return await self.perform("charge", f"ch-{order.order_id}")
-
-        async def reserve(order: Order) -> str:
-            return await self.perform("reserve", f"rs-{order.sku}")
-
-        async def ship(charge_id: str, reservation_id: str) -> str:
-            return await self.perform("ship", f"tr-{charge_id}-{reservation_id}")
-
-        async def refund(charge_id: str) -> str:
-            return await self.perform("refund", f"rf-{charge_id}")
-
-        async def release(reservation_id: str) -> str:
-            return await self.perform("release", f"rl-{reservation_id}")
-
-        return Services(charge=charge, reserve=reserve, ship=ship, refund=refund, release=release)
-
-
 async def test_a_workflow_resumes_from_a_checkpoint_left_in_redis_by_a_dead_process(
     redis: Redis,
     workflow: str,
@@ -186,24 +155,6 @@ async def test_a_compensation_is_recorded_under_its_own_key(redis: Redis, workfl
         "unwound": {"refunded": "rf-ch-o-42", "released": "rl-rs-gizmo"},
     }
     assert sorted(gateway.calls[-2:]) == ["refund", "release"]
-
-
-def paying(calls: list[str]) -> Payouts:
-    """A payout's effects, recording each one so a test can see what a pass performed."""
-
-    async def items(order_id: str) -> dict[str, int]:
-        calls.append("items")
-        return {"piano": 90_000, "stool": 4_000}
-
-    async def capture(sku: str, amount: int) -> str:
-        calls.append(f"capture:{sku}")
-        return f"cap-{sku}"
-
-    async def pay(order_id: str, total: int) -> str:
-        calls.append("pay")
-        return f"pay-{total}"
-
-    return Payouts(items=items, capture=capture, pay=pay)
 
 
 async def test_a_workflow_suspended_on_an_approval_resumes_when_another_process_records_it(
@@ -300,16 +251,6 @@ async def test_an_order_submitted_to_the_api_is_carried_to_payout_by_the_worker(
         worker.cancel()
         with suppress(asyncio.CancelledError):
             await worker
-
-
-async def until(client: httpx.AsyncClient, workflow: str, reached: object) -> dict[str, object]:
-    """Watch a workflow the way a UI would: poll its status until it says what we want."""
-    while True:
-        state = json.loads((await client.get(f"/orders/{workflow}")).text)
-        if reached(state):  # type: ignore[operator]
-            recorded: dict[str, object] = state["recorded"]
-            return recorded
-        await asyncio.sleep(0.05)
 
 
 async def test_only_one_of_many_processes_racing_for_a_workflow_gets_to_pass_over_it(

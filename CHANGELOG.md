@@ -117,6 +117,28 @@
   BLOCK` parks a worker inside Redis, a sorted set has none, so this polls and the interval is a
   floor under how fast anything starts. It is a drop-in, and the end-to-end test now runs the same
   API and worker over both queues to keep it one.
+- **`integration`**: `durable.postgres`, both seams over one Postgres: `PostgresCheckpoints` and
+  `PostgresSchedule` across three tables (`workflow_checkpoint`, `workflow_claim`,
+  `workflow_queue`), with `SqlEffect` as the effect type `transact` takes there, an async callback
+  handed a cursor inside the open transaction. It is the other half of the argument the Redis store
+  makes, and what it shows is where the atomic unit came from: every write that had to be a Lua
+  script is one statement or one transaction here, because SQL says "check this, then write that,
+  and let nobody in between" by default. The claim is an upsert whose `DO UPDATE` carries a `WHERE`
+  on the lease, so a conflicting row that is still held fails the predicate and `RETURNING` yields
+  nothing, which is how a lost race is reported; `record` is a `FOR UPDATE` CTE over the claim row
+  feeding an upsert whose `DO UPDATE SET value = the value already there` returns the winner's, and
+  the row lock is what makes the fence serialize against a claim in flight rather than read a stale
+  snapshot; the queue takes with `FOR UPDATE SKIP LOCKED`, so several workers polling one table fan
+  out instead of queueing on its head. Three things that were live questions on Redis do not arise:
+  a workflow id is a query parameter rather than key structure, so it carries no contract at all;
+  nothing expires, so the TTL that can lose a suspended workflow is gone and the fencing token can
+  be a plain counter rather than a hybrid logical clock; and a default Postgres commits
+  synchronously, so `record` returning means what `run_durably` assumes it means. What it costs is
+  that sweeping finished workflows becomes a job somebody writes, that `next_ready` still polls
+  (`LISTEN`/`NOTIFY` would close that and does not yet), and that `migrate` is three
+  `CREATE TABLE IF NOT EXISTS` under an advisory lock rather than a migration tool. The queue being
+  a table in the same database is what makes "no second system" a claim this can make, and the
+  end-to-end test now runs the same API and worker over Postgres as well.
 - **`without-web`**: reverse routing. `url_for(route, values)` renders a route back to a concrete
   path from the values for its path parameters, the inverse of the trie walk. It is a plain
   function of the route *value* (routes are identified by value, no registry), each value fed back

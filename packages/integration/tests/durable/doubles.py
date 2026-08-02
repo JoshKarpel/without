@@ -17,8 +17,9 @@ from integration.durable.shell import Pass
 from integration.durable.wakeups import Delivery
 
 # What an effect is for a store whose datastore is a dict: a function over that dict,
-# returning the value to record. The Redis store's is a Lua script; a Postgres one's
-# would take a session. Nothing is shared between them but the position in `transact`.
+# returning the value to record. The Redis store's is a Lua script and the Postgres
+# store's is a callback over an open transaction's cursor. Nothing is shared between the
+# three but the position in `transact`.
 type MemoryEffect = Callable[[dict[str, object]], object]
 
 # The two stores the durable toys talk through, in memory. They are doubles rather

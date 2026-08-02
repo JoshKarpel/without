@@ -143,8 +143,8 @@ omit = [
     "*/benchmarks/harness.py",
     "*/benchmarks/plot.py",
     "*/benchmarks/hotspots.py",
-    # The Redis half of the durable-workflow toy and the tests that drive it, omitted
-    # only when the run *cannot* cover them. Coverage substitutes `${VAR-default}` from
+    # The store-backed half of the durable-workflow toy and the tests that drive it,
+    # omitted only when the run *cannot* cover them. Coverage substitutes `${VAR-default}` from
     # the environment as it reads this file, and the `test` recipe sets
     # WITHOUT_COMPOSE_AVAILABLE once the services in compose.yaml are up: unset, each
     # entry is the bare glob and matches; set, its value prefixes the glob into a
@@ -154,7 +154,11 @@ omit = [
     "${WITHOUT_COMPOSE_AVAILABLE-}*/integration/durable/store.py",
     "${WITHOUT_COMPOSE_AVAILABLE-}*/integration/durable/wakeups.py",
     "${WITHOUT_COMPOSE_AVAILABLE-}*/integration/durable/schedule.py",
+    "${WITHOUT_COMPOSE_AVAILABLE-}*/integration/durable/postgres.py",
     "${WITHOUT_COMPOSE_AVAILABLE-}*/tests/durable/test_durable_redis.py",
+    "${WITHOUT_COMPOSE_AVAILABLE-}*/tests/durable/test_durable_postgres.py",
+    # The effects those two suites share, so it is reached only when they run.
+    "${WITHOUT_COMPOSE_AVAILABLE-}*/tests/durable/gateways.py",
 ]
 
 [tool.coverage.report]

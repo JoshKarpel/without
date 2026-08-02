@@ -138,7 +138,7 @@ class Run[Effect = Never]:
 
         The price is that `effect` has to be something the *store* can perform, which
         means it has to live in the store: a Lua script over keys in the same Redis, a
-        callback over the same Postgres session. An effect that leaves the datastore (a
+        callback over a cursor in the same Postgres transaction. An effect that leaves the datastore (a
         payment gateway, a carrier) cannot be in the commit, is not a transaction anyone
         can offer, and belongs in `step` with an idempotency key. That boundary is a fact
         about distributed transactions rather than a limitation of this seam, which is

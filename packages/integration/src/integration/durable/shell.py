@@ -76,9 +76,9 @@ class Checkpoints[Effect = Never](Protocol):
 
     `Effect` is how *this* store expresses a piece of work it can perform and record in
     one commit, and it is a type parameter because there is no shared answer: a Redis
-    store takes a Lua script over keys in that same Redis, a Postgres one would take a
-    callback handed the transaction's session, and an in-memory one takes a function over
-    its own dict. A store with nothing to offer here uses `Never`, which makes `transact`
+    store takes a Lua script over keys in that same Redis (`store.LuaEffect`), a Postgres
+    one takes a callback handed a cursor inside the open transaction
+    (`postgres.SqlEffect`), and an in-memory one takes a function over its own dict. A store with nothing to offer here uses `Never`, which makes `transact`
     uncallable rather than absent, since a caller cannot produce a value of that type.
     That is also the default, so bare `Checkpoints` reads as "any store, never mind what
     it can co-commit". An effect only ever goes *in*, so the parameter is contravariant
@@ -86,8 +86,8 @@ class Checkpoints[Effect = Never](Protocol):
     does not transact keeps the plain annotation and still accepts all of them.
 
     The narrow seam a durable runner talks through, so the store is injected rather than
-    reached for: a Redis hash in production (`store.RedisCheckpoints`), a plain dict in a
-    test. Its keys are plain names rather than this module's `NodeKey`, because the store
+    reached for: a Redis hash or a Postgres table in production
+    (`store.RedisCheckpoints`, `postgres.PostgresCheckpoints`), a plain dict in a test. Its keys are plain names rather than this module's `NodeKey`, because the store
     is the piece the two mechanisms here share: a graph records under its node names
     (`run_durably`) and an ordinary function under its step names (`stepwise`), and the
     store cannot tell, nor should it.

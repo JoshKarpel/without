@@ -23,3 +23,24 @@ services:
       interval: 1s
       timeout: 3s
       retries: 30
+
+  postgres:
+    image: docker.io/library/postgres:18-alpine
+    # Deliberately *not* tuned for speed. The Redis service above disables persistence
+    # because a checkpoint there lives for one test, but the whole point of the Postgres
+    # store is that a commit is a commit: turning off `fsync` or `synchronous_commit`
+    # would make the suite fast by removing the one property the store is claiming.
+    # Room for the suite rather than for a deployment: every test builds its own pool and
+    # pytest-xdist runs many at once, so the default cap of 100 is a limit on the harness
+    # instead of on anything being tested.
+    command: ["postgres", "-c", "max_connections=300"]
+    environment:
+      POSTGRES_PASSWORD: without
+      POSTGRES_DB: without
+    ports:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready --username postgres --dbname without"]
+      interval: 1s
+      timeout: 3s
+      retries: 30

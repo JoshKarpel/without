@@ -17,6 +17,9 @@ from integration.durable.payout import Payouts
 from integration.durable.payout import parse_approver
 from integration.durable.payout import parse_items
 from integration.durable.payout import pay_out
+from integration.durable.postgres import PostgresCheckpoints
+from integration.durable.postgres import PostgresSchedule
+from integration.durable.postgres import SqlEffect
 from integration.durable.schedule import RedisSchedule
 from integration.durable.shell import Checkpoints
 from integration.durable.shell import Contended
@@ -55,6 +58,8 @@ __all__ = [
     "Payments",
     "Payout",
     "Payouts",
+    "PostgresCheckpoints",
+    "PostgresSchedule",
     "Reached",
     "Receipt",
     "RedisCheckpoints",
@@ -63,6 +68,7 @@ __all__ = [
     "Rollback",
     "Run",
     "Services",
+    "SqlEffect",
     "StepKey",
     "SubmittedOrder",
     "Suspended",

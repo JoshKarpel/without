@@ -18,21 +18,26 @@ way to write an imperative shell.
 `durable` is a durable workflow mechanism built on `without-dag`, together with an
 API server and a queue worker that make it a running service. It asks how much of
 a workflow engine is left once the state is a checkpoint any process can read,
-and the answer it arrives at is a dict lookup, a queue, and a handful of small
-Lua scripts. Those scripts are the point: exclusion has to be enforced by
+and the answer it arrives at is a dict lookup, a queue, and whatever atomicity
+the store already has. Which store is the point: exclusion has to be enforced by
 whatever holds the data, which is what Temporal builds a server for and DBOS
-requires Postgres for, and here it is stated as requirements on the store seam.
-The same reasoning gets exactly-once out of Redis, since a script is an atomic
-commit over Redis data and the real constraint on co-committing an effect with
-its checkpoint is that both live in one datastore, not that one of them is
-Postgres. It is a validation artifact rather than a substitute for either:
-[`durable/README.md`](src/integration/durable/README.md) is the design, where the
-guarantee lives, the gaps that remain, and how it sits against those systems.
+requires Postgres for, and here it is stated as requirements on the store seam so
+that an implementation can say how it meets them. Two do. `RedisCheckpoints`
+reaches all of them with small Lua scripts, including exactly-once, since a
+script is an atomic commit over Redis data and the real constraint on
+co-committing an effect with its checkpoint is that both live in one datastore,
+not that one of them is Postgres. `PostgresCheckpoints` reaches them with
+ordinary transactions, which is the same guarantee arriving for free rather than
+being constructed, and it puts the queue in the same database so a deployment
+runs one system. It is a validation artifact rather than a substitute for any of
+them: [`durable/README.md`](src/integration/durable/README.md) is the design,
+where the guarantee lives, the gaps that remain, how the two stores differ, and
+how the whole thing sits against those systems (including what it owes DBOS).
 
-The Redis tests drive a real server rather than a fake: `just test` starts the
-services in `compose.yaml` with podman, hands each published address to pytest
-through the environment, and takes the stack down again from an exit trap. They
-carry a `compose` mark and skip when that address is unset (no podman on the
+The Redis and Postgres tests drive real servers rather than fakes: `just test`
+starts the services in `compose.yaml` with podman, hands each published address to
+pytest through the environment, and takes the stack down again from an exit trap.
+They carry a `compose` mark and skip when that address is unset (no podman on the
 machine, or pytest run directly), so `-m "not compose"` opts out up front.
 
 `transform` is a text-transform service built on the `without-asgi` adapters.

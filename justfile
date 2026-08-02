@@ -45,6 +45,7 @@ test *args:
         exit 1
       fi
       export WITHOUT_TESTS_REDIS="$("${compose[@]}" port redis 6379 2> /dev/null)"
+      export WITHOUT_TESTS_POSTGRES="$("${compose[@]}" port postgres 5432 2> /dev/null)"
       # The services are up, so the code only their tests reach is measurable. Coverage
       # substitutes this into its omit globs, where any non-empty value makes them match
       # nothing; the value says so out loud (see the note in pyproject.toml).

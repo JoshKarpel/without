@@ -256,10 +256,10 @@ class RedisCheckpoints:
     since deriving a sibling id by suffixing is true of that runner against any store.
 
     Note what is *not* on this list. The queue (`wakeups`, `schedule`) holds a workflow
-    id as a value rather than in a key name, so none of this applies there, and a store
-    that bound the id as a query parameter rather than concatenating it would have no
-    constraints at all. This is a property of building keys by interpolation, not of
-    workflow ids.
+    id as a value rather than in a key name, so none of this applies there, and
+    `postgres.PostgresCheckpoints` binds the id as a query parameter and so asks nothing
+    of it at all. This is a property of building keys by interpolation, not of workflow
+    ids.
     """
 
     redis: Redis

@@ -5,18 +5,18 @@ server and a queue worker that make it a running service.
 
 It exists to answer one question about the substrate: once workflow state is a
 checkpoint any process can read, how much of a workflow engine is left? The
-answer this arrives at is a dict lookup, a queue, and a handful of small Lua
-scripts. That is a claim about *mechanism*, and it holds. It is not a claim that
-this is a substitute for Temporal, DBOS, or LangGraph, and [Gaps](#gaps) is the
-specific list of why not.
+answer this arrives at is a dict lookup, a queue, and whatever atomicity the
+store already has - a handful of small Lua scripts on Redis, ordinary
+transactions on Postgres. That is a claim about *mechanism*, and it holds. It is
+not a claim that this is a substitute for Temporal, DBOS, or LangGraph, and
+[Gaps](#gaps) is the specific list of why not.
 
-The scripts are where the interesting part turned out to be, and they are the
-reason [Where the guarantee lives](#where-the-guarantee-lives) is its own
-section. A protocol of `load` and `record` is not enough to run a workflow
-safely, whatever the store underneath it can do, because it has no way to say
-"only if nobody else is running this" or "only if I am still the one who may
-write." That is the same problem Temporal answers with a server and DBOS answers
-by requiring Postgres.
+Where that atomicity comes from is the interesting part, and it is the reason
+[Where the guarantee lives](#where-the-guarantee-lives) is its own section. A
+protocol of `load` and `record` is not enough to run a workflow safely, whatever
+the store underneath it can do, because it has no way to say "only if nobody else
+is running this" or "only if I am still the one who may write." That is the same
+problem Temporal answers with a server and DBOS answers by requiring Postgres.
 
 ```text
 core.py      a fulfilment graph and its compensations (pure)
@@ -26,6 +26,7 @@ payout.py    a workflow the graph cannot express (pure)
 store.py     Checkpoints as a Redis hash, JSON-encoded: the claim, and LuaEffect
 wakeups.py   a Redis stream of ready ids and a deadline-scored sorted set
 schedule.py  the same Wakeups as one sorted set, as a drop-in alternative
+postgres.py  both seams over one Postgres: three tables, and SqlEffect
 worker.py    the queue worker and its timer
 api.py       three endpoints, none of which runs a workflow
 ```
@@ -76,7 +77,9 @@ diagram.
 
 `durable.api` and `durable.worker` are the piece that notices a suspension and
 comes back. They are an API server and a queue worker, deployed separately,
-sharing only Redis.
+sharing only the two stores. Neither mentions Redis or Postgres: both are written
+against `Checkpoints` and `Wakeups`, which is what lets the same two processes run
+over either.
 
 The API never runs a workflow. Submitting an order and confirming a payout are
 the same two-line move, `record` one value then `make_ready`, because both are
@@ -148,6 +151,16 @@ async with serving(payments_app(Payments(checkpoints=checkpoints, wakeups=wakeup
 await work(checkpoints, wakeups)
 ```
 
+Or over one Postgres, where both stores are tables in the same database and the
+two lines above it are the only difference:
+
+```python
+pool = AsyncConnectionPool(dsn, open=False)
+await pool.open(wait=True)
+await migrate(pool)  # three CREATE TABLE IF NOT EXISTS, under an advisory lock
+checkpoints, wakeups = PostgresCheckpoints(pool=pool), PostgresSchedule(pool=pool)
+```
+
 ## Where the guarantee lives
 
 Temporal and DBOS sit at two ends of one axis, and the axis is *who enforces that
@@ -168,23 +181,27 @@ than at-least-once.
 
 This puts it in the seam, which is a third position rather than a midpoint on
 that line: `Checkpoints` states the guarantees as requirements, and an
-implementation says how many of them it can meet. What that costs is that the
-implementations are *not* interchangeable, and the bottom row is why.
+implementation says how many of them it can meet. Both implementations here meet
+all of them, which is the point of having two. What it costs is that they are
+still not *interchangeable*, and the bottom row is why.
 
 | Capability | Redis | Postgres | What it buys |
 |---|---|---|---|
 | `record` a value durably | yes | yes | resumption at all |
 | Record only if absent, returning the winner | `HSETNX` in a script | `INSERT ... ON CONFLICT ... RETURNING` | two passes that both ran an effect agree on its result instead of diverging |
-| Exclusive pass with a fencing token | `HINCRBY` plus a lease, in a script | advisory lock or `SELECT FOR UPDATE` | one pass at a time, holding even when a process stalls past its lease |
+| Exclusive pass with a fencing token | `HINCRBY` plus a lease, in a script | an upsert whose `DO UPDATE` carries a `WHERE` | one pass at a time, holding even when a process stalls past its lease |
 | Step and checkpoint in one commit | a Lua script, for effects in *this* Redis | a transaction, for effects in *this* database | exactly-once for that step |
 
-All four are implemented, and the fourth is worth stating carefully because the
-obvious phrasing is wrong. It is not that Redis lacks what Postgres has: a Lua
-script is an atomic commit over Redis data, so a step whose effect *is* a Redis
-write records itself in the same script exactly as DBOS records itself in the
-same transaction. The real constraint is that you can only transact within a
-single datastore. Postgres wins this row only for effects that live in that
-Postgres, and loses it for everything else in precisely the way Redis does.
+All four are implemented in both stores, and the fourth is worth stating
+carefully because the obvious phrasing is wrong. It is not that Redis lacks what
+Postgres has: a Lua script is an atomic commit over Redis data, so a step whose
+effect *is* a Redis write records itself in the same script exactly as DBOS
+records itself in the same transaction. The real constraint is that you can only
+transact within a single datastore. Postgres wins this row only for effects that
+live in that Postgres, and loses it for everything else in precisely the way
+Redis does. What it wins in practice is that the effects usually *do* live there,
+which is a fact about where applications keep their data and not about the
+database.
 
 `Run.transact` is where that lands. `step` performs an effect and then writes the
 record, so a crash in between leaves the effect done and unrecorded and the next
@@ -205,7 +222,20 @@ await run.transact(
 
 That step is exactly-once on Redis. Run the workflow ten times and the ledger
 moves once, without an idempotency key and without the effect being written to
-tolerate repetition.
+tolerate repetition. The same step against `PostgresCheckpoints` is the same
+sentence with the store's own language in it, and the effect is now an ordinary
+application write rather than something staged into the checkpoint's datastore:
+
+```python
+async def reserve(cursor: AsyncCursor[TupleRow]) -> object:
+    await cursor.execute(
+        "UPDATE stock SET reserved = reserved + 1 WHERE sku = %s RETURNING reserved",
+        ("piano",),
+    )
+    return (await cursor.fetchone())[0]
+
+await run.transact("reserved", reserve)
+```
 
 What it costs is that the effect has to be something the store can perform, which
 means it has to live in the store. An effect that leaves the datastore (a payment
@@ -217,12 +247,12 @@ wearing a local disguise.
 
 This is why `Checkpoints` is generic. `Checkpoints[Effect]` names the type of
 thing *this* store can commit alongside a record, and there is no shared answer:
-Redis takes a Lua script, an in-memory store takes a function over its own dict
-(`tests/durable/doubles.py`), and a Postgres one would take a callback handed the
-session. `Effect` defaults to `Never`, so a store with nothing to offer here says
-so in its type and `transact` becomes uncallable rather than absent, while code
-that never transacts keeps writing the bare `Checkpoints` and still accepts every
-store.
+Redis takes a Lua script, Postgres takes an async callback handed a cursor inside
+the open transaction, and an in-memory store takes a function over its own dict
+(`tests/durable/doubles.py`). `Effect` defaults to `Never`, so a store with
+nothing to offer here says so in its type and `transact` becomes uncallable
+rather than absent, while code that never transacts keeps writing the bare
+`Checkpoints` and still accepts every store.
 
 So a family of stores is not one good implementation and one compromise. It is
 the same offer made to two populations, each able to co-commit for the effects
@@ -395,10 +425,134 @@ sorted set has no blocking read, so `RedisSchedule` polls, and the poll interval
 is a floor under how fast anything starts. In one line: a stream is cheaper to
 wait on, a sorted set is cheaper to reason about.
 
+## The same two seams over one Postgres
+
+`postgres.py` is `Checkpoints` and `Wakeups` again, over three tables in one
+database. It is the other half of the argument the Redis store makes: the seam
+states the guarantees, a store says how it reaches them, and putting two real
+stores side by side is what turns that from a design intention into something you
+can read.
+
+```text
+workflow_checkpoint   one row per (workflow, step), the value as jsonb
+workflow_claim        one row per workflow: whose pass it is, and until when
+workflow_queue        one row per (namespace, workflow), scored by when it is visible
+```
+
+What is worth reading it for is how little of it is mechanism. Every write that
+had to be a Lua script is one statement here, or one transaction, and neither is
+a thing this app supplies. Redis needs scripts because it has no way to say
+"check this, then write that, and let nobody in between"; SQL says it by default.
+So the comparison to draw is not which store is better but *where the atomic unit
+came from*, and here it came with the database:
+
+| | Redis | Postgres |
+|---|---|---|
+| Claim the workflow | the `CLAIM` script: read the lease, compare, write, expire | one upsert whose `DO UPDATE` carries a `WHERE` |
+| Record under the fence | the `RECORD` script: read the token, refuse or `HSETNX`, read back | one statement: a `FOR UPDATE` CTE feeding an upsert |
+| Supply from outside a pass | the `SUPPLY` script: `HSETNX`, read back | the same upsert without the CTE |
+| Step and checkpoint together | the `TRANSACT` script, a wrapper the effect is spliced into | `BEGIN` ... `COMMIT`, with the effect's own SQL in the middle |
+| Take the next ready workflow | the `TAKE` script, serialized against itself | `FOR UPDATE SKIP LOCKED` |
+
+The claim is the one to look at, because every clause of the script it replaces
+survives as a clause of the statement:
+
+```sql
+INSERT INTO workflow_claim AS held (workflow, token, held_until)
+VALUES (%(workflow)s, 1, now() + %(lease)s)
+ON CONFLICT (workflow) DO UPDATE
+    SET token = held.token + 1, held_until = now() + %(lease)s
+    WHERE held.held_until <= now()
+RETURNING token
+```
+
+The `WHERE` on `DO UPDATE` is the "is it free" check: a conflicting row whose
+lease has not elapsed fails it, the update does not happen, and `RETURNING` yields
+no row, which is how a lost race is reported. The insert arm covers a workflow
+nobody has ever claimed, and Postgres serializes two of those against each other
+on the primary key, so the loser waits and then takes the `DO UPDATE` path rather
+than both winning. The clock is the server's, for the reason the Lua script's is:
+a lease compared against the claimant's own clock is only as good as the agreement
+between the two, which is exactly what fails when a machine is unhealthy enough to
+stall mid-pass.
+
+`FOR UPDATE` in `record` is the one piece that is easy to leave out and wrong to.
+Without it the fence is read from the statement's snapshot, so a claim committing
+a microsecond after the statement began goes unseen and a superseded pass's write
+lands. Taking the row lock makes the write queue behind any claim in flight and
+then re-read the row it locked, so the token it compares against is the newest one.
+
+### What the move takes away
+
+Three things that were live questions on Redis do not arise here, and one of them
+is a load-bearing gap rather than a detail.
+
+**A workflow id carries no contract.** `RedisCheckpoints` asks an id not to
+contain braces and to stay short, purely because it builds key names by
+interpolating one. Here the id is a query parameter, so there is nothing to ask:
+an id full of braces, quotes, and semicolons addresses exactly itself. That is
+the tell the Redis store's own docstring predicted, that the contract was a
+property of building keys by concatenation rather than of workflow ids.
+
+**Nothing expires, so nothing is lost by expiring.** The Redis store re-arms a TTL
+on every write, which sweeps finished workflows for free and costs the sharp edge
+in the gaps below: a workflow suspended for longer than the TTL loses its
+checkpoint while its wakeup survives, and resumes into an empty one. Rows do not
+do that. The same change also lets the fencing token be an ordinary counter rather
+than the hybrid logical clock `store.py` needs, because a token can only rewind if
+a claim row disappears, and here that happens only if a sweep deletes it.
+
+**A commit is a commit.** `RedisCheckpoints` has to hedge on whether `record`
+returning means the value survived, because default persistence and asynchronous
+replication do not give that. A default Postgres has `synchronous_commit` on, so
+it does, which is why the test service is deliberately *not* tuned for speed: an
+`fsync=off` in `compose.yaml` would make the suite quick by removing the one
+property the store is claiming.
+
+### What it costs
+
+**The sweep is now homework.** Redis's TTL is a control plane you get for free.
+Here a finished workflow's rows stay until something deletes them, and nothing
+here does, so a long-running deployment needs a job that deletes checkpoints and
+claims past some age. That job is also the only way to bring back the reused-id
+hazard the counter avoids, so it should delete a workflow's claim and its
+checkpoint together or neither.
+
+**There is still no blocking read.** `PostgresSchedule` polls, exactly as
+`RedisSchedule` does, so the poll interval is a floor under how fast anything
+starts. Postgres can close this where a sorted set cannot (`LISTEN`/`NOTIFY` on a
+dedicated connection, woken by the writer or by a trigger), and this does not,
+which is the honest state of it rather than a claim that a table cannot wait.
+
+**`migrate` is not a migration tool.** It runs three `CREATE TABLE IF NOT EXISTS`
+under an advisory lock, which is enough to boot a fleet of workers concurrently
+(concurrent `IF NOT EXISTS` is a duplicate-key error on the system catalog, not a
+no-op) and nothing like enough to change the shape of these tables later. That is
+Alembic's job, or sqitch's, or numbered SQL files'.
+
+### One database, not two
+
+The queue being a table is what makes "you need no second system" a claim this can
+actually make. The Redis deployment is one server holding two unrelated
+structures; this is one database holding three tables, which also means a queue
+write and a checkpoint write *could* be one commit. Nothing here does that,
+because the worker and the API are written against the two protocols and neither
+knows they share a datastore. It is worth naming anyway, because it is the shape
+of the next thing: making a workflow ready in the transaction that records the
+step which decided to is a guarantee neither seam can currently express.
+
+What `SKIP LOCKED` buys is the other half. `RedisSchedule` gets exclusive takes by
+running its scan inside a script that is serialized against every other script;
+Postgres gets them by having the second poller step over the row the first is
+updating rather than queue behind it. Same outcome, and the second one is a lock
+manager doing its ordinary job rather than a global lock being borrowed.
+
 ## Gaps
 
 Two of these are load-bearing, in the sense that a deployment would be wrong
-rather than merely limited. They are listed first.
+rather than merely limited. Both are about the Redis store specifically, and the
+Postgres one is the answer to each, which is most of why it exists. They are
+listed first.
 
 **Redis is not obviously durable enough for the claim `run_durably` makes.** That
 docstring reasons carefully about the crash window between an effect and its
@@ -407,7 +561,7 @@ with default persistence and asynchronous replication does not give that: a
 failover can roll back acknowledged writes, and nothing here uses `WAIT`. The
 test `compose.yaml` disables persistence outright, which is right for tests and
 means the suite never exercises the question. Temporal on Cassandra or Postgres
-and DBOS on Postgres commit for real.
+and DBOS on Postgres commit for real, and so does `PostgresCheckpoints`.
 
 **The checkpoint TTL can lose a workflow that is behaving correctly.**
 `RedisCheckpoints.ttl` defaults to one day and is re-armed only on `record`. A
@@ -416,9 +570,12 @@ hash expires, while its entry in the sleeping sorted set (which has no TTL)
 survives. The timer then fires, the worker resumes, `load` returns `{}`, and the
 workflow suspends on its first `awaiting` forever, with whatever effects it
 already performed left standing. The `ttl` knob is the right idea and its default
-is shorter than the sleep semantics this same package advertises.
+is shorter than the sleep semantics this same package advertises. Rows do not
+expire, so `PostgresCheckpoints` trades this failure for a sweep somebody has to
+write.
 
-The rest are ordinary missing features, expected in something this size:
+The rest are ordinary missing features, expected in something this size, and hold
+for either store unless they name one:
 
 - **An effect outside the store is still at-least-once.** The claim stops a
   second pass from starting, and the fence stops a superseded one from writing,
@@ -439,9 +596,12 @@ The rest are ordinary missing features, expected in something this size:
 - **No history.** The checkpoint is latest-state only: no timestamps, no attempt
   counts, and no record of a failure. From the store, a failed workflow and a
   suspended one are indistinguishable.
-- **No enumeration, cancellation, or search.** Checkpoints are keyed by workflow
-  id with no index over them, so listing means `SCAN`. Nothing can terminate or
-  reset a workflow.
+- **No enumeration, cancellation, or search.** Nothing can terminate or reset a
+  workflow, and nothing exposes a list of them. How hard that would be to add
+  differs in kind between the stores: Redis checkpoints are keyed with no index
+  over them, so listing means `SCAN`, where a table answers "which workflows are
+  suspended" with an ordinary query. That is the clearest thing Postgres offers
+  that this does not yet spend.
 - **Determinism is documented, not enforced.** Nothing stops a workflow calling
   out to the network between two steps. `Run` does take its clock as an argument,
   which covers the most common case. The failure mode is milder than Temporal's,
@@ -455,8 +615,9 @@ The rest are ordinary missing features, expected in something this size:
   `RedisSchedule` does not have this gap at all, which is the strongest single
   argument for it.
 - **JSON restricts what a step can return,** and nothing bounds a payload's size.
-  The codec is the app's boundary decision, so `store.py` is the only file a
-  richer one changes.
+  The codec is the app's boundary decision, so `store.py` and `postgres.py` are
+  the only files a richer one changes: one spends a `json.dumps`, the other
+  declares a `jsonb` column and lets the driver do it.
 
 ## Against the alternatives
 
@@ -467,7 +628,7 @@ identifies a step across a replay, and who guarantees one writer.
 | | Closest piece here | What it has that this does not |
 |---|---|---|
 | **Temporal** | `stepwise` | An event history replayed in order, a versioning API for changing in-flight code, retries and timeouts and heartbeats, visibility and search, a determinism sandbox |
-| **DBOS** | `stepwise`, almost exactly: a library plus a database, no server of its own | Postgres commit semantics, a step and its own write in one transaction, recovery of pending workflows at startup, queues with concurrency and rate limits, workflow and step status tables |
+| **DBOS** | `stepwise` over `PostgresCheckpoints`, almost exactly: a library plus a database, no server of its own | Recovery of pending workflows at startup, queues with concurrency and rate limits, workflow and step status tables, decorators that make all of it invisible, a real migration story |
 | **LangGraph** | `run_durably` over `without-dag` | The same graph-plus-checkpointer shape, with per-superstep state snapshots, time travel, and a platform for scheduling |
 | **Restate** | the `api`/`worker` pair | Also a single binary rather than a cluster, with exclusion structural in keyed virtual objects rather than leased |
 
@@ -476,6 +637,39 @@ starting position (a durable workflow should not need a cluster) and still
 concludes it needs a log and a leader per key. What it gets for that is exclusion
 that does not expire: a lease has to be guessed at, and a partition leader does
 not.
+
+### Credit, and how this sits next to DBOS
+
+[DBOS Transact](https://github.com/dbos-inc/dbos-transact-py) is the direct
+inspiration for the Postgres half, and two of its findings are load-bearing here.
+The first is that a library plus a database is enough, so the exclusion a durable
+workflow needs does not require a server to be built for it. The second is
+sharper and is the whole reason `transact` exists: a step's own business write and
+its checkpoint, committed together, is what moves that step from at-least-once to
+exactly-once, and no amount of care in user code reproduces it. Both are theirs,
+and this repo would not have looked for either. What is borrowed is those ideas
+and nothing else: the three tables here were designed for this toy's own two
+protocols and look nothing like theirs.
+
+Where this differs is worth stating plainly, because it is a different position
+rather than a smaller version of the same one:
+
+- **The guarantee lives in the seam, not in the database.** DBOS requires
+  Postgres, and that requirement is what lets it supply the semantics. Here
+  `Checkpoints` states the requirements and Postgres is one implementation that
+  meets them, alongside Redis, which meets them too. What DBOS gets for its choice
+  is that it can assume the semantics everywhere; what this gets is that a
+  deployment brings whatever it already runs.
+- **Steps are named at the call site, not declared by a decorator.**
+  `await run.step("charged", ...)` puts what is durable, and under what key, in
+  the line that does it. A decorator makes the ordinary case shorter and moves the
+  key off the call. That is the usual locality trade, taken deliberately in the
+  other direction, and DBOS's version is far nicer to use.
+- **This is a validation artifact and that is not a modest disclaimer.** No
+  recovery of pending workflows at startup, no status tables, no queues with
+  concurrency or rate limits, no retries, no observability. The [Gaps](#gaps)
+  above are the specific list. DBOS is a product built to run production
+  workflows; this exists to find out what the substrate makes cheap.
 
 Two choices here differ from all of them in a way worth naming, with what each
 costs:
@@ -498,9 +692,14 @@ costs:
 
 ## Tests
 
-The Redis tests drive a real server rather than a fake, under the `compose` mark
-that the [integration README](../../../README.md) describes. The end-to-end test
-submits over HTTP, waits out a real one-second window, confirms, and reads the
-payout back. Everything else runs against dicts, because `Checkpoints` and
-`Wakeups` are injected: `tests/durable/doubles.py` is the in-memory pair, and it
-is what lets the worker be driven without a server at all.
+The Redis and Postgres tests drive real servers rather than fakes, under the
+`compose` mark that the [integration README](../../../README.md) describes. Each
+store gets the same end-to-end test, submitting over HTTP, waiting out a real
+one-second window, confirming, and reading the payout back, which is what keeps
+"the same API and worker over either store" a claim rather than an aspiration.
+They share their gateway doubles (`tests/durable/gateways.py`) for the same
+reason: where the two suites differ should be the store and nothing else.
+
+Everything else runs against dicts, because `Checkpoints` and `Wakeups` are
+injected: `tests/durable/doubles.py` is the in-memory pair, and it is what lets
+the worker be driven without a server at all.
