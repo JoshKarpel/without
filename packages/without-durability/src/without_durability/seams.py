@@ -25,9 +25,50 @@ from datetime import timedelta
 from typing import Never
 from typing import Protocol
 
-# How long a claim is good for. It has to exceed the longest a pass can honestly take,
-# since a pass that outlives its claim finds its writes `Fenced` and has to start over.
+# How long a claim is good for, and how long a delivery stays its taker's. It has to
+# exceed the longest a pass can honestly take, since a pass that outlives its claim finds
+# its writes `Fenced` and has to start over.
+#
+# One number for both, defined once here and read by every store and the worker, because
+# the two are not independent: a delivery that becomes reclaimable before its holder's
+# claim expires is handed to a worker that cannot yet write, which spends a pass to
+# discover it. Keeping a second copy per store would let the two drift silently, so a
+# store that wants a different window sets `Scheduler.lease` and the worker follows it
+# (see `Scheduler` and `worker.work`).
 LEASE = timedelta(minutes=1)
+
+
+def check_duration(name: str, duration: timedelta) -> None:
+    """
+    Refuse a duration that is not positive, where the value enters.
+
+    Every timing here is an amount of time to let pass, and not one of them has a
+    meaningful zero: a lease that has already expired when it is granted excludes nobody,
+    a `poll` or a `tick` of zero spins, and a blocking read bounded by zero turns the
+    worker's pull into a busy loop over the queue. So the check is on all of them rather
+    than on the one that matters most, which is the lease: its failure is the only silent
+    one (two passes then run the same unrecorded step and nothing raises at all), but
+    "this one is quiet and those merely burn a core" is a poor reason to leave a
+    footgun in, and one comparison at construction removes the question for every one of
+    them.
+
+    At the boundary rather than at the point of use, because a duration assembled from
+    configuration (`timedelta(seconds=settings.lease_seconds)`, with the setting unset) is
+    exactly how a zero arrives, and by the time a claim is being granted with it there is
+    nothing left to say.
+
+    Two durations are deliberately *not* run through this, because they are thresholds
+    rather than intervals and their zero means something: `reclaim`'s `idle` (take over
+    anything outstanding, however recently it was delivered) and SQLite's `busy_timeout`
+    (do not wait for the write lock at all).
+
+    What no check reaches is the bound that decides correctness, that a lease exceed the
+    longest a pass can honestly take. Only the deployment knows that (see the guide's
+    gaps), so this rules out the values that are nonsense rather than certifying the ones
+    that are not.
+    """
+    if duration <= timedelta():
+        raise ValueError(f"{name} must be a positive duration, but got {duration}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,7 +286,28 @@ class Scheduler(Protocol):
     time. The stream will happily deliver two scheduler for one workflow to two consumers,
     and that is safe because exclusion belongs to `Checkpointer.claim` rather than here:
     this seam answers "who owes a pass", the checkpoint store answers "who may write".
+
+    `lease` is how long a delivery stays its taker's, and it is on the store rather than
+    an argument to every call because the same number has to bound the *checkpoint*
+    claim. The implementations reach it by different routes (an idle threshold `reclaim`
+    measures against, or the invisibility a visibility-scored queue writes when it takes
+    one) and it is the answer to the same question either way, so `worker.work` reads it
+    here and claims the workflow for exactly as long. A worker that took the two from
+    different places would eventually take one shorter than the other, and the failure is
+    quiet: a delivery reclaimed while its holder can still write is a pass spent finding
+    out that somebody else owns the workflow. That is why this is the one knob and why
+    turning it means constructing the scheduler with a different one.
+
+    A `wake_at` deadline is the *caller's* clock, where a lease is measured by the
+    store's. A workflow chooses its own deadline (`Run.sleep` records one), and nothing
+    else can say what it meant, so the skew a lease is deliberately protected from is one
+    a deadline still carries: a wakeup lands early or late by whatever the two clocks
+    disagree by. It is a bound on how promptly a sleep ends rather than on correctness,
+    since a pass that wakes too early finds its deadline unreached and suspends again.
     """
+
+    @property
+    def lease(self) -> timedelta: ...
 
     async def prepare(self) -> None: ...
 
@@ -341,6 +403,7 @@ async def claimed(checkpointer: Checkpointer, workflow: str, lease: timedelta = 
     losing the race is ordinary there and the answer is to come back later rather than
     to fail.
     """
+    check_duration("a lease", lease)
     holder = await checkpointer.claim(workflow, lease)
     if holder is None:
         raise Contended(f"another pass holds {workflow!r}")

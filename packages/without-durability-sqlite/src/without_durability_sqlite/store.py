@@ -43,15 +43,18 @@ from typing import cast
 
 from without_durability.codec import JSON
 from without_durability.codec import CheckpointCodec
+from without_durability.seams import LEASE
 from without_durability.seams import Delivery
 from without_durability.seams import Fenced
 from without_durability.seams import Pass
 from without_durability.seams import Recorded
+from without_durability.seams import check_duration
 from without_durability.stepwise import now_utc
 
-# The same two numbers the other queues document: a taken workflow is invisible for
-# `LEASE`, and a worker with nothing to do asks again every `POLL`.
-LEASE = timedelta(minutes=1)
+# How often a worker with nothing to do asks again, which is the price of having no
+# blocking read. The *lease* is not restated here: it is `seams.LEASE`, because unlike the
+# poll interval it has to agree with something outside this store (the checkpoint claim
+# the worker takes for exactly as long).
 POLL = timedelta(milliseconds=50)
 
 # `value` is TEXT rather than a richer type, which is the same shape the Redis store's
@@ -400,6 +403,11 @@ class SqliteScheduler:
 
     database: Database
     namespace: str = "workflow"
+    # How long a taken workflow stays invisible, and so how long after a process dies
+    # before another picks its workflow up. `worker.work` reads it and claims the workflow
+    # for the same span, which is the whole reason it is one number: a workflow that
+    # becomes visible before its claim lapses is taken by a worker that cannot write to it
+    # yet. This is the knob for a deployment whose passes take longer than a minute.
     lease: timedelta = LEASE
     poll: timedelta = POLL
     # Only `make_ready` reads it: "visible now" is the one time a caller names, where the
@@ -413,6 +421,8 @@ class SqliteScheduler:
     poll_seconds: float = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        check_duration("a lease", self.lease)
+        check_duration("a poll interval", self.poll)
         object.__setattr__(self, "lease_seconds", self.lease.total_seconds())
         object.__setattr__(self, "poll_seconds", self.poll.total_seconds())
 

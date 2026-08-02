@@ -54,9 +54,14 @@
   than taking it to the grave, and the ack lands after the pass on every path but cancellation. A
   worker runs up to `POOL` passes at once through `without`'s `limit_concurrency`, and every pull
   takes exactly one delivery (a reclaimed one if any workflow was abandoned, otherwise a fresh read),
-  so it holds precisely as many wakeups as it is working on and stops reading at capacity. The
-  end-to-end test submits over HTTP, waits out a real one-second window, confirms, and reads the
-  payout back.
+  so it holds precisely as many wakeups as it is working on and stops reading at capacity. How long
+  a pass may honestly take is one number rather than two, and it lives on the scheduler
+  (`PostgresScheduler(pool=pool, lease=...)`): `work` reads it and claims the workflow for exactly
+  as long, because the two windows disagreeing fails quietly, a delivery reclaimable before its
+  holder's claim lapses going to a worker that cannot write to it yet. The rest of the loop's
+  timings are arguments to `work` (`tick`, `within`, `contended`, `limit`), and every duration
+  across the stores and the worker is refused at construction unless it is positive. The end-to-end
+  test submits over HTTP, waits out a real one-second window, confirms, and reads the payout back.
 - **`integration`**: `durable`'s `Checkpointer` seam now states the guarantees a store has to
   provide, and the Redis one provides them. A protocol of `load` and `record` was too weak to run
   a workflow safely at any scale: it had no way to say "only if nobody else is running this" or
@@ -246,6 +251,9 @@
   `waking` and `trimming` are both sinks over it now, which means the same code runs off a timer,
   off a queue an operator pokes, or off a fixed list of instants in a test. Each tick carries its
   own moment, so a consumer needs no clock of its own and a test controls time by choosing values.
+  An interval that is not positive is refused, as `drive` refuses a `limit` below one: taken
+  literally it is a loop that yields as fast as its sink can consume, which pins a core to do
+  housekeeping, and a duration read from a setting that was never set is how one arrives.
 - **`without-web`**: reverse routing. `url_for(route, values)` renders a route back to a concrete
   path from the values for its path parameters, the inverse of the trie walk. It is a plain
   function of the route *value* (routes are identified by value, no registry), each value fed back
@@ -313,6 +321,15 @@
   rather than masquerading as a client 400.
 
 ### Changed
+
+- **`without-dag`**: `Graph.node` takes the node's key as its first argument
+  (`graph.node("charged", charge, order)`), and `NodeKey` is a `str` rather than any `Hashable`.
+  A key was previously an `object()` the builder minted, which is unique but means nothing on the
+  other side of a crash; a name chosen in the source is what lets a run's `(key, result)` pairs be
+  stored and handed back as a `checkpoint`, so the key had to become something a store can hold and
+  a human can recognise in one. It must be distinct from every other key in the graph, and entries
+  are keyed by position (`input:0`), which a node may not take. Existing graphs add a name per
+  `node` call; nothing else about the builder changes.
 
 - **`without-web`**: the extractor context type `Request` is renamed `RequestHead` and no longer
   carries the request body. `RequestHead` is exactly the parsed head an extractor reads (scope,

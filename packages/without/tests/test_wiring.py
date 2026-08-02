@@ -277,11 +277,25 @@ async def test_ticks_fires_at_once_and_then_on_the_interval() -> None:
     moments = [datetime(2026, 3, 14, 9, 30, tzinfo=UTC) + timedelta(seconds=n) for n in range(3)]
     handed = iter(moments)
 
-    beating = ticks(timedelta(), now=lambda: next(handed))
+    # The smallest positive interval, so the waiting is not what this measures: the moments
+    # come from the clock it was handed, and only the *first* one proves it yields before
+    # it sleeps at all.
+    beating = ticks(timedelta(microseconds=1), now=lambda: next(handed))
     taken = [await anext(beating) for _ in moments]
     await beating.aclose()
 
     assert taken == moments, "each tick carries its own moment, so a consumer needs no clock"
+
+
+@pytest.mark.parametrize("every", [timedelta(), timedelta(seconds=-1)])
+async def test_ticks_refuses_an_interval_that_is_not_positive(every: timedelta) -> None:
+    # There is no reading of a zero interval worth having: taken literally it is a loop
+    # that yields as fast as its sink can consume, which pins a core to do housekeeping.
+    # A duration read out of configuration whose setting was never set is how one arrives.
+    beating = ticks(every)
+
+    with pytest.raises(ValueError, match="every must be a positive duration"):
+        await anext(beating)
 
 
 async def test_ticks_waits_the_interval_between_events() -> None:

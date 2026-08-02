@@ -98,7 +98,20 @@ async def run_durably[*Ins, Out](
     stepwise mechanism reaches it because a step names its effect at the call site
     (`run.transact(...)`); expressing that here would mean a node type that hands
     the graph an effect instead of running one.
+
+    A graph whose output is one of its own *entries* is refused rather than run.
+    `evaluate` supports that identity plan, because an entry it was handed is a
+    value it can return; here the output is read back out of the checkpoint, and an
+    entry is the one thing a checkpoint never holds (it is fed positionally on
+    every call, which is why `Graph.of` keys entries by position). So the run would
+    record every node correctly and then fail looking for a key that was never
+    going to be there.
     """
+    if run.output in run.inputs:
+        raise ValueError(
+            f"{run.output!r} is one of this graph's entries rather than a node, and an entry is "
+            f"never recorded, so there would be nothing to resume from or to return"
+        )
     checkpoint = await checkpointer.load(holder.workflow)
     async for key, value in run.stream(*values, checkpoint=checkpoint):
         recorded = await checkpointer.record(holder, key, value)

@@ -24,6 +24,7 @@ from without_durability_redis import RedisCheckpointer
 from without_durability_redis import RedisSetScheduler
 from without_durability_redis import RedisStreamScheduler
 from without_durability_redis import trimming
+from without_durability_redis.checkpointer import fenced
 
 # `just test` starts the services in compose.yaml and publishes each address; these
 # tests drive the real server it started rather than a fake, and skip when it did not
@@ -206,6 +207,22 @@ async def test_a_store_error_that_is_not_the_fence_is_not_swallowed(redis: Redis
 
     with pytest.raises(ResponseError, match="WRONGTYPE"):
         await checkpointer.record(holder, "paid", "pay-1")
+
+
+@pytest.mark.parametrize(
+    ("message", "refusal"),
+    [
+        ("FENCED pass 3 superseded by 4", True),
+        ("WRONGTYPE Operation against a key holding the wrong kind of value", False),
+        # The reason the check is anchored rather than a search: the word can reach a
+        # message as *data* (a workflow id, a step's own encoding quoted back by a script
+        # error), and reading that as a fence would tell a healthy pass to stand down over
+        # a store that is actually broken.
+        ("ERR user_script:1: cannot encode the value 'FENCED' script: 3d4f", False),
+    ],
+)
+def test_only_a_refusal_that_leads_with_the_code_is_read_as_a_fence(message: str, refusal: bool) -> None:
+    assert fenced(ResponseError(message)) is refusal
 
 
 async def test_a_second_worker_preparing_the_same_queue_is_not_an_error(redis: Redis, workflow: str) -> None:

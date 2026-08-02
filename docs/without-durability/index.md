@@ -156,7 +156,7 @@ async with serving(payments_app(Payments(durable=durable))):
     await asyncio.Event().wait()
 
 # the worker process, however many of them
-await work(durable)
+await work(durable, submitted)
 ```
 
 Or over one Postgres, where both stores are tables in the same database and the
@@ -168,6 +168,55 @@ await pool.open(wait=True)
 await migrate(pool)  # three CREATE TABLE IF NOT EXISTS, under an advisory lock
 durable = PostgresDurable(PostgresCheckpointer(pool=pool), PostgresScheduler(pool=pool))
 ```
+
+How long a pass may honestly take is the one timing a deployment usually has to
+change, and it is a single number on the scheduler:
+`PostgresScheduler(pool=pool, lease=timedelta(minutes=5))` keeps a taken workflow
+invisible for five minutes, and `work` reads that back and claims the workflow for
+five minutes to match. It sits on the store rather than being an argument to `work`
+because the queue is where half of it is already written (a visibility-scored store
+puts it in the row it takes), and because the two halves disagreeing is a quiet
+failure rather than a loud one: a delivery that becomes reclaimable before its
+holder's claim lapses goes to a worker that cannot write to it yet, which spends a
+whole pass discovering that. What `work` does take is the rest of the loop's
+timings: `tick` for the timer, `within` for how long a read blocks before the loop
+can notice a shutdown, `contended` for how long to leave a workflow somebody else
+holds, and `limit` for the pool.
+
+### How the timings relate
+
+There are six durations across the stores and the worker, and the natural worry is
+that they form a hierarchy nobody has written down. They mostly do not, and where
+one relation would have had teeth it was designed out rather than documented:
+
+| Duration | Where it is set | What it depends on |
+|---|---|---|
+| `lease` | the scheduler | how long a pass can honestly take, which is a property of the *workflow*, not of any other setting |
+| `poll` | the scheduler | nothing; above `within` it merely stops having an effect |
+| `within` | `work` | nothing; it is a shutdown bound, not a rate |
+| `tick` | `work` | nothing; it is the granularity a slept-out workflow wakes at |
+| `contended` | `work` | nothing; a preference about how eagerly to re-look |
+| `ttl` | `RedisCheckpointer` | the longest a workflow may *wait*, which is again the workflow's property |
+
+Two of those are worth spelling out. `poll` and `within` interact but cannot
+conflict, because `next_ready` sleeps for `min(poll, remaining)`: a poll interval
+longer than the read budget costs one extra attempt and nothing else, so the pair
+needs no rule. And `ttl` looks like it must exceed `lease`, since a checkpoint that
+expires under a live claim would take the fencing token with it, but it does not:
+the Redis `CLAIM` script stamps each token `max(now_ms, previous + 1)`, a hybrid
+logical clock, precisely so that a claim key recreated after an expiry still
+outranks a pass stalled since before it. The dependency was removed rather than
+left for an operator to respect, which is the shape to prefer whenever it is
+available.
+
+What that leaves is one relation with real teeth, and it is the one no check can
+reach: a `lease` has to exceed the longest a pass takes, and a Redis `ttl` has to
+exceed the longest sleep or approval a workflow can sit in. Both right-hand sides
+are facts about the workflow body rather than about any configured value, so they
+are stated as requirements (see `RedisCheckpointer` and the [gaps](#gaps)) and
+guessed at by whoever deploys. What *is* enforced is the floor: every one of these
+is refused at construction unless it is a positive duration, since none of them has
+a meaningful zero and a duration read from an unset setting is how one arrives.
 
 ## Where the guarantee lives
 
@@ -476,11 +525,13 @@ features, expected in something this size:
   the API an ordinary client retry under the same idempotency key supplies the
   missing wakeup, but nothing here retries on the caller's behalf and no sweep
   looks for workflows in that state. `PostgresDurable` does not have this gap.
-- **The lease is a guess, not a bound.** `LEASE` has to exceed the longest a pass
-  can honestly take. Set it too short and a slow pass is fenced mid-flight and
-  has to be re-run; too long and a crashed worker's workflow waits that long.
-  Nothing renews it while a pass runs, deliberately: the fence makes an overrun
-  safe rather than corrupting, so renewal would buy throughput, not correctness.
+- **The lease is a guess, not a bound.** `Scheduler.lease` has to exceed the
+  longest a pass can honestly take, and nothing can work that out for you. Set it
+  too short and a slow pass is fenced mid-flight and has to be re-run; too long
+  and a crashed worker's workflow waits that long. Nothing renews it while a pass
+  runs, deliberately: the fence makes an overrun safe rather than corrupting, so
+  renewal would buy throughput, not correctness. What is *not* left to a guess is
+  the two windows agreeing, since the worker takes both from this one number.
 - **No retries, backoff, or timeouts.** A step that raises is logged and
   acknowledged, and the workflow stops until something else wakes it. There is
   no dead-letter and no heartbeat.

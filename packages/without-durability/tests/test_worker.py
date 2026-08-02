@@ -8,9 +8,11 @@ from dataclasses import dataclass
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
+from time import monotonic
 
 import pytest
 from without import ticks
+from without_durability import LEASE
 from without_durability import Delivery
 from without_durability import MemoryCheckpointer
 from without_durability import MemoryScheduler
@@ -20,7 +22,6 @@ from without_durability import Suspended
 from without_durability import claimed
 from without_durability import now_utc
 from without_durability.worker import CONTENDED
-from without_durability.worker import LEASE
 from without_durability.worker import passes
 from without_durability.worker import ready
 from without_durability.worker import waking
@@ -357,6 +358,114 @@ async def test_the_ready_stream_takes_over_a_delivery_a_dead_worker_never_answer
     assert taken.receipt == abandoned.receipt, "the same delivery, taken over rather than duplicated"
 
 
+async def test_the_worker_claims_a_workflow_for_the_lease_its_queue_hands_out() -> None:
+    # The two windows that have to agree, and why the lease is the scheduler's rather than
+    # an argument to `work`: a delivery that becomes reclaimable before its holder's claim
+    # lapses goes to a worker that cannot write to it yet, which spends a whole pass
+    # finding that out. The worker reads one number off the queue and claims for exactly
+    # as long, so a store built with a longer lease is honoured without a second setting.
+    lease = LEASE / 2
+    checkpointer = MemoryCheckpointer()
+    scheduler = MemoryScheduler(lease=lease)
+    holding = asyncio.Event()
+    releasing = asyncio.Event()
+
+    async def blocking(run: Run) -> None:
+        holding.set()
+        await releasing.wait()
+
+    await scheduler.make_ready(WORKFLOW)
+    worker = asyncio.create_task(work(SplitDurable(checkpointer, scheduler), tick=BRIEF, body=blocking))
+    try:
+        async with asyncio.timeout(3):
+            await holding.wait()
+        held_for = timedelta(seconds=checkpointer.held_until[WORKFLOW] - monotonic())
+    finally:
+        releasing.set()
+        worker.cancel()
+
+    assert lease - BRIEF <= held_for <= lease, f"the claim runs to the queue's lease, not to {LEASE}"
+
+
+@pytest.mark.parametrize("lease", [timedelta(), timedelta(seconds=-1)])
+def test_a_scheduler_refuses_a_lease_that_is_not_a_positive_duration(lease: timedelta) -> None:
+    # Checked where the value enters, because a lease is the one timing whose nonsense
+    # value is silent: a claim that has already expired when it is granted excludes
+    # nobody, so two passes run the same unrecorded step and nothing raises. A lease read
+    # out of configuration is how a zero gets here.
+    with pytest.raises(ValueError, match="a lease must be a positive duration"):
+        MemoryScheduler(lease=lease)
+
+
+@pytest.mark.parametrize(
+    ("start", "refused"),
+    [
+        (lambda durable: work(durable, BODY, tick=timedelta()), "a tick"),
+        (lambda durable: work(durable, BODY, within=timedelta(seconds=-1)), "a blocking read"),
+        (lambda durable: work(durable, BODY, contended=timedelta()), "a contended interval"),
+    ],
+)
+async def test_the_worker_refuses_a_timing_that_is_not_a_positive_duration(
+    start: Callable[[SplitDurable], Awaitable[None]],
+    refused: str,
+) -> None:
+    # Up front rather than inside the task group, so a mis-set duration is a `ValueError`
+    # from the call that made it rather than an `ExceptionGroup` from somewhere in the
+    # loop. None of these has a meaningful zero: each is a span to let pass.
+    durable = SplitDurable(MemoryCheckpointer(), MemoryScheduler())
+
+    with pytest.raises(ValueError, match=f"{refused} must be a positive duration"):
+        await start(durable)
+
+
+async def test_a_pass_loop_refuses_a_contended_interval_that_is_not_positive() -> None:
+    # `passes` is drivable on its own, so it checks the two durations it is handed rather
+    # than trusting whatever `work` already looked at.
+    durable = SplitDurable(MemoryCheckpointer(), MemoryScheduler())
+
+    with pytest.raises(ValueError, match="a contended interval must be a positive duration"):
+        passes(durable, BODY, contended=timedelta())
+
+    with pytest.raises(ValueError, match="a lease must be a positive duration"):
+        passes(durable, BODY, lease=timedelta())
+
+
+async def test_the_ready_stream_refuses_a_blocking_read_that_is_not_positive() -> None:
+    # On the first pull rather than at the call, because a generator's body does not run
+    # until it is advanced. `work` checks the same value up front, so the only caller who
+    # sees it this late is one driving the stream directly, and it is still before the
+    # first read of the queue. Its `idle` is deliberately not on this list: a threshold of
+    # zero means "take over anything outstanding", which is a real thing to ask for.
+    workflows = ready(MemoryScheduler(), within=timedelta())
+
+    with pytest.raises(ValueError, match="a blocking read must be a positive duration"):
+        await anext(workflows)
+
+
+async def test_the_worker_defers_a_contended_wakeup_for_the_interval_it_was_given() -> None:
+    # How long to wait before looking at a workflow somebody else holds is a deployment's
+    # call (how long a pass usually takes, how much a redundant wakeup costs), so it is an
+    # argument rather than a constant reachable only by calling `passes` directly.
+    checkpointer = MemoryCheckpointer()
+    scheduler = MemoryScheduler()
+    clock = Clock()
+    held = await claimed(checkpointer, WORKFLOW)
+    await scheduler.make_ready(WORKFLOW)
+
+    worker = asyncio.create_task(
+        work(SplitDurable(checkpointer, scheduler), tick=BRIEF, body=BODY, contended=BRIEF, now=clock)
+    )
+    try:
+        async with asyncio.timeout(3):
+            while WORKFLOW not in scheduler.sleeping:
+                await asyncio.sleep(BRIEF.total_seconds())
+    finally:
+        worker.cancel()
+        await checkpointer.release(held)
+
+    assert scheduler.sleeping == {WORKFLOW: STARTED_AT + BRIEF}, f"the interval it was given, not {CONTENDED}"
+
+
 async def test_the_worker_carries_a_submitted_order_through_its_own_wait() -> None:
     # The assembled thing: submitting is enough. The timer and the pass loop hand the
     # workflow back and forth until it is done, with nobody driving it.
@@ -365,7 +474,7 @@ async def test_the_worker_carries_a_submitted_order_through_its_own_wait() -> No
     await checkpointer.supply(WORKFLOW, "order", SMALL)
     await scheduler.make_ready(WORKFLOW)
 
-    worker = asyncio.create_task(work(SplitDurable(checkpointer, scheduler), tick=BRIEF, body=BODY))
+    worker = asyncio.create_task(work(SplitDurable(checkpointer, scheduler), tick=BRIEF, within=BRIEF, body=BODY))
     try:
         async with asyncio.timeout(3):
             while "paid" not in await checkpointer.load(WORKFLOW):

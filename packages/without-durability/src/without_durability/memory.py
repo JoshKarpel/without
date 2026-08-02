@@ -14,10 +14,12 @@ from time import monotonic
 
 from without_durability.codec import JSON
 from without_durability.codec import CheckpointCodec
+from without_durability.seams import LEASE
 from without_durability.seams import Delivery
 from without_durability.seams import Fenced
 from without_durability.seams import Pass
 from without_durability.seams import Recorded
+from without_durability.seams import check_duration
 
 # Both seams over ordinary dicts, shipped rather than kept in a test directory, because
 # the whole design says a store is injected and this is the store a test should inject.
@@ -81,7 +83,11 @@ class MemoryCheckpointer:
     data: dict[str, object] = field(default_factory=dict)
 
     async def load(self, workflow: str) -> dict[str, object]:
-        return {key: self.codec.decode(encoded) for key, encoded in self.hashes[workflow].items()}
+        # `get` rather than the `defaultdict`'s own lookup: reading a workflow is not
+        # creating one, and this is the call a status endpoint makes for an id nobody
+        # has ever submitted, so indexing here would grow the mapping by one empty
+        # entry per miss for as long as the process lives.
+        return {key: self.codec.decode(encoded) for key, encoded in self.hashes.get(workflow, {}).items()}
 
     async def claim(self, workflow: str, lease: timedelta) -> Pass | None:
         if self.held_until[workflow] > monotonic():
@@ -146,6 +152,14 @@ class MemoryScheduler:
     outstanding: dict[str, tuple[Delivery, float]] = field(default_factory=dict)
     arrived: asyncio.Event = field(default_factory=asyncio.Event)
     receipts: count[int] = field(default_factory=count)
+    # How long a delivery stays this taker's, which `reclaim` measures against and which
+    # `worker.work` reads to decide how long to claim the workflow for. A field rather
+    # than the constant read inline, like every other scheduler here, so a test can shrink
+    # it and so the two windows cannot be set to different numbers.
+    lease: timedelta = LEASE
+
+    def __post_init__(self) -> None:
+        check_duration("a lease", self.lease)
 
     async def prepare(self) -> None:
         """Nothing to set up: a dict is its own consumer group."""

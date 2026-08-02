@@ -70,7 +70,15 @@ async def ticks(every: timedelta, *, now: Callable[[], datetime] = utc_now) -> A
     It yields before it sleeps, so the first event lands at once rather than one interval
     later, and it never ends on its own: drive it inside a `background_task`, a task
     group, or anything else that will cancel it.
+
+    An interval that is not positive is refused rather than run, for the same reason
+    `drive` refuses a `limit` below one: it has no sensible reading, and taken literally
+    it is a loop that yields as fast as the sink can consume, which pins a core to do
+    housekeeping. A zero arrives from a configured duration whose setting was never set,
+    so it is worth one comparison here.
     """
+    if every <= timedelta():
+        raise ValueError(f"every must be a positive duration, but got {every}")
     every_seconds = every.total_seconds()
     while True:
         yield now()

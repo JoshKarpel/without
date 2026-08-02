@@ -50,13 +50,11 @@ from typing import cast
 
 from redis.asyncio import Redis
 from redis.commands.core import AsyncScript
+from without_durability.seams import LEASE
 from without_durability.seams import Delivery
+from without_durability.seams import check_duration
 from without_durability.stepwise import now_utc
 
-# How long a taken workflow stays invisible, and so how long after a worker dies before
-# someone else picks its workflow up. The same reasoning as the checkpoint claim's lease:
-# it has to exceed the longest a pass can honestly take.
-LEASE = timedelta(minutes=1)
 # How often a worker with nothing to do asks again. This is the price of losing the
 # blocking read, so it is the one number to look at if scheduler feel slow.
 POLL = timedelta(milliseconds=50)
@@ -116,6 +114,11 @@ class RedisSetScheduler:
 
     redis: Redis
     namespace: str = "workflow"
+    # How long a taken workflow stays invisible, and so how long after a worker dies
+    # before someone else picks its workflow up. `worker.work` reads it and claims the
+    # workflow for the same span, which is the whole reason it is one number: a
+    # workflow that becomes visible before its claim lapses is taken by a worker that
+    # cannot write to it yet.
     lease: timedelta = LEASE
     poll: timedelta = POLL
     # Only `make_ready` reads it: "visible now" is the one score a caller names, where
@@ -130,6 +133,8 @@ class RedisSetScheduler:
     poll_seconds: float = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        check_duration("a lease", self.lease)
+        check_duration("a poll interval", self.poll)
         registered = tuple(self.redis.register_script(source) for source in (TAKE, DONE))
         object.__setattr__(self, "scripts", registered)
         object.__setattr__(self, "lease_ms", int(self.lease.total_seconds() * 1000))

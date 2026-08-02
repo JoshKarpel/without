@@ -41,6 +41,7 @@ from without_durability.codec import CheckpointCodec
 from without_durability.seams import Fenced
 from without_durability.seams import Pass
 from without_durability.seams import Recorded
+from without_durability.seams import check_duration
 
 # Take the workflow if nobody holds it, and stamp the taking with a number that only
 # ever goes up. It is the store, not the claimant, that decides the ordering, so two
@@ -145,6 +146,26 @@ if tonumber(redis.call('HGET', KEYS[1], 'token') or '0') == tonumber(ARGV[1]) th
 end
 return 0
 """
+
+
+# The prefix `RECORD` and `TRANSACT` refuse a superseded pass with, and the one thing
+# `record` and `transact` read out of an error before deciding it is not theirs.
+FENCED = "FENCED "
+
+
+def fenced(error: ResponseError) -> bool:
+    """
+    Whether this is one of our scripts refusing a superseded pass, or a real store error.
+
+    Anchored at the start rather than searched for anywhere in the message, because the
+    two are answered very differently: a fence tells a pass to stand down, and anything
+    else (a `WRONGTYPE`, a script that will not load, a server out of memory) means the
+    checkpoint is unusable and must reach the caller. redis-py surfaces a script's
+    `error_reply` as the server's string verbatim, so the message *starts* with the code
+    exactly as Redis's own do, and a value carrying the word further in cannot be
+    mistaken for one.
+    """
+    return str(error).startswith(FENCED)
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,6 +327,7 @@ class RedisCheckpointer:
     transactions: dict[str, AsyncScript] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        check_duration("a ttl", self.ttl)
         registered = tuple(self.redis.register_script(source) for source in (CLAIM, RECORD, SUPPLY, RELEASE))
         object.__setattr__(self, "scripts", registered)
         object.__setattr__(self, "ttl_seconds", int(self.ttl.total_seconds()))
@@ -359,9 +381,7 @@ class RedisCheckpointer:
                 ),
             )
         except ResponseError as error:
-            # The script's own refusal, which redis-py surfaces as the server's string.
-            # Anything else is a real problem with the store and must not be swallowed.
-            if "FENCED" not in str(error):
+            if not fenced(error):
                 raise
             raise Fenced(f"{holder.workflow!r} moved on while this pass held it: {error}") from error
         return Recorded(value=self.codec.decode(stored), first=bool(first))
@@ -396,7 +416,7 @@ class RedisCheckpointer:
                 args=[key, holder.token, self.ttl_seconds, *effect.args],
             )
         except ResponseError as error:
-            if "FENCED" not in str(error):
+            if not fenced(error):
                 raise
             raise Fenced(f"{holder.workflow!r} moved on while this pass held it: {error}") from error
         return self.codec.decode(cast(str, stored))

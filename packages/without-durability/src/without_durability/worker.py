@@ -74,11 +74,13 @@ from without import from_sink
 from without import limit_concurrency
 from without import ticks
 
+from without_durability.seams import LEASE
 from without_durability.seams import Contended
 from without_durability.seams import Delivery
 from without_durability.seams import Durable
 from without_durability.seams import Fenced
 from without_durability.seams import Scheduler
+from without_durability.seams import check_duration
 from without_durability.stepwise import Run
 from without_durability.stepwise import Suspended
 from without_durability.stepwise import now_utc
@@ -92,12 +94,6 @@ BLOCKING = timedelta(seconds=1)
 # else (a gateway, the store), so the useful number is far above the core count and is
 # bounded by what the dependencies will take rather than by this process.
 POOL = 20
-# How long a delivery may go unacknowledged before another worker takes it over, and how
-# long a claim on a workflow is good for. One constant for both because they answer the
-# same question, how long a pass may honestly take, and because a reclaim that beats the
-# workflow claim to expiring just hands the work to someone who cannot yet do it. A
-# minute is generous for passes whose steps are single calls.
-LEASE = timedelta(minutes=1)
 # How long a worker that lost the claim waits before looking again. Long enough that the
 # pass holding it has a fair chance to finish (and to make this wakeup redundant), short
 # enough that a claim dropped immediately afterwards is not left sitting.
@@ -144,6 +140,8 @@ def passes(
     the same answer, so the two paths share `look_again`. What they do not get is a
     warning, because nothing went wrong.
     """
+    check_duration("a lease", lease)
+    check_duration("a contended interval", contended)
 
     async def look_again(delivery: Delivery, why: str) -> None:
         """Hand the workflow back to whoever holds it, and ask for another look shortly."""
@@ -205,7 +203,12 @@ async def ready(
     one delivery the caller has a slot for. Abandoned work goes first because it has
     been waiting the longest, and it is bounded work: the pending list is ordinarily
     empty, so the blocking read is what paces the loop.
+
+    `idle` is deliberately not checked for being positive as the other durations are: it
+    is a threshold rather than an interval, and a zero one is meaningful (take over
+    anything outstanding, however recently it was delivered).
     """
+    check_duration("a blocking read", within)
     while True:
         delivery = await scheduler.reclaim(idle)
         if delivery is None:
@@ -243,7 +246,8 @@ async def work(
     body: Callable[[Run], Awaitable[object]],
     *,
     tick: timedelta = TICK,
-    idle: timedelta = LEASE,
+    within: timedelta = BLOCKING,
+    contended: timedelta = CONTENDED,
     limit: int = POOL,
     now: Callable[[], datetime] = now_utc,
 ) -> None:
@@ -259,14 +263,33 @@ async def work(
     over a stream. One consumes deliveries, the other consumes moments, and a deployment
     that wants a third (trimming a Redis stream, sweeping old checkpointer) adds a task to
     this group rather than a mechanism.
+
+    The lease is the scheduler's rather than an argument here, and it is the one number
+    that is *not* a knob on this call. It bounds two things that have to agree (how long
+    a delivery stays this worker's, and how long its claim on the workflow is good for),
+    and the queue is where the first one already lives: a visibility-scored store writes
+    it into the row it takes. Reading it back and claiming for exactly as long is what
+    keeps a store constructed with a ten-minute lease from being reclaimed after one.
+    Turning it means `PostgresScheduler(pool, lease=...)`, which is also where the
+    matching `poll` and the store's own timings are set, so the passes a deployment can
+    honestly run are described in one place.
     """
+    # Up front, rather than leaving each to the function that spends it, so a bad timing
+    # is a `ValueError` from this call instead of an `ExceptionGroup` out of the task
+    # group below. The lease is checked where the scheduler was built.
+    check_duration("a tick", tick)
+    check_duration("a blocking read", within)
+    check_duration("a contended interval", contended)
     await durable.scheduler.prepare()
+    lease = durable.scheduler.lease
 
     async def sweep_due() -> None:
         await waking(durable.scheduler)(ticks(tick, now=now))
 
     async def advance_ready() -> None:
-        await passes(durable, body, limit, lease=idle, now=now)(ready(durable.scheduler, idle=idle))
+        await passes(durable, body, limit, lease=lease, contended=contended, now=now)(
+            ready(durable.scheduler, within=within, idle=lease)
+        )
 
     async with asyncio.TaskGroup() as group:
         group.create_task(sweep_due())

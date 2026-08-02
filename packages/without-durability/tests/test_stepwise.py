@@ -260,6 +260,17 @@ def as_count(recorded: object) -> int:
     return recorded
 
 
+async def test_reading_a_workflow_nobody_has_started_does_not_create_one() -> None:
+    # The status endpoint's call for an id that has never been submitted, which is also
+    # the one an unauthenticated 404 loop makes. Reading is not creating: the checkpoints
+    # are a `defaultdict`, so indexing rather than asking would leave an empty entry
+    # behind per miss for as long as the process lives.
+    checkpointer = MemoryCheckpointer()
+
+    assert await checkpointer.load("wf-never-submitted") == {}
+    assert checkpointer.hashes == {}, "a miss left nothing behind"
+
+
 async def test_a_workflow_already_being_passed_over_cannot_be_claimed_again() -> None:
     # The property the whole seam exists for. Without it, two scheduler for one workflow
     # (which the submit-then-confirm flow produces every time) run two passes side by

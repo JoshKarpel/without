@@ -53,7 +53,9 @@ from redis.commands.core import AsyncScript
 from redis.exceptions import ResponseError
 from without import Sink
 from without import from_sink
+from without_durability.seams import LEASE
 from without_durability.seams import Delivery
+from without_durability.seams import check_duration
 
 type Entries = list[tuple[str, dict[str, str]]]
 
@@ -120,6 +122,13 @@ class RedisStreamScheduler:
     group: str = "workers"
     batch: int = 100
     consumer: str = field(default_factory=lambda: uuid4().hex)
+    # How long a delivery may sit in a consumer's pending list before `reclaim` will take
+    # it over. Here it is genuinely an *argument* to `XAUTOCLAIM` rather than something
+    # written into the queue, which is the visibility-scored stores' route to the same
+    # property, so the worker passes it back in on every pull. It is on the store anyway,
+    # and for the reason the seam gives: it also bounds the checkpoint claim, and the two
+    # drift the moment they are set in two places.
+    lease: timedelta = LEASE
     # Derived at construction, the way `without_web.Router` compiles its trie: a store
     # has *one* script, and registering it is local work (it precomputes the digest and
     # holds the client), so calling it sends the digest and falls back to the source
@@ -127,6 +136,7 @@ class RedisStreamScheduler:
     move: AsyncScript = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        check_duration("a lease", self.lease)
         object.__setattr__(self, "move", self.redis.register_script(WAKE_DUE))
 
     @property

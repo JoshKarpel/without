@@ -17,6 +17,7 @@ from without_durability.seams import Pass
 from without_durability.seams import Recorded
 from without_durability.seams import Scheduler
 from without_durability.seams import SplitDurable
+from without_durability.seams import check_duration
 from without_durability.seams import claimed
 from without_durability.stepwise import Run
 from without_durability.stepwise import StepKey
@@ -50,6 +51,7 @@ __all__ = [
     "SplitDurable",
     "StepKey",
     "Suspended",
+    "check_duration",
     "claimed",
     "now_utc",
     "parse_deadline",

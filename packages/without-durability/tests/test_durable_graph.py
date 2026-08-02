@@ -18,6 +18,7 @@ from integration.durable import recorded_id
 from integration.durable import unwinding
 from without_dag import CompiledGraph
 from without_dag import Graph
+from without_durability import LEASE
 from without_durability import Checkpointer
 from without_durability import Contended
 from without_durability import Delivery
@@ -275,6 +276,23 @@ async def test_a_node_whose_result_round_trips_is_recorded_without_complaint() -
     assert await durably(run, MemoryCheckpointer(), "wf-round-trips", ORDER) == {"widget": 2500}
 
 
+async def test_a_graph_whose_output_is_one_of_its_entries_is_refused_before_it_runs() -> None:
+    # `evaluate` runs such a graph happily, because an entry it was handed is a value it
+    # can return. Durably it is not runnable at all: the output is read back out of the
+    # checkpoint, and an entry is the one thing a checkpoint never holds, so without this
+    # the run would perform every effect and *then* fail looking for a key that was never
+    # going to be written.
+    graph, (order,) = Graph.of(Order)
+    gateway = Gateway()
+    graph.node("charged", gateway.services().charge, order)
+    run = graph.build(output=order)
+
+    with pytest.raises(ValueError, match="'input:0' is one of this graph's entries rather than a node"):
+        await durably(run, MemoryCheckpointer(), "wf-identity", ORDER)
+
+    assert gateway.calls == [], "and it is refused before the first effect, not after"
+
+
 async def test_a_pass_that_lost_the_workflow_mid_run_does_not_compensate() -> None:
     # The loser must stop, not unwind. Another pass holds the workflow and is advancing
     # it, so refunding here would give back a charge the winner is still building on.
@@ -303,6 +321,8 @@ async def test_reading_a_checkpoint_written_by_something_else_fails_loudly() -> 
 @dataclass(frozen=True, slots=True)
 class UnreachableQueue:
     """A `Scheduler` that cannot be written to, standing in for a crash mid-`arrive`."""
+
+    lease: timedelta = LEASE
 
     async def prepare(self) -> None:  # pragma: no cover - unused here
         return None

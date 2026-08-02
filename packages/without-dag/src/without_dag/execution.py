@@ -147,11 +147,16 @@ async def drive(
                 running[future] = key
                 future.add_done_callback(completed.put_nowait)
             if not running:
-                # Everything the sorter had ready was already supplied, so nothing is
-                # in flight and no completion is coming: awaiting one would hang the
-                # run forever. Re-testing `is_active` ends it instead, which is what a
-                # checkpoint covering a graph's last nodes reaches.
-                continue
+                # Everything the sorter had ready was already supplied, so nothing is in
+                # flight and no completion is coming: awaiting one would hang the run
+                # forever. Nothing is left to do either, which is what a checkpoint
+                # covering a graph's last nodes reaches: an empty pool means the loop
+                # above drained `ready` (a free slot always takes the next key), and
+                # every key it drained was either marked done or spawned, so the sorter
+                # has nothing outstanding and nothing further to release. Ending here
+                # rather than re-testing `is_active` says that in the control flow, and
+                # cannot spin if the invariant is ever broken.
+                break
             done = await completed.get()
             key = running.pop(done)
             value = done.result()
