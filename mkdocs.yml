@@ -106,6 +106,18 @@ nav:
   - without-dag:
       - without-dag/index.md
       - Reference: without-dag/reference.md
+  - without-durability:
+      - without-durability/index.md
+      - Reference: without-durability/reference.md
+  - without-durability-redis:
+      - without-durability-redis/index.md
+      - Reference: without-durability-redis/reference.md
+  - without-durability-postgres:
+      - without-durability-postgres/index.md
+      - Reference: without-durability-postgres/reference.md
+  - without-durability-sqlite:
+      - without-durability-sqlite/index.md
+      - Reference: without-durability-sqlite/reference.md
   - without-logging:
       - without-logging/index.md
       - Reference: without-logging/reference.md

@@ -21,7 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 
-from integration.durable.stepwise import Run
+from without_durability import Run
 
 type Cents = dict[str, int]
 type Payout = dict[str, object]

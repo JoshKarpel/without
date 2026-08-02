@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncGenerator
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from collections.abc import Callable
@@ -23,6 +24,9 @@ from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from dataclasses import field
+from datetime import UTC
+from datetime import datetime
+from datetime import timedelta
 from typing import cast
 from typing import overload
 
@@ -42,6 +46,35 @@ async def stream_from_iterable[T](values: Iterable[T]) -> AsyncIterator[T]:
     """
     for value in values:
         yield value
+
+
+def utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+async def ticks(every: timedelta, *, now: Callable[[], datetime] = utc_now) -> AsyncGenerator[datetime]:
+    """
+    A `Stream` of moments, one now and one every `every` after: the clock as a source.
+
+    The source periodic work runs off, so that *when* something happens is a stream a
+    caller supplies rather than a loop inside the thing being done. A cache sweep, a
+    config refresh, a queue's housekeeping: each becomes a `Sink` that says only what
+    happens per event, and composing it with this says how often. A `while True` with a
+    `sleep` in it can only ever be a timer, and it buries the schedule inside the work;
+    a sink over a stream runs off this, off `stream_from_queue` when an operator pokes
+    it, or off `stream_from_iterable` in a test that chooses the instants.
+
+    Each tick *carries* its moment, so a consumer needs no clock of its own and a test
+    controls time by choosing values rather than by patching one.
+
+    It yields before it sleeps, so the first event lands at once rather than one interval
+    later, and it never ends on its own: drive it inside a `background_task`, a task
+    group, or anything else that will cancel it.
+    """
+    every_seconds = every.total_seconds()
+    while True:
+        yield now()
+        await asyncio.sleep(every_seconds)
 
 
 async def stream_from_queue[T](queue: asyncio.Queue[T]) -> AsyncIterator[T]:

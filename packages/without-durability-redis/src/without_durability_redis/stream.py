@@ -37,7 +37,7 @@
 #
 # The sorted set is an *index*, not the record: the deadline itself lives in the
 # workflow's checkpoint, put there by `Run.sleep`. Losing the set leaves a workflow
-# asleep forever rather than corrupt, and rebuilding it is a scan over checkpoints.
+# asleep forever rather than corrupt, and rebuilding it is a scan over checkpointer.
 
 from __future__ import annotations
 
@@ -45,75 +45,21 @@ from dataclasses import dataclass
 from dataclasses import field
 from datetime import datetime
 from datetime import timedelta
-from typing import Protocol
 from typing import cast
 from uuid import uuid4
 
 from redis.asyncio import Redis
 from redis.commands.core import AsyncScript
 from redis.exceptions import ResponseError
+from without import Sink
+from without import from_sink
+from without_durability.seams import Delivery
 
 type Entries = list[tuple[str, dict[str, str]]]
 
-
-@dataclass(frozen=True, slots=True)
-class Delivery:
-    """
-    One wakeup, taken by a worker and not yet acknowledged.
-
-    The `receipt` is what makes the queue crash-safe: it names the entry the store is
-    still holding on this worker's behalf, so acknowledging is a separate act from
-    receiving and a worker that dies between them leaves the wakeup to be taken over
-    rather than losing it.
-    """
-
-    workflow: str
-    receipt: str
-
-
-class Wakeups(Protocol):
-    """
-    Where a workflow's *right to run* is kept, apart from what it has done.
-
-    The seam the API and the worker share: the API makes a workflow ready, a worker
-    takes the next ready one and says when it is `done` with it. Injected like the
-    checkpoint store, so the worker is drivable from a dict in a test.
-
-    The requirements are about *not losing a wakeup*, since a lost one is a workflow
-    that never runs again, and they are stated as properties rather than as mechanics
-    because the two implementations here reach them by different routes.
-    `RedisWakeups` is a stream beside a sorted set; `RedisSchedule` is one sorted set
-    scored by visibility, where `wake_due`, `reclaim`, and `prepare` all have nothing to
-    do. An implementation MUST guarantee that:
-
-    - a workflow passed to `make_ready` is eventually yielded by some `next_ready`, even
-      if the worker holding it dies mid-pass, and even if the wakeup arrives *while* a
-      pass on that workflow is running;
-    - `wake_due` moves each workflow it reports in one durable step, since one that
-      removes a deadline and then queues the workflow loses it whenever it dies in
-      between (an implementation with nothing to move satisfies this trivially);
-    - a `wake_at` survives a `done` for a delivery taken before it, because the worker
-      calls them in that order and the acknowledgement must not undo the scheduling.
-
-    What is deliberately *not* required is that a workflow reach only one worker at a
-    time. The stream will happily deliver two wakeups for one workflow to two consumers,
-    and that is safe because exclusion belongs to `Checkpoints.claim` rather than here:
-    this seam answers "who owes a pass", the checkpoint store answers "who may write".
-    """
-
-    async def prepare(self) -> None: ...
-
-    async def make_ready(self, workflow: str) -> None: ...
-
-    async def wake_at(self, workflow: str, when: datetime) -> None: ...
-
-    async def wake_due(self, now: datetime) -> tuple[str, ...]: ...
-
-    async def next_ready(self, within: timedelta) -> Delivery | None: ...
-
-    async def reclaim(self, idle: timedelta) -> Delivery | None: ...
-
-    async def done(self, delivery: Delivery) -> None: ...
+# How often the trimmer looks. It is a housekeeping interval rather than a correctness
+# one: nothing goes wrong if it never runs except that the stream keeps every entry.
+TRIM_EVERY = timedelta(minutes=1)
 
 
 # `LIMIT` bounds one tick's work, so a backlog drains over several ticks rather than in
@@ -124,8 +70,8 @@ class Wakeups(Protocol):
 # Deliberately no `MAXLEN`: a stream trims by *length*, not by what has been consumed,
 # so capping it would drop the oldest entries once a backlog outgrew the cap, and the
 # oldest entries are the ones nobody has run yet. A queue that sheds unread work under
-# load is worse than one that grows. What bounds it instead is trimming by `MINID` once
-# entries are acknowledged, which is a control-plane job this toy leaves out.
+# load is worse than one that grows. What bounds it instead is `trim`, which removes by
+# `MINID` behind what every consumer group has finished with.
 #
 #   KEYS[1]  the sleeping sorted set, scored by deadline
 #   KEYS[2]  the ready stream
@@ -143,11 +89,11 @@ return due
 
 
 @dataclass(frozen=True, slots=True)
-class RedisWakeups:
+class RedisStreamScheduler:
     """
-    `Wakeups` as one Redis stream (with a consumer group) and one sorted set.
+    `Scheduler` as one Redis stream (with a consumer group) and one sorted set.
 
-    Like `RedisCheckpoints`, the client MUST be built with `decode_responses=True`:
+    Like `RedisCheckpointer`, the client MUST be built with `decode_responses=True`:
     this app owns both ends of the queue, so it decides once here rather than every
     read deciding again.
 
@@ -162,11 +108,11 @@ class RedisWakeups:
     deployment would name consumers after the host and process (and retire dead ones
     with `XGROUP DELCONSUMER`) rather than minting one per instance as this does.
 
-    Nothing here trims the stream. `XACK` clears an entry from the pending list but
-    leaves it in the stream, so a long-lived deployment needs a control-plane job that
-    trims by `MINID` behind what every group has acknowledged. Capping the stream's
-    *length* instead would be the wrong bound, since that drops the oldest entries,
-    which are the ones nobody has run yet.
+    `XACK` clears an entry from the pending list but leaves it in the stream, so the
+    thing that bounds this queue is `trim`, run as its own control-plane task beside
+    the worker (see `trimming`). Without it the stream is correct and grows forever;
+    capping its *length* instead would be the wrong bound, since that drops the oldest
+    entries, which are the ones nobody has run yet.
     """
 
     redis: Redis
@@ -266,6 +212,85 @@ class RedisWakeups:
 
     async def done(self, delivery: Delivery) -> None:
         await self.redis.xack(self.ready_key, self.group, delivery.receipt)
+
+    async def trim(self) -> int:
+        """
+        Drop the entries every consumer group has finished with, and report how many.
+
+        `XACK` clears an entry from a group's pending list and leaves it in the stream, so
+        without this the queue is append-only: correct, and unbounded. `ACKED` is the
+        bound, and it is the server's own answer rather than one computed here: it removes
+        only entries that every group has read *and* acknowledged, so a group reading the
+        same stream at its own pace protects everything it has not finished with. Working
+        that floor out client-side (the oldest pending entry per group, minimum across
+        groups) is possible and strictly worse, because it races every ack that lands
+        between the read and the trim.
+
+        `MAXLEN 0` reads as "keep nothing", and with `ACKED` that is exactly right:
+        trimming still stops at the first entry somebody has not answered for, so the
+        threshold only says "as much as you are allowed to".
+
+        Note what `ACKED` does *not* do. With no consumer groups at all it has no effect
+        and the trim degrades to a plain `MAXLEN 0`, which would delete a queue nobody has
+        read yet - and orders can be queued before the first worker ever boots, which is
+        the case `prepare` creates its group from `0` to handle. So this refuses to trim a
+        stream that has no groups, which is the one hazard in an otherwise safe command.
+
+        Safe to run from every process at once, and safe to never run at all. The trim is
+        idempotent, what counts as acknowledged only grows, and a stream nobody trims is
+        merely large.
+
+        Requires Redis 8.2 or newer, which is where `ACKED` arrives.
+        """
+        try:
+            groups = cast(list[dict[str, object]], await self.redis.xinfo_groups(self.ready_key))
+        except ResponseError as error:
+            # Nobody has created the stream yet, which is ordinary when the trimmer starts
+            # before the first worker's `prepare`. There is nothing to trim either way.
+            if "no such key" not in str(error):
+                raise
+            return 0
+        if not groups:
+            return 0
+        # `execute_command` because redis-py's `xtrim` helper predates `ACKED` and has no
+        # parameter for it.
+        return int(await self.redis.execute_command("XTRIM", self.ready_key, "MAXLEN", 0, "ACKED"))
+
+
+def trimming(scheduler: RedisStreamScheduler) -> Sink[object]:
+    """
+    Keep the stream tidy, once per event, over whatever stream you drive it with.
+
+    A `Sink` rather than a loop with a sleep in it, which is the same shape `waking` has
+    and for the same reason: what makes a trim happen is a value somebody supplies, so
+    this runs off a timer, off an operator poking a queue, off a Kubernetes cron hitting
+    an endpoint, or off three items in a test. A loop can only ever be a timer, and it
+    buries the schedule inside the thing being scheduled.
+
+    It takes `Sink[object]` because it reads nothing from the event: whatever the stream
+    carries, a trim is a trim.
+
+    ```python
+    async with asyncio.TaskGroup() as group:
+        group.create_task(work(durable, body))
+        group.create_task(trimming(scheduler)(ticks(TRIM_EVERY)))
+    ```
+
+    Control plane rather than data plane, and deliberately not folded into `work`: whether
+    an entry is still needed is a question about what every group has acknowledged, not
+    about the delivery a worker happens to be holding, so triggering it by traffic would
+    make housekeeping cost scale with load for no reason.
+
+    Its cardinality is not something to arrange. Every process may run one, because the
+    trim is idempotent and what counts as acknowledged only grows, so there is no leader
+    to elect and nothing to coordinate; N processes running it just means the same trim
+    happens N times. That is the same reasoning `waking` already relies on.
+    """
+
+    async def tidy(_event: object) -> None:
+        await scheduler.trim()
+
+    return from_sink(tidy)
 
 
 def deliveries(entries: Entries) -> tuple[Delivery, ...]:

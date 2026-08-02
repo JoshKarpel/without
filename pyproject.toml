@@ -16,6 +16,10 @@ dependencies = [
     "without-http",
     "without-web",
     "without-dag",
+    "without-durability",
+    "without-durability-redis",
+    "without-durability-postgres",
+    "without-durability-sqlite",
     "without-logging",
 ]
 
@@ -34,6 +38,10 @@ without-asgi = { workspace = true }
 without-http = { workspace = true }
 without-web = { workspace = true }
 without-dag = { workspace = true }
+without-durability = { workspace = true }
+without-durability-redis = { workspace = true }
+without-durability-postgres = { workspace = true }
+without-durability-sqlite = { workspace = true }
 without-logging = { workspace = true }
 integration = { workspace = true }
 benchmarks = { workspace = true }
@@ -151,13 +159,14 @@ omit = [
     # pattern that matches nothing, so both files are measured like any other. A run
     # where the compose-marked tests skip (no podman, as on the macOS and Windows CI
     # legs) then leaves the gate reporting the suite rather than the environment.
-    "${WITHOUT_COMPOSE_AVAILABLE-}*/integration/durable/store.py",
-    "${WITHOUT_COMPOSE_AVAILABLE-}*/integration/durable/wakeups.py",
-    "${WITHOUT_COMPOSE_AVAILABLE-}*/integration/durable/schedule.py",
-    "${WITHOUT_COMPOSE_AVAILABLE-}*/integration/durable/postgres.py",
-    "${WITHOUT_COMPOSE_AVAILABLE-}*/tests/durable/test_durable_redis.py",
-    "${WITHOUT_COMPOSE_AVAILABLE-}*/tests/durable/test_durable_postgres.py",
-    # The effects those two suites share, so it is reached only when they run.
+    "${WITHOUT_COMPOSE_AVAILABLE-}*/without_durability_redis/*.py",
+    "${WITHOUT_COMPOSE_AVAILABLE-}*/without_durability_postgres/*.py",
+    "${WITHOUT_COMPOSE_AVAILABLE-}*/tests/test_redis_store.py",
+    "${WITHOUT_COMPOSE_AVAILABLE-}*/tests/test_postgres_store.py",
+    # The cross-store suite and the doubles it shares, reached only when the servers are
+    # up: it is parametrized over every store at once, so one unavailable skips them all.
+    "${WITHOUT_COMPOSE_AVAILABLE-}*/tests/durable/test_workflows_over_stores.py",
+    "${WITHOUT_COMPOSE_AVAILABLE-}*/tests/durable/stores.py",
     "${WITHOUT_COMPOSE_AVAILABLE-}*/tests/durable/gateways.py",
 ]
 

@@ -42,8 +42,8 @@ from datetime import timedelta
 from typing import Never
 from typing import cast
 
-from integration.durable.shell import Checkpoints
-from integration.durable.shell import Pass
+from without_durability.seams import Checkpointer
+from without_durability.seams import Pass
 
 type StepKey = str
 
@@ -91,7 +91,7 @@ class Run[Effect = Never]:
     """
 
     holder: Pass
-    checkpoints: Checkpoints[Effect]
+    checkpointer: Checkpointer[Effect]
     recorded: dict[StepKey, object]
     now: Callable[[], datetime] = now_utc
     claimed: set[StepKey] = field(default_factory=set)
@@ -122,7 +122,7 @@ class Run[Effect = Never]:
         self.claim(key)
         if key in self.recorded:
             return cast(T, self.recorded[key])
-        stored = await self.checkpoints.record(self.holder, key, await effect())
+        stored = await self.checkpointer.record(self.holder, key, await effect())
         self.recorded[key] = stored
         return cast(T, stored)
 
@@ -151,7 +151,7 @@ class Run[Effect = Never]:
         self.claim(key)
         if key in self.recorded:
             return self.recorded[key]
-        stored = await self.checkpoints.transact(self.holder, key, effect)
+        stored = await self.checkpointer.transact(self.holder, key, effect)
         self.recorded[key] = stored
         return stored
 
@@ -212,7 +212,7 @@ def parse_deadline(key: StepKey, recorded: object) -> datetime:
 
 async def resume[T, Effect](
     holder: Pass,
-    checkpoints: Checkpoints[Effect],
+    checkpointer: Checkpointer[Effect],
     body: Callable[[Run[Effect]], Awaitable[T]],
     *,
     now: Callable[[], datetime] = now_utc,
@@ -233,5 +233,5 @@ async def resume[T, Effect](
     another. `shell.claimed` is the second of those.
     """
     return await body(
-        Run(holder=holder, checkpoints=checkpoints, recorded=await checkpoints.load(holder.workflow), now=now)
+        Run(holder=holder, checkpointer=checkpointer, recorded=await checkpointer.load(holder.workflow), now=now)
     )

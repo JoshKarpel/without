@@ -64,24 +64,20 @@ from datetime import timedelta
 
 from without import Sink
 from without import Stream
+from without import from_sink
 from without import limit_concurrency
+from without import ticks
 
-from integration.durable.payout import Payout
-from integration.durable.payout import Payouts
-from integration.durable.payout import parse_items
-from integration.durable.payout import pay_out
-from integration.durable.shell import Checkpoints
-from integration.durable.stepwise import Run
-from integration.durable.stepwise import Suspended
-from integration.durable.stepwise import now_utc
-from integration.durable.stepwise import resume
-from integration.durable.wakeups import Delivery
-from integration.durable.wakeups import Wakeups
+from without_durability.seams import Delivery
+from without_durability.seams import Durable
+from without_durability.seams import Scheduler
+from without_durability.stepwise import Run
+from without_durability.stepwise import Suspended
+from without_durability.stepwise import now_utc
+from without_durability.stepwise import resume
 
 logger = logging.getLogger(__name__)
 
-SETTLING = timedelta(seconds=1)
-APPROVAL_OVER = 10_000
 TICK = timedelta(milliseconds=50)
 BLOCKING = timedelta(seconds=1)
 # How many workflows one worker runs at once. Passes are almost all waiting on someone
@@ -100,59 +96,9 @@ LEASE = timedelta(minutes=1)
 CONTENDED = timedelta(seconds=1)
 
 
-def submitting(
-    *,
-    settling: timedelta = SETTLING,
-    approval_over: int = APPROVAL_OVER,
-) -> Callable[[Run], Awaitable[Payout]]:
-    """
-    The workflow this deployment runs: a payout over whatever the API submitted.
-
-    The order arrives as a *recorded value* rather than an argument, because the
-    worker is handed a workflow id and nothing else. `awaiting` is the same call a
-    human confirmation uses: an order that has not been submitted is simply one whose
-    first value has not landed yet, so the worker needs no separate notion of "this
-    workflow has not started".
-
-    The two knobs are arguments rather than constants read inside so a test can run
-    the same body against a settlement window it does not have to wait out.
-    """
-
-    async def body(run: Run) -> Payout:
-        items = parse_items(await run.awaiting("order"))
-        return await pay_out(run, run.workflow, in_memory(items), settling=settling, approval_over=approval_over)
-
-    return body
-
-
-submitted = submitting()
-
-
-def in_memory(items: dict[str, int]) -> Payouts:
-    """
-    The payout's effects, standing in for a gateway and a warehouse.
-
-    `items` hands back what the request carried; in a real system it reads the order
-    table, which is why `pay_out` keeps it a step at all rather than an argument: the
-    read can fail, and its result is worth recording.
-    """
-
-    async def line_items(order_id: str) -> dict[str, int]:
-        return items
-
-    async def capture(sku: str, amount: int) -> str:
-        return f"cap-{sku}-{amount}"
-
-    async def pay(order_id: str, total: int) -> str:
-        return f"pay-{order_id}-{total}"
-
-    return Payouts(items=line_items, capture=capture, pay=pay)
-
-
 def passes(
-    checkpoints: Checkpoints,
-    wakeups: Wakeups,
-    body: Callable[[Run], Awaitable[object]] = submitted,
+    durable: Durable,
+    body: Callable[[Run], Awaitable[object]],
     limit: int = POOL,
     *,
     lease: timedelta = LEASE,
@@ -185,26 +131,26 @@ def passes(
     """
 
     async def advance(delivery: Delivery) -> None:
-        holder = await checkpoints.claim(delivery.workflow, lease)
+        holder = await durable.checkpointer.claim(delivery.workflow, lease)
         if holder is None:
             # Someone else is mid-pass. Whatever this wakeup carried is in the store
             # already, so the pass in flight may cover it; ask again shortly rather than
             # blocking a slot, and answer for the delivery so it is not reclaimed too.
             logger.info(f"{delivery.workflow} is held by another pass; looking again in {contended}")
-            await wakeups.wake_at(delivery.workflow, now() + contended)
-            await wakeups.done(delivery)
+            await durable.scheduler.wake_at(delivery.workflow, now() + contended)
+            await durable.scheduler.done(delivery)
             return
         try:
-            await resume(holder, checkpoints, body)
+            await resume(holder, durable.checkpointer, body)
         except Suspended as pause:
             if pause.due is not None:
-                await wakeups.wake_at(delivery.workflow, pause.due)
+                await durable.scheduler.wake_at(delivery.workflow, pause.due)
             logger.info(f"{delivery.workflow} suspended at {pause.key}")
         except Exception as error:  # noqa: BLE001 - a workflow's failure is data here, not a fault in the loop
             logger.warning(f"{delivery.workflow} failed: {error!r}")
         finally:
-            await checkpoints.release(holder)
-        await wakeups.done(delivery)
+            await durable.checkpointer.release(holder)
+        await durable.scheduler.done(delivery)
 
     async def pool(deliveries: Stream[Delivery]) -> None:
         async for finished in limit_concurrency((advance(delivery) async for delivery in deliveries), limit):
@@ -214,15 +160,15 @@ def passes(
 
 
 async def ready(
-    wakeups: Wakeups,
+    scheduler: Scheduler,
     within: timedelta = BLOCKING,
     idle: timedelta = LEASE,
 ) -> AsyncGenerator[Delivery]:
     """
-    The stream of wakeups this worker should act on: taken over, then new.
+    The stream of scheduler this worker should act on: taken over, then new.
 
     A source stream like any other, so everything downstream is ordinary wiring, and
-    swapping Redis for another queue changes this function alone. It merges the two
+    swapping one queue for another changes this function alone. It merges the two
     sources because `reclaim` assigns a dead worker's delivery to *this* one, which
     obliges it to run it.
 
@@ -233,40 +179,44 @@ async def ready(
     empty, so the blocking read is what paces the loop.
     """
     while True:
-        delivery = await wakeups.reclaim(idle)
+        delivery = await scheduler.reclaim(idle)
         if delivery is None:
-            delivery = await wakeups.next_ready(within)
+            delivery = await scheduler.next_ready(within)
         if delivery is not None:
             yield delivery
 
 
-async def waking(wakeups: Wakeups, *, tick: timedelta = TICK, now: Callable[[], datetime] = now_utc) -> None:
+def waking(scheduler: Scheduler) -> Sink[datetime]:
     """
     The control plane: make every workflow whose deadline has passed ready again.
 
-    Runs on its own tick rather than on traffic, because whether a wait is over is a
-    question about the clock and not about the request that happens to arrive. Safe to
-    run in every worker, and safe to be killed at any point in it, because the move is
-    the store's single operation rather than this loop's two (see `wake_due`).
+    A `Sink` over a stream of moments rather than its own timer, so *when* it runs is the
+    caller's to decide and this only says what happens each time. Driven off `ticks` in
+    `work`; driven off a list in a test.
 
-    Whether it does anything is the queue's business. Over `RedisWakeups` this is what
-    carries a workflow from the sleepers to the stream; over `RedisSchedule` it spins
-    against a no-op, because there being due and being ready are one score and nothing
-    has to move. The worker runs it either way rather than asking which queue it has.
+    Safe to run in every worker, and safe to be killed at any point in it, because the
+    move is the store's single operation rather than this sink's two (see `wake_due`).
+
+    Whether it does anything is the queue's business. Over a stream beside a sorted set
+    this is what carries a workflow from the sleepers to the queue; over a single
+    structure scored by visibility it spins against a no-op, because being due and being
+    ready are then the same score and nothing has to move. The worker runs it either way
+    rather than asking which queue it has.
     """
-    while True:
-        await wakeups.wake_due(now())
-        await asyncio.sleep(tick.total_seconds())
+
+    async def wake(moment: datetime) -> None:
+        await scheduler.wake_due(moment)
+
+    return from_sink(wake)
 
 
 async def work(
-    checkpoints: Checkpoints,
-    wakeups: Wakeups,
+    durable: Durable,
+    body: Callable[[Run], Awaitable[object]],
     *,
     tick: timedelta = TICK,
     idle: timedelta = LEASE,
     limit: int = POOL,
-    body: Callable[[Run], Awaitable[object]] = submitted,
     now: Callable[[], datetime] = now_utc,
 ) -> None:
     """
@@ -276,12 +226,20 @@ async def work(
     foreground and a background: cancelling either (a shutdown, a failed timer) takes
     the other down with it instead of leaving a worker that runs passes nobody wakes.
     `prepare` first, because reading a queue takes setup that writing to it does not.
+
+    Both halves are also the same shape, which is the point of the vocabulary: a sink
+    over a stream. One consumes deliveries, the other consumes moments, and a deployment
+    that wants a third (trimming a Redis stream, sweeping old checkpointer) adds a task to
+    this group rather than a mechanism.
     """
-    await wakeups.prepare()
+    await durable.scheduler.prepare()
+
+    async def sweep_due() -> None:
+        await waking(durable.scheduler)(ticks(tick, now=now))
 
     async def advance_ready() -> None:
-        await passes(checkpoints, wakeups, body, limit, lease=idle, now=now)(ready(wakeups, idle=idle))
+        await passes(durable, body, limit, lease=idle, now=now)(ready(durable.scheduler, idle=idle))
 
     async with asyncio.TaskGroup() as group:
-        group.create_task(waking(wakeups, tick=tick, now=now))
+        group.create_task(sweep_due())
         group.create_task(advance_ready())

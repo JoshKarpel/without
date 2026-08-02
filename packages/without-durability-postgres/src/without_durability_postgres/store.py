@@ -1,6 +1,6 @@
 # The same two seams as `store.py` and `schedule.py`, over one Postgres instead of one
 # Redis. It is the other half of the argument the Redis store makes, and putting the two
-# side by side is the point: `Checkpoints` and `Wakeups` state the guarantees, and a
+# side by side is the point: `Checkpointer` and `Scheduler` state the guarantees, and a
 # store says how it reaches them, so a family of stores is not one good implementation
 # and one compromise.
 #
@@ -28,7 +28,7 @@
 # Two consequences fall out of SQL that are worth naming, because both were live
 # questions in the Redis store and neither survives the move.
 #
-# A workflow id is a *parameter* here, never part of a key. `RedisCheckpoints` documents
+# A workflow id is a *parameter* here, never part of a key. `RedisCheckpointer` documents
 # a contract on ids (no braces, bounded length) purely because it builds key names by
 # interpolation; this store binds the id as a query parameter, so there is nothing to
 # say. That is the tell the Redis store's own docstring predicted: the contract was a
@@ -43,7 +43,7 @@
 # disappears, and here that happens only if a sweep deletes it, which is a policy this
 # app chooses rather than a lifetime the store imposes.
 #
-# Namespacing is the connection's job, not the key's. `RedisCheckpoints` carries a
+# Namespacing is the connection's job, not the key's. `RedisCheckpointer` carries a
 # `namespace` because a Redis keyspace is one flat namespace; a table name is already
 # scoped by its schema and database, so two deployments sharing a server are two
 # databases (or two `search_path`s in the DSN) rather than two prefixes. The queue keeps
@@ -65,11 +65,10 @@ from psycopg import AsyncCursor
 from psycopg.rows import TupleRow
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
-
-from integration.durable.shell import Fenced
-from integration.durable.shell import Pass
-from integration.durable.stepwise import now_utc
-from integration.durable.wakeups import Delivery
+from without_durability.seams import Delivery
+from without_durability.seams import Fenced
+from without_durability.seams import Pass
+from without_durability.stepwise import now_utc
 
 # The same two numbers `schedule.py` documents at length, and for the same reasons: a
 # taken workflow is invisible for `LEASE`, and a worker with nothing to do asks again
@@ -227,11 +226,11 @@ async def migrate(pool: AsyncConnectionPool) -> None:
 
 
 @dataclass(frozen=True, slots=True)
-class PostgresCheckpoints:
+class PostgresCheckpointer:
     """
     A workflow's completed steps as rows in one table, and its claim as a row in another.
 
-    The `Checkpoints` implementation for the deployment that already has a Postgres, and
+    The `Checkpointer` implementation for the deployment that already has a Postgres, and
     the one that can co-commit with the application's own tables, which is the capability
     the whole `Effect` parameter exists for. `SqlEffect` is a callback over `transact`'s
     open transaction, so a step whose effect is a write to *this* database happens exactly
@@ -243,7 +242,7 @@ class PostgresCheckpoints:
     it waits. Call `migrate` once against the same pool before anything else, at the
     entrypoint that built it.
 
-    The durability question `RedisCheckpoints` has to hedge on does not arise here.
+    The durability question `RedisCheckpointer` has to hedge on does not arise here.
     `record` returning means the transaction committed, and a default Postgres has
     `synchronous_commit` on, so the write is on disk and survives a crash of the server
     rather than only of the client. That is the property `run_durably`'s reasoning about
@@ -338,7 +337,7 @@ class PostgresCheckpoints:
 # on its head; with it, they fan out. It is also why nothing here needs a consumer group.
 #
 # The new `visible_at` is returned because it *is* the receipt, which is the trick
-# `RedisSchedule` documents at length: a workflow appears once, so a wakeup arriving
+# `RedisSetScheduler` documents at length: a workflow appears once, so a wakeup arriving
 # mid-pass lands on top of the entry that pass is holding, and finishing has to be
 # conditional on the value being unchanged or it throws the wakeup away.
 #
@@ -373,12 +372,12 @@ FINISH = "DELETE FROM workflow_queue WHERE namespace = %s AND workflow = %s AND 
 
 
 @dataclass(frozen=True, slots=True)
-class PostgresSchedule:
+class PostgresScheduler:
     """
-    `Wakeups` as one table, each row scored by when its workflow becomes visible.
+    `Scheduler` as one table, each row scored by when its workflow becomes visible.
 
-    A drop-in for `RedisWakeups` and `RedisSchedule`: the same protocol, the same worker,
-    the same API. It is modelled on `RedisSchedule` rather than on the stream, and not
+    A drop-in for `RedisStreamScheduler` and `RedisSetScheduler`: the same protocol, the same worker,
+    the same API. It is modelled on `RedisSetScheduler` rather than on the stream, and not
     because a table cannot do better: queued now is a `visible_at` in the past, sleeping
     is one in the future, and being worked on is one a lease ahead, so `wake_due`,
     `reclaim`, and `prepare`'s queue half all have nothing to do, exactly as they do
@@ -390,7 +389,7 @@ class PostgresSchedule:
 
     What it does not add is the blocking read. This polls on `poll`, so an idle worker
     costs a round trip per interval and a submitted order waits up to one interval to be
-    picked up, which is the same regression `RedisSchedule` takes and the same knob to
+    picked up, which is the same regression `RedisSetScheduler` takes and the same knob to
     turn. Postgres can close it (`LISTEN`/`NOTIFY` on a dedicated connection, woken by a
     trigger or by the writer) and this does not, which is the honest state of it rather
     than a claim that a table cannot wait.
@@ -481,3 +480,51 @@ class PostgresSchedule:
                 FINISH,
                 (self.namespace, delivery.workflow, datetime.fromisoformat(delivery.receipt)),
             )
+
+
+@dataclass(frozen=True, slots=True)
+class PostgresDurable:
+    """
+    A `Durable` whose two stores are one database, so `arrive` is a single commit.
+
+    This is the row `SplitDurable` cannot fill in. Recording the value a workflow is
+    waiting on and making the workflow runnable are two writes, and everywhere else they
+    are two writes with a crash window between them; here they are two statements in one
+    transaction, so the window does not exist. That is the same capability `transact`
+    offers a step, arriving at the seam above rather than inside a pass, and it is
+    available for the same reason: both things live in one datastore.
+
+    Which is why the two stores MUST share a pool, checked at construction rather than
+    documented. It is the exact question `LuaEffect` asks with its hash tag, and it does
+    not stop being asked because SQL hides it: a checkpoint and a queue in two Postgres
+    databases are two datastores, and a transaction across them is a distributed
+    transaction whatever the connection string suggests. Sharded Postgres asks it again
+    at the next level down, where the answer is that both tables must be distributed by
+    the workflow id and co-located, or the "one commit" here becomes a two-phase commit
+    across nodes (see the package README).
+    """
+
+    checkpointer: PostgresCheckpointer
+    scheduler: PostgresScheduler
+
+    def __post_init__(self) -> None:
+        if self.checkpointer.pool is not self.scheduler.pool:
+            raise ValueError("a PostgresDurable's two stores must share one pool, or `arrive` is not one commit")
+
+    async def arrive(self, workflow: str, key: str, value: object) -> object:
+        """
+        Record the value and make the workflow ready, together or not at all.
+
+        The order within the transaction does not matter, which is the point: a commit
+        has no halfway. What does matter is that both statements go through the *same*
+        cursor, since a second connection would be a second transaction wearing the same
+        method's name.
+        """
+        async with self.checkpointer.pool.connection() as connection, connection.cursor() as cursor:
+            await cursor.execute(SUPPLY, {"workflow": workflow, "step": key, "value": Jsonb(value)})
+            stored = cast(tuple[object], await cursor.fetchone())
+            await cursor.execute(
+                SCHEDULE,
+                {"namespace": self.scheduler.namespace, "workflow": workflow, "visible_at": self.scheduler.now()},
+            )
+            return stored[0]

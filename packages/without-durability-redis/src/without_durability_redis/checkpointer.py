@@ -1,4 +1,4 @@
-# The one place that knows both Redis and JSON: the `Checkpoints` implementation the
+# The one place that knows both Redis and JSON: the `Checkpointer` implementation the
 # durable runner talks to. A workflow is one Redis hash, a completed step is one
 # field in it, and the vocabulary is small, because the shape `CompiledGraph.stream`
 # emits (a mapping of name to result) is already the shape a hash holds. Nothing above
@@ -35,9 +35,8 @@ from typing import cast
 from redis.asyncio import Redis
 from redis.commands.core import AsyncScript
 from redis.exceptions import ResponseError
-
-from integration.durable.shell import Fenced
-from integration.durable.shell import Pass
+from without_durability.seams import Fenced
+from without_durability.seams import Pass
 
 # Take the workflow if nobody holds it, and stamp the taking with a number that only
 # ever goes up. It is the store, not the claimant, that decides the ordering, so two
@@ -140,12 +139,12 @@ class LuaEffect:
     """
     A piece of work this Redis can do, written as the Lua it would be on its own.
 
-    The `Effect` type for `RedisCheckpoints`, and the shape of the answer to "what can a
+    The `Effect` type for `RedisCheckpointer`, and the shape of the answer to "what can a
     store commit alongside its record". `source` is an ordinary script body: it reads
     `KEYS` and `ARGV` from index 1 as if it were the only thing running, and it MUST
     return JSON, since what it returns is written into the checkpoint verbatim and read
     back through the same codec as any step (`cjson.encode` is the usual way).
-    `RedisCheckpoints.transact` splices it into a wrapper that supplies the fence check
+    `RedisCheckpointer.transact` splices it into a wrapper that supplies the fence check
     and the record, and rebinds those two tables so the numbering an author sees is the
     numbering they wrote.
 
@@ -205,7 +204,7 @@ return result
 
 
 @dataclass(frozen=True, slots=True)
-class RedisCheckpoints:
+class RedisCheckpointer:
     """
     A workflow's completed steps as one Redis hash, and its claim as another.
 
@@ -255,9 +254,9 @@ class RedisCheckpoints:
     in `:unwind` addresses another workflow's rollback), and it is documented there,
     since deriving a sibling id by suffixing is true of that runner against any store.
 
-    Note what is *not* on this list. The queue (`wakeups`, `schedule`) holds a workflow
+    Note what is *not* on this list. The queue (`scheduler`, `schedule`) holds a workflow
     id as a value rather than in a key name, so none of this applies there, and
-    `postgres.PostgresCheckpoints` binds the id as a query parameter and so asks nothing
+    `postgres.PostgresCheckpointer` binds the id as a query parameter and so asks nothing
     of it at all. This is a property of building keys by interpolation, not of workflow
     ids.
     """
@@ -265,7 +264,7 @@ class RedisCheckpoints:
     redis: Redis
     namespace: str = "workflow"
     ttl: timedelta = timedelta(days=1)
-    # Registered once at construction, the way `RedisWakeups` registers its own: this
+    # Registered once at construction, the way `RedisStreamScheduler` registers its own: this
     # precomputes each digest and holds the client, so a call sends the digest and falls
     # back to the source only when the server has not seen it.
     scripts: tuple[AsyncScript, ...] = field(init=False, repr=False, compare=False)

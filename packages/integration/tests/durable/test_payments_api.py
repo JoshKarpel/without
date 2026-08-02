@@ -8,16 +8,17 @@ from typing import Never
 
 import httpx
 import pytest
-from doubles import MemoryCheckpoints
-from doubles import MemoryWakeups
-from integration.durable import Pass
 from integration.durable.api import Payments
 from integration.durable.api import payments_app
+from without_durability import MemoryCheckpointer
+from without_durability import MemoryScheduler
+from without_durability import Pass
+from without_durability import SplitDurable
 from without_http import serving
 
 # The API served for real by `without-http` and driven by an ordinary HTTP client,
 # against in-memory stores: the endpoints hold nothing else, so a container adds
-# nothing to what these can prove (the compose-marked tests cover Redis itself).
+# nothing to what these can prove (the compose-marked tests cover the real stores).
 
 WORKFLOW = "idem-key-9f2"
 ORDER = {"items": {"widget": 1200, "gizmo": 800}}
@@ -25,7 +26,7 @@ ORDER = {"items": {"widget": 1200, "gizmo": 800}}
 
 @pytest.fixture
 def payments() -> Payments:
-    return Payments(checkpoints=MemoryCheckpoints(), wakeups=MemoryWakeups())
+    return Payments(durable=SplitDurable(MemoryCheckpointer(), MemoryScheduler()))
 
 
 @pytest.fixture
@@ -36,13 +37,13 @@ async def client(payments: Payments) -> AsyncIterator[httpx.AsyncClient]:
 
 
 def hashes(payments: Payments) -> dict[str, dict[str, object]]:
-    assert isinstance(payments.checkpoints, MemoryCheckpoints)
-    return payments.checkpoints.hashes
+    assert isinstance(payments.durable.checkpointer, MemoryCheckpointer)
+    return payments.durable.checkpointer.hashes
 
 
 def queue(payments: Payments) -> list[str]:
-    assert isinstance(payments.wakeups, MemoryWakeups)
-    return list(payments.wakeups.queue)
+    assert isinstance(payments.durable.scheduler, MemoryScheduler)
+    return list(payments.durable.scheduler.queue)
 
 
 async def test_submitting_an_order_records_it_and_makes_the_workflow_ready(
@@ -115,8 +116,8 @@ async def test_the_status_endpoint_shows_what_the_workflow_has_recorded(
     client: httpx.AsyncClient,
     payments: Payments,
 ) -> None:
-    await payments.checkpoints.supply(WORKFLOW, "order", ORDER["items"])
-    await payments.checkpoints.supply(WORKFLOW, "paid", "pay-2000")
+    await payments.durable.checkpointer.supply(WORKFLOW, "order", ORDER["items"])
+    await payments.durable.checkpointer.supply(WORKFLOW, "paid", "pay-2000")
 
     response = await client.get(f"/orders/{WORKFLOW}")
 
@@ -143,7 +144,7 @@ async def test_an_unrouted_path_is_a_404(client: httpx.AsyncClient) -> None:
 
 
 @dataclass(frozen=True, slots=True)
-class BrokenCheckpoints:
+class BrokenCheckpointer:
     """A store whose writes fail: the app's own bug, not the client's."""
 
     async def load(self, workflow: str) -> dict[str, object]:  # pragma: no cover - present to satisfy the protocol
@@ -171,7 +172,7 @@ async def test_a_failure_that_is_not_the_requests_fault_is_a_500_not_a_422() -> 
     # The recovery policy answers for what a *client* got wrong and nothing else, so a
     # store that cannot write falls through it and surfaces as a server error. Reading
     # a 422 here would tell the caller to fix a request that was fine.
-    payments = Payments(checkpoints=BrokenCheckpoints(), wakeups=MemoryWakeups())
+    payments = Payments(durable=SplitDurable(BrokenCheckpointer(), MemoryScheduler()))
 
     async with serving(payments_app(payments)) as server:
         async with httpx.AsyncClient(base_url=f"http://{server.host}:{server.port}") as client:

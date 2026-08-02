@@ -48,6 +48,14 @@ packages). Each package is its own top-level import.
   workflows: a `Graph` builder threads value types through the wiring, and a
   single-input graph is an async callable that `from_map` lifts straight into a
   `Processor`. Imported as `without_dag`.
+- `packages/without-durability` — durable workflows over `without-dag`: a
+  checkpoint any process can read, plus the store seams (`Checkpointer`,
+  `Scheduler`, `Durable`) that make "one writer at a time" enforceable rather than
+  hoped for. Imported as `without_durability`.
+- `packages/without-durability-redis`, `packages/without-durability-postgres`,
+  `packages/without-durability-sqlite` — one store each, so the core pulls no
+  driver. Redis reaches every guarantee with small Lua scripts, the SQL stores with
+  ordinary transactions, and SQLite needs no server at all.
 - `packages/without-logging` — a logging pipeline: stdlib log records parsed into
   immutable `Record` values at a `capture` boundary, filtered and enriched as
   processors, drained to a sink the app owns. Imported as `without_logging`.

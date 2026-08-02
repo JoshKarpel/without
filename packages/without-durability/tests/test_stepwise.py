@@ -7,20 +7,20 @@ from datetime import datetime
 from datetime import timedelta
 
 import pytest
-from doubles import MemoryCheckpoints
-from doubles import MemoryEffect
-from integration.durable import Contended
-from integration.durable import Fenced
 from integration.durable import Payouts
-from integration.durable import Run
-from integration.durable import Suspended
-from integration.durable import claimed
-from integration.durable import now_utc
 from integration.durable import parse_approver
-from integration.durable import parse_deadline
 from integration.durable import parse_items
 from integration.durable import pay_out
-from integration.durable import resume
+from without_durability import Contended
+from without_durability import Fenced
+from without_durability import MemoryCheckpointer
+from without_durability import MemoryEffect
+from without_durability import Run
+from without_durability import Suspended
+from without_durability import claimed
+from without_durability import now_utc
+from without_durability import parse_deadline
+from without_durability import resume
 
 ORDER = "ord-88"
 ITEMS = {"widget": 1200, "gizmo": 800}
@@ -74,7 +74,7 @@ class Ledger:
 
 async def paying(
     ledger: Ledger,
-    checkpoints: MemoryCheckpoints,
+    checkpointer: MemoryCheckpointer,
     clock: Clock,
     *,
     settling: timedelta = timedelta(),
@@ -90,18 +90,18 @@ async def paying(
     async def body(run: Run) -> dict[str, object]:
         return await pay_out(run, ORDER, ledger.services(), settling=settling, approval_over=APPROVAL_OVER)
 
-    holder = await claimed(checkpoints, ORDER)
+    holder = await claimed(checkpointer, ORDER)
     try:
-        return await resume(holder, checkpoints, body, now=clock)
+        return await resume(holder, checkpointer, body, now=clock)
     finally:
-        await checkpoints.release(holder)
+        await checkpointer.release(holder)
 
 
 async def test_a_workflow_performs_each_effect_once_and_returns_its_payout() -> None:
     ledger = Ledger()
-    checkpoints = MemoryCheckpoints()
+    checkpointer = MemoryCheckpointer()
 
-    payout = await paying(ledger, checkpoints, Clock())
+    payout = await paying(ledger, checkpointer, Clock())
 
     assert payout == {
         "order_id": ORDER,
@@ -115,11 +115,11 @@ async def test_a_workflow_performs_each_effect_once_and_returns_its_payout() -> 
 
 async def test_a_second_pass_over_a_finished_workflow_performs_no_effects() -> None:
     ledger = Ledger()
-    checkpoints = MemoryCheckpoints()
+    checkpointer = MemoryCheckpointer()
 
-    first = await paying(ledger, checkpoints, Clock())
+    first = await paying(ledger, checkpointer, Clock())
     ledger.calls.clear()
-    second = await paying(ledger, checkpoints, Clock())
+    second = await paying(ledger, checkpointer, Clock())
 
     assert second == first
     assert ledger.calls == [], "every step reached its record, so the pass was a re-read"
@@ -127,12 +127,12 @@ async def test_a_second_pass_over_a_finished_workflow_performs_no_effects() -> N
 
 async def test_a_pass_that_fails_partway_leaves_the_steps_that_finished_recorded() -> None:
     ledger = Ledger(broken={"pay"})
-    checkpoints = MemoryCheckpoints()
+    checkpointer = MemoryCheckpointer()
 
     with pytest.raises(RuntimeError, match="pay is down"):
-        await paying(ledger, checkpoints, Clock())
+        await paying(ledger, checkpointer, Clock())
 
-    assert checkpoints.hashes[ORDER] == {
+    assert checkpointer.hashes[ORDER] == {
         "items": ITEMS,
         "captured:gizmo": "cap-gizmo-800",
         "captured:widget": "cap-widget-1200",
@@ -142,7 +142,7 @@ async def test_a_pass_that_fails_partway_leaves_the_steps_that_finished_recorded
     ledger.broken.clear()
     ledger.calls.clear()
 
-    payout = await paying(ledger, checkpoints, Clock())
+    payout = await paying(ledger, checkpointer, Clock())
 
     assert payout["reference"] == "pay-ord-88-2000"
     assert ledger.calls == ["pay"], "the captures were read back rather than re-charged"
@@ -153,11 +153,11 @@ async def test_the_fan_out_is_one_step_per_item_the_first_step_returned() -> Non
     # *result*, not an input, and each carries its own key so a crash resumes item by
     # item rather than re-capturing the lot.
     ledger = Ledger(items={"a": 1, "b": 2, "c": 3, "d": 4})
-    checkpoints = MemoryCheckpoints()
+    checkpointer = MemoryCheckpointer()
 
-    await paying(ledger, checkpoints, Clock())
+    await paying(ledger, checkpointer, Clock())
 
-    assert [key for key in checkpoints.hashes[ORDER] if key.startswith("captured:")] == [
+    assert [key for key in checkpointer.hashes[ORDER] if key.startswith("captured:")] == [
         "captured:a",
         "captured:b",
         "captured:c",
@@ -167,18 +167,18 @@ async def test_the_fan_out_is_one_step_per_item_the_first_step_returned() -> Non
 
 async def test_a_wait_suspends_the_pass_and_resumes_once_its_deadline_has_passed() -> None:
     ledger = Ledger()
-    checkpoints = MemoryCheckpoints()
+    checkpointer = MemoryCheckpointer()
     clock = Clock()
 
     with pytest.raises(Suspended) as suspension:
-        await paying(ledger, checkpoints, clock, settling=SETTLING)
+        await paying(ledger, checkpointer, clock, settling=SETTLING)
 
     assert suspension.value.key == "settling"
     assert suspension.value.due == STARTED_AT + SETTLING
     assert "pay" not in ledger.calls
 
     clock.advance(SETTLING)
-    payout = await paying(ledger, checkpoints, clock, settling=SETTLING)
+    payout = await paying(ledger, checkpointer, clock, settling=SETTLING)
 
     assert payout["reference"] == "pay-ord-88-2000"
 
@@ -187,27 +187,27 @@ async def test_a_wait_interrupted_partway_does_not_restart_its_clock() -> None:
     # The reason the *deadline* is recorded rather than the duration: a pass on day two
     # of a three-day wait must not push the deadline out to day five.
     ledger = Ledger()
-    checkpoints = MemoryCheckpoints()
+    checkpointer = MemoryCheckpointer()
     clock = Clock()
 
     with pytest.raises(Suspended):
-        await paying(ledger, checkpoints, clock, settling=SETTLING)
+        await paying(ledger, checkpointer, clock, settling=SETTLING)
 
     clock.advance(timedelta(days=2))
 
     with pytest.raises(Suspended) as second:
-        await paying(ledger, checkpoints, clock, settling=SETTLING)
+        await paying(ledger, checkpointer, clock, settling=SETTLING)
 
     assert second.value.due == STARTED_AT + SETTLING
-    assert checkpoints.hashes[ORDER]["settling"] == (STARTED_AT + SETTLING).isoformat()
+    assert checkpointer.hashes[ORDER]["settling"] == (STARTED_AT + SETTLING).isoformat()
 
 
 async def test_a_payout_over_the_threshold_waits_for_an_approval_another_process_records() -> None:
     ledger = Ledger(items=dict(BIG_ITEMS))
-    checkpoints = MemoryCheckpoints()
+    checkpointer = MemoryCheckpointer()
 
     with pytest.raises(Suspended) as suspension:
-        await paying(ledger, checkpoints, Clock())
+        await paying(ledger, checkpointer, Clock())
 
     assert suspension.value.key == "approved-by"
     assert suspension.value.due is None, "this wait ends when it is told, not when a clock says so"
@@ -215,10 +215,10 @@ async def test_a_payout_over_the_threshold_waits_for_an_approval_another_process
 
     # Whoever took the approval writes one field into the workflow's checkpoint. It
     # shares nothing with the suspended pass, which is gone.
-    await checkpoints.supply(ORDER, "approved-by", "auditor-7")
+    await checkpointer.supply(ORDER, "approved-by", "auditor-7")
     ledger.calls.clear()
 
-    payout = await paying(ledger, checkpoints, Clock())
+    payout = await paying(ledger, checkpointer, Clock())
 
     assert payout["approved_by"] == "auditor-7"
     assert payout["total"] == 94_000
@@ -226,14 +226,14 @@ async def test_a_payout_over_the_threshold_waits_for_an_approval_another_process
 
 
 async def test_a_pass_refuses_two_steps_sharing_a_name() -> None:
-    checkpoints = MemoryCheckpoints()
+    checkpointer = MemoryCheckpointer()
 
     async def body(run: Run) -> None:
         await run.step("charged", lambda: answering("first"))
         await run.step("charged", lambda: answering("second"))
 
     with pytest.raises(ValueError, match="'charged' was already used in this pass"):
-        await resume(await claimed(checkpoints, ORDER), checkpoints, body, now=Clock())
+        await resume(await claimed(checkpointer, ORDER), checkpointer, body, now=Clock())
 
 
 async def answering(value: str) -> str:
@@ -241,28 +241,28 @@ async def answering(value: str) -> str:
 
 
 async def test_a_workflow_already_being_passed_over_cannot_be_claimed_again() -> None:
-    # The property the whole seam exists for. Without it, two wakeups for one workflow
+    # The property the whole seam exists for. Without it, two scheduler for one workflow
     # (which the submit-then-confirm flow produces every time) run two passes side by
     # side, and both find the same step unrecorded.
-    checkpoints = MemoryCheckpoints()
+    checkpointer = MemoryCheckpointer()
 
-    holder = await claimed(checkpoints, ORDER)
+    holder = await claimed(checkpointer, ORDER)
 
-    assert await checkpoints.claim(ORDER, timedelta(minutes=1)) is None
+    assert await checkpointer.claim(ORDER, timedelta(minutes=1)) is None
     with pytest.raises(Contended, match=f"another pass holds {ORDER!r}"):
-        await claimed(checkpoints, ORDER)
+        await claimed(checkpointer, ORDER)
 
-    await checkpoints.release(holder)
+    await checkpointer.release(holder)
 
-    assert await checkpoints.claim(ORDER, timedelta(minutes=1)) is not None, "released, so the next pass may run"
+    assert await checkpointer.claim(ORDER, timedelta(minutes=1)) is not None, "released, so the next pass may run"
 
 
 async def test_a_claim_outranks_every_claim_before_it() -> None:
-    checkpoints = MemoryCheckpoints()
+    checkpointer = MemoryCheckpointer()
 
-    first = await claimed(checkpoints, ORDER)
-    await checkpoints.release(first)
-    second = await claimed(checkpoints, ORDER)
+    first = await claimed(checkpointer, ORDER)
+    await checkpointer.release(first)
+    second = await claimed(checkpointer, ORDER)
 
     assert second.token > first.token, "releasing hands the workflow back, it does not rewind the fence"
 
@@ -270,20 +270,20 @@ async def test_a_claim_outranks_every_claim_before_it() -> None:
 async def test_a_write_from_a_superseded_pass_is_refused_rather_than_applied() -> None:
     # A lease alone cannot do this: a pass that stalls past its lease still believes it
     # holds the workflow, and only the store knows better. The token is what tells it.
-    checkpoints = MemoryCheckpoints()
-    stalled = await claimed(checkpoints, ORDER)
-    await checkpoints.release(stalled)
-    took_over = await claimed(checkpoints, ORDER)
+    checkpointer = MemoryCheckpointer()
+    stalled = await claimed(checkpointer, ORDER)
+    await checkpointer.release(stalled)
+    took_over = await claimed(checkpointer, ORDER)
 
     with pytest.raises(Fenced, match=f"pass {stalled.token} of {ORDER!r} was superseded"):
-        await checkpoints.record(stalled, "paid", "pay-from-the-dead")
+        await checkpointer.record(stalled, "paid", "pay-from-the-dead")
 
-    assert await checkpoints.record(took_over, "paid", "pay-real") == "pay-real"
-    assert checkpoints.hashes[ORDER] == {"paid": "pay-real"}
+    assert await checkpointer.record(took_over, "paid", "pay-real") == "pay-real"
+    assert checkpointer.hashes[ORDER] == {"paid": "pay-real"}
 
-    await checkpoints.release(stalled)
+    await checkpointer.release(stalled)
 
-    assert await checkpoints.claim(ORDER, timedelta(minutes=1)) is None, (
+    assert await checkpointer.claim(ORDER, timedelta(minutes=1)) is None, (
         "and a superseded pass cannot hand back a workflow that is no longer its to give"
     )
 
@@ -293,11 +293,11 @@ async def test_two_passes_that_both_ran_a_step_agree_on_its_result() -> None:
     # has already failed: the effect happened twice (nothing here can prevent that), but
     # the second pass is handed the first's value rather than overwriting it, so the two
     # do not carry different capture ids into everything downstream.
-    checkpoints = MemoryCheckpoints()
-    holder = await claimed(checkpoints, ORDER)
+    checkpointer = MemoryCheckpointer()
+    holder = await claimed(checkpointer, ORDER)
 
-    won = await checkpoints.record(holder, "captured:widget", "cap-from-the-winner")
-    lost = await checkpoints.record(holder, "captured:widget", "cap-from-the-loser")
+    won = await checkpointer.record(holder, "captured:widget", "cap-from-the-winner")
+    lost = await checkpointer.record(holder, "captured:widget", "cap-from-the-loser")
 
     assert won == "cap-from-the-winner"
     assert lost == "cap-from-the-winner", "the loser learns the winner's value instead of clobbering it"
@@ -307,10 +307,10 @@ async def test_a_step_returns_what_the_store_holds_rather_than_what_its_effect_p
     # The same property seen from inside a workflow, which is where it does its work:
     # `run.step` hands back the recorded value, so a pass whose effect ran a second time
     # still proceeds on the one result everybody agrees on.
-    checkpoints = MemoryCheckpoints()
-    await checkpoints.supply(ORDER, "charged", "ch-recorded-earlier")
-    holder = await claimed(checkpoints, ORDER)
-    run = Run(holder=holder, checkpoints=checkpoints, recorded={})
+    checkpointer = MemoryCheckpointer()
+    await checkpointer.supply(ORDER, "charged", "ch-recorded-earlier")
+    holder = await claimed(checkpointer, ORDER)
+    run = Run(holder=holder, checkpointer=checkpointer, recorded={})
 
     assert await run.step("charged", lambda: answering("ch-just-now")) == "ch-recorded-earlier"
 
@@ -331,19 +331,19 @@ async def test_a_step_whose_record_never_lands_runs_its_effect_again() -> None:
     # The at-least-once bound, made concrete, so the next test has something to beat.
     # `step` performs the effect and *then* writes the record, and a pass that dies in
     # between leaves the effect done and unrecorded, so the next pass repeats it.
-    checkpoints = MemoryCheckpoints()
-    holder = await claimed(checkpoints, ORDER)
-    run = Run(holder=holder, checkpoints=checkpoints, recorded={})
+    checkpointer = MemoryCheckpointer()
+    holder = await claimed(checkpointer, ORDER)
+    run = Run(holder=holder, checkpointer=checkpointer, recorded={})
     effect = tallying("charges")
 
     async def charge() -> object:
-        return effect(checkpoints.data)
+        return effect(checkpointer.data)
 
     await run.step("charged", charge)
-    checkpoints.hashes[ORDER].clear()  # the record that a crash lost
-    await Run(holder=holder, checkpoints=checkpoints, recorded={}).step("charged", charge)
+    checkpointer.hashes[ORDER].clear()  # the record that a crash lost
+    await Run(holder=holder, checkpointer=checkpointer, recorded={}).step("charged", charge)
 
-    assert checkpoints.data["charges"] == 2, "the card was charged twice, which is what an idempotency key is for"
+    assert checkpointer.data["charges"] == 2, "the card was charged twice, which is what an idempotency key is for"
 
 
 async def test_a_transacted_step_cannot_be_run_without_being_recorded() -> None:
@@ -352,34 +352,34 @@ async def test_a_transacted_step_cannot_be_run_without_being_recorded() -> None:
     # happen either. Losing the record the way the test above does is not something a
     # crash can produce here, so the only way to re-reach this step is a fresh pass, and
     # a fresh pass finds it recorded and performs nothing.
-    checkpoints = MemoryCheckpoints()
-    holder = await claimed(checkpoints, ORDER)
+    checkpointer = MemoryCheckpointer()
+    holder = await claimed(checkpointer, ORDER)
 
-    first = await Run(holder=holder, checkpoints=checkpoints, recorded={}).transact("charged", tallying("charges"))
+    first = await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("charged", tallying("charges"))
     again = await Run(
         holder=holder,
-        checkpoints=checkpoints,
-        recorded=await checkpoints.load(ORDER),
+        checkpointer=checkpointer,
+        recorded=await checkpointer.load(ORDER),
     ).transact("charged", tallying("charges"))
-    fresh = await Run(holder=holder, checkpoints=checkpoints, recorded={}).transact("charged", tallying("charges"))
+    fresh = await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("charged", tallying("charges"))
 
     assert (first, again, fresh) == (1, 1, 1), "one effect, however many passes reach it"
-    assert checkpoints.data["charges"] == 1
-    assert checkpoints.hashes[ORDER] == {"charged": 1}
+    assert checkpointer.data["charges"] == 1
+    assert checkpointer.hashes[ORDER] == {"charged": 1}
 
 
 async def test_a_transacted_step_is_refused_from_a_superseded_pass() -> None:
     # The fence covers `transact` as it covers `record`, and it has to: a stalled pass
     # performing its effect is worse here than a stalled write, since the effect is real.
-    checkpoints = MemoryCheckpoints()
-    stalled = await claimed(checkpoints, ORDER)
-    await checkpoints.release(stalled)
-    await claimed(checkpoints, ORDER)
+    checkpointer = MemoryCheckpointer()
+    stalled = await claimed(checkpointer, ORDER)
+    await checkpointer.release(stalled)
+    await claimed(checkpointer, ORDER)
 
     with pytest.raises(Fenced):
-        await Run(holder=stalled, checkpoints=checkpoints, recorded={}).transact("charged", tallying("charges"))
+        await Run(holder=stalled, checkpointer=checkpointer, recorded={}).transact("charged", tallying("charges"))
 
-    assert checkpoints.data == {}, "refused before the effect ran, not after"
+    assert checkpointer.data == {}, "refused before the effect ran, not after"
 
 
 async def test_a_deadline_recorded_as_something_else_fails_loudly() -> None:

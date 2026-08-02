@@ -15,30 +15,26 @@ render a reply) and `kv.shell` (a generic line-server transport plus the wiring
 that runs the core over it), a small demonstration that `without` is a principled
 way to write an imperative shell.
 
-`durable` is a durable workflow mechanism built on `without-dag`, together with an
-API server and a queue worker that make it a running service. It asks how much of
-a workflow engine is left once the state is a checkpoint any process can read,
-and the answer it arrives at is a dict lookup, a queue, and whatever atomicity
-the store already has. Which store is the point: exclusion has to be enforced by
-whatever holds the data, which is what Temporal builds a server for and DBOS
-requires Postgres for, and here it is stated as requirements on the store seam so
-that an implementation can say how it meets them. Two do. `RedisCheckpoints`
-reaches all of them with small Lua scripts, including exactly-once, since a
-script is an atomic commit over Redis data and the real constraint on
-co-committing an effect with its checkpoint is that both live in one datastore,
-not that one of them is Postgres. `PostgresCheckpoints` reaches them with
-ordinary transactions, which is the same guarantee arriving for free rather than
-being constructed, and it puts the queue in the same database so a deployment
-runs one system. It is a validation artifact rather than a substitute for any of
-them: [`durable/README.md`](src/integration/durable/README.md) is the design,
-where the guarantee lives, the gaps that remain, how the two stores differ, and
-how the whole thing sits against those systems (including what it owes DBOS).
+`durable` is the application half of the durable-workflow work: an order
+fulfilment graph, a payout workflow, the body a worker runs, and an HTTP API in
+front of it. The mechanism it exercises now ships as
+[`without-durability`](https://without.help/without-durability/) and its three
+stores, so what lives here is only what a *deployment* supplies: what a pass
+actually does, and the endpoints that hand it values.
 
-The Redis and Postgres tests drive real servers rather than fakes: `just test`
-starts the services in `compose.yaml` with podman, hands each published address to
-pytest through the environment, and takes the stack down again from an exit trap.
-They carry a `compose` mark and skip when that address is unset (no podman on the
-machine, or pytest run directly), so `-m "not compose"` opts out up front.
+It is what keeps the substitutability claim honest. `tests/durable/stores.py`
+builds one `Durable` per store (memory, Redis, Postgres, SQLite) behind a single
+fixture, and `test_workflows_over_stores.py` runs the same saga, the same
+suspension, and the same API-plus-worker flow against every one of them. A test
+written once and run four ways says more about the seam than four suites each
+proving it for one store. What each store *is* (its scripts, its statements, its
+own failure modes) is tested in that store's own package.
+
+Those tests drive real servers rather than fakes: `just test` starts the services
+in `compose.yaml` with podman, hands each published address to pytest through the
+environment, and takes the stack down again from an exit trap. They carry a
+`compose` mark and skip when that address is unset (no podman on the machine, or
+pytest run directly), so `-m "not compose"` opts out up front.
 
 `transform` is a text-transform service built on the `without-asgi` adapters.
 `POST /transform` reads the request body, uppercases/lowercases/title-cases it

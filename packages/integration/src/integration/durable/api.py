@@ -1,8 +1,8 @@
 # The API half of the pair: three endpoints, none of which runs a workflow. Submitting
-# an order and confirming a payout are the same two-line move, and that symmetry is the
+# an order and confirming a payout are the same one-line move, and that symmetry is the
 # design rather than a coincidence:
 #
-#   supply one value into the workflow's checkpoint, then make the workflow ready.
+#   a value the workflow was waiting on has arrived.
 #
 # A submission supplies the order the workflow is waiting on; a confirmation supplies the
 # approval it is waiting on. Both are values some *other* process wrote, which is
@@ -10,16 +10,21 @@
 # versus resuming one, and no channel to a running process. The worker finds out the
 # same way either time.
 #
-# `supply` rather than `record` because these writes come from outside any pass, and
-# deliberately do not take the workflow's claim. An approval that failed because a worker
-# happened to be mid-pass would be an API that gets slower the busier the system is, for
-# a value nothing is racing it to write. What it does keep is first-writer-wins, which is
-# what makes a resubmission harmless.
+# One line rather than two because `Durable.arrive` names the transition. It was two
+# (record the value, then make the workflow ready), which put the burden of ordering them
+# on every caller and left a crash window nothing in the types mentioned. Whether the
+# pair is atomic is now the store's business to state rather than this module's to hope.
+#
+# It records rather than writing under a claim, because these writes come from outside
+# any pass. An approval that failed because a worker happened to be mid-pass would be an
+# API that gets slower the busier the system is, for a value nothing is racing it to
+# write. What it does keep is first-writer-wins, which is what makes a resubmission
+# harmless.
 #
 # That is what replaces a client library talking to a workflow server: the API writes
-# to a hash and a list, and holds nothing. It can be restarted mid-flight, scaled to
-# any number of instances, or deployed separately from the worker, because the only
-# state it touches is the store both share.
+# two rows and holds nothing. It can be restarted mid-flight, scaled to any number of
+# instances, or deployed separately from the worker, because the only state it touches
+# is the store both share.
 #
 # The workflow id is the request's `Idempotency-Key`, so a resubmitted order is not a
 # second workflow: the second submission records the same order over the same key and
@@ -39,6 +44,7 @@ from without_asgi import ASGIApp
 from without_asgi import HttpScope
 from without_asgi import Response
 from without_asgi import make_asgi_app
+from without_durability import Durable
 from without_web import STR
 from without_web import ExtractionError
 from without_web import Router
@@ -52,8 +58,6 @@ from without_web import once
 from without_web import path_param
 from without_web import post
 
-from integration.durable.shell import Checkpoints
-from integration.durable.wakeups import Wakeups
 from integration.responses import json_response
 
 
@@ -76,15 +80,15 @@ class Confirmation(BaseModel):
 @dataclass(frozen=True, slots=True)
 class Payments:
     """
-    Everything the API touches: the checkpoint store and the ready queue.
+    Everything the API touches: one `Durable`, which is both stores and the moves across
+    them.
 
     Injected as router state, so the endpoints are functions of values and the app is
     assembled once at the entrypoint (`payments_app`), which is also what lets the
     tests drive it against dicts.
     """
 
-    checkpoints: Checkpoints
-    wakeups: Wakeups
+    durable: Durable
 
 
 order_body = body(SubmittedOrder.model_validate_json, schema=SubmittedOrder)
@@ -94,7 +98,7 @@ confirmation_body = body(Confirmation.model_validate_json, schema=Confirmation)
 # the work already recorded.
 #
 # It is also the one place a client's own text becomes a workflow id, so it is where an
-# id contract would be enforced if a deployment wanted one (see `RedisCheckpoints` for
+# id contract would be enforced if a deployment wanted one (see `RedisCheckpointer` for
 # what the Redis store asks of an id, and `run_saga` for the one constraint that holds
 # whatever the store is). This takes the header as given, because the ids that matter
 # are UUIDs their senders generated and every constraint on the list is one they meet
@@ -117,9 +121,14 @@ async def submit_order(payments: Payments, order: SubmittedOrder, workflow: str)
     one the workflow runs, so a client that retries with a changed basket gets the
     original back, which is what an idempotency key promises and the alternative
     (letting the second overwrite) would break for a workflow already spending it.
+
+    That retry is also what covers the one failure a split store can still have here.
+    If `arrive` is two writes and this process dies between them, the order is recorded
+    and nothing is queued; the client sees no `202` and sends the same key again, which
+    records nothing new and queues the workflow. Over a `Durable` that commits both at
+    once there is no window to cover.
     """
-    await payments.checkpoints.supply(workflow, "order", order.items)
-    await payments.wakeups.make_ready(workflow)
+    await payments.durable.arrive(workflow, "order", order.items)
     return json_response(202, {"workflow": workflow, "status": f"/orders/{workflow}"})
 
 
@@ -128,12 +137,11 @@ async def confirm_order(payments: Payments, workflow: str, confirmation: Confirm
     """
     Record the approval the workflow suspended on, then make it ready.
 
-    Identical in shape to submitting, because it is the same act: a value arrives that
-    the workflow cannot produce for itself. Nothing here knows whether a workflow is
+    Identical to submitting, because it is the same act: a value arrives that the
+    workflow cannot produce for itself. Nothing here knows whether a workflow is
     actually waiting; recording an approval nobody asked for leaves an unread field.
     """
-    await payments.checkpoints.supply(workflow, "approved-by", confirmation.approved_by)
-    await payments.wakeups.make_ready(workflow)
+    await payments.durable.arrive(workflow, "approved-by", confirmation.approved_by)
     return json_response(202, {"workflow": workflow, "status": f"/orders/{workflow}"})
 
 
@@ -146,7 +154,7 @@ async def show_order(payments: Payments, workflow: str) -> Response:
     separate status field to keep in sync with it, and `paid` appearing is what "done"
     means.
     """
-    recorded = await payments.checkpoints.load(workflow)
+    recorded = await payments.durable.checkpointer.load(workflow)
     if not recorded:
         return json_response(404, {"error": f"no workflow {workflow}"})
     return json_response(200, {"workflow": workflow, "recorded": recorded, "done": "paid" in recorded})

@@ -52,6 +52,12 @@ packages. Each is its own top-level import.
   client built on the sans-IO `h11`/`h2`/`wsproto` state machines.
 - [`without-dag`](without-dag/index.md): bounded-concurrency execution of
   DAG-shaped async workflows, liftable straight into a `Processor`.
+- [`without-durability`](without-durability/index.md): durable workflows over a
+  checkpoint any process can read, with the store seams that make one writer at a
+  time enforceable. Its stores are
+  [Redis](without-durability-redis/index.md),
+  [Postgres](without-durability-postgres/index.md), and
+  [SQLite](without-durability-sqlite/index.md).
 
 The [package dependency graph](architecture/package-graph.md) is derived from the
 declared dependencies, and each package's API reference (its `Reference` page,

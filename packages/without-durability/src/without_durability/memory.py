@@ -12,34 +12,45 @@ from datetime import timedelta
 from itertools import count
 from time import monotonic
 
-from integration.durable.shell import Fenced
-from integration.durable.shell import Pass
-from integration.durable.wakeups import Delivery
+from without_durability.seams import Delivery
+from without_durability.seams import Fenced
+from without_durability.seams import Pass
+
+# Both seams over ordinary dicts, shipped rather than kept in a test directory, because
+# the whole design says a store is injected and this is the store a test should inject.
+# They are doubles rather than mocks: every mechanism (the load, the record, the resume,
+# the queue, the timer's claim) runs for real and only the storage is swapped, so a test
+# against them exercises the same code paths a server-backed one does.
+#
+# What that buys is a suite with no container in it. What it costs is the one thing a
+# single process cannot stand in for: these hold their state in this process's memory, so
+# nothing here says whether a *second* process would see the same exclusion. That is
+# exactly what the store-backed suites are for, and it is why meeting the protocol's
+# requirements here is not optional (see `MemoryCheckpointer`).
 
 # What an effect is for a store whose datastore is a dict: a function over that dict,
-# returning the value to record. The Redis store's is a Lua script and the Postgres
-# store's is a callback over an open transaction's cursor. Nothing is shared between the
-# three but the position in `transact`.
+# returning the value to record. A Redis store's is a Lua script and a SQL store's is a
+# callback over an open transaction's cursor. Nothing is shared between them but the
+# position in `transact`.
 type MemoryEffect = Callable[[dict[str, object]], object]
-
-# The two stores the durable toys talk through, in memory. They are doubles rather
-# than mocks: every mechanism here (the load, the record, the resume, the queue, the
-# timer's claim) runs for real, and only the storage is swapped, which is the payoff
-# of injecting both seams. The container-backed tests run the same code against Redis.
 
 
 @dataclass(frozen=True, slots=True)
-class MemoryCheckpoints:
+class MemoryCheckpointer:
     """
-    A `Checkpoints` keeping one dict per workflow, and one claim beside it.
+    A `Checkpointer` keeping one dict per workflow, and one claim beside it.
 
     It meets the protocol's requirements rather than approximating them, which is the
-    only way a test against it says anything about the Redis one: tokens rise per
+    only way a test against it says anything about a real store: tokens rise per
     workflow, a write below the fence raises `Fenced`, and a key already recorded is
     never overwritten. Every method is synchronous between its `await`s, which is this
-    double's version of the Lua scripts: nothing can interleave halfway through a claim
-    or a conditional write, so it enforces atomicity the way the real store does rather
-    than pretending the question does not arise.
+    store's version of a Lua script or a transaction: nothing can interleave halfway
+    through a claim or a conditional write, so it enforces atomicity the way a real store
+    does rather than pretending the question does not arise.
+
+    A workflow whose checkpoint is a dict in this process is durable across exactly
+    nothing, so this is for tests and for driving a workflow in a script, not for a
+    deployment. Every other store here is the same code with the dict somewhere else.
     """
 
     hashes: dict[str, dict[str, object]] = field(default_factory=lambda: defaultdict(dict))
@@ -68,7 +79,8 @@ class MemoryCheckpoints:
         """
         Run `effect` over this store's own data and record it, without an `await` between.
 
-        The in-memory answer to the same question Redis answers with a script: this
+        The in-memory answer to the question Redis answers with a script and SQL with a
+        transaction: this
         store's datastore is `data`, so an effect is a function over `data`, and single
         threaded code with no suspension point is its transaction. Which is the point of
         `Effect` being a type parameter, since nothing about `LuaEffect` would fit here.
@@ -92,9 +104,9 @@ class MemoryCheckpoints:
 
 
 @dataclass(frozen=True, slots=True)
-class MemoryWakeups:
+class MemoryScheduler:
     """
-    A `Wakeups` keeping the queue in a deque, the sleepers in a dict, and, like the
+    A `Scheduler` keeping the queue in a deque, the sleepers in a dict, and, like the
     stream it stands in for, the deliveries nobody has answered for yet.
 
     `outstanding` is the part worth having a double for: a delivery stays there until

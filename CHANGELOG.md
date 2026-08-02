@@ -25,7 +25,7 @@
   hands pytest each published address, and takes the stack down from an exit trap. They carry a
   `compose` mark and skip where podman is not installed.
 - **`integration`**: `durable.stepwise`, the same durability without the graph, sharing the one
-  `Checkpoints` seam. A workflow is an ordinary async function whose effects are named
+  `Checkpointer` seam. A workflow is an ordinary async function whose effects are named
   (`await run.step("charged", ...)`); resuming calls it again and each step hands back what is
   recorded. It asks one thing in return, because the code *between* steps re-runs: effects live in
   steps, the code around them is pure (Temporal and DBOS state the same rule as workflow
@@ -57,7 +57,7 @@
   so it holds precisely as many wakeups as it is working on and stops reading at capacity. The
   end-to-end test submits over HTTP, waits out a real one-second window, confirms, and reads the
   payout back.
-- **`integration`**: `durable`'s `Checkpoints` seam now states the guarantees a store has to
+- **`integration`**: `durable`'s `Checkpointer` seam now states the guarantees a store has to
   provide, and the Redis one provides them. A protocol of `load` and `record` was too weak to run
   a workflow safely at any scale: it had no way to say "only if nobody else is running this" or
   "only if I am still the one who may write", so two wakeups for one workflow (which the
@@ -72,7 +72,7 @@
   agree on its result; `Run.step` hands that value back rather than its own. `supply` is the
   unclaimed half for values that come from outside a pass (the API's order and approval), which
   keeps first-writer-wins without making an approval fail because a worker is mid-pass, and makes
-  a resubmitted order genuinely idempotent rather than an overwrite. In `RedisCheckpoints` each of
+  a resubmitted order genuinely idempotent rather than an overwrite. In `RedisCheckpointer` each of
   these is one Lua script, for the reason `wake_due` already was: checking whether a workflow is
   free and taking it, or checking a token and applying the write it guards, are only correct as a
   single step, and the keys are hash-tagged so a workflow's two land on one slot. The worker claims
@@ -87,13 +87,13 @@
   reason this works on Redis is worth stating, because the usual framing (that exactly-once needs
   Postgres) is wrong about why: a Lua script is an atomic commit over Redis data, and the real
   constraint is that you can only transact within one datastore. Postgres wins only for effects
-  that live in that Postgres, and loses for everything else exactly as Redis does. So `Checkpoints`
+  that live in that Postgres, and loses for everything else exactly as Redis does. So `Checkpointer`
   is now generic over the type of effect a store can commit: `LuaEffect` for Redis (a script
   spliced into a wrapper supplying the fence check and the record, with `KEYS` and `ARGV` rebound
   so it is written as if it ran alone), a function over its own dict for the in-memory double, a
   session callback for a Postgres store that does not exist yet. The parameter defaults to `Never`,
   so a store with nothing to offer says so in its type and `transact` becomes uncallable rather
-  than absent, and code that never transacts keeps the bare `Checkpoints` annotation. On a cluster
+  than absent, and code that never transacts keeps the bare `Checkpointer` annotation. On a cluster
   the effect's keys must carry the workflow's own hash tag, since a script spanning two slots is a
   distributed transaction wearing a local disguise.
 - **`integration`**: a workflow's fencing token is now `max(now_ms, previous + 1)`, a hybrid
@@ -103,7 +103,7 @@
   the living. Seeding from the server clock closes that without coupling the two keys' lifetimes,
   and falling back to `previous + 1` keeps it strictly monotonic within one incarnation even if the
   clock steps backwards.
-- **`integration`**: `durable.schedule`, a second `Wakeups` that replaces the stream and the
+- **`integration`**: `durable.schedule`, a second `Scheduler` that replaces the stream and the
   sleeping sorted set with one sorted set scored by when each workflow becomes visible. Queued now
   is a score in the past, sleeping is a score in the future, and being worked on is a score one
   lease ahead, so there is nothing to move between structures: `wake_due`, `reclaim`, and `prepare`
@@ -117,8 +117,8 @@
   BLOCK` parks a worker inside Redis, a sorted set has none, so this polls and the interval is a
   floor under how fast anything starts. It is a drop-in, and the end-to-end test now runs the same
   API and worker over both queues to keep it one.
-- **`integration`**: `durable.postgres`, both seams over one Postgres: `PostgresCheckpoints` and
-  `PostgresSchedule` across three tables (`workflow_checkpoint`, `workflow_claim`,
+- **`integration`**: `durable.postgres`, both seams over one Postgres: `PostgresCheckpointer` and
+  `PostgresScheduler` across three tables (`workflow_checkpoint`, `workflow_claim`,
   `workflow_queue`), with `SqlEffect` as the effect type `transact` takes there, an async callback
   handed a cursor inside the open transaction. It is the other half of the argument the Redis store
   makes, and what it shows is where the atomic unit came from: every write that had to be a Lua
@@ -139,6 +139,66 @@
   `CREATE TABLE IF NOT EXISTS` under an advisory lock rather than a migration tool. The queue being
   a table in the same database is what makes "no second system" a claim this can make, and the
   end-to-end test now runs the same API and worker over Postgres as well.
+- **`integration`**: `durable.Durable`, one seam over `Checkpointer` and `Scheduler` that names the
+  transitions crossing both. Making a workflow runnable was two writes to two stores in the
+  caller's hands, in an order it had to get right, with a crash window nothing in the types
+  mentioned; `arrive(workflow, key, value)` is now one call and the API's submit and confirm are
+  one line each. The argument was already in this package, about `wake_due`: a protocol that names
+  the transition rather than its halves makes the lossy intermediate state unrepresentable, which
+  beats remembering to do both halves. It had just not been carried across the two seams. Two other
+  tells that the boundary was misplaced: `Scheduler` had to state a cross-call ordering rule in prose,
+  and three of its seven methods are no-ops in two of three implementations, which is a protocol
+  shaped around one implementation's mechanism rather than around its question. The fix is not one
+  big interface, which would bundle a mechanism to repair a contract and forfeit the split
+  deployment (a Postgres checkpoint beside an SQS queue is ordinary), so the contract is bundled and
+  the mechanisms are not: `Checkpointer` and `Scheduler` are unchanged underneath, and what varies is
+  what `arrive` *guarantees*. `SplitDurable` composes any two stores and does two writes, recording
+  before it queues, because recorded-and-unqueued is recoverable by anything that asks again where
+  queued-with-nothing-recorded drops the value; `PostgresDurable` requires its two stores to share
+  one pool, checked at construction rather than documented, and does one commit. `Scheduler` and
+  `Delivery` moved into the contracts module beside `Checkpointer`, so all three contracts are in one file and
+  everything naming a product implements them.
+- **`integration`**: corrected what "one datastore" means for `transact` and `arrive`, which had
+  been written as though a Postgres transaction were unconditionally local. Measured rather than
+  recalled: Redis Cluster rejects a script whose declared keys span slots (`CROSSSLOT`) and kills
+  one that reaches an undeclared non-local key partway through, having written nothing, so a
+  cross-node atomic write is unavailable rather than expensive, and a single node owning every slot
+  cannot show you either rule. Sharded Postgres instead escalates: under Citus a transaction
+  touching shards on two nodes becomes a real distributed transaction with `PREPARE TRANSACTION` /
+  `COMMIT PREPARED`, a deadlock detector, and `max_prepared_transactions` to size, which still
+  commits atomically but is a different guarantee arriving silently. The escape is the same shape on
+  both sides: Redis's hash tag and Citus co-location by workflow id are one idea, and sharing a pool
+  is the necessary half of it rather than the sufficient one.
+- **`without-durability`** (new package): the durable-workflow mechanism, extracted from the
+  `integration` toy now that it has earned its own name. It holds the three contracts (`seams.py`),
+  the graph runners (`graph.py`), the stepwise mechanism, the queue worker, and `memory.py`, whose
+  in-memory stores are promoted from test doubles to a shipped artifact because "a store is
+  injected" is the design and this is the store a test should inject. It depends on `without` and
+  `without-dag` and nothing else; every store is its own package, so nobody installing the core
+  pulls a driver they will not use. What stays in `integration` is what a *deployment* supplies:
+  the fulfilment graph, the payout workflow, the body the worker runs, and the HTTP API.
+- **`without-durability-redis`, `without-durability-postgres`, `without-durability-sqlite`** (new
+  packages): one per store, matching how `without-env` and `without-configmap` already split two
+  config sources. The SQLite one is the smallest thing that meets every requirement the seam
+  states, with no server and no third-party driver: `BEGIN IMMEDIATE` *is* the exclusion, so it
+  needs neither Postgres's `FOR UPDATE` nor Redis's Lua, and because the datastore is a file there
+  is nothing to co-locate, which is DBOS's guarantee for an application that never needed Postgres.
+  Its effect type is a *synchronous* callback where the Postgres one is `async`, because the whole
+  transaction runs on one worker thread. Its scope is one machine, which is the deployment it is
+  for rather than a defect.
+- **`without-durability-redis`**: `trim`, which bounds a stream that otherwise only grows, closing
+  the one gap that made the sorted-set queue strictly better. It is `XTRIM ... MAXLEN 0 ACKED`
+  (Redis 8.2+), so the *server* decides what every consumer group has finished with rather than
+  this computing a floor client-side and racing every ack that lands meanwhile. One hazard is
+  guarded rather than inherited: with no consumer groups at all `ACKED` has no effect and the trim
+  degrades to a plain `MAXLEN 0`, which would delete orders queued before the first worker booted,
+  so `trim` refuses a stream that has no groups.
+- **`without`**: `ticks(every)`, a `Stream` of moments, one now and one every interval after. It is
+  the clock as a source, so periodic work stops being a `while True` with a `sleep` buried in it
+  and becomes a `Sink` that says only what happens per event, composed with a stream that says when.
+  `waking` and `trimming` are both sinks over it now, which means the same code runs off a timer,
+  off a queue an operator pokes, or off a fixed list of instants in a test. Each tick carries its
+  own moment, so a consumer needs no clock of its own and a test controls time by choosing values.
 - **`without-web`**: reverse routing. `url_for(route, values)` renders a route back to a concrete
   path from the values for its path parameters, the inverse of the trie walk. It is a plain
   function of the route *value* (routes are identified by value, no registry), each value fed back

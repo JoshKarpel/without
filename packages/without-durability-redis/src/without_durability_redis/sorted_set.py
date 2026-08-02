@@ -1,4 +1,4 @@
-# The same `Wakeups`, as one sorted set instead of a stream beside a sorted set.
+# The same `Scheduler`, as one sorted set instead of a stream beside a sorted set.
 #
 # A workflow's score is the time it becomes visible, which turns three things that were
 # separate into one:
@@ -12,7 +12,7 @@
 # noticing. Reclaiming a dead worker's delivery is the same non-event, since the lease
 # it pushed the score to simply arrives. The timer, the consumer group, the pending
 # list, the acknowledgement, and the script that moved a workflow from one structure to
-# the other are all gone, and so is the stream that nothing trims.
+# the other are all gone, and so is the stream a trimmer has to keep tidy.
 #
 # What pays for that is the receipt, and the trick is that the *score* is the receipt.
 # A stream never loses a wakeup because every `make_ready` appends a new entry; a sorted
@@ -50,16 +50,15 @@ from typing import cast
 
 from redis.asyncio import Redis
 from redis.commands.core import AsyncScript
-
-from integration.durable.stepwise import now_utc
-from integration.durable.wakeups import Delivery
+from without_durability.seams import Delivery
+from without_durability.stepwise import now_utc
 
 # How long a taken workflow stays invisible, and so how long after a worker dies before
 # someone else picks its workflow up. The same reasoning as the checkpoint claim's lease:
 # it has to exceed the longest a pass can honestly take.
 LEASE = timedelta(minutes=1)
 # How often a worker with nothing to do asks again. This is the price of losing the
-# blocking read, so it is the one number to look at if wakeups feel slow.
+# blocking read, so it is the one number to look at if scheduler feel slow.
 POLL = timedelta(milliseconds=50)
 
 # Take the first workflow that is visible and push it a lease into the future, in one
@@ -99,11 +98,11 @@ return 0
 
 
 @dataclass(frozen=True, slots=True)
-class RedisSchedule:
+class RedisSetScheduler:
     """
-    `Wakeups` as a single sorted set scored by when each workflow becomes visible.
+    `Scheduler` as a single sorted set scored by when each workflow becomes visible.
 
-    A drop-in for `RedisWakeups`: the same protocol, the same worker, one structure
+    A drop-in for `RedisStreamScheduler`: the same protocol, the same worker, one structure
     instead of two. Like the other Redis stores here, the client MUST be built with
     `decode_responses=True`.
 

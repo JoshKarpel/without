@@ -26,6 +26,7 @@ from without.wiring import stack
 from without.wiring import stream_from_iterable
 from without.wiring import stream_from_queue
 from without.wiring import tee
+from without.wiring import ticks
 
 __all__ = [
     "Context",
@@ -55,5 +56,6 @@ __all__ = [
     "stream_from_iterable",
     "stream_from_queue",
     "tee",
+    "ticks",
     "timeout",
 ]

@@ -15,8 +15,11 @@ the guide is that directory's `index.md`, its API reference is the generated
 core (`without/index.md`), the ASGI boundary (`without-asgi/index.md`), the HTTP
 server and client (`without-http/index.md`, with cookie handling split out into
 `without-http/cookies.md`), the opinionated router (`without-web/index.md`), the
-config sources (`without-env/index.md`, `without-configmap/index.md`), and the
-DAG executor (`without-dag/index.md`). Those guides carry the design narrative;
+config sources (`without-env/index.md`, `without-configmap/index.md`), the DAG
+executor (`without-dag/index.md`), and durable workflows
+(`without-durability/index.md`, with one page per store in
+`without-durability-redis/`, `without-durability-postgres/`, and
+`without-durability-sqlite/`). Those guides carry the design narrative;
 each package's `README.md` is now a short orientation that links to them, and the
 `integration` toys that exercise the whole stack live under `packages/integration`.
 

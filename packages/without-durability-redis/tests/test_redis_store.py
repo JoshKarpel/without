@@ -1,47 +1,28 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 from collections.abc import AsyncIterator
-from collections.abc import Awaitable
-from collections.abc import Callable
-from collections.abc import Mapping
 from contextlib import suppress
 from datetime import timedelta
 from uuid import uuid4
 
-import httpx
 import pytest
-from gateways import Gateway
-from gateways import paying
-from gateways import until
-from integration.durable import Contended
-from integration.durable import Fenced
-from integration.durable import LuaEffect
 from integration.durable import Order
-from integration.durable import Reached
-from integration.durable import RedisCheckpoints
-from integration.durable import RedisSchedule
-from integration.durable import Run
-from integration.durable import Suspended
-from integration.durable import Wakeups
-from integration.durable import claimed
-from integration.durable import fulfilment
-from integration.durable import now_utc
-from integration.durable import pay_out
-from integration.durable import resume
-from integration.durable import run_saga
-from integration.durable import unwinding
-from integration.durable.api import Payments
-from integration.durable.api import payments_app
-from integration.durable.wakeups import RedisWakeups
-from integration.durable.worker import work
 from redis.asyncio import Redis
 from redis.crc import key_slot
 from redis.exceptions import ResponseError
-from without_dag import CompiledGraph
-from without_http import serving
+from without import ticks
+from without_durability import Contended
+from without_durability import Fenced
+from without_durability import Run
+from without_durability import claimed
+from without_durability import now_utc
+from without_durability_redis import LuaEffect
+from without_durability_redis import RedisCheckpointer
+from without_durability_redis import RedisSetScheduler
+from without_durability_redis import RedisStreamScheduler
+from without_durability_redis import trimming
 
 # `just test` starts the services in compose.yaml and publishes each address; these
 # tests drive the real server it started rather than a fake, and skip when it did not
@@ -49,34 +30,6 @@ from without_http import serving
 pytestmark = pytest.mark.compose
 
 ORDER = Order(order_id="o-42", sku="gizmo", cents=1999)
-
-
-async def passing[T](
-    checkpoints: RedisCheckpoints,
-    workflow: str,
-    body: Callable[[Run], Awaitable[T]],
-) -> T:
-    """One claimed pass, released on the way out, which is what the worker does."""
-    holder = await claimed(checkpoints, workflow)
-    try:
-        return await resume(holder, checkpoints, body)
-    finally:
-        await checkpoints.release(holder)
-
-
-async def saga[In, Out, Reaches, Undone](
-    forward: CompiledGraph[In, Out],
-    unwind: CompiledGraph[Reaches, Undone],
-    reaches: Callable[[Mapping[str, object]], Reaches],
-    checkpoints: RedisCheckpoints,
-    workflow: str,
-    value: In,
-) -> Out:
-    holder = await claimed(checkpoints, workflow)
-    try:
-        return await run_saga(forward, unwind, reaches, checkpoints, holder, value)
-    finally:
-        await checkpoints.release(holder)
 
 
 @pytest.fixture
@@ -107,152 +60,6 @@ def workflow() -> str:
     return f"test-{uuid4().hex}"
 
 
-async def test_a_workflow_resumes_from_a_checkpoint_left_in_redis_by_a_dead_process(
-    redis: Redis,
-    workflow: str,
-) -> None:
-    # The whole point of the string keys, end to end: the first "process" leaves a
-    # hash behind, and a second one that shares nothing with it but the workflow's
-    # id picks the run up from that hash alone.
-    checkpoints = RedisCheckpoints(redis=redis)
-    crashed = Gateway(broken={"ship"})
-    services = crashed.services()
-
-    with pytest.raises(RuntimeError, match="ship is down"):
-        await saga(fulfilment(services), unwinding(services), Reached.of, checkpoints, workflow, ORDER)
-
-    # What an operator sees with `redis-cli`: one hash per workflow, one field per
-    # completed step, each holding that step's result as JSON.
-    assert set(await redis.hkeys(f"workflow:{{{workflow}}}")) == {"charged", "reserved"}
-    assert await redis.hget(f"workflow:{{{workflow}}}", "charged") == '"ch-o-42"'
-    assert await redis.ttl(f"workflow:{{{workflow}}}") > 0, "a checkpoint expires on its own rather than being swept"
-
-    recovered = Gateway()
-    receipt = await saga(
-        fulfilment(recovered.services()),
-        unwinding(recovered.services()),
-        Reached.of,
-        checkpoints,
-        workflow,
-        ORDER,
-    )
-
-    assert receipt["tracking"] == "tr-ch-o-42-rs-gizmo"
-    assert recovered.calls == ["ship"], "the charge and the reservation were read back out of Redis"
-
-
-async def test_a_compensation_is_recorded_under_its_own_key(redis: Redis, workflow: str) -> None:
-    checkpoints = RedisCheckpoints(redis=redis)
-    gateway = Gateway(broken={"ship"})
-    services = gateway.services()
-
-    with pytest.raises(RuntimeError, match="ship is down"):
-        await saga(fulfilment(services), unwinding(services), Reached.of, checkpoints, workflow, ORDER)
-
-    assert await checkpoints.load(f"{workflow}:unwind") == {
-        "refunded": "rf-ch-o-42",
-        "released": "rl-rs-gizmo",
-        "unwound": {"refunded": "rf-ch-o-42", "released": "rl-rs-gizmo"},
-    }
-    assert sorted(gateway.calls[-2:]) == ["refund", "release"]
-
-
-async def test_a_workflow_suspended_on_an_approval_resumes_when_another_process_records_it(
-    redis: Redis,
-    workflow: str,
-) -> None:
-    # The stepwise mechanism end to end, and the thing a signal usually needs a server
-    # for: the pass that asked for the approval is gone, and what resumes the workflow
-    # is one field written into its hash by something that shares nothing with it.
-    suspended = RedisCheckpoints(redis=redis)
-    asked: list[str] = []
-
-    async def body(run: Run) -> dict[str, object]:
-        return await pay_out(run, "ord-42", paying(asked), settling=timedelta(), approval_over=10_000)
-
-    with pytest.raises(Suspended) as suspension:
-        await passing(suspended, workflow, body)
-
-    assert suspension.value.key == "approved-by"
-    assert set(await redis.hkeys(f"workflow:{{{workflow}}}")) == {
-        "items",
-        "captured:piano",
-        "captured:stool",
-        "settling",
-    }
-    assert asked == ["items", "capture:piano", "capture:stool"], "the money moved, the payout did not"
-
-    approvals = RedisCheckpoints(redis=redis)
-    await approvals.supply(workflow, "approved-by", "auditor-7")
-
-    answered: list[str] = []
-
-    async def resumed(run: Run) -> dict[str, object]:
-        return await pay_out(run, "ord-42", paying(answered), settling=timedelta(), approval_over=10_000)
-
-    payout = await passing(RedisCheckpoints(redis=redis), workflow, resumed)
-
-    assert payout["approved_by"] == "auditor-7"
-    assert payout["captures"] == {"piano": "cap-piano", "stool": "cap-stool"}
-    assert answered == ["pay"], "everything before the approval was read back out of Redis"
-
-
-# The pair, end to end, over a real one-second wait: an API process that only writes,
-# a worker process that only reads, and Redis holding everything between them. Its
-# budget is generous because the workflow really does sleep for a second.
-#
-# Run against both queues, which is what makes "drop-in" a claim rather than an
-# aspiration: the same API, the same worker, the same assertions, over a stream beside a
-# sorted set and over one sorted set. Nothing above `Wakeups` can tell which it has.
-@pytest.mark.timeout(30)
-@pytest.mark.parametrize("queue", [RedisWakeups, RedisSchedule], ids=["stream", "schedule"])
-async def test_an_order_submitted_to_the_api_is_carried_to_payout_by_the_worker(
-    redis: Redis,
-    workflow: str,
-    queue: Callable[..., Wakeups],
-) -> None:
-    checkpoints = RedisCheckpoints(redis=redis)
-    # The queue is namespaced per test so parallel runs do not pop each other's work,
-    # which a deployment would not do: there, sharing one queue *is* how work spreads.
-    wakeups = queue(redis=redis, namespace=workflow)
-    worker = asyncio.create_task(work(checkpoints, wakeups))
-
-    try:
-        async with (
-            serving(payments_app(Payments(checkpoints=checkpoints, wakeups=wakeups))) as server,
-            httpx.AsyncClient(base_url=f"http://{server.host}:{server.port}") as client,
-        ):
-            submitted = await client.post(
-                "/orders",
-                json={"items": {"piano": 90_000, "stool": 4_000}},
-                headers={"idempotency-key": workflow},
-            )
-            assert submitted.status_code == 202
-
-            # The captures happen at once; the payout then waits out its settlement
-            # window, and the worker is the only thing that knows the window exists.
-            recorded = await until(client, workflow, lambda state: "settling" in state["recorded"])
-            assert set(recorded) == {"order", "items", "captured:piano", "captured:stool", "settling"}
-
-            # Past the deadline the timer makes it ready again, the pass runs, and it
-            # stops on the confirmation, where nothing but a person can move it.
-            await asyncio.sleep(1.5)
-            held = await client.get(f"/orders/{workflow}")
-            assert json.loads(held.text)["done"] is False
-
-            confirmed = await client.post(f"/orders/{workflow}/confirmation", json={"approved_by": "auditor-7"})
-            assert confirmed.status_code == 202
-
-            paid = await until(client, workflow, lambda state: state["done"])
-
-        assert paid["approved-by"] == "auditor-7"
-        assert paid["paid"] == f"pay-{workflow}-94000"
-    finally:
-        worker.cancel()
-        with suppress(asyncio.CancelledError):
-            await worker
-
-
 async def test_only_one_of_many_processes_racing_for_a_workflow_gets_to_pass_over_it(
     redis: Redis,
     workflow: str,
@@ -260,7 +67,7 @@ async def test_only_one_of_many_processes_racing_for_a_workflow_gets_to_pass_ove
     # The guarantee against the real server, where it has to hold across processes that
     # share nothing: every client registers the same script, and Redis is the only party
     # that sees all of them, which is why the check and the take have to happen there.
-    racing = [RedisCheckpoints(redis=redis) for _ in range(8)]
+    racing = [RedisCheckpointer(redis=redis) for _ in range(8)]
 
     claims = await asyncio.gather(*(store.claim(workflow, timedelta(minutes=1)) for store in racing))
     won = [holder for holder in claims if holder is not None]
@@ -283,16 +90,16 @@ async def test_a_write_from_a_pass_that_lost_the_workflow_is_refused_by_redis(
     # What a lease alone cannot give: the stalled holder still believes it owns the
     # workflow, and only the store can tell it otherwise. The script compares the token
     # it was handed against the highest one issued, in the same step as the write.
-    checkpoints = RedisCheckpoints(redis=redis)
-    stalled = await claimed(checkpoints, workflow, timedelta(milliseconds=1))
+    checkpointer = RedisCheckpointer(redis=redis)
+    stalled = await claimed(checkpointer, workflow, timedelta(milliseconds=1))
     await asyncio.sleep(0.05)
-    took_over = await claimed(checkpoints, workflow)
+    took_over = await claimed(checkpointer, workflow)
 
     with pytest.raises(Fenced, match="moved on while this pass held it"):
-        await checkpoints.record(stalled, "paid", "pay-from-the-dead")
+        await checkpointer.record(stalled, "paid", "pay-from-the-dead")
 
-    assert await checkpoints.record(took_over, "paid", "pay-real") == "pay-real"
-    assert await checkpoints.load(workflow) == {"paid": "pay-real"}
+    assert await checkpointer.record(took_over, "paid", "pay-real") == "pay-real"
+    assert await checkpointer.load(workflow) == {"paid": "pay-real"}
 
 
 async def test_a_workflow_whose_keys_expired_still_outranks_a_pass_from_before(
@@ -303,34 +110,34 @@ async def test_a_workflow_whose_keys_expired_still_outranks_a_pass_from_before(
     # id is then reused, a plain counter would hand the new incarnation token 1 while a
     # pass stalled since before the expiry still held token 3, and the corpse would
     # outrank the living. Seeding the token from the server clock is what closes that.
-    checkpoints = RedisCheckpoints(redis=redis)
-    before = await claimed(checkpoints, workflow)
+    checkpointer = RedisCheckpointer(redis=redis)
+    before = await claimed(checkpointer, workflow)
 
-    await redis.delete(checkpoints.pass_key(workflow), checkpoints.hash_key(workflow))
+    await redis.delete(checkpointer.pass_key(workflow), checkpointer.hash_key(workflow))
     # The seeding is the server's clock, so the guarantee is "a later claim gets a later
     # millisecond", and the deletion above has to actually take one. A real expiry takes
     # the `ttl`, which buys this by a margin of about a day; a test that deletes the keys
     # by hand has to buy it explicitly.
     await asyncio.sleep(0.005)
-    after = await claimed(checkpoints, workflow)
+    after = await claimed(checkpointer, workflow)
 
     assert after.token > before.token, "the workflow was forgotten, but its fence did not rewind"
 
     with pytest.raises(Fenced):
-        await checkpoints.record(before, "paid", "pay-from-a-previous-life")
+        await checkpointer.record(before, "paid", "pay-from-a-previous-life")
 
 
 async def test_a_step_already_recorded_is_never_overwritten_and_hands_back_the_winner(
     redis: Redis,
     workflow: str,
 ) -> None:
-    checkpoints = RedisCheckpoints(redis=redis)
-    holder = await claimed(checkpoints, workflow)
+    checkpointer = RedisCheckpointer(redis=redis)
+    holder = await claimed(checkpointer, workflow)
 
-    assert await checkpoints.record(holder, "captured:piano", "cap-first") == "cap-first"
-    assert await checkpoints.record(holder, "captured:piano", "cap-second") == "cap-first"
-    assert await checkpoints.supply(workflow, "captured:piano", "cap-third") == "cap-first"
-    assert await checkpoints.load(workflow) == {"captured:piano": "cap-first"}
+    assert await checkpointer.record(holder, "captured:piano", "cap-first") == "cap-first"
+    assert await checkpointer.record(holder, "captured:piano", "cap-second") == "cap-first"
+    assert await checkpointer.supply(workflow, "captured:piano", "cap-third") == "cap-first"
+    assert await checkpointer.load(workflow) == {"captured:piano": "cap-first"}
 
 
 async def test_a_workflows_two_keys_share_a_slot_so_a_script_may_touch_both(workflow: str) -> None:
@@ -338,9 +145,9 @@ async def test_a_workflows_two_keys_share_a_slot_so_a_script_may_touch_both(work
     # one script, which Redis Cluster refuses unless both keys hash to the same slot.
     # `key_slot` is the same function the cluster client routes with, so this answers the
     # question without needing a cluster (the compose stack is a single node).
-    checkpoints = RedisCheckpoints(redis=Redis())
+    checkpointer = RedisCheckpointer(redis=Redis())
 
-    steps, claim = checkpoints.hash_key(workflow), checkpoints.pass_key(workflow)
+    steps, claim = checkpointer.hash_key(workflow), checkpointer.pass_key(workflow)
 
     assert steps == f"workflow:{{{workflow}}}"
     assert claim == f"{steps}:pass"
@@ -354,27 +161,112 @@ async def test_a_store_error_that_is_not_the_fence_is_not_swallowed(redis: Redis
     # `record` forgives exactly one error, the script's own refusal. Anything else is a
     # real problem with the store, and reading it as "another pass took over" would tell
     # a workflow to stand down when the truth is that its checkpoint is unusable.
-    checkpoints = RedisCheckpoints(redis=redis)
-    holder = await claimed(checkpoints, workflow)
-    await redis.set(checkpoints.hash_key(workflow), "not a hash at all")
+    checkpointer = RedisCheckpointer(redis=redis)
+    holder = await claimed(checkpointer, workflow)
+    await redis.set(checkpointer.hash_key(workflow), "not a hash at all")
 
     with pytest.raises(ResponseError, match="WRONGTYPE"):
-        await checkpoints.record(holder, "paid", "pay-1")
+        await checkpointer.record(holder, "paid", "pay-1")
 
 
 async def test_a_second_worker_preparing_the_same_queue_is_not_an_error(redis: Redis, workflow: str) -> None:
     # Every worker prepares the queue at boot, so all but the first find the consumer
     # group already there. Redis reports that as an error; here it is the normal case.
-    wakeups = RedisWakeups(redis=redis, namespace=workflow)
-    await wakeups.prepare()
-    await wakeups.prepare()
+    scheduler = RedisStreamScheduler(redis=redis, namespace=workflow)
+    await scheduler.prepare()
+    await scheduler.prepare()
 
-    await wakeups.make_ready("wf-after-two-prepares")
-    delivered = await wakeups.next_ready(timedelta(seconds=1))
+    await scheduler.make_ready("wf-after-two-prepares")
+    delivered = await scheduler.next_ready(timedelta(seconds=1))
 
     assert delivered is not None
     assert delivered.workflow == "wf-after-two-prepares"
-    assert await wakeups.next_ready(timedelta(milliseconds=50)) is None, "and nothing is delivered twice"
+    assert await scheduler.next_ready(timedelta(milliseconds=50)) is None, "and nothing is delivered twice"
+
+
+async def test_trimming_drops_what_has_been_answered_for_and_keeps_the_rest(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # The bound on a stream that only ever grows. `XACK` clears the pending list and
+    # leaves the entry, so without this the queue is correct and unbounded.
+    scheduler = RedisStreamScheduler(redis=redis, namespace=workflow)
+    await scheduler.prepare()
+    for each in ("wf-a", "wf-b", "wf-c"):
+        await scheduler.make_ready(each)
+
+    answered = await scheduler.next_ready(timedelta(seconds=1))
+    assert answered is not None
+    await scheduler.done(answered)
+    held = await scheduler.next_ready(timedelta(seconds=1))  # taken, and deliberately not acked
+
+    assert await scheduler.trim() == 1, "one entry has been answered for"
+    assert await redis.xlen(scheduler.ready_key) == 2
+
+    assert held is not None
+    await scheduler.done(held)
+
+    assert await scheduler.trim() == 1, "and the one that was pending goes once it is acked"
+    assert await redis.xlen(scheduler.ready_key) == 1, "the unread entry stays, which is the whole point"
+
+
+async def test_trimming_a_queue_no_worker_has_read_yet_removes_nothing(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # The one hazard in `XTRIM ... ACKED`: with no consumer group it has no effect, so the
+    # trim degrades to a plain `MAXLEN 0` and would delete work nobody has run. An order
+    # submitted before the first worker boots is exactly that case, and `prepare` creating
+    # its group from `0` is what makes such an order deliverable rather than stranded.
+    scheduler = RedisStreamScheduler(redis=redis, namespace=workflow)
+    await scheduler.make_ready("wf-submitted-before-any-worker")
+
+    assert await scheduler.trim() == 0
+    assert await redis.xlen(scheduler.ready_key) == 1, "the order survived the trimmer that ran before the worker"
+
+    await scheduler.prepare()
+    delivered = await scheduler.next_ready(timedelta(seconds=1))
+
+    assert delivered is not None
+    assert delivered.workflow == "wf-submitted-before-any-worker"
+
+
+async def test_trimming_a_queue_that_does_not_exist_yet_is_not_an_error(redis: Redis, workflow: str) -> None:
+    # A trimmer started beside the worker rather than after it, which is how it would
+    # actually be deployed.
+    assert await RedisStreamScheduler(redis=redis, namespace=workflow).trim() == 0
+
+
+async def test_a_trim_error_that_is_not_a_missing_stream_is_not_swallowed(redis: Redis, workflow: str) -> None:
+    scheduler = RedisStreamScheduler(redis=redis, namespace=workflow)
+    await redis.set(scheduler.ready_key, "not a stream at all")
+
+    with pytest.raises(ResponseError, match="WRONGTYPE"):
+        await scheduler.trim()
+
+
+async def test_the_trimmer_keeps_running_until_it_is_cancelled(redis: Redis, workflow: str) -> None:
+    # Control plane, not data plane: its own loop on its own interval, so housekeeping
+    # does not cost more the busier the queue gets.
+    scheduler = RedisStreamScheduler(redis=redis, namespace=workflow)
+    await scheduler.prepare()
+    await scheduler.make_ready("wf-tidied")
+    answered = await scheduler.next_ready(timedelta(seconds=1))
+    assert answered is not None
+    await scheduler.done(answered)
+
+    async def tidy() -> None:
+        await trimming(scheduler)(ticks(timedelta(milliseconds=10)))
+
+    tidying = asyncio.create_task(tidy())
+    try:
+        async with asyncio.timeout(5):
+            while await redis.xlen(scheduler.ready_key):
+                await asyncio.sleep(0.01)
+    finally:
+        tidying.cancel()
+        with suppress(asyncio.CancelledError):
+            await tidying
 
 
 async def test_an_effect_in_this_redis_is_performed_and_recorded_in_one_commit(
@@ -386,35 +278,35 @@ async def test_an_effect_in_this_redis_is_performed_and_recorded_in_one_commit(
     # Redis write records itself in the same script. What actually bounds this is that
     # you can only transact within one datastore, and Postgres is only privileged because
     # that is usually where the data already is.
-    checkpoints = RedisCheckpoints(redis=redis)
-    holder = await claimed(checkpoints, workflow)
+    checkpointer = RedisCheckpointer(redis=redis)
+    holder = await claimed(checkpointer, workflow)
     # Tagged into the workflow's own slot, which is what "the same datastore" reduces to
     # once the datastore is partitioned.
-    ledger = f"{checkpoints.hash_key(workflow)}:ledger"
+    ledger = f"{checkpointer.hash_key(workflow)}:ledger"
     reserve = LuaEffect(
         source="return cjson.encode(redis.call('HINCRBY', KEYS[1], ARGV[1], tonumber(ARGV[2])))",
         keys=(ledger,),
         args=("piano", 1),
     )
 
-    first = await Run(holder=holder, checkpoints=checkpoints, recorded={}).transact("reserved", reserve)
-    again = await Run(holder=holder, checkpoints=checkpoints, recorded={}).transact("reserved", reserve)
+    first = await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("reserved", reserve)
+    again = await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("reserved", reserve)
 
     assert (first, again) == (1, 1), "the second pass read the record rather than reserving again"
     assert await redis.hget(ledger, "piano") == "1", "the stock moved once, however many passes reached the step"
-    assert await checkpoints.load(workflow) == {"reserved": 1}
-    assert key_slot(ledger.encode()) == key_slot(checkpoints.hash_key(workflow).encode())
+    assert await checkpointer.load(workflow) == {"reserved": 1}
+    assert key_slot(ledger.encode()) == key_slot(checkpointer.hash_key(workflow).encode())
 
 
 async def test_a_transacted_effect_is_refused_from_a_superseded_pass(redis: Redis, workflow: str) -> None:
-    checkpoints = RedisCheckpoints(redis=redis)
-    stalled = await claimed(checkpoints, workflow, timedelta(milliseconds=1))
+    checkpointer = RedisCheckpointer(redis=redis)
+    stalled = await claimed(checkpointer, workflow, timedelta(milliseconds=1))
     await asyncio.sleep(0.05)
-    await claimed(checkpoints, workflow)
-    ledger = f"{checkpoints.hash_key(workflow)}:ledger"
+    await claimed(checkpointer, workflow)
+    ledger = f"{checkpointer.hash_key(workflow)}:ledger"
 
     with pytest.raises(Fenced):
-        await Run(holder=stalled, checkpoints=checkpoints, recorded={}).transact(
+        await Run(holder=stalled, checkpointer=checkpointer, recorded={}).transact(
             "reserved",
             LuaEffect(
                 source="return cjson.encode(redis.call('HINCRBY', KEYS[1], ARGV[1], 1))",
@@ -430,19 +322,19 @@ async def test_a_transact_error_that_is_not_the_fence_is_not_swallowed(redis: Re
     # As for `record`: the script's own refusal is the one error this reads, and taking
     # a broken store for "another pass took over" would tell a workflow to stand down
     # when the truth is that its checkpoint is unusable.
-    checkpoints = RedisCheckpoints(redis=redis)
-    holder = await claimed(checkpoints, workflow)
-    await redis.set(checkpoints.hash_key(workflow), "not a hash at all")
+    checkpointer = RedisCheckpointer(redis=redis)
+    holder = await claimed(checkpointer, workflow)
+    await redis.set(checkpointer.hash_key(workflow), "not a hash at all")
 
     with pytest.raises(ResponseError, match="WRONGTYPE"):
-        await Run(holder=holder, checkpoints=checkpoints, recorded={}).transact(
+        await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact(
             "reserved",
             LuaEffect(source="return cjson.encode(1)"),
         )
 
 
-def scheduled(redis: Redis, workflow: str, lease: timedelta = timedelta(seconds=30)) -> RedisSchedule:
-    return RedisSchedule(redis=redis, namespace=workflow, lease=lease)
+def scheduled(redis: Redis, workflow: str, lease: timedelta = timedelta(seconds=30)) -> RedisSetScheduler:
+    return RedisSetScheduler(redis=redis, namespace=workflow, lease=lease)
 
 
 BRIEFLY = timedelta(milliseconds=200)
@@ -537,7 +429,54 @@ async def test_a_queue_key_holding_something_other_than_a_stream_fails_loudly(re
     # `prepare` forgives exactly one error, the one that means "another worker got here
     # first". Anything else is a real problem with the queue and must not be swallowed.
     await redis.set(f"{workflow}:ready", "not a stream at all")
-    wakeups = RedisWakeups(redis=redis, namespace=workflow)
+    scheduler = RedisStreamScheduler(redis=redis, namespace=workflow)
 
     with pytest.raises(ResponseError, match="WRONGTYPE"):
-        await wakeups.prepare()
+        await scheduler.prepare()
+
+
+async def test_a_sleeping_workflow_is_moved_to_the_stream_when_it_comes_due(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # The move that has to be one operation: off the sleepers and onto the stream. As two
+    # calls, a timer that died in between would leave the workflow in neither structure
+    # and asleep forever, which is why it is a script.
+    scheduler = RedisStreamScheduler(redis=redis, namespace=workflow)
+    await scheduler.prepare()
+    await scheduler.wake_at("wf-sleeping", now_utc() + timedelta(seconds=30))
+
+    assert await scheduler.wake_due(now_utc()) == (), "not due yet, so it stays on the sleepers"
+    assert await redis.zcard(scheduler.sleeping_key) == 1
+
+    assert await scheduler.wake_due(now_utc() + timedelta(minutes=1)) == ("wf-sleeping",)
+    assert await redis.zcard(scheduler.sleeping_key) == 0, "and it is off the sleepers, not in both"
+
+    delivered = await scheduler.next_ready(timedelta(seconds=1))
+
+    assert delivered is not None
+    assert delivered.workflow == "wf-sleeping"
+
+
+async def test_a_delivery_a_dead_worker_never_answered_for_is_taken_over(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # The crash the pending list exists to survive. `XREADGROUP` moves an entry into the
+    # consumer's pending list rather than deleting it, so a worker that dies mid-pass
+    # leaves the wakeup to be reclaimed instead of taking it to the grave.
+    dying = RedisStreamScheduler(redis=redis, namespace=workflow)
+    await dying.prepare()
+    await dying.make_ready("wf-abandoned")
+    abandoned = await dying.next_ready(timedelta(seconds=1))
+    assert abandoned is not None  # taken, and deliberately never acknowledged
+
+    surviving = RedisStreamScheduler(redis=redis, namespace=workflow)
+
+    assert await surviving.next_ready(timedelta(milliseconds=50)) is None, "no new entries to read"
+
+    taken_over = await surviving.reclaim(timedelta())
+
+    assert taken_over is not None
+    assert taken_over.receipt == abandoned.receipt, "the same delivery, taken over rather than duplicated"
+    assert await surviving.reclaim(timedelta(minutes=1)) is None, "and nothing else is outstanding for long"

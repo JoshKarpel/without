@@ -18,6 +18,10 @@ members = [
     "without-configmap",
     "without-core",
     "without-dag",
+    "without-durability",
+    "without-durability-postgres",
+    "without-durability-redis",
+    "without-durability-sqlite",
     "without-env",
     "without-http",
     "without-logging",
@@ -661,14 +665,16 @@ version = "0.0.0"
 source = { editable = "packages/integration" }
 dependencies = [
     { name = "httpx" },
-    { name = "psycopg", extra = ["binary", "pool"] },
     { name = "pydantic" },
     { name = "pydantic-settings" },
-    { name = "redis" },
     { name = "without-asgi" },
     { name = "without-configmap" },
     { name = "without-core" },
     { name = "without-dag" },
+    { name = "without-durability" },
+    { name = "without-durability-postgres" },
+    { name = "without-durability-redis" },
+    { name = "without-durability-sqlite" },
     { name = "without-env" },
     { name = "without-http" },
     { name = "without-web" },
@@ -677,14 +683,16 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
-    { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.2" },
     { name = "pydantic", specifier = ">=2" },
     { name = "pydantic-settings", specifier = ">=2.7" },
-    { name = "redis", specifier = ">=8.0.1" },
     { name = "without-asgi", editable = "packages/without-asgi" },
     { name = "without-configmap", editable = "packages/without-configmap" },
     { name = "without-core", editable = "packages/without" },
     { name = "without-dag", editable = "packages/without-dag" },
+    { name = "without-durability", editable = "packages/without-durability" },
+    { name = "without-durability-postgres", editable = "packages/without-durability-postgres" },
+    { name = "without-durability-redis", editable = "packages/without-durability-redis" },
+    { name = "without-durability-sqlite", editable = "packages/without-durability-sqlite" },
     { name = "without-env", editable = "packages/without-env" },
     { name = "without-http", editable = "packages/without-http" },
     { name = "without-web", editable = "packages/without-web" },
@@ -2050,6 +2058,62 @@ dependencies = [
 requires-dist = [{ name = "without-core", editable = "packages/without" }]
 
 [[package]]
+name = "without-durability"
+version = "0.0.0"
+source = { editable = "packages/without-durability" }
+dependencies = [
+    { name = "without-core" },
+    { name = "without-dag" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "without-core", editable = "packages/without" },
+    { name = "without-dag", editable = "packages/without-dag" },
+]
+
+[[package]]
+name = "without-durability-postgres"
+version = "0.0.0"
+source = { editable = "packages/without-durability-postgres" }
+dependencies = [
+    { name = "psycopg", extra = ["binary", "pool"] },
+    { name = "without-durability" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.2" },
+    { name = "without-durability", editable = "packages/without-durability" },
+]
+
+[[package]]
+name = "without-durability-redis"
+version = "0.0.0"
+source = { editable = "packages/without-durability-redis" }
+dependencies = [
+    { name = "redis" },
+    { name = "without-durability" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "redis", specifier = ">=8.0.1" },
+    { name = "without-durability", editable = "packages/without-durability" },
+]
+
+[[package]]
+name = "without-durability-sqlite"
+version = "0.0.0"
+source = { editable = "packages/without-durability-sqlite" }
+dependencies = [
+    { name = "without-durability" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "without-durability", editable = "packages/without-durability" }]
+
+[[package]]
 name = "without-env"
 version = "0.0.0"
 source = { editable = "packages/without-env" }
@@ -2120,6 +2184,10 @@ dependencies = [
     { name = "without-configmap" },
     { name = "without-core" },
     { name = "without-dag" },
+    { name = "without-durability" },
+    { name = "without-durability-postgres" },
+    { name = "without-durability-redis" },
+    { name = "without-durability-sqlite" },
     { name = "without-env" },
     { name = "without-http" },
     { name = "without-logging" },
@@ -2161,6 +2229,10 @@ requires-dist = [
     { name = "without-configmap", editable = "packages/without-configmap" },
     { name = "without-core", editable = "packages/without" },
     { name = "without-dag", editable = "packages/without-dag" },
+    { name = "without-durability", editable = "packages/without-durability" },
+    { name = "without-durability-postgres", editable = "packages/without-durability-postgres" },
+    { name = "without-durability-redis", editable = "packages/without-durability-redis" },
+    { name = "without-durability-sqlite", editable = "packages/without-durability-sqlite" },
     { name = "without-env", editable = "packages/without-env" },
     { name = "without-http", editable = "packages/without-http" },
     { name = "without-logging", editable = "packages/without-logging" },

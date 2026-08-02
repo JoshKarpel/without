@@ -5,31 +5,34 @@ from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field
+from datetime import datetime
 from datetime import timedelta
 from typing import Never
 
 import pytest
-from doubles import MemoryCheckpoints
-from integration.durable import Checkpoints
-from integration.durable import Contended
 from integration.durable import Order
-from integration.durable import Pass
 from integration.durable import Reached
 from integration.durable import Services
-from integration.durable import claimed
 from integration.durable import fulfilment
 from integration.durable import recorded_id
-from integration.durable import run_durably
-from integration.durable import run_saga
 from integration.durable import unwinding
 from without_dag import CompiledGraph
+from without_durability import Checkpointer
+from without_durability import Contended
+from without_durability import Delivery
+from without_durability import MemoryCheckpointer
+from without_durability import Pass
+from without_durability import SplitDurable
+from without_durability import claimed
+from without_durability import run_durably
+from without_durability import run_saga
 
 ORDER = Order(order_id="o-7", sku="widget", cents=2500)
 
 
 async def durably[*Ins, Out](
     run: CompiledGraph[*Ins, Out],
-    checkpoints: Checkpoints,
+    checkpointer: Checkpointer,
     workflow: str,
     *values: *Ins,
 ) -> Out:
@@ -39,27 +42,27 @@ async def durably[*Ins, Out](
     Releasing at the end is what makes the *next* call in a test a resumption rather
     than a contended one, which is also true of the worker this stands in for.
     """
-    holder = await claimed(checkpoints, workflow)
+    holder = await claimed(checkpointer, workflow)
     try:
-        return await run_durably(run, checkpoints, holder, *values)
+        return await run_durably(run, checkpointer, holder, *values)
     finally:
-        await checkpoints.release(holder)
+        await checkpointer.release(holder)
 
 
 async def saga[In, Out, Reaches, Undone](
     forward: CompiledGraph[In, Out],
     unwind: CompiledGraph[Reaches, Undone],
     reaches: Callable[[Mapping[str, object]], Reaches],
-    checkpoints: Checkpoints,
+    checkpointer: Checkpointer,
     workflow: str,
     value: In,
 ) -> Out:
     """The same, for the compensating runner, which takes its rollback's claim itself."""
-    holder = await claimed(checkpoints, workflow)
+    holder = await claimed(checkpointer, workflow)
     try:
-        return await run_saga(forward, unwind, reaches, checkpoints, holder, value)
+        return await run_saga(forward, unwind, reaches, checkpointer, holder, value)
     finally:
-        await checkpoints.release(holder)
+        await checkpointer.release(holder)
 
 
 @dataclass(slots=True)
@@ -106,54 +109,54 @@ class Gateway:
 async def test_a_workflow_runs_every_step_once_and_returns_its_receipt() -> None:
     gateway = Gateway()
 
-    receipt = await durably(fulfilment(gateway.services()), MemoryCheckpoints(), "wf-1", ORDER)
+    receipt = await durably(fulfilment(gateway.services()), MemoryCheckpointer(), "wf-1", ORDER)
 
     assert receipt == {"order_id": "o-7", "charge_id": "ch-o-7", "tracking": "tr-ch-o-7-rs-widget", "cents": 2500}
     assert sorted(gateway.calls) == ["charge", "reserve", "ship"]
 
 
 async def test_a_resumed_workflow_re_runs_only_what_had_not_finished() -> None:
-    checkpoints = MemoryCheckpoints()
+    checkpointer = MemoryCheckpointer()
     gateway = Gateway(broken={"ship"})
     run = fulfilment(gateway.services())
 
     with pytest.raises(RuntimeError, match="ship is down"):
-        await durably(run, checkpoints, "wf-2", ORDER)
+        await durably(run, checkpointer, "wf-2", ORDER)
 
-    assert checkpoints.hashes["wf-2"] == {"charged": "ch-o-7", "reserved": "rs-widget"}
+    assert checkpointer.hashes["wf-2"] == {"charged": "ch-o-7", "reserved": "rs-widget"}
 
     gateway.broken.clear()
     gateway.calls.clear()
 
-    receipt = await durably(run, checkpoints, "wf-2", ORDER)
+    receipt = await durably(run, checkpointer, "wf-2", ORDER)
 
     assert receipt["tracking"] == "tr-ch-o-7-rs-widget"
     assert gateway.calls == ["ship"], "the card was charged and the stock reserved before the crash"
 
 
 async def test_re_running_a_finished_workflow_performs_no_effects() -> None:
-    checkpoints = MemoryCheckpoints()
+    checkpointer = MemoryCheckpointer()
     gateway = Gateway()
     run = fulfilment(gateway.services())
 
-    first = await durably(run, checkpoints, "wf-3", ORDER)
+    first = await durably(run, checkpointer, "wf-3", ORDER)
     gateway.calls.clear()
-    second = await durably(run, checkpoints, "wf-3", ORDER)
+    second = await durably(run, checkpointer, "wf-3", ORDER)
 
     assert second == first
     assert gateway.calls == [], "a completed workflow is idempotent, not merely restartable"
 
 
 async def test_a_failed_workflow_unwinds_what_it_had_already_done() -> None:
-    checkpoints = MemoryCheckpoints()
+    checkpointer = MemoryCheckpointer()
     gateway = Gateway(broken={"ship"})
     services = gateway.services()
 
     with pytest.raises(RuntimeError, match="ship is down"):
-        await saga(fulfilment(services), unwinding(services), Reached.of, checkpoints, "wf-4", ORDER)
+        await saga(fulfilment(services), unwinding(services), Reached.of, checkpointer, "wf-4", ORDER)
 
     assert sorted(gateway.calls[-2:]) == ["refund", "release"]
-    assert checkpoints.hashes["wf-4:unwind"] == {
+    assert checkpointer.hashes["wf-4:unwind"] == {
         "refunded": "rf-ch-o-7",
         "released": "rl-rs-widget",
         "unwound": {"refunded": "rf-ch-o-7", "released": "rl-rs-widget"},
@@ -161,34 +164,34 @@ async def test_a_failed_workflow_unwinds_what_it_had_already_done() -> None:
 
 
 async def test_a_workflow_that_failed_before_any_effect_has_nothing_to_unwind() -> None:
-    checkpoints = MemoryCheckpoints()
+    checkpointer = MemoryCheckpointer()
     gateway = Gateway(broken={"charge"}, blocked={"reserve"})
     services = gateway.services()
 
     with pytest.raises(RuntimeError, match="charge is down"):
-        await saga(fulfilment(services), unwinding(services), Reached.of, checkpoints, "wf-5", ORDER)
+        await saga(fulfilment(services), unwinding(services), Reached.of, checkpointer, "wf-5", ORDER)
 
-    assert checkpoints.hashes["wf-5"] == {}
+    assert checkpointer.hashes["wf-5"] == {}
     assert gateway.calls == ["charge"], "the reservation was cancelled mid-flight, so there is nothing to release"
-    assert checkpoints.hashes["wf-5:unwind"]["unwound"] == {"refunded": None, "released": None}
+    assert checkpointer.hashes["wf-5:unwind"]["unwound"] == {"refunded": None, "released": None}
 
 
 async def test_a_rollback_interrupted_partway_resumes_instead_of_compensating_twice() -> None:
-    checkpoints = MemoryCheckpoints()
+    checkpointer = MemoryCheckpointer()
     gateway = Gateway(broken={"ship"})
     services = gateway.services()
 
     with pytest.raises(RuntimeError, match="ship is down"):
-        await durably(fulfilment(services), checkpoints, "wf-6", ORDER)
+        await durably(fulfilment(services), checkpointer, "wf-6", ORDER)
 
     # A rollback that refunded and then died. Which of two concurrent compensations
     # lands first is a scheduling detail, so the half-done state is written rather
     # than raced for; a checkpoint is a value either way.
-    reached = Reached.of(await checkpoints.load("wf-6"))
-    await checkpoints.supply("wf-6:unwind", "refunded", "rf-ch-o-7")
+    reached = Reached.of(await checkpointer.load("wf-6"))
+    await checkpointer.supply("wf-6:unwind", "refunded", "rf-ch-o-7")
     gateway.calls.clear()
 
-    rollback = await durably(unwinding(services), checkpoints, "wf-6:unwind", reached)
+    rollback = await durably(unwinding(services), checkpointer, "wf-6:unwind", reached)
 
     assert rollback == {"refunded": "rf-ch-o-7", "released": "rl-rs-widget"}
     assert gateway.calls == ["release"], "the refund was already recorded, so the money is not returned twice"
@@ -228,10 +231,10 @@ class Preempted:
 
 async def test_a_graph_run_stops_when_a_node_was_already_recorded_by_another_pass() -> None:
     gateway = Gateway()
-    checkpoints = Preempted(already={"charged": "ch-from-the-other-pass"})
+    checkpointer = Preempted(already={"charged": "ch-from-the-other-pass"})
 
     with pytest.raises(Contended, match="'charged' was recorded by another pass at 'wf-race'"):
-        await durably(fulfilment(gateway.services()), checkpoints, "wf-race", ORDER)
+        await durably(fulfilment(gateway.services()), checkpointer, "wf-race", ORDER)
 
     assert "ship" not in gateway.calls, "it stopped rather than shipping against a charge that is not the real one"
 
@@ -239,3 +242,46 @@ async def test_a_graph_run_stops_when_a_node_was_already_recorded_by_another_pas
 async def test_reading_a_checkpoint_written_by_something_else_fails_loudly() -> None:
     with pytest.raises(TypeError, match="'charged' was recorded as 17"):
         recorded_id({"charged": 17}, "charged")
+
+
+@dataclass(frozen=True, slots=True)
+class UnreachableQueue:
+    """A `Scheduler` that cannot be written to, standing in for a crash mid-`arrive`."""
+
+    async def prepare(self) -> None:  # pragma: no cover - unused here
+        return None
+
+    async def make_ready(self, workflow: str) -> None:
+        raise RuntimeError("the queue is down")
+
+    async def wake_at(self, workflow: str, when: datetime) -> None:  # pragma: no cover - unused here
+        return None
+
+    async def wake_due(self, now: datetime) -> tuple[str, ...]:  # pragma: no cover - unused here
+        return ()
+
+    async def next_ready(self, within: timedelta) -> Delivery | None:  # pragma: no cover - unused here
+        return None
+
+    async def reclaim(self, idle: timedelta) -> Delivery | None:  # pragma: no cover - unused here
+        return None
+
+    async def done(self, delivery: Delivery) -> None:  # pragma: no cover - unused here
+        return None
+
+
+async def test_an_arrival_over_a_split_store_records_before_it_queues() -> None:
+    # The one guarantee `SplitDurable` can offer in place of a commit, and the reason its
+    # two writes are in this order rather than the other. Losing the queue write leaves a
+    # workflow holding its value and waiting for a wakeup, which anything asking again
+    # supplies; losing the record instead would wake a pass that finds nothing to do and
+    # answers for the delivery, dropping the value for good.
+    checkpointer = MemoryCheckpointer()
+    durable = SplitDurable(checkpointer, UnreachableQueue())
+
+    with pytest.raises(RuntimeError, match="the queue is down"):
+        await durable.arrive("wf-half-arrived", "order", {"piano": 90_000})
+
+    assert await checkpointer.load("wf-half-arrived") == {"order": {"piano": 90_000}}, (
+        "the recoverable half is the one that survives"
+    )

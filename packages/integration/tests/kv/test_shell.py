@@ -226,12 +226,17 @@ async def test_idle_connection_is_reaped_after_the_idle_timeout() -> None:
 
 async def test_idle_timeout_does_not_disturb_an_active_client() -> None:
     # The idle clock is per-read: a client that keeps sending within the window is never reaped.
-    async with _serve(idle_timeout=0.2) as running:
+    #
+    # The window is far wider than the pause rather than just wider, because the only way
+    # this can fail spuriously is scheduling jitter closing the gap: under a loaded
+    # parallel run a 0.1s sleep can overshoot by enough to eat a 0.2s budget. Nothing here
+    # waits out the window, so widening it costs no wall-clock and buys the whole margin.
+    async with _serve(idle_timeout=2.0) as running:
         host, port = running.sockets[0].getsockname()[:2]
         reader, writer = await asyncio.open_connection(host, port)
         try:
             assert await _roundtrip(reader, writer, "SET k v") == "1 OK"
-            await asyncio.sleep(0.1)  # under the window
+            await asyncio.sleep(0.1)  # well under the window
             assert await _roundtrip(reader, writer, "GET k") == "2 v"
         finally:
             writer.close()
