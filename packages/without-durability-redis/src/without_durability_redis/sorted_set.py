@@ -123,10 +123,17 @@ class RedisSetScheduler:
     # workflow itself. Injected so a test can place a wakeup in a clock it controls.
     now: Callable[[], datetime] = now_utc
     scripts: tuple[AsyncScript, ...] = field(init=False, repr=False, compare=False)
+    # The two durations as the numbers the wire and `asyncio.sleep` actually want,
+    # rendered once at construction. Both are read inside `next_ready`'s poll loop, which
+    # is the one place here that runs more than once per unit of work.
+    lease_ms: int = field(init=False, repr=False, compare=False)
+    poll_seconds: float = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         registered = tuple(self.redis.register_script(source) for source in (TAKE, DONE))
         object.__setattr__(self, "scripts", registered)
+        object.__setattr__(self, "lease_ms", int(self.lease.total_seconds() * 1000))
+        object.__setattr__(self, "poll_seconds", self.poll.total_seconds())
 
     @property
     def take(self) -> AsyncScript:
@@ -180,7 +187,7 @@ class RedisSetScheduler:
             remaining = deadline - monotonic()
             if remaining <= 0:
                 return None
-            await asyncio.sleep(min(self.poll.total_seconds(), remaining))
+            await asyncio.sleep(min(self.poll_seconds, remaining))
 
     async def reclaim(self, idle: timedelta) -> Delivery | None:
         """Nothing to take over by hand: an abandoned workflow becomes visible on its own."""
@@ -197,10 +204,6 @@ class RedisSetScheduler:
         undoing the first.
         """
         await self.finish(keys=[self.schedule_key], args=[delivery.workflow, delivery.receipt])
-
-    @property
-    def lease_ms(self) -> int:
-        return int(self.lease.total_seconds() * 1000)
 
 
 def milliseconds(when: datetime) -> int:

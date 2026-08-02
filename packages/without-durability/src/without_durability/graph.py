@@ -53,12 +53,36 @@ async def run_durably[*Ins, Out](
     one's result is durable: the write is a barrier, not a background flush.
     Siblings already in flight keep running, which is the point of the fan-out.
 
-    A record that comes back holding something else means another pass recorded
+    A record the store did not take from this pass means another pass recorded
     that node first. Unlike `stepwise`, this cannot simply adopt the winner's
     value: the graph handed its own to the node's dependents the moment the node
     finished, so the run is already downstream of a value the store rejected, and
     the only honest move left is to stop. Holding a claim makes that rare, and it
     is `Fenced` rather than this when the claim has lapsed.
+
+    The store says whether it took the value; this does not infer it by comparing
+    what came back. A node's result crosses a `CheckpointCodec`, so a run that won
+    outright can still be handed back something unequal (a tuple returns as a list
+    under the default JSON codec), and reading that as a lost race would report a
+    second pass that does not exist. `Recorded.first` is the store's own answer.
+
+    With that separated out, the comparison itself becomes the *other* check worth
+    making, and this is the one place able to make it. A graph hands a node's result
+    straight to its dependents, so a node computed in this pass feeds them `fn`'s
+    own return value while the same node restored from the store would feed them
+    whatever the codec rebuilt. If those differ, the workflow is not resumable and
+    nothing later can tell: the dependents would see a `tuple` on the pass that
+    computed it and a `list` on the pass that restored it, and no crash is needed
+    for the two to disagree. Here both values are in hand at once, so a node whose
+    result does not survive its own store is refused on the pass that wrote it,
+    naming the node, rather than going wrong quietly on a pass days later.
+
+    That is why the graph needs no per-node parser where `stepwise` does. Verifying
+    beats parsing when you still hold what you sent, and `run.step` does not:
+    `Run.awaiting` reads a value some *other* process wrote, so there is nothing to
+    compare it against and a parser is the only thing that can establish its shape.
+    The check here is also inductive rather than per-pass, since every value in a
+    checkpoint this runner wrote passed it on the way in.
 
     The exactly-once claim reaches exactly as far as that write: a crash between a
     node's effect and its record leaves the effect done and unrecorded, so the
@@ -77,10 +101,15 @@ async def run_durably[*Ins, Out](
     """
     checkpoint = await checkpointer.load(holder.workflow)
     async for key, value in run.stream(*values, checkpoint=checkpoint):
-        stored = await checkpointer.record(holder, key, value)
-        if stored != value:
+        recorded = await checkpointer.record(holder, key, value)
+        if not recorded.first:
             raise Contended(f"{key!r} was recorded by another pass at {holder.workflow!r}")
-        checkpoint[key] = stored
+        if recorded.value != value:
+            raise TypeError(
+                f"{key!r} returned {value!r}, which this store reads back as {recorded.value!r}: "
+                f"a node whose result does not survive the checkpoint cannot be resumed from one"
+            )
+        checkpoint[key] = recorded.value
     # Every node has run or been restored, so the output is in hand either way. It
     # is read from the checkpoint rather than from the call, because a fully
     # recorded workflow runs nothing and so has nothing to return.
@@ -118,9 +147,16 @@ async def run_saga[In, Out, Reached, Undone](
     failure *inside* the compensation propagates in its place, carrying the original
     as its context, since a half-unwound saga is the more urgent problem.
 
-    Cancellation is not caught. It is not a failed workflow but a stopped one, and
-    unwinding on the way out would fire the compensations while their forward steps
-    may still be running.
+    Cancellation is not caught, and neither is any other `Interruption`. They are not
+    failed workflows but stopped passes, and each stops for a reason that makes
+    unwinding actively wrong rather than merely unnecessary. Cancellation would fire
+    the compensations while their forward steps may still be running. `Fenced` and
+    `Contended` are worse: they say another pass holds this workflow and is advancing
+    it, so a loser that compensated would refund a charge the winner is still
+    building on, and would do it under a claim on `:unwind` that the winner has no
+    reason to be holding. Descending from `BaseException` is what keeps the `except
+    Exception` below from reaching them, so the rule is enforced by the exceptions'
+    own shape rather than by a list of types kept correct here.
 
     The rollback's id is the workflow's own with `:unwind` appended, which puts one
     constraint on ids in exchange for needing no second namespace: an id that already

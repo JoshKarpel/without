@@ -1,8 +1,16 @@
 # The same durability, without the graph: a workflow is an ordinary async function
-# whose effects are named. `run.step(key, effect)` runs the effect once and records
-# what it returned; resuming means calling the function again, where each step it
-# reaches hands back what is already recorded instead of running. The whole engine is
+# whose effects are named. `run.step(key, effect, parse)` runs the effect once and
+# records what it returned; resuming means calling the function again, where each step
+# it reaches hands back what is already recorded instead of running. The whole engine is
 # the dict lookup in `Run.step`.
+#
+# Every step takes a parser, and that is the one piece of ceremony here that earns its
+# place. A step never hands back the object its effect produced: it hands back what the
+# *store* holds, read through a codec, so the value has already been somewhere that does
+# not preserve Python types. Annotating the effect and casting would be a lie on the
+# first pass, not merely after a crash, since a tuple comes back a list the moment it is
+# recorded. A parser is the same thing the rest of this repo does at every boundary, and
+# unlike a cast it can fail loudly when the store holds something else.
 #
 # What is re-executed is the code *between* the steps, and that is the one rule this
 # mechanism asks for: effects must live in steps, the code around them must be pure. Temporal
@@ -40,15 +48,29 @@ from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
 from typing import Never
-from typing import cast
 
 from without_durability.seams import Checkpointer
+from without_durability.seams import Interruption
 from without_durability.seams import Pass
 
 type StepKey = str
+# How a recorded value re-enters the workflow as the type the workflow declared.
+#
+# It takes `object` because that is honestly what a checkpoint holds: the store's codec
+# carries every key uniformly and can only promise to hand something back, never what.
+# It returns `T` because a parser that ran is a *proof* the value has that shape, which
+# a `cast` is not. So this is the one direction that has to be per-step, where the codec
+# is per-store: only the workflow knows that `"items"` is a mapping of sku to cents.
+#
+# It is one function rather than half of a per-step codec, and the asymmetry is the same
+# one `CheckpointCodec` has from the other side. Encoding is uniform, so the store does
+# it once for every key; a step that encoded for itself would have to lower its value
+# into something the store's codec also understands, which is a second pass over the
+# same data for nothing (see `CheckpointCodec`).
+type Parse[T] = Callable[[object], T]
 
 
-class Suspended(Exception):
+class Suspended(Interruption):
     """
     The pass cannot go further until `key` is recorded. Nothing has failed.
 
@@ -60,7 +82,10 @@ class Suspended(Exception):
 
     Error handling *around* a workflow must let this through, for the same reason
     `run_saga` does not compensate on cancellation: a suspended workflow is one that
-    is going fine, and unwinding it would undo work it is still counting on.
+    is going fine, and unwinding it would undo work it is still counting on. Being an
+    `Interruption` is what makes that structural rather than a rule to remember, since
+    the `except Exception` a workflow author writes around a flaky gateway no longer
+    reaches it.
     """
 
     def __init__(self, key: StepKey, due: datetime | None = None) -> None:
@@ -100,33 +125,58 @@ class Run[Effect = Never]:
     def workflow(self) -> str:
         return self.holder.workflow
 
-    async def step[T](self, key: StepKey, effect: Callable[[], Awaitable[T]]) -> T:
+    async def step[T](self, key: StepKey, effect: Callable[[], Awaitable[object]], parse: Parse[T]) -> T:
         """
         Run `effect` once across every pass of this workflow, recording what it returns.
 
-        The recorded value is what later passes get back, so it round-trips through
-        the store's codec: a step that returns a value the codec cannot carry hands
-        back something else after a crash (JSON here, so keep step results JSON-native,
-        the same constraint the graph's nodes carry). The record is written before the
-        step returns, so the workflow never proceeds on a result the store has not
-        accepted.
+        `parse` is what makes the return type true rather than asserted, and it is
+        required for that reason. What this hands back is never the object `effect`
+        produced: it is what the *store* holds, read back through the store's
+        `CheckpointCodec`, so a step returning a tuple is handed a list under the
+        default `JsonCodec` on the very pass that ran it. A `cast` here would be a lie
+        on every path rather than only after a crash. Parsing at the point where the
+        value re-enters the workflow is the same move the rest of this repo makes at
+        every boundary, and it is the only one that can be checked.
+
+        The effect's own return type is deliberately not tied to `parse`'s. What goes
+        in and what comes out are related by encode-then-decode, which is not the
+        identity, so requiring one type for both would assert something false. `sleep`
+        is the proof rather than the exception: it records an ISO string and reads back
+        a `datetime`, and a step that records a mapping to rebuild a domain value does
+        the same thing. `effect` therefore promises only something the codec can carry,
+        which no annotation expresses, and `parse` says what the workflow gets.
+
+        It also decides how much a codec has to carry. A richer codec narrows what a
+        parser has to repair, and no codec removes it: `pydantic_core` renders a tuple
+        as a JSON array too, because the round trip is lossy by nature rather than by
+        the stdlib's weakness. So the codec is a transport concern, uniform over every
+        key, and this is a meaning concern, particular to one.
+
+        The record is written before the step returns, so the workflow never proceeds
+        on a result the store has not accepted.
 
         What comes back from `record` is what the *store* holds, not necessarily what
-        this effect returned, and this returns that. The difference shows up when two
-        passes both ran the effect: the first to record wins, the second is handed the
-        winner's value, and from there they proceed identically instead of two
-        workflows diverging on which capture id is real. The duplicate effect is not
-        prevented by that, only made harmless downstream; preventing it is what the
-        claim is for, and the two together are why a step is written this way.
+        this effect returned. The difference shows up when two passes both ran the
+        effect: the first to record wins, the second is handed the winner's value, and
+        from there they proceed identically instead of two workflows diverging on which
+        capture id is real. The duplicate effect is not prevented by that, only made
+        harmless downstream; preventing it is what the claim is for, and the two
+        together are why a step is written this way.
+
+        Which of the two happened is on the `Recorded` and is deliberately ignored here.
+        A step has already been told the winner's value and has no dependents holding
+        the loser's, so adopting it and carrying on is the whole response; `run_durably`
+        is the caller that cannot, because a graph fed its node's result downstream
+        before the write.
         """
         self.claim(key)
         if key in self.recorded:
-            return cast(T, self.recorded[key])
-        stored = await self.checkpointer.record(self.holder, key, await effect())
-        self.recorded[key] = stored
-        return cast(T, stored)
+            return parse(self.recorded[key])
+        recorded = await self.checkpointer.record(self.holder, key, await effect())
+        self.recorded[key] = recorded.value
+        return parse(recorded.value)
 
-    async def transact(self, key: StepKey, effect: Effect) -> object:
+    async def transact[T](self, key: StepKey, effect: Effect, parse: Parse[T]) -> T:
         """
         Perform `effect` and record it in one commit, so the step is *exactly* once.
 
@@ -144,16 +194,16 @@ class Run[Effect = Never]:
         about distributed transactions rather than a limitation of this seam, which is
         why `Effect` is a type parameter and not a shared interface.
 
-        The result comes back as `object` rather than the effect's own type, because
-        what is returned is what the *store* holds after the commit: read back from the
-        record on a later pass, so it round-trips through the codec like any step.
+        `parse` is required for the reason it is on `step`, and more plainly: what the
+        effect returns is produced by the *store* (a Lua script's reply, a cursor's
+        row), so there is no Python type to infer even before the codec touches it.
         """
         self.claim(key)
         if key in self.recorded:
-            return self.recorded[key]
+            return parse(self.recorded[key])
         stored = await self.checkpointer.transact(self.holder, key, effect)
         self.recorded[key] = stored
-        return stored
+        return parse(stored)
 
     async def sleep(self, key: StepKey, duration: timedelta) -> None:
         """
@@ -168,11 +218,11 @@ class Run[Effect = Never]:
         async def deadline_from_now() -> str:
             return (self.now() + duration).isoformat()
 
-        deadline = parse_deadline(key, await self.step(key, deadline_from_now))
+        deadline = await self.step(key, deadline_from_now, parsing_deadline(key))
         if self.now() < deadline:
             raise Suspended(key, due=deadline)
 
-    async def awaiting(self, key: StepKey) -> object:
+    async def awaiting[T](self, key: StepKey, parse: Parse[T]) -> T:
         """
         The value another process recorded under `key`, suspending until there is one.
 
@@ -180,13 +230,17 @@ class Run[Effect = Never]:
         approval, a webhook) writes one field into this workflow's checkpoint and asks
         for another pass. Because the wait is a *recorded value* rather than a message
         delivered to a running process, it outlives the process that was waiting and
-        can be satisfied by any other. The value crosses a trust boundary, so it comes
-        back as `object` for the workflow to parse.
+        can be satisfied by any other.
+
+        This is the value most worth parsing and the one a caller is least able to
+        assume anything about: it crossed a trust boundary, written by something that
+        shares nothing with this workflow but an id. A step at least chose its own
+        effect; here the workflow is reading what an HTTP handler put there.
         """
         self.claim(key)
         if key not in self.recorded:
             raise Suspended(key)
-        return self.recorded[key]
+        return parse(self.recorded[key])
 
     def claim(self, key: StepKey) -> None:
         """
@@ -208,6 +262,15 @@ def parse_deadline(key: StepKey, recorded: object) -> datetime:
     if not isinstance(recorded, str):
         raise TypeError(f"{key!r} holds {recorded!r}, which is not a deadline this workflow wrote")
     return datetime.fromisoformat(recorded)
+
+
+def parsing_deadline(key: StepKey) -> Parse[datetime]:
+    """`parse_deadline` as the one-argument parser `step` takes, closed over its key."""
+
+    def parse(recorded: object) -> datetime:
+        return parse_deadline(key, recorded)
+
+    return parse
 
 
 async def resume[T, Effect](

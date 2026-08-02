@@ -16,6 +16,7 @@ from integration.durable.payout import Payout
 from integration.durable.payout import Payouts
 from integration.durable.payout import parse_approver
 from integration.durable.payout import parse_items
+from integration.durable.payout import parse_reference
 from integration.durable.payout import pay_out
 from integration.durable.workflow import APPROVAL_OVER
 from integration.durable.workflow import SETTLING
@@ -41,6 +42,7 @@ __all__ = [
     "in_memory",
     "parse_approver",
     "parse_items",
+    "parse_reference",
     "pay_out",
     "payments_app",
     "recorded_id",

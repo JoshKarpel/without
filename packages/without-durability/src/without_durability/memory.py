@@ -12,15 +12,26 @@ from datetime import timedelta
 from itertools import count
 from time import monotonic
 
+from without_durability.codec import JSON
+from without_durability.codec import CheckpointCodec
 from without_durability.seams import Delivery
 from without_durability.seams import Fenced
 from without_durability.seams import Pass
+from without_durability.seams import Recorded
 
 # Both seams over ordinary dicts, shipped rather than kept in a test directory, because
 # the whole design says a store is injected and this is the store a test should inject.
 # They are doubles rather than mocks: every mechanism (the load, the record, the resume,
-# the queue, the timer's claim) runs for real and only the storage is swapped, so a test
-# against them exercises the same code paths a server-backed one does.
+# the queue, the timer's claim, the codec) runs for real and only the storage is swapped,
+# so a test against them exercises the same code paths a server-backed one does.
+#
+# The codec is on that list for a reason worth stating plainly, because leaving it off is
+# the natural thing to do and it is what makes a double lie. A dict can hold a value
+# directly, so encoding into it looks like ceremony; but then a step's result comes back
+# by identity here and through a round trip everywhere else, and every property that
+# depends on the round trip (what a resumed pass reads, whether two encodings agree)
+# passes in the suite and fails in production. So `hashes` holds *encoded* values, exactly
+# as a Redis hash or a `TEXT` column does, and reading a checkpoint means `load`.
 #
 # What that buys is a suite with no container in it. What it costs is the one thing a
 # single process cannot stand in for: these hold their state in this process's memory, so
@@ -51,17 +62,26 @@ class MemoryCheckpointer:
     A workflow whose checkpoint is a dict in this process is durable across exactly
     nothing, so this is for tests and for driving a workflow in a script, not for a
     deployment. Every other store here is the same code with the dict somewhere else.
+
+    `hashes` holds what the codec produced, not what a step returned, so reading a
+    checkpoint back means `load` rather than reaching into it. That is the same distance
+    a real store puts between a caller and its bytes, and keeping it here is what makes a
+    test against this double say anything about a test against Redis.
     """
 
-    hashes: dict[str, dict[str, object]] = field(default_factory=lambda: defaultdict(dict))
+    hashes: dict[str, dict[str, str]] = field(default_factory=lambda: defaultdict(dict))
     tokens: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     held_until: dict[str, float] = field(default_factory=lambda: defaultdict(float))
+    codec: CheckpointCodec[str] = JSON
     # This store's *other* data, standing in for the application tables that live
-    # alongside a checkpoint. `transact` is only meaningful over something like it.
+    # alongside a checkpoint. `transact` is only meaningful over something like it, and
+    # it holds ordinary values rather than encoded ones: it stands in for the
+    # application's own tables, whose shape is the application's business and not this
+    # store's to encode.
     data: dict[str, object] = field(default_factory=dict)
 
     async def load(self, workflow: str) -> dict[str, object]:
-        return dict(self.hashes[workflow])
+        return {key: self.codec.decode(encoded) for key, encoded in self.hashes[workflow].items()}
 
     async def claim(self, workflow: str, lease: timedelta) -> Pass | None:
         if self.held_until[workflow] > monotonic():
@@ -70,10 +90,16 @@ class MemoryCheckpointer:
         self.held_until[workflow] = monotonic() + lease.total_seconds()
         return Pass(workflow=workflow, token=self.tokens[workflow])
 
-    async def record(self, holder: Pass, key: str, value: object) -> object:
+    async def record(self, holder: Pass, key: str, value: object) -> Recorded:
         if holder.token < self.tokens[holder.workflow]:
             raise Fenced(f"pass {holder.token} of {holder.workflow!r} was superseded")
-        return await self.supply(holder.workflow, key, value)
+        encoded = self.codec.encode(value)
+        # `setdefault` is the whole of first-writer-wins, and it reports the winner by
+        # handing back what is now stored: ours when we won, and the earlier writer's
+        # when we did not. Comparing encodings rather than values is what makes a tie
+        # (two passes that ran the same effect) count as winning for both.
+        stored = self.hashes[holder.workflow].setdefault(key, encoded)
+        return Recorded(value=self.codec.decode(stored), first=stored == encoded)
 
     async def transact(self, holder: Pass, key: str, effect: MemoryEffect) -> object:
         """
@@ -88,13 +114,12 @@ class MemoryCheckpointer:
         if holder.token < self.tokens[holder.workflow]:
             raise Fenced(f"pass {holder.token} of {holder.workflow!r} was superseded")
         recorded = self.hashes[holder.workflow]
-        if key in recorded:
-            return recorded[key]
-        recorded[key] = effect(self.data)
-        return recorded[key]
+        if key not in recorded:
+            recorded[key] = self.codec.encode(effect(self.data))
+        return self.codec.decode(recorded[key])
 
     async def supply(self, workflow: str, key: str, value: object) -> object:
-        return self.hashes[workflow].setdefault(key, value)
+        return self.codec.decode(self.hashes[workflow].setdefault(key, self.codec.encode(value)))
 
     async def release(self, holder: Pass) -> None:
         # The token stays, so the next claim outranks this one: releasing hands the

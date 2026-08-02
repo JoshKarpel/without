@@ -11,10 +11,14 @@
 #     node and its old result no longer applies to it, which is the honest answer:
 #     a `checkpoint` written by an older version of this function is rejected by
 #     `CompiledGraph`, not silently half-applied.
-#   - Every node's result is JSON-native, because a checkpointed result round-trips
-#     through the store. The codec is the *app's* boundary decision (see `store`),
-#     so a richer one would let these steps return domain values instead; the toy
-#     stays with strings and mappings to keep the boundary in one obvious place.
+#   - Every node's result survives the store's codec, which for the default JSON one
+#     means it is JSON-*native* rather than merely JSON-serializable: a tuple would
+#     encode and come back a list. That is checked rather than trusted, on the pass
+#     that writes each node (`run_durably`), so getting it wrong is a loud failure
+#     naming the node instead of a dependent quietly seeing a different shape after a
+#     crash. The codec is the *app's* boundary decision (see the store packages), so a
+#     richer one would let these steps return domain values instead; the toy stays with
+#     strings and mappings to keep the boundary in one obvious place.
 #
 # The effects are injected as `Services` rather than reached for, so the same graphs
 # run against a real gateway or a test double with no patching, and so this module

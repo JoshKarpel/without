@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from without_durability import Contended
 from without_durability import Fenced
+from without_durability import Recorded
 from without_durability import Run
 from without_durability import claimed
 from without_durability import now_utc
@@ -28,6 +29,15 @@ WORKFLOW = "wf-sqlite-1"
 BRIEFLY = timedelta(milliseconds=200)
 
 LEDGER = "CREATE TABLE IF NOT EXISTS stock_ledger (sku TEXT PRIMARY KEY, reserved INTEGER NOT NULL)"
+
+
+def as_count(recorded: object) -> int:
+    """What a `transact` effect records here: the ledger total after the reservation."""
+    if not isinstance(
+        recorded, int
+    ):  # pragma: no cover - the arm that makes this a parser rather than a cast; no test feeds it a bad value
+        raise TypeError(f"{recorded!r} is not the count this effect recorded")
+    return recorded
 
 
 @pytest.fixture
@@ -111,7 +121,7 @@ async def test_a_write_from_a_pass_that_lost_the_workflow_is_refused(checkpointe
     with pytest.raises(Fenced, match="moved on while this pass held it"):
         await checkpointer.record(stalled, "paid", "pay-from-the-dead")
 
-    assert await checkpointer.record(took_over, "paid", "pay-real") == "pay-real"
+    assert await checkpointer.record(took_over, "paid", "pay-real") == Recorded(value="pay-real", first=True)
     assert await checkpointer.load(WORKFLOW) == {"paid": "pay-real"}
 
 
@@ -120,10 +130,35 @@ async def test_a_step_already_recorded_is_never_overwritten_and_hands_back_the_w
 ) -> None:
     holder = await claimed(checkpointer, WORKFLOW)
 
-    assert await checkpointer.record(holder, "captured", "cap-first") == "cap-first"
-    assert await checkpointer.record(holder, "captured", "cap-second") == "cap-first"
+    assert await checkpointer.record(holder, "captured", "cap-first") == Recorded(value="cap-first", first=True)
+    assert await checkpointer.record(holder, "captured", "cap-second") == Recorded(value="cap-first", first=False)
     assert await checkpointer.supply(WORKFLOW, "captured", "cap-third") == "cap-first"
     assert await checkpointer.load(WORKFLOW) == {"captured": "cap-first"}
+
+
+async def test_a_result_the_codec_reshapes_still_counts_as_this_pass_s_own(
+    checkpointer: SqliteCheckpointer,
+) -> None:
+    # A result crosses the codec both ways, so a pass that won outright can be handed back
+    # something unequal: JSON has no tuple. `first` is this store's own answer rather than
+    # that comparison, which is what stops `run_durably` reading a reshape as a race that
+    # never happened.
+    holder = await claimed(checkpointer, WORKFLOW)
+
+    assert await checkpointer.record(holder, "bounds", (0, 2000)) == Recorded(value=[0, 2000], first=True)
+
+
+async def test_two_passes_that_recorded_the_same_value_both_count_as_the_writer(
+    checkpointer: SqliteCheckpointer,
+) -> None:
+    # A tie is not a race. Two passes that ran the same effect and produced the same
+    # encoding have nothing to disagree about, so calling the second a loser would stop a
+    # graph run over a difference that does not exist.
+    holder = await claimed(checkpointer, WORKFLOW)
+
+    await checkpointer.record(holder, "captured", "cap-1")
+
+    assert await checkpointer.record(holder, "captured", "cap-1") == Recorded(value="cap-1", first=True)
 
 
 async def test_a_step_that_records_json_null_is_not_a_step_that_never_ran(
@@ -134,7 +169,7 @@ async def test_a_step_that_records_json_null_is_not_a_step_that_never_ran(
     # resumed pass run that step again.
     holder = await claimed(checkpointer, WORKFLOW)
 
-    assert await checkpointer.record(holder, "notified", None) is None
+    assert await checkpointer.record(holder, "notified", None) == Recorded(value=None, first=True)
     assert await checkpointer.load(WORKFLOW) == {"notified": None}
 
 
@@ -148,8 +183,8 @@ async def test_an_effect_in_this_file_is_performed_and_recorded_in_one_commit(
     holder = await claimed(checkpointer, WORKFLOW)
     reserve = reserving("piano", 1)
 
-    first = await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("reserved", reserve)
-    again = await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("reserved", reserve)
+    first = await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("reserved", reserve, as_count)
+    again = await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("reserved", reserve, as_count)
 
     assert (first, again) == (1, 1), "the second pass read the record rather than reserving again"
     assert await reserved(database, "piano") == 1, "the stock moved once, however many passes reached the step"
@@ -165,7 +200,9 @@ async def test_a_transacted_effect_is_refused_from_a_superseded_pass(
     await claimed(checkpointer, WORKFLOW)
 
     with pytest.raises(Fenced):
-        await Run(holder=stalled, checkpointer=checkpointer, recorded={}).transact("reserved", reserving("piano", 1))
+        await Run(holder=stalled, checkpointer=checkpointer, recorded={}).transact(
+            "reserved", reserving("piano", 1), as_count
+        )
 
     assert await reserved(database, "piano") is None, "the fence is checked before the effect runs, not after"
 
@@ -183,7 +220,7 @@ async def test_an_effect_that_fails_leaves_neither_the_work_nor_the_record(
         raise RuntimeError("the warehouse said no")
 
     with pytest.raises(RuntimeError, match="the warehouse said no"):
-        await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("reserved", half_way)
+        await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("reserved", half_way, as_count)
 
     assert await reserved(database, "piano") is None
     assert await checkpointer.load(WORKFLOW) == {}, "and the step is unrecorded, so the next pass may retry it"

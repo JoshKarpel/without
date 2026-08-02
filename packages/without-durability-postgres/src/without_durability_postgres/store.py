@@ -56,6 +56,7 @@ import asyncio
 from collections.abc import Awaitable
 from collections.abc import Callable
 from dataclasses import dataclass
+from dataclasses import field
 from datetime import datetime
 from datetime import timedelta
 from time import monotonic
@@ -63,11 +64,13 @@ from typing import cast
 
 from psycopg import AsyncCursor
 from psycopg.rows import TupleRow
-from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
+from without_durability.codec import JSON
+from without_durability.codec import CheckpointCodec
 from without_durability.seams import Delivery
 from without_durability.seams import Fenced
 from without_durability.seams import Pass
+from without_durability.seams import Recorded
 from without_durability.stepwise import now_utc
 
 # The same two numbers `schedule.py` documents at length, and for the same reasons: a
@@ -78,10 +81,18 @@ LEASE = timedelta(minutes=1)
 POLL = timedelta(milliseconds=50)
 
 # One DDL for one database, because it *is* one database. `value` is `jsonb` rather than
-# `json` so it is stored parsed: the codec decision `store.py` makes with `json.dumps` is
-# made here by the column type, and psycopg hands back ordinary Python values on the way
-# out. It carries the same cost, that a step result must be JSON-native, and the same
-# consolation, that an operator with `psql` can read a workflow's whole history.
+# `json` so it is stored parsed, which is what buys the indexing and the operators that
+# let an operator with `psql` query a workflow's history rather than only read it.
+#
+# That is a *storage* decision, and it is worth separating from the codec, which is the
+# boundary decision the caller injects. The column says the bytes are a JSON document and
+# normalizes them; the codec says how a Python value becomes that document and comes back.
+# So every value crosses the boundary as text with an explicit `::jsonb` going in and a
+# `::text` coming out, rather than letting psycopg's adapter be a second, invisible codec
+# underneath the injected one. The cost of the column type is that a `PostgresCheckpointer`
+# constrains its codec to produce JSON *text*, which is a real narrowing next to Redis and
+# SQLite; what still varies is the library and the value mapping, which is where the
+# interesting codecs differ anyway.
 #
 # `NOT NULL` on `value` is not decoration: it is what keeps "no row" and "a row holding
 # JSON null" distinguishable, so a step that legitimately records `None` is not read back
@@ -155,15 +166,22 @@ RETURNING token
 # instead of carrying on with its own. A plain `DO NOTHING` would return no row at all
 # and force a second read that a concurrent inserter could still beat.
 #
-#   returns  the value stored after the call, or no row at all when the pass is fenced
+# The second returned column is who won, which the caller cannot work out afterwards: a
+# result crosses the codec on the way in and out, so comparing what came back against what
+# went in answers a different question (see `Recorded`). Here the comparison is between
+# `jsonb` values, which is better than the text comparison the other two stores make: it is
+# semantic, so two encoders that order an object's keys differently still agree.
+#
+#   returns  the value stored after the call and whether it is this call's, or no row at
+#            all when the pass is fenced
 RECORD = """
 WITH fence AS (
     SELECT token FROM workflow_claim WHERE workflow = %(workflow)s FOR UPDATE
 )
 INSERT INTO workflow_checkpoint AS recorded (workflow, step, value)
-SELECT %(workflow)s, %(step)s, %(value)s FROM fence WHERE fence.token <= %(token)s
+SELECT %(workflow)s, %(step)s, %(value)s::jsonb FROM fence WHERE fence.token <= %(token)s
 ON CONFLICT (workflow, step) DO UPDATE SET value = recorded.value
-RETURNING recorded.value
+RETURNING recorded.value::text, recorded.value = %(value)s::jsonb
 """
 
 # The same conditional write without the fence, for a value that comes from outside any
@@ -171,9 +189,9 @@ RETURNING recorded.value
 # happens to be mid-pass, and first-writer-wins is the whole guarantee it needs.
 SUPPLY = """
 INSERT INTO workflow_checkpoint AS recorded (workflow, step, value)
-VALUES (%(workflow)s, %(step)s, %(value)s)
+VALUES (%(workflow)s, %(step)s, %(value)s::jsonb)
 ON CONFLICT (workflow, step) DO UPDATE SET value = recorded.value
-RETURNING recorded.value
+RETURNING recorded.value::text
 """
 
 # The three statements `transact` runs between `BEGIN` and `COMMIT`, with the effect's own
@@ -181,10 +199,10 @@ RETURNING recorded.value
 # arbitrary application SQL that this store cannot see, which is precisely what makes the
 # transaction worth having.
 FENCE = "SELECT token FROM workflow_claim WHERE workflow = %s FOR UPDATE"
-ALREADY = "SELECT value FROM workflow_checkpoint WHERE workflow = %s AND step = %s"
-WRITE = "INSERT INTO workflow_checkpoint (workflow, step, value) VALUES (%s, %s, %s) RETURNING value"
+ALREADY = "SELECT value::text FROM workflow_checkpoint WHERE workflow = %s AND step = %s"
+WRITE = "INSERT INTO workflow_checkpoint (workflow, step, value) VALUES (%s, %s, %s::jsonb) RETURNING value::text"
 
-LOAD = "SELECT step, value FROM workflow_checkpoint WHERE workflow = %s"
+LOAD = "SELECT step, value::text FROM workflow_checkpoint WHERE workflow = %s"
 # Hand the workflow back early, but keep the token, so the next claim gets the next
 # number up and a pass that comes back from the dead still loses. Conditional on the
 # token for the same reason `release` is in the Redis store: a superseded pass letting go
@@ -199,9 +217,11 @@ RELEASE = "UPDATE workflow_claim SET held_until = now() WHERE workflow = %s AND 
 # A callback rather than a statement-and-parameters pair, because the transaction is the
 # unit and a caller may need several statements in it, may need to read before it writes,
 # and may want ordinary Python between them. Whatever it returns is recorded as the step's
-# value, so it MUST be JSON-native, and it MUST confine itself to the cursor it is handed:
-# opening another connection puts the work outside the transaction and gives back exactly
-# the at-least-once gap `transact` exists to close.
+# value, so it MUST be something the store's codec encodes, and it MUST confine itself to
+# the cursor it is handed: opening another connection puts the work outside the transaction
+# and gives back exactly the at-least-once gap `transact` exists to close. Unlike Redis's
+# `LuaEffect` it returns an ordinary Python value rather than an encoding, because it runs
+# in this process where the codec is.
 type SqlEffect = Callable[[AsyncCursor[TupleRow]], Awaitable[object]]
 
 
@@ -253,16 +273,23 @@ class PostgresCheckpointer:
     it is never parsed as key structure, and the only constraint that survives is the one
     `run_saga` states about any store: an id ending in `:unwind` addresses another
     workflow's rollback.
+
+    `codec` is how a step's result becomes the document in a `jsonb` column and comes
+    back, defaulting to the stdlib's JSON. The column type narrows what a codec here may
+    be in a way it does not for the other two stores: it MUST render JSON *text*, because
+    that is what `jsonb` will accept. What that still leaves free is the library and the
+    value mapping, which is the part worth changing (a pydantic `TypeAdapter` renders
+    domain values that `json.dumps` refuses). What it MUST keep, as everywhere, is the
+    round trip.
     """
 
     pool: AsyncConnectionPool
+    codec: CheckpointCodec[str] = JSON
 
     async def load(self, workflow: str) -> dict[str, object]:
         async with self.pool.connection() as connection, connection.cursor() as cursor:
             await cursor.execute(LOAD, (workflow,))
-            # `jsonb` comes back already parsed, so the decode that `store.py` spends a
-            # `json.loads` on per field is the column type's job here.
-            return dict(await cursor.fetchall())
+            return {step: self.codec.decode(encoded) for step, encoded in await cursor.fetchall()}
 
     async def claim(self, workflow: str, lease: timedelta) -> Pass | None:
         async with self.pool.connection() as connection, connection.cursor() as cursor:
@@ -272,11 +299,16 @@ class PostgresCheckpointer:
             return None
         return Pass(workflow=workflow, token=cast(int, taken[0]))
 
-    async def record(self, holder: Pass, key: str, value: object) -> object:
+    async def record(self, holder: Pass, key: str, value: object) -> Recorded:
         async with self.pool.connection() as connection, connection.cursor() as cursor:
             await cursor.execute(
                 RECORD,
-                {"workflow": holder.workflow, "step": key, "value": Jsonb(value), "token": holder.token},
+                {
+                    "workflow": holder.workflow,
+                    "step": key,
+                    "value": self.codec.encode(value),
+                    "token": holder.token,
+                },
             )
             stored = await cursor.fetchone()
         if stored is None:
@@ -285,7 +317,7 @@ class PostgresCheckpointer:
             # and refused it. (A missing claim row would land here too, and a `Pass` is
             # only ever handed out by a `claim` that wrote one.)
             raise Fenced(f"{holder.workflow!r} moved on while this pass held it")
-        return stored[0]
+        return Recorded(value=self.codec.decode(cast(str, stored[0])), first=cast(bool, stored[1]))
 
     async def transact(self, holder: Pass, key: str, effect: SqlEffect) -> object:
         """
@@ -314,14 +346,14 @@ class PostgresCheckpointer:
             await cursor.execute(ALREADY, (holder.workflow, key))
             recorded = await cursor.fetchone()
             if recorded is not None:
-                return recorded[0]
-            await cursor.execute(WRITE, (holder.workflow, key, Jsonb(await effect(cursor))))
-            return cast(tuple[object], await cursor.fetchone())[0]
+                return self.codec.decode(cast(str, recorded[0]))
+            await cursor.execute(WRITE, (holder.workflow, key, self.codec.encode(await effect(cursor))))
+            return self.codec.decode(cast(tuple[str], await cursor.fetchone())[0])
 
     async def supply(self, workflow: str, key: str, value: object) -> object:
         async with self.pool.connection() as connection, connection.cursor() as cursor:
-            await cursor.execute(SUPPLY, {"workflow": workflow, "step": key, "value": Jsonb(value)})
-            return cast(tuple[object], await cursor.fetchone())[0]
+            await cursor.execute(SUPPLY, {"workflow": workflow, "step": key, "value": self.codec.encode(value)})
+            return self.codec.decode(cast(tuple[str], await cursor.fetchone())[0])
 
     async def release(self, holder: Pass) -> None:
         async with self.pool.connection() as connection:
@@ -406,6 +438,14 @@ class PostgresScheduler:
     # lease is measured by the server (in `TAKE`) and a deadline was chosen by the
     # workflow itself. Injected so a test can place a wakeup in a clock it controls.
     now: Callable[[], datetime] = now_utc
+    # The poll interval as the number `asyncio.sleep` wants, rendered once rather than per
+    # iteration of `next_ready`'s loop, which is the one place here that runs more than
+    # once per unit of work. `lease` stays a `timedelta`, since psycopg adapts it directly
+    # into the `interval` the statement wants.
+    poll_seconds: float = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "poll_seconds", self.poll.total_seconds())
 
     async def prepare(self) -> None:
         """
@@ -459,7 +499,7 @@ class PostgresScheduler:
             remaining = deadline - monotonic()
             if remaining <= 0:
                 return None
-            await asyncio.sleep(min(self.poll.total_seconds(), remaining))
+            await asyncio.sleep(min(self.poll_seconds, remaining))
 
     async def reclaim(self, idle: timedelta) -> Delivery | None:
         """Nothing to take over by hand: an abandoned workflow becomes visible on its own."""
@@ -520,11 +560,12 @@ class PostgresDurable:
         cursor, since a second connection would be a second transaction wearing the same
         method's name.
         """
+        codec = self.checkpointer.codec
         async with self.checkpointer.pool.connection() as connection, connection.cursor() as cursor:
-            await cursor.execute(SUPPLY, {"workflow": workflow, "step": key, "value": Jsonb(value)})
-            stored = cast(tuple[object], await cursor.fetchone())
+            await cursor.execute(SUPPLY, {"workflow": workflow, "step": key, "value": codec.encode(value)})
+            stored = cast(tuple[str], await cursor.fetchone())
             await cursor.execute(
                 SCHEDULE,
                 {"namespace": self.scheduler.namespace, "workflow": workflow, "visible_at": self.scheduler.now()},
             )
-            return stored[0]
+            return codec.decode(stored[0])

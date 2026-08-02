@@ -90,6 +90,13 @@ do that. The same change also lets the fencing token be an ordinary counter rath
 than the hybrid logical clock the Redis store needs, because a token can only rewind if
 a claim row disappears, and here that happens only if a sweep deletes it.
 
+**Comparing two encodings is semantic.** `record` reports whether the value stored
+is this pass's own, and on Redis and SQLite that comparison is between strings.
+Here it is between `jsonb` values, which are normalized, so two documents that
+differ only in key order or whitespace are equal. Nothing depends on the
+difference, since `CheckpointCodec` requires a deterministic `encode` and one
+store has one codec, but it is the stronger comparison of the two.
+
 **A commit is a commit.** `RedisCheckpointer` has to hedge on whether `record`
 returning means the value survived, because default persistence and asynchronous
 replication do not give that. A default Postgres has `synchronous_commit` on, so
@@ -105,6 +112,14 @@ here does, so a long-running deployment needs a job that deletes checkpoints and
 claims past some age. That job is also the only way to bring back the reused-id
 hazard the counter avoids, so it should delete a workflow's claim and its
 checkpoint together or neither.
+
+**The column narrows the codec.** Redis and SQLite hold text, so any
+`CheckpointCodec[str]` fits. A `jsonb` column will only take JSON, so a codec here
+MUST render JSON _text_, which rules out (say) a msgpack-in-base64 one. What that
+still leaves free is the library and the value mapping, which is where the
+interesting codecs differ anyway; the alternative was a `text` column, and giving
+up indexing and the `jsonb` operators to hold encodings nobody was going to use
+was the worse trade.
 
 **There is still no blocking read.** `PostgresScheduler` polls, exactly as
 `RedisSetScheduler` does, so the poll interval is a floor under how fast anything

@@ -6,6 +6,7 @@ from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Mapping
 from contextlib import suppress
+from datetime import datetime
 from datetime import timedelta
 from uuid import uuid4
 
@@ -20,7 +21,7 @@ from integration.durable import Reached
 from integration.durable import fulfilment
 from integration.durable import pay_out
 from integration.durable import payments_app
-from integration.durable import submitted
+from integration.durable import submitting
 from integration.durable import unwinding
 from stores import durable  # noqa: F401 - the parametrized fixture every test here takes
 from without_dag import CompiledGraph
@@ -29,6 +30,7 @@ from without_durability import Durable
 from without_durability import Run
 from without_durability import Suspended
 from without_durability import claimed
+from without_durability import now_utc
 from without_durability import resume
 from without_durability import run_saga
 from without_durability import work
@@ -162,14 +164,19 @@ async def test_a_workflow_suspended_on_an_approval_resumes_when_another_process_
     assert answered == ["pay"], "everything before the approval was read back out of the store"
 
 
-# The API and the worker over every store, across a real one-second wait. Its budget is
-# generous because the workflow really does sleep for a second.
+# The API and the worker over every store, across a settlement window this really does
+# wait out. It is short because nothing here is testing how long a workflow can sleep, and
+# it is a value the test chooses rather than the module default, so waiting it out means
+# reading the deadline the workflow recorded instead of guessing a duration.
+SETTLING = timedelta(milliseconds=200)
+
+
 @pytest.mark.timeout(60)
 async def test_an_order_submitted_to_the_api_is_carried_to_payout_by_the_worker(
     durable: Durable,  # noqa: F811
     workflow: str,
 ) -> None:
-    worker = asyncio.create_task(work(durable, submitted))
+    worker = asyncio.create_task(work(durable, submitting(settling=SETTLING)))
 
     try:
         async with (
@@ -189,8 +196,13 @@ async def test_an_order_submitted_to_the_api_is_carried_to_payout_by_the_worker(
             assert set(recorded) == {"order", "items", "captured:piano", "captured:stool", "settling"}
 
             # Past the deadline the workflow becomes ready again, the pass runs, and it
-            # stops on the confirmation, where nothing but a person can move it.
-            await asyncio.sleep(1.5)
+            # stops on the confirmation, where nothing but a person can move it. Waiting
+            # out the deadline the *workflow* recorded rather than a constant chosen here
+            # keeps the two from drifting apart, and no margin is needed on top: `done`
+            # cannot become true until the confirmation below, so this reads the same
+            # whether or not the wakeup has landed yet.
+            deadline = datetime.fromisoformat(str(recorded["settling"]))
+            await asyncio.sleep(max((deadline - now_utc()).total_seconds(), 0.0))
             held = await client.get(f"/orders/{workflow}")
             assert json.loads(held.text)["done"] is False
 

@@ -49,6 +49,12 @@
 # winner: it schedules itself a little later and lets go, because the pass in flight may
 # well finish the work, and holding a slot to find out would spend the pool on waiting.
 #
+# Losing that claim has two arrival times and one answer. It is refused up front when
+# someone already holds the workflow, and it surfaces mid-pass as `Fenced` when this
+# pass's lease lapsed and another worker took over between two steps. Both mean the same
+# thing (somebody else is advancing this workflow), so both take the same path out, and
+# neither is a failure to warn about.
+#
 # There is still no retry policy: a workflow whose step raises is logged and
 # acknowledged, and comes back only when something wakes it.
 
@@ -68,8 +74,10 @@ from without import from_sink
 from without import limit_concurrency
 from without import ticks
 
+from without_durability.seams import Contended
 from without_durability.seams import Delivery
 from without_durability.seams import Durable
+from without_durability.seams import Fenced
 from without_durability.seams import Scheduler
 from without_durability.stepwise import Run
 from without_durability.stepwise import Suspended
@@ -128,7 +136,20 @@ def passes(
     rather than forgotten. Releasing the claim is not on that list: it happens on the way
     out of every path including cancellation, because a shutting-down worker that keeps
     its claim makes every other worker wait out the lease for nothing.
+
+    Losing the workflow is handled by name rather than falling into the failure arm, and
+    it has to be: `Fenced` and `Contended` are `Interruption`s, so `except Exception` no
+    longer reaches them, and treating them as failures was never right anyway. They say
+    another pass owns the workflow, which is the same thing a refused claim says and gets
+    the same answer, so the two paths share `look_again`. What they do not get is a
+    warning, because nothing went wrong.
     """
+
+    async def look_again(delivery: Delivery, why: str) -> None:
+        """Hand the workflow back to whoever holds it, and ask for another look shortly."""
+        logger.info(f"{delivery.workflow} {why}; looking again in {contended}")
+        await durable.scheduler.wake_at(delivery.workflow, now() + contended)
+        await durable.scheduler.done(delivery)
 
     async def advance(delivery: Delivery) -> None:
         holder = await durable.checkpointer.claim(delivery.workflow, lease)
@@ -136,9 +157,7 @@ def passes(
             # Someone else is mid-pass. Whatever this wakeup carried is in the store
             # already, so the pass in flight may cover it; ask again shortly rather than
             # blocking a slot, and answer for the delivery so it is not reclaimed too.
-            logger.info(f"{delivery.workflow} is held by another pass; looking again in {contended}")
-            await durable.scheduler.wake_at(delivery.workflow, now() + contended)
-            await durable.scheduler.done(delivery)
+            await look_again(delivery, "is held by another pass")
             return
         try:
             await resume(holder, durable.checkpointer, body)
@@ -146,6 +165,15 @@ def passes(
             if pause.due is not None:
                 await durable.scheduler.wake_at(delivery.workflow, pause.due)
             logger.info(f"{delivery.workflow} suspended at {pause.key}")
+        except (Fenced, Contended) as lost:
+            # The claim lapsed mid-pass and someone else took the workflow, which is the
+            # same situation as losing it outright, discovered later. So it gets the same
+            # answer rather than being logged as a failure: the winner is advancing the
+            # workflow, and this asks again in case it does not finish. Releasing is left
+            # to the `finally`, where it is the no-op it has to be, since the whole
+            # meaning of `Fenced` is that this pass's token no longer matches.
+            await look_again(delivery, f"was taken over mid-pass ({lost!r})")
+            return
         except Exception as error:  # noqa: BLE001 - a workflow's failure is data here, not a fault in the loop
             logger.warning(f"{delivery.workflow} failed: {error!r}")
         finally:

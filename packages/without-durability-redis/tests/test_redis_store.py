@@ -15,6 +15,7 @@ from redis.exceptions import ResponseError
 from without import ticks
 from without_durability import Contended
 from without_durability import Fenced
+from without_durability import Recorded
 from without_durability import Run
 from without_durability import claimed
 from without_durability import now_utc
@@ -30,6 +31,15 @@ from without_durability_redis import trimming
 pytestmark = pytest.mark.compose
 
 ORDER = Order(order_id="o-42", sku="gizmo", cents=1999)
+
+
+def as_count(recorded: object) -> int:
+    """What a `transact` effect records here: the ledger total after the reservation."""
+    if not isinstance(
+        recorded, int
+    ):  # pragma: no cover - the arm that makes this a parser rather than a cast; no test feeds it a bad value
+        raise TypeError(f"{recorded!r} is not the count this effect recorded")
+    return recorded
 
 
 @pytest.fixture
@@ -98,7 +108,7 @@ async def test_a_write_from_a_pass_that_lost_the_workflow_is_refused_by_redis(
     with pytest.raises(Fenced, match="moved on while this pass held it"):
         await checkpointer.record(stalled, "paid", "pay-from-the-dead")
 
-    assert await checkpointer.record(took_over, "paid", "pay-real") == "pay-real"
+    assert await checkpointer.record(took_over, "paid", "pay-real") == Recorded(value="pay-real", first=True)
     assert await checkpointer.load(workflow) == {"paid": "pay-real"}
 
 
@@ -134,10 +144,39 @@ async def test_a_step_already_recorded_is_never_overwritten_and_hands_back_the_w
     checkpointer = RedisCheckpointer(redis=redis)
     holder = await claimed(checkpointer, workflow)
 
-    assert await checkpointer.record(holder, "captured:piano", "cap-first") == "cap-first"
-    assert await checkpointer.record(holder, "captured:piano", "cap-second") == "cap-first"
+    assert await checkpointer.record(holder, "captured:piano", "cap-first") == Recorded(value="cap-first", first=True)
+    assert await checkpointer.record(holder, "captured:piano", "cap-second") == Recorded(value="cap-first", first=False)
     assert await checkpointer.supply(workflow, "captured:piano", "cap-third") == "cap-first"
     assert await checkpointer.load(workflow) == {"captured:piano": "cap-first"}
+
+
+async def test_a_result_the_codec_reshapes_still_counts_as_this_pass_s_own(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # A result crosses the codec both ways, so a pass that won outright can be handed back
+    # something unequal: JSON has no tuple. `first` is this store's own answer rather than
+    # that comparison, which is what stops `run_durably` reading a reshape as a race that
+    # never happened.
+    checkpointer = RedisCheckpointer(redis=redis)
+    holder = await claimed(checkpointer, workflow)
+
+    assert await checkpointer.record(holder, "bounds", (0, 2000)) == Recorded(value=[0, 2000], first=True)
+
+
+async def test_two_passes_that_recorded_the_same_value_both_count_as_the_writer(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # A tie is not a race. Two passes that ran the same effect and produced the same
+    # encoding have nothing to disagree about, so calling the second a loser would stop a
+    # graph run over a difference that does not exist.
+    checkpointer = RedisCheckpointer(redis=redis)
+    holder = await claimed(checkpointer, workflow)
+
+    await checkpointer.record(holder, "captured", "cap-1")
+
+    assert await checkpointer.record(holder, "captured", "cap-1") == Recorded(value="cap-1", first=True)
 
 
 async def test_a_workflows_two_keys_share_a_slot_so_a_script_may_touch_both(workflow: str) -> None:
@@ -289,8 +328,8 @@ async def test_an_effect_in_this_redis_is_performed_and_recorded_in_one_commit(
         args=("piano", 1),
     )
 
-    first = await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("reserved", reserve)
-    again = await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("reserved", reserve)
+    first = await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("reserved", reserve, as_count)
+    again = await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("reserved", reserve, as_count)
 
     assert (first, again) == (1, 1), "the second pass read the record rather than reserving again"
     assert await redis.hget(ledger, "piano") == "1", "the stock moved once, however many passes reached the step"
@@ -313,6 +352,7 @@ async def test_a_transacted_effect_is_refused_from_a_superseded_pass(redis: Redi
                 keys=(ledger,),
                 args=("piano",),
             ),
+            as_count,
         )
 
     assert await redis.exists(ledger) == 0, "the fence is checked before the effect runs, not after"
@@ -330,6 +370,7 @@ async def test_a_transact_error_that_is_not_the_fence_is_not_swallowed(redis: Re
         await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact(
             "reserved",
             LuaEffect(source="return cjson.encode(1)"),
+            as_count,
         )
 
 

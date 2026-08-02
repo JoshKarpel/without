@@ -63,8 +63,8 @@ hand, as it is in every engine that formalizes sagas.
 `durable.stepwise` is the same durability without the graph, and the two sit
 together deliberately: one checkpoint, two ways to spend it. A workflow is an
 ordinary async function whose effects are named (`await run.step("charged",
-...)`), resuming means calling it again, and each step it reaches hands back what
-is already recorded instead of running. What it asks in return is the rule the
+charge, as_text)`), resuming means calling it again, and each step it reaches
+hands back what is already recorded instead of running. What it asks in return is the rule the
 rest of this repo already keeps, since the code *between* the steps re-runs:
 effects live in steps, the code around them is pure. Temporal and DBOS state that
 same rule as workflow determinism. Nothing here enforces it (see
@@ -196,7 +196,7 @@ still not *interchangeable*, and the bottom row is why.
 | Capability | Redis | Postgres | What it buys |
 |---|---|---|---|
 | `record` a value durably | yes | yes | resumption at all |
-| Record only if absent, returning the winner | `HSETNX` in a script | `INSERT ... ON CONFLICT ... RETURNING` | two passes that both ran an effect agree on its result instead of diverging |
+| Record only if absent, returning the winner and which pass it was | `HSETNX` and an encoding comparison, in a script | `INSERT ... ON CONFLICT ... RETURNING`, comparing `jsonb` | two passes that both ran an effect agree on its result instead of diverging, and a graph run knows to stop |
 | Exclusive pass with a fencing token | `HINCRBY` plus a lease, in a script | an upsert whose `DO UPDATE` carries a `WHERE` | one pass at a time, holding even when a process stalls past its lease |
 | Step and checkpoint in one commit | a Lua script, for effects in *this* Redis | a transaction, for effects in *this* database | exactly-once for that step |
 
@@ -225,6 +225,7 @@ await run.transact(
         keys=(f"{checkpointer.hash_key(workflow)}:ledger",),
         args=("piano", 1),
     ),
+    as_count,
 )
 ```
 
@@ -242,7 +243,7 @@ async def reserve(cursor: AsyncCursor[TupleRow]) -> object:
     )
     return (await cursor.fetchone())[0]
 
-await run.transact("reserved", reserve)
+await run.transact("reserved", reserve, as_count)
 ```
 
 What it costs is that the effect has to be something the store can perform, which
@@ -286,6 +287,73 @@ Three notes on the shape that took, since none of them is obvious:
   failing because a worker happened to be mid-pass, for a value nothing is racing
   it to write. It keeps first-writer-wins, which is what makes a resubmitted order
   harmless.
+- **The store says who won; the caller cannot work it out.** `record` returns a
+  `Recorded`, which carries the stored value _and_ whether this pass is the one
+  that put it there. Inferring the second from the first looks free and is wrong:
+  a result crosses the codec both ways, so a pass that won outright can be handed
+  back something unequal (a tuple returns as a list under `JsonCodec`), and
+  `run_durably` reading that as a lost race would fail a run in which nothing
+  raced. The store is the only party holding both encodings, so it answers.
+
+### Every step names its parser, and the graph names none
+
+A step hands back what the *store* holds, not the object its effect produced, so
+`run.step("charged", charge)` returning the effect's own type was a lie the type
+checker accepted. Not only after a crash: a step returning a tuple is handed a
+list on the very pass that ran it. So `step`, `transact`, and `awaiting` take a
+`parse: Callable[[object], T]`, and the return type is proven by a function that
+ran rather than asserted by a `cast`.
+
+The effect's own type is deliberately not tied to the parser's. What goes in and
+what comes out are related by encode-then-decode, which is not the identity, so
+one type for both would assert something false. `Run.sleep` is the proof rather
+than the exception: it records an ISO string and reads back a `datetime`.
+
+`run_durably` needs none of this, and the asymmetry is the point rather than an
+inconsistency. It holds *both* values at the moment it records: what the node
+returned, and what the store now has. So it verifies instead of parsing, and
+refuses a node whose result does not survive its own store, naming the node, on
+the pass that wrote it. That check matters more for a graph than a parser would,
+because a graph feeds a node's result straight to its dependents: without it they
+would see a `tuple` on the pass that computed it and a `list` on the pass that
+restored it, with no crash needed for the two to disagree.
+
+Verifying beats parsing whenever you still hold what you sent. `Run.awaiting` is
+exactly the case that does not: it reads a value some *other* process wrote, so
+there is nothing to compare against and only a parser can establish its shape.
+
+### The codec is a seam too
+
+What a step's result *becomes* in the store is a boundary decision, and boundary
+decisions belong to the application: what a workflow's steps return, what an
+operator needs to read out of the store, and what a service in another language
+has to parse are questions this library cannot answer. So `CheckpointCodec` is a
+protocol every store takes, defaulting to `JsonCodec` over the stdlib.
+
+It is one object rather than a pair of functions because both requirements on it
+are about the pair. `decode(encode(x))` MUST equal `x`, or a resumed pass sees
+something the first pass did not, silently, one crash later. And `encode` MUST be
+deterministic, because `record` decides who won a race by comparing encodings.
+
+The in-memory doubles apply it too, which is the part that is easy to skip and is
+exactly what makes a double lie. A dict can hold a value directly, so encoding
+into it looks like ceremony, but then a step's result comes back by identity in
+the suite and through a round trip in production, and every property that depends
+on the round trip passes in tests and fails in deployment. `MemoryCheckpointer`
+holds encoded values, so reading a checkpoint means `load`.
+
+### Losing the workflow is not the workflow failing
+
+`Fenced`, `Contended`, and `Suspended` descend from `BaseException` rather than
+`Exception`, for the reason `asyncio.CancelledError` does. Each says something
+about whether _this pass_ may continue, not about the work; an `except Exception`
+written to handle a declined gateway must not absorb one.
+
+The case that forced it is `run_saga`. It compensates on failure, and a `Fenced`
+forward run is not a failure: it says another pass holds this workflow and is
+advancing it, so a loser that compensated would refund a charge the winner is
+still building on. Making the exception's own shape enforce that beats keeping a
+list of types correct at every `except` site.
 
 ## One seam or two
 
@@ -431,10 +499,15 @@ features, expected in something this size:
   since keying by name means a workflow that takes a different branch on replay
   runs different steps and leaves the old records unread rather than erroring,
   but that also means it goes undetected.
-- **JSON restricts what a step can return,** and nothing bounds a payload's size.
-  The codec is each store's boundary decision, so one file per store is what a
-  richer one changes: two spend a `json.dumps`, the Postgres one declares a
-  `jsonb` column and lets the driver do it.
+- **The default codec restricts what a step can return,** and nothing bounds a
+  payload's size. `JsonCodec` is the stdlib's `json`, so a step result must be
+  JSON-*native* rather than merely JSON-serializable: a tuple encodes and comes
+  back a list, which breaks the round trip `CheckpointCodec` requires. Swapping in
+  a codec that knows the application's types is a constructor argument
+  (`RedisCheckpointer(redis=..., codec=...)`) rather than a change to any store,
+  which is what the seam buys; what it does not buy is a shipped alternative, and
+  there is none here. `PostgresCheckpointer` also narrows the choice, since a
+  `jsonb` column will only take JSON text.
 
 ## Against the alternatives
 
@@ -478,7 +551,8 @@ rather than a smaller version of the same one:
   is that it can assume the semantics everywhere; what this gets is that a
   deployment brings whatever it already runs.
 - **Steps are named at the call site, not declared by a decorator.**
-  `await run.step("charged", ...)` puts what is durable, and under what key, in
+  `await run.step("charged", ..., as_text)` puts what is durable, under what key, and
+  how it comes back, all in
   the line that does it. A decorator makes the ordinary case shorter and moves the
   key off the call. That is the usual locality trade, taken deliberately in the
   other direction, and DBOS's version is far nicer to use.

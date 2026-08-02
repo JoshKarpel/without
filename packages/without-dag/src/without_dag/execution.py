@@ -110,11 +110,31 @@ async def drive(
     running: dict[asyncio.Future[object], NodeKey] = {}
     completed: asyncio.Queue[asyncio.Future[object]] = asyncio.Queue()
     ready: deque[NodeKey] = deque(sorter.get_ready())
+
+    def release_dependencies(key: NodeKey) -> None:
+        """Drop the result of every dependency `key` was the last consumer of."""
+        # A supplied *input* names no node, so it has no dependencies to release; the
+        # lookup rather than an index is what lets both branches call this.
+        consumed = plan.by_key.get(key)
+        if consumed is None:
+            return
+        for dependency in consumed.dependencies:
+            consumers[dependency] -= 1
+            if consumers[dependency] == 0:
+                del results[dependency]
+
     try:
         while sorter.is_active():
             while ready and (limit is None or len(running) < limit):
                 key = ready.popleft()
                 if key in results:
+                    # A supplied node still *consumes* its dependencies, in the only
+                    # sense that matters here: it is the last thing that will ever want
+                    # them. Dropping their counts keeps a resumed run's memory bounded by
+                    # what is left to do, rather than pinning every ancestor of a
+                    # checkpointed node for the whole run because nothing claimed to have
+                    # read it.
+                    release_dependencies(key)
                     sorter.done(key)
                     ready.extend(sorter.get_ready())
                     continue
@@ -122,10 +142,7 @@ async def drive(
                     raise KeyError(f"{key!r} is neither a supplied input nor a defined node")
                 node = plan.by_key[key]
                 args = tuple(results[dependency] for dependency in node.dependencies)
-                for dependency in node.dependencies:
-                    consumers[dependency] -= 1
-                    if consumers[dependency] == 0:
-                        del results[dependency]
+                release_dependencies(key)
                 future = asyncio.ensure_future(node.run(args))
                 running[future] = key
                 future.add_done_callback(completed.put_nowait)

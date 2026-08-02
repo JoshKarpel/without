@@ -17,11 +17,14 @@ from integration.durable import fulfilment
 from integration.durable import recorded_id
 from integration.durable import unwinding
 from without_dag import CompiledGraph
+from without_dag import Graph
 from without_durability import Checkpointer
 from without_durability import Contended
 from without_durability import Delivery
+from without_durability import Fenced
 from without_durability import MemoryCheckpointer
 from without_durability import Pass
+from without_durability import Recorded
 from without_durability import SplitDurable
 from without_durability import claimed
 from without_durability import run_durably
@@ -123,7 +126,7 @@ async def test_a_resumed_workflow_re_runs_only_what_had_not_finished() -> None:
     with pytest.raises(RuntimeError, match="ship is down"):
         await durably(run, checkpointer, "wf-2", ORDER)
 
-    assert checkpointer.hashes["wf-2"] == {"charged": "ch-o-7", "reserved": "rs-widget"}
+    assert await checkpointer.load("wf-2") == {"charged": "ch-o-7", "reserved": "rs-widget"}
 
     gateway.broken.clear()
     gateway.calls.clear()
@@ -156,7 +159,7 @@ async def test_a_failed_workflow_unwinds_what_it_had_already_done() -> None:
         await saga(fulfilment(services), unwinding(services), Reached.of, checkpointer, "wf-4", ORDER)
 
     assert sorted(gateway.calls[-2:]) == ["refund", "release"]
-    assert checkpointer.hashes["wf-4:unwind"] == {
+    assert await checkpointer.load("wf-4:unwind") == {
         "refunded": "rf-ch-o-7",
         "released": "rl-rs-widget",
         "unwound": {"refunded": "rf-ch-o-7", "released": "rl-rs-widget"},
@@ -171,9 +174,9 @@ async def test_a_workflow_that_failed_before_any_effect_has_nothing_to_unwind() 
     with pytest.raises(RuntimeError, match="charge is down"):
         await saga(fulfilment(services), unwinding(services), Reached.of, checkpointer, "wf-5", ORDER)
 
-    assert checkpointer.hashes["wf-5"] == {}
+    assert await checkpointer.load("wf-5") == {}
     assert gateway.calls == ["charge"], "the reservation was cancelled mid-flight, so there is nothing to release"
-    assert checkpointer.hashes["wf-5:unwind"]["unwound"] == {"refunded": None, "released": None}
+    assert (await checkpointer.load("wf-5:unwind"))["unwound"] == {"refunded": None, "released": None}
 
 
 async def test_a_rollback_interrupted_partway_resumes_instead_of_compensating_twice() -> None:
@@ -216,8 +219,9 @@ class Preempted:
     async def claim(self, workflow: str, lease: timedelta) -> Pass | None:
         return Pass(workflow=workflow, token=1)
 
-    async def record(self, holder: Pass, key: str, value: object) -> object:
-        return self.already.setdefault(key, value)
+    async def record(self, holder: Pass, key: str, value: object) -> Recorded:
+        stored = self.already.setdefault(key, value)
+        return Recorded(value=stored, first=stored is value)
 
     async def transact(self, holder: Pass, key: str, effect: Never) -> object:  # pragma: no cover - uncallable
         raise NotImplementedError
@@ -237,6 +241,58 @@ async def test_a_graph_run_stops_when_a_node_was_already_recorded_by_another_pas
         await durably(fulfilment(gateway.services()), checkpointer, "wf-race", ORDER)
 
     assert "ship" not in gateway.calls, "it stopped rather than shipping against a charge that is not the real one"
+
+
+async def test_a_node_whose_result_does_not_survive_the_store_fails_on_the_pass_that_wrote_it() -> None:
+    # A graph hands a node's result straight to its dependents, so a node that comes back
+    # from the store as something else would feed them a tuple on the pass that computed
+    # it and a list on the pass that restored it, with no crash needed for the two to
+    # disagree. Both values are in hand here, so it is refused where it is cheap to
+    # diagnose rather than days later in a dependent. This is what `stepwise` needs a
+    # per-step parser for and a graph does not: verifying beats parsing while you still
+    # hold what you sent.
+    graph, (order,) = Graph.of(Order)
+
+    async def bounds(placed: Order) -> tuple[int, int]:
+        return (0, placed.cents)
+
+    run = graph.build(output=graph.node("bounds", bounds, order))
+
+    with pytest.raises(TypeError, match=r"'bounds' returned \(0, 2500\), which this store reads back as \[0, 2500\]"):
+        await durably(run, MemoryCheckpointer(), "wf-reshaped", ORDER)
+
+
+async def test_a_node_whose_result_round_trips_is_recorded_without_complaint() -> None:
+    # The check is on the round trip, not on identity: an equal value that took a
+    # different object identity through the codec is exactly the ordinary case.
+    graph, (order,) = Graph.of(Order)
+
+    async def lines(placed: Order) -> dict[str, int]:
+        return {placed.sku: placed.cents}
+
+    run = graph.build(output=graph.node("lines", lines, order))
+
+    assert await durably(run, MemoryCheckpointer(), "wf-round-trips", ORDER) == {"widget": 2500}
+
+
+async def test_a_pass_that_lost_the_workflow_mid_run_does_not_compensate() -> None:
+    # The loser must stop, not unwind. Another pass holds the workflow and is advancing
+    # it, so refunding here would give back a charge the winner is still building on.
+    # `Fenced` is an `Interruption` precisely so the `except Exception` that drives the
+    # compensation cannot reach it.
+    checkpointer = MemoryCheckpointer()
+    gateway = Gateway()
+    services = gateway.services()
+
+    stalled = await claimed(checkpointer, "wf-lost")
+    await checkpointer.release(stalled)
+    await claimed(checkpointer, "wf-lost")  # the winner, which outranks the stalled pass
+
+    with pytest.raises(Fenced):
+        await run_saga(fulfilment(services), unwinding(services), Reached.of, checkpointer, stalled, ORDER)
+
+    assert "refund" not in gateway.calls, "the loser left the winner's charge alone"
+    assert await checkpointer.load("wf-lost:unwind") == {}, "and took no claim on the rollback"
 
 
 async def test_reading_a_checkpoint_written_by_something_else_fails_loudly() -> None:

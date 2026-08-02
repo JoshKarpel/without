@@ -41,7 +41,7 @@ def submitting(
     """
 
     async def body(run: Run) -> Payout:
-        items = parse_items(await run.awaiting("order"))
+        items = await run.awaiting("order", parse_items)
         return await pay_out(run, run.workflow, in_memory(items), settling=settling, approval_over=approval_over)
 
     return body

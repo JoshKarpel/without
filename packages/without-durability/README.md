@@ -9,15 +9,25 @@ recorded instead of running.
 ```python
 from without_durability import MemoryCheckpointer, Run, claimed, resume
 
+def as_text(recorded: object) -> str:
+    if not isinstance(recorded, str):
+        raise TypeError(f"{recorded!r} is not the reference this step recorded")
+    return recorded
+
 async def fulfil(run: Run) -> str:
-    charge = await run.step("charged", lambda: gateway.charge(order))
-    await run.sleep("settling", timedelta(days=3))     # survives a crash on day two
-    approver = await run.awaiting("approved-by")       # another process writes this
-    return await run.step("paid", lambda: gateway.pay(charge, approver))
+    charge = await run.step("charged", lambda: gateway.charge(order), as_text)
+    await run.sleep("settling", timedelta(days=3))          # survives a crash on day two
+    approver = await run.awaiting("approved-by", as_text)    # another process writes this
+    return await run.step("paid", lambda: gateway.pay(charge, approver), as_text)
 
 checkpointer = MemoryCheckpointer()
 await resume(await claimed(checkpointer, "order-42"), checkpointer, fulfil)
 ```
+
+Each read names a parser because a step hands back what the *store* holds, not
+what its effect returned: the value has been through a codec, so a step returning
+a tuple is handed a list on the pass that ran it. A parser makes the return type
+something a function proved rather than something a `cast` asserted.
 
 There is no server here and no engine. What there is instead is a seam, and the
 seam is where the interesting part lives.

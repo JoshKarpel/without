@@ -10,11 +10,13 @@ import pytest
 from integration.durable import Payouts
 from integration.durable import parse_approver
 from integration.durable import parse_items
+from integration.durable import parse_reference
 from integration.durable import pay_out
 from without_durability import Contended
 from without_durability import Fenced
 from without_durability import MemoryCheckpointer
 from without_durability import MemoryEffect
+from without_durability import Recorded
 from without_durability import Run
 from without_durability import Suspended
 from without_durability import claimed
@@ -132,7 +134,7 @@ async def test_a_pass_that_fails_partway_leaves_the_steps_that_finished_recorded
     with pytest.raises(RuntimeError, match="pay is down"):
         await paying(ledger, checkpointer, Clock())
 
-    assert checkpointer.hashes[ORDER] == {
+    assert await checkpointer.load(ORDER) == {
         "items": ITEMS,
         "captured:gizmo": "cap-gizmo-800",
         "captured:widget": "cap-widget-1200",
@@ -157,7 +159,7 @@ async def test_the_fan_out_is_one_step_per_item_the_first_step_returned() -> Non
 
     await paying(ledger, checkpointer, Clock())
 
-    assert [key for key in checkpointer.hashes[ORDER] if key.startswith("captured:")] == [
+    assert [key for key in await checkpointer.load(ORDER) if key.startswith("captured:")] == [
         "captured:a",
         "captured:b",
         "captured:c",
@@ -199,7 +201,7 @@ async def test_a_wait_interrupted_partway_does_not_restart_its_clock() -> None:
         await paying(ledger, checkpointer, clock, settling=SETTLING)
 
     assert second.value.due == STARTED_AT + SETTLING
-    assert checkpointer.hashes[ORDER]["settling"] == (STARTED_AT + SETTLING).isoformat()
+    assert (await checkpointer.load(ORDER))["settling"] == (STARTED_AT + SETTLING).isoformat()
 
 
 async def test_a_payout_over_the_threshold_waits_for_an_approval_another_process_records() -> None:
@@ -229,8 +231,8 @@ async def test_a_pass_refuses_two_steps_sharing_a_name() -> None:
     checkpointer = MemoryCheckpointer()
 
     async def body(run: Run) -> None:
-        await run.step("charged", lambda: answering("first"))
-        await run.step("charged", lambda: answering("second"))
+        await run.step("charged", lambda: answering("first"), as_text)
+        await run.step("charged", lambda: answering("second"), as_text)
 
     with pytest.raises(ValueError, match="'charged' was already used in this pass"):
         await resume(await claimed(checkpointer, ORDER), checkpointer, body, now=Clock())
@@ -238,6 +240,24 @@ async def test_a_pass_refuses_two_steps_sharing_a_name() -> None:
 
 async def answering(value: str) -> str:
     return value
+
+
+# The parsers these steps take. Written out rather than imported because deciding what
+# a checkpoint holds is the application's job, and a test standing in for one does it too.
+def as_text(recorded: object) -> str:
+    if not isinstance(
+        recorded, str
+    ):  # pragma: no cover - the arm that makes this a parser rather than a cast; no test feeds it a bad value
+        raise TypeError(f"{recorded!r} is not the text this step recorded")
+    return recorded
+
+
+def as_count(recorded: object) -> int:
+    if not isinstance(
+        recorded, int
+    ):  # pragma: no cover - the arm that makes this a parser rather than a cast; no test feeds it a bad value
+        raise TypeError(f"{recorded!r} is not the count this step recorded")
+    return recorded
 
 
 async def test_a_workflow_already_being_passed_over_cannot_be_claimed_again() -> None:
@@ -278,8 +298,8 @@ async def test_a_write_from_a_superseded_pass_is_refused_rather_than_applied() -
     with pytest.raises(Fenced, match=f"pass {stalled.token} of {ORDER!r} was superseded"):
         await checkpointer.record(stalled, "paid", "pay-from-the-dead")
 
-    assert await checkpointer.record(took_over, "paid", "pay-real") == "pay-real"
-    assert checkpointer.hashes[ORDER] == {"paid": "pay-real"}
+    assert await checkpointer.record(took_over, "paid", "pay-real") == Recorded(value="pay-real", first=True)
+    assert await checkpointer.load(ORDER) == {"paid": "pay-real"}
 
     await checkpointer.release(stalled)
 
@@ -299,8 +319,37 @@ async def test_two_passes_that_both_ran_a_step_agree_on_its_result() -> None:
     won = await checkpointer.record(holder, "captured:widget", "cap-from-the-winner")
     lost = await checkpointer.record(holder, "captured:widget", "cap-from-the-loser")
 
-    assert won == "cap-from-the-winner"
-    assert lost == "cap-from-the-winner", "the loser learns the winner's value instead of clobbering it"
+    assert won == Recorded(value="cap-from-the-winner", first=True)
+    assert lost == Recorded(value="cap-from-the-winner", first=False), (
+        "the loser learns the winner's value instead of clobbering it, and learns that it lost"
+    )
+
+
+async def test_two_passes_that_recorded_the_same_value_both_count_as_the_writer() -> None:
+    # A tie is not a race. Two passes that ran the same effect and produced the same
+    # encoding have nothing to disagree about, so reporting the second as a loser would
+    # stop a graph run over a difference that does not exist.
+    checkpointer = MemoryCheckpointer()
+    holder = await claimed(checkpointer, ORDER)
+
+    await checkpointer.record(holder, "captured:widget", "cap-widget-1200")
+    again = await checkpointer.record(holder, "captured:widget", "cap-widget-1200")
+
+    assert again == Recorded(value="cap-widget-1200", first=True)
+
+
+async def test_a_recorded_value_comes_back_through_the_codec_rather_than_as_it_went_in() -> None:
+    # The double is a double all the way down: it encodes as every real store does, so a
+    # value that does not survive the round trip fails on the first pass here, where a
+    # test can see it, rather than on the second pass in production. The tuple is the
+    # ordinary way to trip over this with the default JSON codec.
+    checkpointer = MemoryCheckpointer()
+    holder = await claimed(checkpointer, ORDER)
+
+    recorded = await checkpointer.record(holder, "bounds", (0, 2000))
+
+    assert recorded == Recorded(value=[0, 2000], first=True)
+    assert await checkpointer.load(ORDER) == {"bounds": [0, 2000]}
 
 
 async def test_a_step_returns_what_the_store_holds_rather_than_what_its_effect_produced() -> None:
@@ -312,7 +361,7 @@ async def test_a_step_returns_what_the_store_holds_rather_than_what_its_effect_p
     holder = await claimed(checkpointer, ORDER)
     run = Run(holder=holder, checkpointer=checkpointer, recorded={})
 
-    assert await run.step("charged", lambda: answering("ch-just-now")) == "ch-recorded-earlier"
+    assert await run.step("charged", lambda: answering("ch-just-now"), as_text) == "ch-recorded-earlier"
 
 
 def tallying(counter: str) -> MemoryEffect:
@@ -339,9 +388,9 @@ async def test_a_step_whose_record_never_lands_runs_its_effect_again() -> None:
     async def charge() -> object:
         return effect(checkpointer.data)
 
-    await run.step("charged", charge)
+    await run.step("charged", charge, as_count)
     checkpointer.hashes[ORDER].clear()  # the record that a crash lost
-    await Run(holder=holder, checkpointer=checkpointer, recorded={}).step("charged", charge)
+    await Run(holder=holder, checkpointer=checkpointer, recorded={}).step("charged", charge, as_count)
 
     assert checkpointer.data["charges"] == 2, "the card was charged twice, which is what an idempotency key is for"
 
@@ -355,17 +404,21 @@ async def test_a_transacted_step_cannot_be_run_without_being_recorded() -> None:
     checkpointer = MemoryCheckpointer()
     holder = await claimed(checkpointer, ORDER)
 
-    first = await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("charged", tallying("charges"))
+    first = await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact(
+        "charged", tallying("charges"), as_count
+    )
     again = await Run(
         holder=holder,
         checkpointer=checkpointer,
         recorded=await checkpointer.load(ORDER),
-    ).transact("charged", tallying("charges"))
-    fresh = await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("charged", tallying("charges"))
+    ).transact("charged", tallying("charges"), as_count)
+    fresh = await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact(
+        "charged", tallying("charges"), as_count
+    )
 
     assert (first, again, fresh) == (1, 1, 1), "one effect, however many passes reach it"
     assert checkpointer.data["charges"] == 1
-    assert checkpointer.hashes[ORDER] == {"charged": 1}
+    assert await checkpointer.load(ORDER) == {"charged": 1}
 
 
 async def test_a_transacted_step_is_refused_from_a_superseded_pass() -> None:
@@ -377,7 +430,9 @@ async def test_a_transacted_step_is_refused_from_a_superseded_pass() -> None:
     await claimed(checkpointer, ORDER)
 
     with pytest.raises(Fenced):
-        await Run(holder=stalled, checkpointer=checkpointer, recorded={}).transact("charged", tallying("charges"))
+        await Run(holder=stalled, checkpointer=checkpointer, recorded={}).transact(
+            "charged", tallying("charges"), as_count
+        )
 
     assert checkpointer.data == {}, "refused before the effect ran, not after"
 
@@ -385,6 +440,16 @@ async def test_a_transacted_step_is_refused_from_a_superseded_pass() -> None:
 async def test_a_deadline_recorded_as_something_else_fails_loudly() -> None:
     with pytest.raises(TypeError, match="'settling' holds 17"):
         parse_deadline("settling", 17)
+
+
+async def test_a_gateway_reference_recorded_as_something_else_fails_loudly() -> None:
+    # Every step's parser is a place a store holding the wrong thing gets caught, and
+    # this is the one that guards the money: a capture or a payment reference read back
+    # as anything but text means the checkpoint is not what this workflow wrote.
+    with pytest.raises(TypeError, match="a gateway reference was recorded as 17"):
+        parse_reference(17)
+
+    assert parse_reference("cap-piano") == "cap-piano"
 
 
 async def test_line_items_recorded_as_something_else_fail_loudly() -> None:

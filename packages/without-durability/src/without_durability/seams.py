@@ -47,11 +47,57 @@ class Pass:
     token: int
 
 
-class Contended(Exception):
+@dataclass(frozen=True, slots=True)
+class Recorded:
+    """
+    What a store holds under a step's key after a write, and whether this pass put it there.
+
+    `first` is the part a caller cannot work out for itself, and the reason `record`
+    returns a value rather than a bare `object`. Equality between what a pass handed in
+    and what came back is not the same question: a result crosses a `CheckpointCodec` on
+    the way in and out, so a step returning a tuple gets a list back from a JSON codec
+    *having won outright*. A runner comparing those two would report a race that never
+    happened. The store is the only party that sees both encodings, so it is the one that
+    answers, and this carries the answer instead of leaving it to be inferred.
+
+    It is true when the encoding stored is this pass's own, which covers a tie: two passes
+    that ran the same effect and produced the same value have nothing to disagree about,
+    whichever of them wrote first.
+
+    Separating the two is what makes the equality *worth* testing rather than something to
+    avoid. Once `first` answers "did I win", comparing `value` against what went in answers
+    the other question cleanly: did this value survive its own store. `run_durably` makes
+    exactly that check, and it is only sound because it is no longer overloaded onto the
+    first one.
+
+    `value` is what the store holds, *decoded*, which is the caller's value when it won and
+    the winner's when it did not. It is read back through the codec either way rather than
+    handed back as it came, so a value that does not survive the round trip does so on the
+    first pass rather than surprising the second.
+    """
+
+    value: object
+    first: bool
+
+
+class Interruption(BaseException):
+    """
+    A control-flow signal from the durable machinery, not a failure of the work.
+
+    It descends from `BaseException` for the reason `asyncio.CancelledError` does: an
+    `except Exception` written to handle a workflow's *own* errors (a gateway declined, a
+    row was missing) must not silently absorb a signal about whether this pass may run at
+    all. Every one of these means something specific about the pass rather than about the
+    workflow, and swallowing one leaves a caller carrying on from a position it no longer
+    holds. Catching them is deliberate, by name, or not at all.
+    """
+
+
+class Contended(Interruption):
     """Another pass holds this workflow, so this caller does not get to run one."""
 
 
-class Fenced(Exception):
+class Fenced(Interruption):
     """
     A write from a pass that has been superseded, refused rather than applied.
 
@@ -59,6 +105,11 @@ class Fenced(Exception):
     workflow. It means this pass has lost, not that the workflow has: whoever holds the
     newer claim carries on, and the right response is to stop, since every subsequent
     write would be refused too.
+
+    Which is exactly why it is an `Interruption`. Compensating a saga, retrying a step, or
+    logging a failure are all responses to the *workflow* going wrong, and every one of
+    them is wrong here: the workflow is fine and someone else is advancing it, so a loser
+    that unwinds is undoing work the winner is still building on.
     """
 
 
@@ -97,10 +148,15 @@ class Checkpointer[Effect = Never](Protocol):
       one. It returns `None` when someone else holds the workflow.
     - `record` MUST refuse a write whose token is below the highest claimed for that
       workflow, raising `Fenced`, and MUST NOT overwrite a key that is already recorded.
-      It returns the value that is stored *after* the call, which is the caller's if it
-      won and the existing one if it did not, so two passes that both ran an effect at
-      least agree on its result rather than diverging.
+      It returns a `Recorded`: the value stored *after* the call, which is the caller's if
+      it won and the existing one if it did not, so two passes that both ran an effect at
+      least agree on its result rather than diverging, and whether that value is this
+      pass's own, which only the store can say.
     - `record` and `supply` MUST make the value durable before returning.
+    - Every value MUST cross the store's `CheckpointCodec` in both directions, so that what
+      `load` and `record` hand back is what a later pass will read rather than what this
+      one happened to pass in. A store that skips the round trip on the way out is a store
+      whose tests pass and whose resumed workflows see something else.
 
     `transact` is the one that changes the guarantee rather than protecting it, and it
     is why `Effect` exists. `record` is a second round trip after an effect already
@@ -110,6 +166,15 @@ class Checkpointer[Effect = Never](Protocol):
     the effect at most once across every pass of a workflow, returning the recorded value
     without re-running when the step is already recorded, and it MUST NOT leave the
     effect applied without its record or the reverse.
+
+    Only `record` reports who won, and the asymmetry is deliberate rather than an
+    omission. It is the one write whose caller has a decision to make: `run_durably` has
+    already handed a node's result to that node's dependents by the time it writes, so
+    losing means the run is downstream of a value the store rejected and must stop.
+    `supply` is called from outside any pass by a client that wants the stored value and
+    nothing else, and `transact` runs at most once across every pass by construction, so
+    there is no race for either of them to report. Giving all four the same return type
+    would make them look alike without making any of them simpler.
 
     What bounds it is not this seam and not the store's feature list: you can only
     transact within one datastore. A Lua script commits atomically over Redis data, a
@@ -124,7 +189,7 @@ class Checkpointer[Effect = Never](Protocol):
 
     async def claim(self, workflow: str, lease: timedelta) -> Pass | None: ...
 
-    async def record(self, holder: Pass, key: str, value: object) -> object: ...
+    async def record(self, holder: Pass, key: str, value: object) -> Recorded: ...
 
     async def transact(self, holder: Pass, key: str, effect: Effect) -> object: ...
 

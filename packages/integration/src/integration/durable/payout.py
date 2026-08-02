@@ -68,6 +68,13 @@ def parse_approver(recorded: object) -> str:
     return recorded
 
 
+def parse_reference(recorded: object) -> str:
+    """A gateway's reference for a capture or a payment, read back out of the store."""
+    if not isinstance(recorded, str):
+        raise TypeError(f"a gateway reference was recorded as {recorded!r}, which is not one")
+    return recorded
+
+
 async def pay_out(
     run: Run,
     order_id: str,
@@ -85,19 +92,24 @@ async def pay_out(
     pass after a crash re-reaches this same line and picks the result back up. The
     capture keys carry their sku, which is what lets a fan-out of unknown width resume
     item by item rather than all-or-nothing.
+
+    Each step names its parser alongside its key, which is where the parsing already
+    happened before `step` took one: what changed is that it is now inside the call
+    that produces the value rather than wrapped around it, so a step whose result is
+    used without being parsed is no longer expressible.
     """
-    items = parse_items(await run.step("items", lambda: services.items(order_id)))
+    items = await run.step("items", lambda: services.items(order_id), parse_items)
     skus = sorted(items)
 
     captures = await asyncio.gather(
-        *(run.step(f"captured:{sku}", capturing(services, sku, items[sku])) for sku in skus)
+        *(run.step(f"captured:{sku}", capturing(services, sku, items[sku]), parse_reference) for sku in skus)
     )
 
     total = sum(items.values())
     await run.sleep("settling", settling)
-    approved_by = parse_approver(await run.awaiting("approved-by")) if total > approval_over else None
+    approved_by = await run.awaiting("approved-by", parse_approver) if total > approval_over else None
 
-    reference = await run.step("paid", lambda: services.pay(order_id, total))
+    reference = await run.step("paid", lambda: services.pay(order_id, total), parse_reference)
 
     return {
         "order_id": order_id,

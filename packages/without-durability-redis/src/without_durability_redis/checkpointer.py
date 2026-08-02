@@ -1,14 +1,16 @@
-# The one place that knows both Redis and JSON: the `Checkpointer` implementation the
-# durable runner talks to. A workflow is one Redis hash, a completed step is one
-# field in it, and the vocabulary is small, because the shape `CompiledGraph.stream`
-# emits (a mapping of name to result) is already the shape a hash holds. Nothing above
-# this module mentions Redis, and nothing in it mentions the workflow's domain.
+# The one place that knows Redis: the `Checkpointer` implementation the durable runner
+# talks to. A workflow is one Redis hash, a completed step is one field in it, and the
+# vocabulary is small, because the shape `CompiledGraph.stream` emits (a mapping of name
+# to result) is already the shape a hash holds. Nothing above this module mentions Redis,
+# and nothing in it mentions the workflow's domain.
 #
-# The codec is the app's boundary decision, not the framework's, and JSON is this
-# app's: it is what makes a checkpoint readable by an operator with `redis-cli` and
-# by a service written in another language, at the cost of restricting node results
-# to JSON-native values. Swapping in a pydantic `TypeAdapter` per node key, or a
-# msgpack codec, changes this file alone.
+# What a step's result *becomes* on the way into that hash is not this module's decision
+# either: it is a `CheckpointCodec` the caller injects, defaulting to the stdlib's JSON.
+# The default is the one that makes a checkpoint readable by an operator with `redis-cli`
+# and by a service written in another language, at the cost of restricting node results to
+# JSON-native values; swapping in a pydantic `TypeAdapter` or a msgspec codec changes the
+# store's construction and nothing else. This file only requires that the encoding be
+# text, which is what a hash field holds.
 #
 # Three of the four writes here are Lua scripts, and each is a script for the same
 # reason: what it does is only correct as *one* step. Checking whether a workflow is
@@ -26,7 +28,6 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import timedelta
@@ -35,8 +36,11 @@ from typing import cast
 from redis.asyncio import Redis
 from redis.commands.core import AsyncScript
 from redis.exceptions import ResponseError
+from without_durability.codec import JSON
+from without_durability.codec import CheckpointCodec
 from without_durability.seams import Fenced
 from without_durability.seams import Pass
+from without_durability.seams import Recorded
 
 # Take the workflow if nobody holds it, and stamp the taking with a number that only
 # ever goes up. It is the store, not the claimant, that decides the ordering, so two
@@ -84,23 +88,32 @@ return token
 # settles, so a caller that lost the race learns the winner's value instead of carrying
 # on with its own.
 #
+# It reports *who won* alongside that value, which is the one thing the caller cannot work
+# out afterwards: a result crosses the codec on the way in and out, so comparing what came
+# back against what went in answers a different question (see `Recorded`). The comparison
+# that decides it is between encodings, here, where both are in hand. Two passes that ran
+# the same effect and produced the same encoding have nothing to disagree about, so that
+# counts as winning for both rather than as a race.
+#
 #   KEYS[1]  the workflow's steps hash
 #   KEYS[2]  the workflow's pass hash
 #   ARGV[1]  step name, the hash field to write
-#   ARGV[2]  the step's result, JSON-encoded
+#   ARGV[2]  the step's result, encoded
 #   ARGV[3]  the writing pass's fencing token
 #   ARGV[4]  expiry for both hashes, in seconds
-#   returns  the JSON stored after the call, or a FENCED error if the pass is superseded
+#   returns  {1 if this call's encoding is what is stored else 0, the encoding stored},
+#            or a FENCED error if the pass is superseded
 RECORD = """
 local fence = tonumber(redis.call('HGET', KEYS[2], 'token') or '0')
 if tonumber(ARGV[3]) < fence then
   return redis.error_reply('FENCED pass ' .. ARGV[3] .. ' superseded by ' .. fence)
 end
-local written = redis.call('HSETNX', KEYS[1], ARGV[1], ARGV[2])
+redis.call('HSETNX', KEYS[1], ARGV[1], ARGV[2])
 redis.call('EXPIRE', KEYS[1], ARGV[4])
 redis.call('EXPIRE', KEYS[2], ARGV[4])
-if written == 1 then return ARGV[2] end
-return redis.call('HGET', KEYS[1], ARGV[1])
+local stored = redis.call('HGET', KEYS[1], ARGV[1])
+if stored == ARGV[2] then return {1, stored} end
+return {0, stored}
 """
 
 # The same conditional write without the fence, for a value that comes from outside any
@@ -109,9 +122,9 @@ return redis.call('HGET', KEYS[1], ARGV[1])
 #
 #   KEYS[1]  the workflow's steps hash
 #   ARGV[1]  step name, the hash field to write
-#   ARGV[2]  the value, JSON-encoded
+#   ARGV[2]  the value, encoded
 #   ARGV[3]  expiry for the steps hash, in seconds
-#   returns  the JSON stored after the call, this caller's or the earlier winner's
+#   returns  the encoding stored after the call, this caller's or the earlier winner's
 SUPPLY = """
 local written = redis.call('HSETNX', KEYS[1], ARGV[1], ARGV[2])
 redis.call('EXPIRE', KEYS[1], ARGV[3])
@@ -142,8 +155,12 @@ class LuaEffect:
     The `Effect` type for `RedisCheckpointer`, and the shape of the answer to "what can a
     store commit alongside its record". `source` is an ordinary script body: it reads
     `KEYS` and `ARGV` from index 1 as if it were the only thing running, and it MUST
-    return JSON, since what it returns is written into the checkpoint verbatim and read
-    back through the same codec as any step (`cjson.encode` is the usual way).
+    return whatever the store's `CheckpointCodec` decodes, since what it returns is
+    written into the checkpoint verbatim and read back through that codec like any step.
+    Under the default `JsonCodec` that means JSON text, and `cjson.encode` is the usual
+    way to produce it. That is the one place an effect has to know which codec its store
+    was built with, and it is unavoidable: the encoding happens in the server, where the
+    Python codec cannot reach.
     `RedisCheckpointer.transact` splices it into a wrapper that supplies the fence check
     and the record, and rebinds those two tables so the numbering an author sees is the
     numbering they wrote.
@@ -181,7 +198,7 @@ class LuaEffect:
 #   ARGV[2]   the acting pass's fencing token
 #   ARGV[3]   expiry for both hashes, in seconds
 #   ARGV[4..] the effect's own arguments, which it sees as ARGV[1..]
-#   returns   the JSON stored after the call, the effect's result or an earlier one,
+#   returns   the encoding stored after the call, the effect's result or an earlier one,
 #             or a FENCED error if the pass is superseded
 TRANSACT = """
 local outer_keys, outer_args = KEYS, ARGV
@@ -210,7 +227,16 @@ class RedisCheckpointer:
 
     The client MUST be built with `decode_responses=True`. That is this app's choice
     to make (it owns both ends of this hash), and making it once here is what keeps
-    every read from carrying a bytes-or-text branch it would never take.
+    every read from carrying a bytes-or-text branch it would never take. It is also what
+    fixes `codec` to a `CheckpointCodec[str]`: a hash field can hold bytes, but a client
+    decoding every reply has already decided this store speaks text.
+
+    `codec` is how a step's result becomes a hash field and comes back, and it defaults
+    to the stdlib's JSON. Change it to widen what a step may return (a pydantic
+    `TypeAdapter` carries domain values that `json.dumps` refuses) or to speed the
+    encoding up; what it MUST keep is the round trip, since a resumed pass reads what it
+    produced. A `LuaEffect` under `transact` has to agree with it, which is the one thing
+    the type cannot check, because that encoding happens in the server.
 
     `namespace` keeps the workflow keys clear of whatever else shares the database,
     and `ttl` is the answer to the question a checkpoint store cannot dodge: these
@@ -264,14 +290,25 @@ class RedisCheckpointer:
     redis: Redis
     namespace: str = "workflow"
     ttl: timedelta = timedelta(days=1)
+    codec: CheckpointCodec[str] = JSON
     # Registered once at construction, the way `RedisStreamScheduler` registers its own: this
     # precomputes each digest and holds the client, so a call sends the digest and falls
     # back to the source only when the server has not seen it.
     scripts: tuple[AsyncScript, ...] = field(init=False, repr=False, compare=False)
+    # The expiry every write re-arms, rendered once rather than per call: `ttl` is fixed
+    # at construction and every `record`, `supply`, and `transact` sends it, so computing
+    # it per step is work on the one path that scales with traffic.
+    ttl_seconds: int = field(init=False, repr=False, compare=False)
+    # One built script per distinct effect source, so a `transact` in a loop pays the
+    # splice and the digest once rather than per step. Bounded by the number of effects
+    # the application has written, which is a property of its source rather than of its
+    # load; an app minting script bodies per request would want its own cache policy.
+    transactions: dict[str, AsyncScript] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         registered = tuple(self.redis.register_script(source) for source in (CLAIM, RECORD, SUPPLY, RELEASE))
         object.__setattr__(self, "scripts", registered)
+        object.__setattr__(self, "ttl_seconds", int(self.ttl.total_seconds()))
 
     @property
     def take(self) -> AsyncScript:
@@ -301,22 +338,25 @@ class RedisCheckpointer:
         # The cast *is* `decode_responses=True`: redis-py types every read as
         # bytes-or-text because the flag is a runtime choice its types cannot see.
         recorded = cast(dict[str, str], await self.redis.hgetall(self.hash_key(workflow)))
-        return {field: json.loads(value) for field, value in recorded.items()}
+        return {field: self.codec.decode(encoded) for field, encoded in recorded.items()}
 
     async def claim(self, workflow: str, lease: timedelta) -> Pass | None:
         token = await self.take(
             keys=[self.pass_key(workflow)],
-            args=[int(lease.total_seconds() * 1000), int(self.ttl.total_seconds())],
+            args=[int(lease.total_seconds() * 1000), self.ttl_seconds],
         )
         if token is None:
             return None
         return Pass(workflow=workflow, token=int(cast(int, token)))
 
-    async def record(self, holder: Pass, key: str, value: object) -> object:
+    async def record(self, holder: Pass, key: str, value: object) -> Recorded:
         try:
-            stored = await self.write(
-                keys=[self.hash_key(holder.workflow), self.pass_key(holder.workflow)],
-                args=[key, json.dumps(value), holder.token, int(self.ttl.total_seconds())],
+            first, stored = cast(
+                tuple[int, str],
+                await self.write(
+                    keys=[self.hash_key(holder.workflow), self.pass_key(holder.workflow)],
+                    args=[key, self.codec.encode(value), holder.token, self.ttl_seconds],
+                ),
             )
         except ResponseError as error:
             # The script's own refusal, which redis-py surfaces as the server's string.
@@ -324,34 +364,49 @@ class RedisCheckpointer:
             if "FENCED" not in str(error):
                 raise
             raise Fenced(f"{holder.workflow!r} moved on while this pass held it: {error}") from error
-        return json.loads(cast(str, stored))
+        return Recorded(value=self.codec.decode(stored), first=bool(first))
+
+    def transaction(self, source: str) -> AsyncScript:
+        """
+        The wrapper script for one effect body, spliced and digested once.
+
+        It cannot be built at construction, because it is the *effect* that decides the
+        body and a store cannot precompile scripts it has not been handed. What it can do
+        is build each one only the first time it sees it: the splice and the SHA are pure
+        functions of the source, and an application's effects are written in its source
+        rather than derived from a request, so the set is small and fixed.
+        """
+        built = self.transactions.get(source)
+        if built is None:
+            built = self.redis.register_script(TRANSACT % source)
+            self.transactions[source] = built
+        return built
 
     async def transact(self, holder: Pass, key: str, effect: LuaEffect) -> object:
         """
         Run `effect` and record it as `key`, in one script, so the step happens once.
 
-        The script is built and registered per call rather than at construction, because
-        it is the *effect* that decides its body: a store cannot precompile scripts it
-        has not been handed. `register_script` is local work, so the cost is the digest,
-        and Redis caches the body after the first call the same as any other script.
+        Whatever the effect returns is written into the checkpoint verbatim, so it has to
+        already be in the shape this store's codec reads back (JSON text by default). The
+        encoding happens in the server, which is exactly why it cannot be the codec's job.
         """
         try:
-            stored = await self.redis.register_script(TRANSACT % effect.source)(
+            stored = await self.transaction(effect.source)(
                 keys=[self.hash_key(holder.workflow), self.pass_key(holder.workflow), *effect.keys],
-                args=[key, holder.token, int(self.ttl.total_seconds()), *effect.args],
+                args=[key, holder.token, self.ttl_seconds, *effect.args],
             )
         except ResponseError as error:
             if "FENCED" not in str(error):
                 raise
             raise Fenced(f"{holder.workflow!r} moved on while this pass held it: {error}") from error
-        return json.loads(cast(str, stored))
+        return self.codec.decode(cast(str, stored))
 
     async def supply(self, workflow: str, key: str, value: object) -> object:
         stored = await self.offer(
             keys=[self.hash_key(workflow)],
-            args=[key, json.dumps(value), int(self.ttl.total_seconds())],
+            args=[key, self.codec.encode(value), self.ttl_seconds],
         )
-        return json.loads(cast(str, stored))
+        return self.codec.decode(cast(str, stored))
 
     async def release(self, holder: Pass) -> None:
         await self.hand_back(keys=[self.pass_key(holder.workflow)], args=[holder.token])

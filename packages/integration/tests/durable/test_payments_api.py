@@ -13,6 +13,7 @@ from integration.durable.api import payments_app
 from without_durability import MemoryCheckpointer
 from without_durability import MemoryScheduler
 from without_durability import Pass
+from without_durability import Recorded
 from without_durability import SplitDurable
 from without_http import serving
 
@@ -36,9 +37,15 @@ async def client(payments: Payments) -> AsyncIterator[httpx.AsyncClient]:
             yield client
 
 
-def hashes(payments: Payments) -> dict[str, dict[str, object]]:
+async def recorded(payments: Payments, workflow: str = WORKFLOW) -> dict[str, object]:
+    """What the store holds for a workflow, read back through the seam rather than raw."""
+    return await payments.durable.checkpointer.load(workflow)
+
+
+def workflows(payments: Payments) -> list[str]:
+    """Which workflows the store has heard of at all, which `load` alone cannot say."""
     assert isinstance(payments.durable.checkpointer, MemoryCheckpointer)
-    return payments.durable.checkpointer.hashes
+    return list(payments.durable.checkpointer.hashes)
 
 
 def queue(payments: Payments) -> list[str]:
@@ -54,7 +61,7 @@ async def test_submitting_an_order_records_it_and_makes_the_workflow_ready(
 
     assert response.status_code == 202
     assert json.loads(response.text) == {"workflow": WORKFLOW, "status": f"/orders/{WORKFLOW}"}
-    assert hashes(payments)[WORKFLOW] == {"order": ORDER["items"]}
+    assert await recorded(payments) == {"order": ORDER["items"]}
     assert queue(payments) == [WORKFLOW], "the API runs nothing; it makes the workflow runnable"
 
 
@@ -65,7 +72,7 @@ async def test_submitting_the_same_key_twice_addresses_the_same_workflow(
     await client.post("/orders", json=ORDER, headers={"idempotency-key": WORKFLOW})
     await client.post("/orders", json=ORDER, headers={"idempotency-key": WORKFLOW})
 
-    assert list(hashes(payments)) == [WORKFLOW], "the idempotency key *is* the workflow id"
+    assert workflows(payments) == [WORKFLOW], "the idempotency key *is* the workflow id"
     assert queue(payments) == [WORKFLOW, WORKFLOW], "a second pass is harmless: it finds the work recorded"
 
 
@@ -84,7 +91,7 @@ async def test_resubmitting_a_changed_basket_under_one_key_does_not_replace_the_
     )
 
     assert second.status_code == 202
-    assert hashes(payments)[WORKFLOW] == {"order": ORDER["items"]}, "the first order recorded is the one that runs"
+    assert await recorded(payments) == {"order": ORDER["items"]}, "the first order recorded is the one that runs"
 
 
 async def test_an_order_without_an_idempotency_key_is_rejected(client: httpx.AsyncClient) -> None:
@@ -108,7 +115,7 @@ async def test_confirming_records_the_approval_and_makes_the_workflow_ready(
     response = await client.post(f"/orders/{WORKFLOW}/confirmation", json={"approved_by": "auditor-7"})
 
     assert response.status_code == 202
-    assert hashes(payments)[WORKFLOW] == {"approved-by": "auditor-7"}
+    assert await recorded(payments) == {"approved-by": "auditor-7"}
     assert queue(payments) == [WORKFLOW]
 
 
@@ -153,7 +160,7 @@ class BrokenCheckpointer:
     async def claim(self, workflow: str, lease: timedelta) -> Pass | None:  # pragma: no cover - same
         return Pass(workflow=workflow, token=1)
 
-    async def record(self, holder: Pass, key: str, value: object) -> object:  # pragma: no cover - same
+    async def record(self, holder: Pass, key: str, value: object) -> Recorded:  # pragma: no cover - same
         raise RuntimeError("the store is down")
 
     async def transact(self, holder: Pass, key: str, effect: Never) -> object:  # pragma: no cover - uncallable

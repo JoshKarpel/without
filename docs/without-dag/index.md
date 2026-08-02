@@ -167,6 +167,13 @@ node completes only after its dependencies did, so resuming re-runs exactly the
 nodes that had not finished. A checkpoint that covers the whole graph runs nothing
 at all, which is what makes a re-run idempotent rather than merely restartable.
 
+A supplied node counts as consuming its dependencies, even though it never runs.
+That is what keeps a resumed run's memory bounded by what is left to do: the
+scheduler drops a result once its last dependent has read it, and a checkpointed
+node is the last thing that will ever want its ancestors' values, so treating it
+as having read them is the difference between freeing them and pinning them for
+the whole run.
+
 The inputs are still passed positionally on every call, because an entry is not
 part of the checkpoint: it lives wherever the request itself does (the queue
 message, the request row). A key that names no node is rejected, since that is the

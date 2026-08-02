@@ -87,7 +87,7 @@ async def durable(request: pytest.FixtureRequest, tmp_path: Path, workflow: str)
                 )
             finally:
                 await pool.close()
-        case _:
+        case "sqlite":
             database = connect(tmp_path / "workflows.db")
             try:
                 await migrate_sqlite(database)
@@ -97,3 +97,9 @@ async def durable(request: pytest.FixtureRequest, tmp_path: Path, workflow: str)
                 )
             finally:
                 database.connection.close()
+        case unknown:  # pragma: no cover - unreachable while `STORES` and the arms above agree, which is the point
+            # Not a `case _` falling through to one of the stores: that would make a typo
+            # in `STORES` run some other store twice under the wrong name, and a suite
+            # claiming four-store coverage while proving three. `request.param` is a plain
+            # `str` to the type checker, so this is the runtime form of `assert_never`.
+            raise ValueError(f"{unknown!r} names no store in this fixture")

@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
-from typing import cast
 
 import pytest
 from without import ticks
@@ -52,18 +51,45 @@ def settling_body(
     """
 
     async def body(run: Run) -> object:
-        items = cast(dict[str, int], await run.awaiting("order"))
-        total = await run.step("total", lambda: as_total(items))
+        items = await run.awaiting("order", as_amounts)
+        total = await run.step("total", lambda: as_total(items), as_whole)
         await run.sleep("settling", settling)
         if total > approval_over:
-            await run.awaiting("approved-by")
-        return await run.step("paid", lambda: paid(run.workflow, total))
+            await run.awaiting("approved-by", as_text)
+        return await run.step("paid", lambda: paid(run.workflow, total), as_text)
 
     return body
 
 
 async def as_total(items: dict[str, int]) -> int:
     return sum(items.values())
+
+
+# The parsers this body's four durable reads take. They are written out rather than
+# reached for because parsing what a checkpoint holds is the *application's* job, and a
+# test standing in for an application does it too.
+def as_text(recorded: object) -> str:
+    if not isinstance(
+        recorded, str
+    ):  # pragma: no cover - the arm that makes this a parser rather than a cast; no test feeds it a bad value
+        raise TypeError(f"{recorded!r} is not the text this step recorded")
+    return recorded
+
+
+def as_whole(recorded: object) -> int:
+    if not isinstance(
+        recorded, int
+    ):  # pragma: no cover - the arm that makes this a parser rather than a cast; no test feeds it a bad value
+        raise TypeError(f"{recorded!r} is not the whole number this step recorded")
+    return recorded
+
+
+def as_amounts(recorded: object) -> dict[str, int]:
+    if not isinstance(
+        recorded, dict
+    ):  # pragma: no cover - the arm that makes this a parser rather than a cast; no test feeds it a bad value
+        raise TypeError(f"{recorded!r} is not the order this workflow was waiting on")
+    return {str(sku): as_whole(amount) for sku, amount in recorded.items()}
 
 
 async def paid(workflow: str, total: int) -> str:
@@ -110,7 +136,7 @@ async def test_a_workflow_nobody_has_submitted_waits_without_being_scheduled() -
 
     await one_pass(checkpointer, scheduler)
 
-    assert checkpointer.hashes[WORKFLOW] == {}
+    assert await checkpointer.load(WORKFLOW) == {}
     assert scheduler.sleeping == {}, "a wait on a value has no deadline, so there is nothing to schedule"
     assert list(scheduler.queue) == []
 
@@ -122,7 +148,7 @@ async def test_a_submitted_order_runs_to_its_first_wait_and_schedules_the_wakeup
 
     await one_pass(checkpointer, scheduler)
 
-    recorded = checkpointer.hashes[WORKFLOW]
+    recorded = await checkpointer.load(WORKFLOW)
     assert set(recorded) == {"order", "total", "settling"}
     assert "paid" not in recorded, "the settlement window has not elapsed"
     # The worker read the deadline off `Suspended` and handed it to the store's
@@ -142,7 +168,7 @@ async def test_a_second_pass_after_the_wait_finishes_a_small_payout() -> None:
     assert await scheduler.wake_due(now_utc()) == (WORKFLOW,), "the timer finds it due and queues it again"
     await one_pass(checkpointer, scheduler)
 
-    assert checkpointer.hashes[WORKFLOW]["paid"] == f"pay-{WORKFLOW}-2000"
+    assert (await checkpointer.load(WORKFLOW))["paid"] == f"pay-{WORKFLOW}-2000"
 
 
 async def test_a_large_payout_stops_at_the_confirmation_and_resumes_once_it_is_recorded() -> None:
@@ -155,13 +181,13 @@ async def test_a_large_payout_stops_at_the_confirmation_and_resumes_once_it_is_r
     await scheduler.wake_due(now_utc())
     await one_pass(checkpointer, scheduler)
 
-    assert "paid" not in checkpointer.hashes[WORKFLOW]
+    assert "paid" not in await checkpointer.load(WORKFLOW)
     assert scheduler.sleeping == {}, "the wait is on a person now, so this pass scheduled nothing"
 
     await checkpointer.supply(WORKFLOW, "approved-by", "auditor-7")
     await one_pass(checkpointer, scheduler)
 
-    assert checkpointer.hashes[WORKFLOW]["paid"] == f"pay-{WORKFLOW}-90000"
+    assert (await checkpointer.load(WORKFLOW))["paid"] == f"pay-{WORKFLOW}-90000"
 
 
 async def test_a_workflow_whose_step_raises_does_not_take_the_worker_down() -> None:
@@ -198,6 +224,29 @@ async def test_a_wakeup_for_a_workflow_someone_else_is_passing_over_is_deferred_
     assert ran == [], "the claim was held elsewhere, so no pass ran"
     assert scheduler.sleeping == {WORKFLOW: STARTED_AT + CONTENDED}
     assert scheduler.outstanding == {}, "and the delivery was answered for rather than left to be reclaimed"
+
+
+async def test_a_pass_whose_claim_lapsed_mid_run_is_deferred_rather_than_logged_as_a_failure() -> None:
+    # Losing the workflow *during* a pass is the same situation as losing the claim
+    # outright, found later, so it gets the same answer: hand it back and look again.
+    # Treating it as a failed workflow would ack the wakeup and log a warning about a
+    # workflow that is going fine in some other process.
+    checkpointer = MemoryCheckpointer()
+    scheduler = MemoryScheduler()
+    clock = Clock()
+
+    async def overtaken(run: Run) -> None:
+        # Another worker takes the workflow while this pass is between two steps, which
+        # is exactly what a lapsed lease produces.
+        await checkpointer.release(run.holder)
+        await claimed(checkpointer, run.workflow)
+        await run.step("charged", lambda: paid(run.workflow, 1), as_text)
+
+    await passes(SplitDurable(checkpointer, scheduler), overtaken, now=clock)(as_stream(WORKFLOW))
+
+    assert await checkpointer.load(WORKFLOW) == {}, "the superseded pass wrote nothing"
+    assert scheduler.sleeping == {WORKFLOW: STARTED_AT + CONTENDED}, "and asked to look again shortly"
+    assert scheduler.outstanding == {}, "and answered for the delivery rather than leaving it to be reclaimed"
 
 
 async def test_a_deferred_wakeup_runs_once_the_claim_is_free() -> None:
@@ -319,12 +368,12 @@ async def test_the_worker_carries_a_submitted_order_through_its_own_wait() -> No
     worker = asyncio.create_task(work(SplitDurable(checkpointer, scheduler), tick=BRIEF, body=BODY))
     try:
         async with asyncio.timeout(3):
-            while "paid" not in checkpointer.hashes[WORKFLOW]:
+            while "paid" not in await checkpointer.load(WORKFLOW):
                 await asyncio.sleep(BRIEF.total_seconds())
     finally:
         worker.cancel()
 
-    assert checkpointer.hashes[WORKFLOW]["paid"] == f"pay-{WORKFLOW}-2000"
+    assert (await checkpointer.load(WORKFLOW))["paid"] == f"pay-{WORKFLOW}-2000"
 
 
 async def test_a_body_driven_without_the_worker_suspends_the_same_way() -> None:
@@ -341,4 +390,4 @@ async def test_a_body_driven_without_the_worker_suspends_the_same_way() -> None:
     with pytest.raises(Suspended, match="suspended at 'settling'"):
         await BODY(run)
 
-    assert checkpointer.hashes[WORKFLOW]["total"] == sum(SMALL.values())
+    assert (await checkpointer.load(WORKFLOW))["total"] == sum(SMALL.values())

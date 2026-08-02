@@ -68,8 +68,14 @@
   alone is not exclusion: a process that stalls past its lease still believes it holds the
   workflow, and only the store knows better, so a write from a superseded pass is refused
   (`Fenced`) rather than applied. `record` is also conditional, never overwriting a recorded step
-  and returning whatever is stored after the call, so two passes that both ran an effect at least
-  agree on its result; `Run.step` hands that value back rather than its own. `supply` is the
+  and returning a `Recorded`: the value stored after the call, so two passes that both ran an
+  effect at least agree on its result, and whether that value is this pass's own, which only the
+  store can say. `Run.step` hands the value back rather than its own and ignores the rest;
+  `run_durably` is the caller that needs it, since a graph has already fed a node's result to its
+  dependents by the time it writes and so must stop when the store took someone else's. Inferring
+  that from equality would be wrong rather than merely indirect, because a result crosses the codec
+  both ways: under `JsonCodec` a pass returning a tuple gets a list back having won outright, and a
+  runner comparing the two would report a race that never happened. `supply` is the
   unclaimed half for values that come from outside a pass (the API's order and approval), which
   keeps first-writer-wins without making an approval fail because a worker is mid-pass, and makes
   a resubmitted order genuinely idempotent rather than an overwrite. In `RedisCheckpointer` each of
@@ -186,6 +192,47 @@
   Its effect type is a *synchronous* callback where the Postgres one is `async`, because the whole
   transaction runs on one worker thread. Its scope is one machine, which is the deployment it is
   for rather than a defect.
+- **`without-durability`**: `CheckpointCodec`, the seam deciding what a step's result becomes in a
+  store, with `JsonCodec` over the stdlib as every store's default. What a checkpoint is encoded as
+  is a boundary decision, so it belongs to the application rather than to four stores answering it
+  identically and wrongly for anyone whose steps return a domain value `json.dumps` has never heard
+  of; swapping one in is now a constructor argument. It is one object rather than a pair of
+  functions because both requirements are about the pair: `decode(encode(x))` MUST equal `x`, or a
+  resumed pass reads something the first pass never wrote, and `encode` MUST be deterministic,
+  because `record` decides who won a race by comparing encodings. `PostgresCheckpointer` narrows the
+  choice to codecs producing JSON *text*, since that is what a `jsonb` column takes; keeping the
+  column buys the indexing and the operators, and the codec still owns the value mapping. The
+  in-memory doubles apply it too, which is the part that is easy to skip and is exactly what makes a
+  double lie: a dict can hold a value directly, so encoding into it looks like ceremony, but then
+  every property that depends on the round trip passes in the suite and fails in a deployment.
+  `MemoryCheckpointer.hashes` holds encoded values, so reading a checkpoint means `load`.
+- **`without-durability`**: every durable read names its parser. `Run.step`, `Run.transact`, and
+  `Run.awaiting` take a `parse: Callable[[object], T]` and return a `T` a function actually
+  produced, where they previously cast. The cast was unsound on every path rather than only after
+  a crash: a step hands back what the *store* holds, read through a codec, so one returning a tuple
+  was handed a list on the pass that ran it while its signature still promised a tuple. The parsers
+  were already there, wrapped around the call sites (`parse_items`, `parse_approver`); moving them
+  inside means a step whose result is used unparsed is no longer expressible. The effect's own
+  return type is deliberately *not* tied to the parser's, because what goes in and what comes out
+  are related by encode-then-decode rather than by identity: `Run.sleep` records an ISO string and
+  reads back a `datetime`, which is the ordinary case and not the exception.
+- **`without-durability`**: `run_durably` refuses a node whose result does not survive its own
+  store, on the pass that wrote it. It needs no per-node parser because it holds both values at
+  once, what the node returned and what the store now has, so it verifies where `stepwise` has to
+  parse. The check earns more here than a parser would: a graph feeds a node's result straight to
+  its dependents, so without it they see a tuple on the pass that computed it and a list on the one
+  that restored it, with no crash needed for the two to disagree. `without-dag` is untouched, and
+  the split is the general rule rather than a convenience: verifying beats parsing whenever the
+  caller still holds what it sent, and `Run.awaiting` is exactly the case that does not, since it
+  reads a value another process wrote.
+- **`without-durability`**: `Interruption`, a `BaseException` base for `Fenced`, `Contended`, and
+  `Suspended`, for the reason `asyncio.CancelledError` has one. Each says something about whether
+  *this pass* may continue rather than about the work, so an `except Exception` written to handle a
+  declined gateway must not absorb one. The case that forced it is `run_saga`, which compensates on
+  failure: a `Fenced` forward run is not a failure but a lost race, and a loser that unwound would
+  refund a charge the winner is still building on. The worker gains a matching arm, treating a claim
+  lost mid-pass as the deferral it already applies to a claim refused up front, rather than as a
+  workflow that failed.
 - **`without-durability-redis`**: `trim`, which bounds a stream that otherwise only grows, closing
   the one gap that made the sorted-set queue strictly better. It is `XTRIM ... MAXLEN 0 ACKED`
   (Redis 8.2+), so the *server* decides what every consumer group has finished with rather than

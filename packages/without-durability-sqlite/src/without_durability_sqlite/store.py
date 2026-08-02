@@ -30,7 +30,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import sqlite3
 from collections.abc import Callable
 from contextlib import closing
@@ -42,9 +41,12 @@ from pathlib import Path
 from time import monotonic
 from typing import cast
 
+from without_durability.codec import JSON
+from without_durability.codec import CheckpointCodec
 from without_durability.seams import Delivery
 from without_durability.seams import Fenced
 from without_durability.seams import Pass
+from without_durability.seams import Recorded
 from without_durability.stepwise import now_utc
 
 # The same two numbers the other queues document: a taken workflow is invisible for
@@ -52,11 +54,12 @@ from without_durability.stepwise import now_utc
 LEASE = timedelta(minutes=1)
 POLL = timedelta(milliseconds=50)
 
-# `value` is TEXT holding JSON rather than a richer type, which is the same boundary
-# decision the Redis store makes with `json.dumps` and for the same reason: it is what
-# makes a checkpoint readable by anything that can open the file. `WITHOUT ROWID` because
-# every one of these tables is addressed by its primary key and never by a rowid, so the
-# extra indirection would be pure overhead.
+# `value` is TEXT rather than a richer type, which is the same shape the Redis store's
+# hash field has and leaves the same question open: what goes *in* the text is the
+# store's injected `CheckpointCodec`, defaulting to JSON because that is what makes a
+# checkpoint readable by anything that can open the file. `WITHOUT ROWID` because every
+# one of these tables is addressed by its primary key and never by a rowid, so the extra
+# indirection would be pure overhead.
 #
 # `NOT NULL` on `value` keeps "no row" and "a row holding JSON null" distinguishable, so
 # a step that legitimately records `None` is not read back as a step that never ran.
@@ -112,12 +115,19 @@ RETURNING token
 # `DO UPDATE SET value = the value already there` is a write that changes nothing and
 # therefore returns the row that was already stored, which is how a caller that lost the
 # race learns the winner's value instead of carrying on with its own.
+#
+# The second returned column is who won, which the caller cannot work out afterwards: a
+# result crosses the codec on the way in and out, so comparing what came back against what
+# went in answers a different question (see `Recorded`). Comparing the stored *text*
+# against the text this call offered answers the right one, in the statement, where both
+# are in hand. Two passes that ran the same effect and encoded it identically both count
+# as having won, which is correct: there is nothing for them to disagree about.
 RECORD = """
 INSERT INTO workflow_checkpoint (workflow, step, value)
 SELECT :workflow, :step, :value FROM workflow_claim
 WHERE workflow = :workflow AND token <= :token
 ON CONFLICT (workflow, step) DO UPDATE SET value = workflow_checkpoint.value
-RETURNING value
+RETURNING value, value = :value
 """
 
 # The same conditional write without the fence, for a value that comes from outside any
@@ -171,9 +181,11 @@ FINISH = "DELETE FROM workflow_queue WHERE namespace = ? AND workflow = ? AND vi
 # It is *not* async, and that is the difference from the Postgres store's rather than an
 # oversight. The whole transaction runs on one worker thread, so an effect is ordinary
 # blocking code there and awaiting inside it would be both impossible and pointless.
-# Whatever it returns is recorded as the step's value, so it MUST be JSON-native, and it
-# MUST confine itself to the cursor it is handed: opening another connection puts the work
-# outside the transaction and gives back exactly the at-least-once gap `transact` closes.
+# Whatever it returns is recorded as the step's value, so it MUST be something the store's
+# codec encodes, and it MUST confine itself to the cursor it is handed: opening another
+# connection puts the work outside the transaction and gives back exactly the at-least-once
+# gap `transact` closes. Unlike Redis's `LuaEffect` it returns an ordinary Python value
+# rather than an encoding, because it runs in this process where the codec is.
 type SqliteEffect = Callable[[sqlite3.Cursor], object]
 
 
@@ -282,13 +294,18 @@ class SqliteCheckpointer:
     parsed as key structure. The only constraint that survives is the one `run_saga`
     states about any store, that an id ending in `:unwind` addresses another workflow's
     rollback.
+
+    `codec` is how a step's result becomes the `TEXT` in a row and comes back, defaulting
+    to the stdlib's JSON. Swap it to widen what a step may return or to speed the encoding
+    up; what it MUST keep is the round trip, since a resumed pass reads what it produced.
     """
 
     database: Database
+    codec: CheckpointCodec[str] = JSON
 
     async def load(self, workflow: str) -> dict[str, object]:
         rows = await self.database.run(lambda connection: connection.execute(LOAD, (workflow,)).fetchall())
-        return {step: json.loads(value) for step, value in rows}
+        return {step: self.codec.decode(encoded) for step, encoded in rows}
 
     async def claim(self, workflow: str, lease: timedelta) -> Pass | None:
         taken = await self.database.run(
@@ -301,14 +318,15 @@ class SqliteCheckpointer:
             return None
         return Pass(workflow=workflow, token=int(taken[0]))
 
-    async def record(self, holder: Pass, key: str, value: object) -> object:
+    async def record(self, holder: Pass, key: str, value: object) -> Recorded:
+        encoded = self.codec.encode(value)
         stored = await self.database.run(
             lambda connection: connection.execute(
                 RECORD,
                 {
                     "workflow": holder.workflow,
                     "step": key,
-                    "value": json.dumps(value),
+                    "value": encoded,
                     "token": holder.token,
                 },
             ).fetchone()
@@ -319,7 +337,7 @@ class SqliteCheckpointer:
             # and refused it. (A missing claim row would land here too, and a `Pass` is
             # only ever handed out by a `claim` that wrote one.)
             raise Fenced(f"{holder.workflow!r} moved on while this pass held it")
-        return json.loads(stored[0])
+        return Recorded(value=self.codec.decode(stored[0]), first=bool(stored[1]))
 
     async def transact(self, holder: Pass, key: str, effect: SqliteEffect) -> object:
         """
@@ -342,10 +360,10 @@ class SqliteCheckpointer:
                 raise Fenced(f"{holder.workflow!r} moved on while this pass held it")
             recorded = cursor.execute(ALREADY, (holder.workflow, key)).fetchone()
             if recorded is not None:
-                return json.loads(recorded[0])
-            written = json.dumps(effect(cursor))
+                return self.codec.decode(recorded[0])
+            written = self.codec.encode(effect(cursor))
             cursor.execute(WRITE, (holder.workflow, key, written))
-            return json.loads(written)
+            return self.codec.decode(written)
 
         return await self.database.run(lambda connection: transacted(connection, one_commit))
 
@@ -353,10 +371,10 @@ class SqliteCheckpointer:
         stored = await self.database.run(
             lambda connection: connection.execute(
                 SUPPLY,
-                {"workflow": workflow, "step": key, "value": json.dumps(value)},
+                {"workflow": workflow, "step": key, "value": self.codec.encode(value)},
             ).fetchone()
         )
-        return json.loads(cast(tuple[str], stored)[0])
+        return self.codec.decode(cast(tuple[str], stored)[0])
 
     async def release(self, holder: Pass) -> None:
         await self.database.run(lambda connection: connection.execute(RELEASE, (holder.workflow, holder.token)))
@@ -388,6 +406,15 @@ class SqliteScheduler:
     # lease is measured by the database (in `TAKE`) and a deadline was chosen by the
     # workflow itself. Injected so a test can place a wakeup in a clock it controls.
     now: Callable[[], datetime] = now_utc
+    # The two durations as the numbers SQLite and `asyncio.sleep` want, rendered once
+    # rather than per iteration of `next_ready`'s poll loop, which is the one place here
+    # that runs more than once per unit of work.
+    lease_seconds: float = field(init=False, repr=False, compare=False)
+    poll_seconds: float = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "lease_seconds", self.lease.total_seconds())
+        object.__setattr__(self, "poll_seconds", self.poll.total_seconds())
 
     async def prepare(self) -> None:
         """Create the tables, which every worker does at boot and all but the first find done."""
@@ -418,7 +445,7 @@ class SqliteScheduler:
             taken = await self.database.run(
                 lambda connection: connection.execute(
                     TAKE,
-                    {"namespace": self.namespace, "lease": self.lease.total_seconds()},
+                    {"namespace": self.namespace, "lease": self.lease_seconds},
                 ).fetchone()
             )
             if taken is not None:
@@ -430,7 +457,7 @@ class SqliteScheduler:
             remaining = deadline - monotonic()
             if remaining <= 0:
                 return None
-            await asyncio.sleep(min(self.poll.total_seconds(), remaining))
+            await asyncio.sleep(min(self.poll_seconds, remaining))
 
     async def reclaim(self, idle: timedelta) -> Delivery | None:
         """Nothing to take over by hand: an abandoned workflow becomes visible on its own."""
@@ -478,12 +505,12 @@ class SqliteDurable:
         def one_commit(cursor: sqlite3.Cursor) -> object:
             stored = cursor.execute(
                 SUPPLY,
-                {"workflow": workflow, "step": key, "value": json.dumps(value)},
+                {"workflow": workflow, "step": key, "value": self.checkpointer.codec.encode(value)},
             ).fetchone()
             cursor.execute(
                 SCHEDULE,
                 {"namespace": self.scheduler.namespace, "workflow": workflow, "visible_at": visible_at},
             )
-            return json.loads(cast(tuple[str], stored)[0])
+            return self.checkpointer.codec.decode(cast(tuple[str], stored)[0])
 
         return await self.checkpointer.database.run(lambda connection: transacted(connection, one_commit))
