@@ -1,16 +1,15 @@
-# The same two seams as `store.py` and `schedule.py`, over one Postgres instead of one
-# Redis. It is the other half of the argument the Redis store makes, and putting the two
-# side by side is the point: `Checkpointer` and `Scheduler` state the guarantees, and a
-# store says how it reaches them, so a family of stores is not one good implementation
-# and one compromise.
+# The same two seams as the Redis store, over one Postgres. It is the other half of that
+# argument, and putting the two side by side is the point: `Checkpointer` and `Scheduler`
+# state the guarantees, and a store says how it reaches them, so a family of stores is
+# not one good implementation and one compromise.
 #
-# What is worth reading this file *for* is how little of it is mechanism. Every write in
-# `store.py` that had to be a Lua script is one statement here, or one transaction, and
+# What is worth reading this file *for* is how little of it is mechanism. Every write the
+# Redis store needs a Lua script for is one statement here, or one transaction, and
 # neither is a thing this app supplies: a transaction is what a relational database is
-# for. Redis needed scripts because it has no way to say "check this, then write that,
-# and let nobody in between"; SQL says it by default. So the interesting comparison is
-# not "which store is better" but *where the atomic unit came from*, and here it came
-# with the database.
+# for. Redis needs scripts because it has no way to say "check this, then write that, and
+# let nobody in between"; SQL says it by default. So the interesting comparison is not
+# "which store is better" but *where the atomic unit came from*, and here it came with
+# the database.
 #
 # Three tables, one database:
 #
@@ -18,37 +17,33 @@
 #   workflow_claim        one row per workflow: whose pass it is, and until when
 #   workflow_queue        one row per (namespace, workflow), scored by when it is visible
 #
-# The third is what makes this a real alternative rather than half of one. The Redis
-# deployment is one server holding two unrelated structures; this is one database holding
-# three tables, which means the queue write and the checkpoint write *could* be one
-# commit. Nothing here does that, because the worker and the API are written against the
-# two protocols and neither knows they share a datastore, but it is the reason "you need
-# no second system" is a claim Postgres can make and Redis-plus-something cannot.
+# The third is what makes this a real alternative rather than half of one, and what
+# `PostgresDurable` spends: the queue write and the checkpoint write are one commit,
+# which is the reason "you need no second system" is a claim Postgres can make and
+# Redis-plus-something cannot.
 #
 # Two consequences fall out of SQL that are worth naming, because both were live
 # questions in the Redis store and neither survives the move.
 #
-# A workflow id is a *parameter* here, never part of a key. `RedisCheckpointer` documents
-# a contract on ids (no braces, bounded length) purely because it builds key names by
-# interpolation; this store binds the id as a query parameter, so there is nothing to
-# say. That is the tell the Redis store's own docstring predicted: the contract was a
-# property of building keys by concatenation, not of workflow ids.
+# A workflow id is a *parameter* here, never part of a key, so the contract the Redis
+# store asks of one (no braces, bounded length) has nothing to attach to. That is the
+# tell the Redis store predicted: it was a property of building keys by concatenation,
+# not of workflow ids.
 #
 # Nothing expires. Redis re-arms a TTL on every write, which sweeps finished workflows
 # for free and costs the sharp edge that a workflow suspended longer than the TTL loses
 # its checkpoint while its wakeup survives. Here the rows stay until something deletes
-# them, so that failure is gone and a control-plane sweep is now homework (see the
-# package README's gaps). It also lets the fencing token be an ordinary counter rather
-# than the hybrid logical clock `store.py` needs: a token can only rewind if a claim row
-# disappears, and here that happens only if a sweep deletes it, which is a policy this
-# app chooses rather than a lifetime the store imposes.
+# them, so that failure is gone and a control-plane sweep is now homework. It also lets
+# the fencing token be an ordinary counter rather than a hybrid logical clock: a token
+# can only rewind if a claim row disappears, and here that happens only if a sweep
+# deletes it, which is a policy this app chooses rather than a lifetime the store
+# imposes.
 #
-# Namespacing is the connection's job, not the key's. `RedisCheckpointer` carries a
-# `namespace` because a Redis keyspace is one flat namespace; a table name is already
-# scoped by its schema and database, so two deployments sharing a server are two
-# databases (or two `search_path`s in the DSN) rather than two prefixes. The queue keeps
-# a `namespace` *column* because there the namespace separates queues rather than
-# deployments, and as a column it is data, which is the same move as the workflow id.
+# Namespacing is the connection's job, not the key's. A table name is already scoped by
+# its schema and database, so two deployments sharing a server are two databases (or two
+# `search_path`s in the DSN) rather than two prefixes. The queue keeps a `namespace`
+# *column* because there the namespace separates queues rather than deployments, and as a
+# column it is data, which is the same move as the workflow id.
 
 from __future__ import annotations
 
@@ -76,11 +71,11 @@ from without_durability.seams import check_duration
 from without_durability.stepwise import now_utc
 
 # How often a worker with nothing to do asks again, which is the price of having no
-# blocking read. It is restated rather than imported from the Redis store that documents
-# it at length, so that running this one pulls in no Redis client at all, which is the
-# whole shape of the offer. The *lease* is not restated: it is `seams.LEASE`, because
-# unlike the poll interval it has to agree with something outside this store (the
-# checkpoint claim the worker takes for exactly as long).
+# blocking read. It is restated rather than imported from the Redis store so that running
+# this one pulls in no Redis client at all, which is the whole shape of the offer. The
+# *lease* is not restated: it is `seams.LEASE`, because unlike the poll interval it has
+# to agree with something outside this store (the checkpoint claim the worker takes for
+# exactly as long).
 POLL = timedelta(milliseconds=50)
 
 # One DDL for one database, because it *is* one database. `value` is `jsonb` rather than
@@ -169,11 +164,10 @@ RETURNING token
 # instead of carrying on with its own. A plain `DO NOTHING` would return no row at all
 # and force a second read that a concurrent inserter could still beat.
 #
-# The second returned column is who won, which the caller cannot work out afterwards: a
-# result crosses the codec on the way in and out, so comparing what came back against what
-# went in answers a different question (see `Recorded`). Here the comparison is between
-# `jsonb` values, which is better than the text comparison the other two stores make: it is
-# semantic, so two encoders that order an object's keys differently still agree.
+# The second returned column is who won, which the caller cannot work out afterwards (see
+# `Recorded`). Here the comparison is between `jsonb` values rather than text, which is
+# the stronger of the two: it is semantic, so two encoders that order an object's keys
+# differently still agree.
 #
 #   returns  the value stored after the call and whether it is this call's, or no row at
 #            all when the pass is fenced
@@ -268,12 +262,11 @@ class PostgresCheckpointer:
     The durability question `RedisCheckpointer` has to hedge on does not arise here.
     `record` returning means the transaction committed, and a default Postgres has
     `synchronous_commit` on, so the write is on disk and survives a crash of the server
-    rather than only of the client. That is the property `run_durably`'s reasoning about
-    the window between an effect and its record assumes, and the reason this store can be
-    read at its word where the Redis one asks for a configuration review first.
+    rather than only of the client. That is exactly what `run_durably`'s reasoning about
+    the window between an effect and its record assumes.
 
-    A workflow id carries no contract here at all. It is bound as a query parameter, so
-    it is never parsed as key structure, and the only constraint that survives is the one
+    A workflow id carries no contract here at all, since it is bound as a query parameter
+    rather than parsed as key structure. The only constraint that survives is the one
     `run_saga` states about any store: an id ending in `:unwind` addresses another
     workflow's rollback.
 
@@ -281,9 +274,8 @@ class PostgresCheckpointer:
     back, defaulting to the stdlib's JSON. The column type narrows what a codec here may
     be in a way it does not for the other two stores: it MUST render JSON *text*, because
     that is what `jsonb` will accept. What that still leaves free is the library and the
-    value mapping, which is the part worth changing (a pydantic `TypeAdapter` renders
-    domain values that `json.dumps` refuses). What it MUST keep, as everywhere, is the
-    round trip.
+    value mapping, which is the part worth changing. What it MUST keep, as everywhere, is
+    the round trip.
     """
 
     pool: AsyncConnectionPool
@@ -411,12 +403,11 @@ class PostgresScheduler:
     """
     `Scheduler` as one table, each row scored by when its workflow becomes visible.
 
-    A drop-in for `RedisStreamScheduler` and `RedisSetScheduler`: the same protocol, the same worker,
-    the same API. It is modelled on `RedisSetScheduler` rather than on the stream, and not
-    because a table cannot do better: queued now is a `visible_at` in the past, sleeping
-    is one in the future, and being worked on is one a lease ahead, so `wake_due`,
-    `reclaim`, and `prepare`'s queue half all have nothing to do, exactly as they do
-    there.
+    A drop-in for either Redis queue: the same protocol, the same worker, the same API.
+    It is modelled on the sorted-set one rather than on the stream, so queued now is a
+    `visible_at` in the past, sleeping is one in the future, and being worked on is one a
+    lease ahead, which leaves `wake_due`, `reclaim`, and `prepare`'s queue half with
+    nothing to do.
 
     What Postgres adds over the sorted set is `SKIP LOCKED`, which is what lets several
     workers poll one queue without serializing on its head, and what a `ZRANGEBYSCORE` in
@@ -424,10 +415,9 @@ class PostgresScheduler:
 
     What it does not add is the blocking read. This polls on `poll`, so an idle worker
     costs a round trip per interval and a submitted order waits up to one interval to be
-    picked up, which is the same regression `RedisSetScheduler` takes and the same knob to
-    turn. Postgres can close it (`LISTEN`/`NOTIFY` on a dedicated connection, woken by a
-    trigger or by the writer) and this does not, which is the honest state of it rather
-    than a claim that a table cannot wait.
+    picked up. Postgres can close that (`LISTEN`/`NOTIFY` on a dedicated connection, woken
+    by a trigger or by the writer) and this does not, which is the honest state of it
+    rather than a claim that a table cannot wait.
 
     `namespace` separates queues rather than deployments, and it is a column rather than
     part of a table name, so a queue name is data here as a workflow id is.
@@ -538,11 +528,11 @@ class PostgresDurable:
     A `Durable` whose two stores are one database, so `arrive` is a single commit.
 
     This is the row `SplitDurable` cannot fill in. Recording the value a workflow is
-    waiting on and making the workflow runnable are two writes, and everywhere else they
-    are two writes with a crash window between them; here they are two statements in one
-    transaction, so the window does not exist. That is the same capability `transact`
-    offers a step, arriving at the seam above rather than inside a pass, and it is
-    available for the same reason: both things live in one datastore.
+    waiting on and making the workflow runnable are two writes with a crash window
+    between them everywhere else; here they are two statements in one transaction, so the
+    window does not exist. That is the same capability `transact` offers a step, arriving
+    at the seam above rather than inside a pass, and it is available for the same reason:
+    both things live in one datastore.
 
     Which is why the two stores MUST share a pool, checked at construction rather than
     documented. It is the exact question `LuaEffect` asks with its hash tag, and it does
@@ -551,7 +541,7 @@ class PostgresDurable:
     transaction whatever the connection string suggests. Sharded Postgres asks it again
     at the next level down, where the answer is that both tables must be distributed by
     the workflow id and co-located, or the "one commit" here becomes a two-phase commit
-    across nodes (see the package README).
+    across nodes.
     """
 
     checkpointer: PostgresCheckpointer

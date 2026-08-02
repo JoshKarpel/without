@@ -72,15 +72,16 @@ then re-read the row it locked, so the token it compares against is the newest o
 
 ### What the move takes away
 
-Three things that were live questions on Redis do not arise here, and one of them
-is a load-bearing gap rather than a detail.
+Four things that were live questions on Redis do not arise here, and one of them
+closes a load-bearing gap rather than a detail.
 
-**A workflow id carries no contract.** `RedisCheckpointer` asks an id not to
-contain braces and to stay short, purely because it builds key names by
+**A workflow id carries no contract.** `RedisCheckpointer`
+[asks an id](../without-durability-redis/index.md#what-redis-holds-and-for-how-long)
+not to contain braces and to stay short, purely because it builds key names by
 interpolating one. Here the id is a query parameter, so there is nothing to ask:
 an id full of braces, quotes, and semicolons addresses exactly itself. That is
-the tell the Redis store's own docstring predicted, that the contract was a
-property of building keys by concatenation rather than of workflow ids.
+the tell the Redis store predicted, that the contract was a property of building
+keys by concatenation rather than of workflow ids.
 
 **Nothing expires, so nothing is lost by expiring.** The Redis store re-arms a TTL
 on every write, which sweeps finished workflows for free and costs the sharp edge
@@ -104,35 +105,6 @@ it does, which is why the test service is deliberately *not* tuned for speed: an
 `fsync=off` in `compose.yaml` would make the suite quick by removing the one
 property the store is claiming.
 
-### What it costs
-
-**The sweep is now homework.** Redis's TTL is a control plane you get for free.
-Here a finished workflow's rows stay until something deletes them, and nothing
-here does, so a long-running deployment needs a job that deletes checkpoints and
-claims past some age. That job is also the only way to bring back the reused-id
-hazard the counter avoids, so it should delete a workflow's claim and its
-checkpoint together or neither.
-
-**The column narrows the codec.** Redis and SQLite hold text, so any
-`CheckpointCodec[str]` fits. A `jsonb` column will only take JSON, so a codec here
-MUST render JSON _text_, which rules out (say) a msgpack-in-base64 one. What that
-still leaves free is the library and the value mapping, which is where the
-interesting codecs differ anyway; the alternative was a `text` column, and giving
-up indexing and the `jsonb` operators to hold encodings nobody was going to use
-was the worse trade.
-
-**There is still no blocking read.** `PostgresScheduler` polls, exactly as
-`RedisSetScheduler` does, so the poll interval is a floor under how fast anything
-starts. Postgres can close this where a sorted set cannot (`LISTEN`/`NOTIFY` on a
-dedicated connection, woken by the writer or by a trigger), and this does not,
-which is the honest state of it rather than a claim that a table cannot wait.
-
-**`migrate` is not a migration tool.** It runs three `CREATE TABLE IF NOT EXISTS`
-under an advisory lock, which is enough to boot a fleet of workers concurrently
-(concurrent `IF NOT EXISTS` is a duplicate-key error on the system catalog, not a
-no-op) and nothing like enough to change the shape of these tables later. That is
-Alembic's job, or sqitch's, or numbered SQL files'.
-
 ### One database, not two
 
 The queue being a table is what makes "you need no second system" a claim this can
@@ -150,14 +122,13 @@ Postgres gets them by having the second poller step over the row the first is
 updating rather than queue behind it. Same outcome, and the second one is a lock
 manager doing its ordinary job rather than a global lock being borrowed.
 
-
 ## Gaps
 
 Beyond [the ones every store carries](../without-durability/index.md#gaps):
 
 - **The sweep is homework.** Redis's TTL is a control plane you get for free. Here
   a finished workflow's rows stay until something deletes them, and nothing here
-  does, so a long-running deployment needs a job that removes checkpointer and
+  does, so a long-running deployment needs a job that deletes checkpoints and
   claims past some age. That job is also the only way to bring back the reused-id
   hazard the plain counter avoids, so it should delete a workflow's claim and its
   checkpoint together or neither.
@@ -166,6 +137,13 @@ Beyond [the ones every store carries](../without-durability/index.md#gaps):
   starts. Postgres can close this where a sorted set cannot (`LISTEN`/`NOTIFY` on a
   dedicated connection, woken by the writer or by a trigger), and this does not,
   which is the honest state of it rather than a claim that a table cannot wait.
+- **The column narrows the codec.** Redis and SQLite hold text, so any
+  `CheckpointCodec[str]` fits. A `jsonb` column will only take JSON, so a codec here
+  MUST render JSON _text_, which rules out (say) a msgpack-in-base64 one. What that
+  still leaves free is the library and the value mapping, which is where the
+  interesting codecs differ anyway; the alternative was a `text` column, and giving
+  up indexing and the `jsonb` operators to hold encodings nobody was going to use
+  was the worse trade.
 - **`migrate` is not a migration tool.** It runs three `CREATE TABLE IF NOT EXISTS`
   under an advisory lock, which is enough to boot a fleet of workers concurrently
   (concurrent `IF NOT EXISTS` is a duplicate-key error on the system catalog, not a

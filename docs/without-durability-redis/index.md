@@ -1,8 +1,8 @@
 # without-durability-redis
 
-[`without-durability`](https://pypi.org/project/without-durability/)'s two seams
-over Redis: a workflow's completed steps as one hash, its claim as another, and a
-queue of workflows that can run now.
+[`without-durability`](../without-durability/index.md)'s two seams over Redis: a
+workflow's completed steps as one hash, its claim as another, and a queue of
+workflows that can run now.
 
 ```python
 from redis.asyncio import Redis
@@ -85,7 +85,7 @@ worker pulls
   step "captured:*" ─▶ ▪ captured:piano
                     ─▶ ▪ captured:stool
   sleep "settling"  ─▶ ▪ settling=D            (the deadline, not the duration)
-  Suspended(due=D)  ──────────────────────────────────────────────────────────▶ ▪ score=D
+  ScheduledWakeup(D) ─────────────────────────────────────────────────────────▶ ▪ score=D
   release           ────────────────────▶ ▪ token=1 until=0
   XACK              ───────────────────────────────────────── ▫ 1-0 acked, still in the stream
 timer, once D passes
@@ -93,7 +93,7 @@ timer, once D passes
 worker pulls again
   claim             ────────────────────▶ ▪ token=2 until=T₂  (the fence advances)
   awaiting          ─  suspends: "approved-by" is not there
-  Suspended(due=None) ── nothing scheduled: only the world can answer this
+  InputNeeded       ── nothing scheduled: only the world can answer this
   release, XACK     ────────────────────▶ until=0             ▫ 2-0 acked
 POST /confirmation
   supply("approved-by") ▪ approved-by
@@ -217,7 +217,6 @@ real shape, so the protocol keeps room for one.
 
 In one line: a stream is cheaper to wait on, a sorted set is cheaper to reason
 about.
-
 
 ## Gaps
 

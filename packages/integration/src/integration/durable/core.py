@@ -7,22 +7,17 @@
 #
 # Two constraints durability puts on this half, and neither is a framework concern:
 #   - Every node is *named* by the caller, so the key a result is stored under is a
-#     name in this source rather than an identity minted at build time. Rename a
-#     node and its old result no longer applies to it, which is the honest answer:
-#     a `checkpoint` written by an older version of this function is rejected by
-#     `CompiledGraph`, not silently half-applied.
+#     name in this source rather than an identity minted at build time. Rename a node
+#     and its old result no longer applies to it, which `CompiledGraph` reports by
+#     rejecting the checkpoint rather than silently half-applying it.
 #   - Every node's result survives the store's codec, which for the default JSON one
 #     means it is JSON-*native* rather than merely JSON-serializable: a tuple would
-#     encode and come back a list. That is checked rather than trusted, on the pass
-#     that writes each node (`run_durably`), so getting it wrong is a loud failure
-#     naming the node instead of a dependent quietly seeing a different shape after a
-#     crash. The codec is the *app's* boundary decision (see the store packages), so a
-#     richer one would let these steps return domain values instead; the toy stays with
-#     strings and mappings to keep the boundary in one obvious place.
+#     encode and come back a list. `run_durably` checks that on the pass that writes
+#     each node, so getting it wrong names the node loudly. A richer codec would let
+#     these steps return domain values; the toy stays with strings and mappings.
 #
-# The effects are injected as `Services` rather than reached for, so the same graphs
-# run against a real gateway or a test double with no patching, and so this module
-# never imports a client.
+# The effects are injected as `Services` rather than reached for, so the same graphs run
+# against a real gateway or a test double with no patching.
 
 from __future__ import annotations
 
@@ -84,11 +79,10 @@ class Reached:
     """
     How far a forward run got, parsed out of its checkpoint.
 
-    The saga's whole input. Deciding what to undo is a *pure function of a value*
-    (the recorded results), not a replay of a history or an inspection of a running
-    engine: the checkpoint already says which steps happened and what each returned,
-    so `of` parses that raw mapping into the typed question the unwinding asks, and
-    nothing downstream re-checks the store.
+    The saga's whole input. Deciding what to undo is a *pure function of a value* (the
+    recorded results) rather than a replay of a history or an inspection of a running
+    engine, so `of` parses that raw mapping into the typed question the unwinding asks
+    and nothing downstream re-checks the store.
     """
 
     charge_id: str | None

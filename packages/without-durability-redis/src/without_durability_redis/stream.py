@@ -1,17 +1,12 @@
-# The piece that is genuinely a service: knowing *when* a workflow can make progress.
-# A checkpoint says what a workflow has done, and `Suspended` says what it is waiting
-# for, but neither brings anyone back. This does, with two Redis structures and no
-# server of our own:
+# The piece that is genuinely a service: knowing *when* a workflow can make progress. A
+# checkpoint says what a workflow has done, and a `Suspended` says what it is waiting
+# for, but neither brings anyone back. This does, with two Redis structures and no server
+# of our own:
 #
 #   - a stream of workflow ids that can run *now*, which the API appends to when an
 #     order arrives or a confirmation lands, and workers read as a consumer group;
 #   - a sorted set of workflows waiting on a clock, scored by their deadline, which a
 #     timer drains into the stream as each one comes due.
-#
-# That is the question this toy exists to ask plainly: is this not what Temporal's
-# server is doing? Yes. A durable workflow needs a queue of ready work and a timer, and
-# once the *state* is a checkpoint anyone can read, those two are a stream and a sorted
-# set rather than a cluster.
 #
 # A stream rather than a list, because a list loses work. `BLPOP` hands an id over and
 # forgets it, so a worker that dies mid-pass takes the wakeup with it and the workflow
@@ -21,23 +16,24 @@
 # holding. The cost is that a wakeup must now be acknowledged, which is why a delivery
 # is a value with a receipt rather than a bare id.
 #
-# `wake_due` is one operation rather than a claim and an append, and that is the whole
-# of its design. Taking a workflow off the sleepers and queueing it are only *durable*
-# together: between them the workflow is in neither structure, so a process that dies
-# in the gap loses the wakeup. Redis has no single command that moves a member from a
-# sorted set to a stream, so the move is a Lua script, which runs to completion in the
-# server where the two writes have to happen together. It settles the timer's
-# cardinality for free: every worker may run a timer, and they all see the same due
-# workflow, but the script is serialized against itself, so the first mover takes it
-# and the rest see an empty range. Leader election buys nothing over that.
+# `wake_due` is one operation rather than a claim and an append, and that is the whole of
+# its design. Taking a workflow off the sleepers and queueing it are only *durable*
+# together: between them the workflow is in neither structure, so a process that dies in
+# the gap loses the wakeup. Redis has no single command that moves a member from a sorted
+# set to a stream, so the move is a Lua script, which runs to completion in the server
+# where the two writes have to happen together. It settles the timer's cardinality for
+# free: every worker may run a timer, and they all see the same due workflow, but the
+# script is serialized against itself, so the first mover takes it and the rest see an
+# empty range. Leader election buys nothing over that.
 #
-# The naming matters as much as the atomicity: the protocol names the *transition*, so
-# a caller cannot hold a claimed-but-unqueued id at all, which is the state that was
-# lossy. Making it unrepresentable beats remembering to do both halves.
+# The naming matters as much as the atomicity: the protocol names the *transition*, so a
+# caller cannot hold a claimed-but-unqueued id at all, which is the state that was lossy.
+# Making it unrepresentable beats remembering to do both halves, and it is the same
+# argument `Durable.arrive` makes one level up.
 #
 # The sorted set is an *index*, not the record: the deadline itself lives in the
 # workflow's checkpoint, put there by `Run.sleep`. Losing the set leaves a workflow
-# asleep forever rather than corrupt, and rebuilding it is a scan over checkpointer.
+# asleep forever rather than corrupt, and rebuilding it is a scan over checkpoints.
 
 from __future__ import annotations
 
@@ -107,14 +103,12 @@ class RedisStreamScheduler:
     Every worker reads the same group under its own `consumer` name, which is how the
     work distributes: the group hands each entry to exactly one of them, so scaling out
     is starting another process rather than partitioning anything. A long-lived
-    deployment would name consumers after the host and process (and retire dead ones
-    with `XGROUP DELCONSUMER`) rather than minting one per instance as this does.
+    deployment would name consumers after the host and process (and retire dead ones with
+    `XGROUP DELCONSUMER`) rather than minting one per instance as this does.
 
-    `XACK` clears an entry from the pending list but leaves it in the stream, so the
-    thing that bounds this queue is `trim`, run as its own control-plane task beside
-    the worker (see `trimming`). Without it the stream is correct and grows forever;
-    capping its *length* instead would be the wrong bound, since that drops the oldest
-    entries, which are the ones nobody has run yet.
+    `XACK` clears an entry from the pending list but leaves it in the stream, so the thing
+    that bounds this queue is `trim`, run as its own control-plane task beside the worker
+    (see `trimming`). Without it the stream is correct and grows forever.
     """
 
     redis: Redis
@@ -129,10 +123,9 @@ class RedisStreamScheduler:
     # and for the reason the seam gives: it also bounds the checkpoint claim, and the two
     # drift the moment they are set in two places.
     lease: timedelta = LEASE
-    # Derived at construction, the way `without_web.Router` compiles its trie: a store
-    # has *one* script, and registering it is local work (it precomputes the digest and
-    # holds the client), so calling it sends the digest and falls back to the source
-    # only when the server has not seen it.
+    # Registered at construction: this precomputes the digest and holds the client, so a
+    # call sends the digest and falls back to the source only when the server has not
+    # seen it.
     move: AsyncScript = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -188,23 +181,25 @@ class RedisStreamScheduler:
         if not read:
             return None  # the block elapsed with nothing new
         _stream, entries = read[0]
+        # Indexed rather than guarded, because a reply for this stream carries at least
+        # one entry: `>` reads only entries never delivered to this group, and the one
+        # thing that removes entries here (`trim`) removes only what every group has
+        # acknowledged, so nothing can vanish between the read and this line.
         return deliveries(entries)[0]
 
     async def reclaim(self, idle: timedelta) -> Delivery | None:
         """
         Take over *one* delivery a worker has been holding without acknowledging.
 
-        One, because a worker should never hold more than it is about to work on:
-        taking a batch would mean owing several passes while running one, which is the
-        thing pulling one at a time exists to avoid. A backlog of abandoned work is
-        drained the same way any other work is, one free slot at a time.
+        One, because a worker should never hold more than it is about to work on: taking
+        a batch would mean owing several passes while running one, which is the thing
+        pulling one at a time exists to avoid. A backlog of abandoned work is drained the
+        same way any other work is, one free slot at a time.
 
-        `idle` is a lease, and the only real knob here: too short and a slow pass is
-        overtaken while it is still running, too long and a crashed worker's workflow
-        waits that long to be picked up. Overtaking is survivable (the second pass
-        re-runs whatever step went unrecorded, which is the at-least-once bound the
-        mechanism already carries) but it is not free, so the bound should exceed how
-        long a pass can honestly take.
+        `idle` is a lease: too short and a slow pass is overtaken while it is still
+        running, too long and a crashed worker's workflow waits that long to be picked
+        up. Overtaking is survivable and not free, so the bound should exceed how long a
+        pass can honestly take.
         """
         _cursor, entries, _deleted = cast(
             tuple[str, Entries, list[str]],
@@ -227,26 +222,27 @@ class RedisStreamScheduler:
         """
         Drop the entries every consumer group has finished with, and report how many.
 
-        `XACK` clears an entry from a group's pending list and leaves it in the stream, so
-        without this the queue is append-only: correct, and unbounded. `ACKED` is the
-        bound, and it is the server's own answer rather than one computed here: it removes
-        only entries that every group has read *and* acknowledged, so a group reading the
-        same stream at its own pace protects everything it has not finished with. Working
-        that floor out client-side (the oldest pending entry per group, minimum across
-        groups) is possible and strictly worse, because it races every ack that lands
-        between the read and the trim.
+        `XACK` clears an entry from a group's pending list and leaves it in the stream,
+        so without this the queue is append-only: correct, and unbounded. `ACKED` is the
+        bound, and it is the server's own answer rather than one computed here: it
+        removes only entries that every group has read *and* acknowledged. Working that
+        floor out client-side is possible and strictly worse, because it races every ack
+        that lands between the read and the trim. Capping by *length* instead would be
+        the wrong bound entirely, since that drops the oldest entries, which are the ones
+        nobody has run yet.
 
         `MAXLEN 0` reads as "keep nothing", and with `ACKED` that is exactly right:
         trimming still stops at the first entry somebody has not answered for, so the
         threshold only says "as much as you are allowed to".
 
         Note what `ACKED` does *not* do. With no consumer groups at all it has no effect
-        and the trim degrades to a plain `MAXLEN 0`, which would delete a queue nobody has
-        read yet - and orders can be queued before the first worker ever boots, which is
-        the case `prepare` creates its group from `0` to handle. So this refuses to trim a
-        stream that has no groups, which is the one hazard in an otherwise safe command.
+        and the trim degrades to a plain `MAXLEN 0`, which would delete a queue nobody
+        has read yet - and orders can be queued before the first worker ever boots, which
+        is the case `prepare` creates its group from `0` to handle. So this refuses to
+        trim a stream that has no groups, which is the one hazard in an otherwise safe
+        command.
 
-        Safe to run from every process at once, and safe to never run at all. The trim is
+        Safe to run from every process at once, and safe to never run at all: the trim is
         idempotent, what counts as acknowledged only grows, and a stream nobody trims is
         merely large.
 
@@ -275,10 +271,8 @@ def trimming(scheduler: RedisStreamScheduler) -> Sink[object]:
     and for the same reason: what makes a trim happen is a value somebody supplies, so
     this runs off a timer, off an operator poking a queue, off a Kubernetes cron hitting
     an endpoint, or off three items in a test. A loop can only ever be a timer, and it
-    buries the schedule inside the thing being scheduled.
-
-    It takes `Sink[object]` because it reads nothing from the event: whatever the stream
-    carries, a trim is a trim.
+    buries the schedule inside the thing being scheduled. It takes `Sink[object]` because
+    it reads nothing from the event: whatever the stream carries, a trim is a trim.
 
     ```python
     async with asyncio.TaskGroup() as group:
@@ -286,15 +280,12 @@ def trimming(scheduler: RedisStreamScheduler) -> Sink[object]:
         group.create_task(trimming(scheduler)(ticks(TRIM_EVERY)))
     ```
 
-    Control plane rather than data plane, and deliberately not folded into `work`: whether
-    an entry is still needed is a question about what every group has acknowledged, not
-    about the delivery a worker happens to be holding, so triggering it by traffic would
-    make housekeeping cost scale with load for no reason.
-
-    Its cardinality is not something to arrange. Every process may run one, because the
-    trim is idempotent and what counts as acknowledged only grows, so there is no leader
-    to elect and nothing to coordinate; N processes running it just means the same trim
-    happens N times. That is the same reasoning `waking` already relies on.
+    Control plane rather than data plane, and deliberately not folded into `work`:
+    whether an entry is still needed is a question about what every group has
+    acknowledged, not about the delivery a worker happens to be holding, so triggering it
+    by traffic would make housekeeping cost scale with load for no reason. Its
+    cardinality needs no arranging either, since the trim is idempotent: every process
+    may run one, and N of them just means the same trim happens N times.
     """
 
     async def tidy(_event: object) -> None:

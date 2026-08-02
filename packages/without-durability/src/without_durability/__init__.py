@@ -19,7 +19,9 @@ from without_durability.seams import Scheduler
 from without_durability.seams import SplitDurable
 from without_durability.seams import check_duration
 from without_durability.seams import claimed
+from without_durability.stepwise import InputNeeded
 from without_durability.stepwise import Run
+from without_durability.stepwise import ScheduledWakeup
 from without_durability.stepwise import StepKey
 from without_durability.stepwise import Suspended
 from without_durability.stepwise import now_utc
@@ -39,6 +41,7 @@ __all__ = [
     "Delivery",
     "Durable",
     "Fenced",
+    "InputNeeded",
     "Interruption",
     "JsonCodec",
     "MemoryCheckpointer",
@@ -47,6 +50,7 @@ __all__ = [
     "Pass",
     "Recorded",
     "Run",
+    "ScheduledWakeup",
     "Scheduler",
     "SplitDurable",
     "StepKey",

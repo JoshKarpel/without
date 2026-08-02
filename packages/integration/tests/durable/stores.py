@@ -17,6 +17,7 @@ from without_durability_postgres import PostgresScheduler
 from without_durability_postgres import migrate as migrate_postgres
 from without_durability_redis import RedisCheckpointer
 from without_durability_redis import RedisSetScheduler
+from without_durability_redis import RedisStreamScheduler
 from without_durability_sqlite import SqliteCheckpointer
 from without_durability_sqlite import SqliteDurable
 from without_durability_sqlite import SqliteScheduler
@@ -31,7 +32,15 @@ from without_durability_sqlite import migrate as migrate_sqlite
 # other two always run, which keeps the shape of these tests honest on a machine with no
 # container runtime.
 
-STORES = ("memory", "redis", "postgres", "sqlite")
+# Both Redis queues, because they are not one store with a knob: the stream carries a
+# consumer group, a pending list, an acknowledgement, and a Lua script that moves a
+# workflow from the sleepers to the queue, where the sorted set answers all four by
+# scoring visibility and has `wake_due`, `reclaim`, and `prepare` do nothing at all. So
+# the stream is the only parameter here that exercises the worker's timer and its
+# takeover arm end to end, and running the same workflows over both is what says the
+# `Scheduler` seam holds across that difference rather than across two spellings of one
+# design.
+STORES = ("memory", "redis-stream", "redis-set", "postgres", "sqlite")
 
 
 def published(variable: str) -> tuple[str, int]:
@@ -57,7 +66,20 @@ async def durable(request: pytest.FixtureRequest, tmp_path: Path, workflow: str)
     match request.param:
         case "memory":
             yield SplitDurable(MemoryCheckpointer(), MemoryScheduler())
-        case "redis":
+        case "redis-stream":
+            host, port = published("WITHOUT_TESTS_REDIS")
+            client = Redis(host=host, port=port, decode_responses=True)
+            try:
+                scheduler = RedisStreamScheduler(redis=client, namespace=workflow)
+                # The one queue here with something to create. `work` calls this itself and
+                # it is idempotent, but a test that only submits (and never runs a worker)
+                # would otherwise leave a stream with no group for the *next* reader to
+                # find, so the fixture hands out a store that is ready to be read from.
+                await scheduler.prepare()
+                yield SplitDurable(RedisCheckpointer(redis=client), scheduler)
+            finally:
+                await client.aclose()
+        case "redis-set":
             host, port = published("WITHOUT_TESTS_REDIS")
             # `decode_responses=True` is the app's call to make, and this app makes it: it
             # owns both ends of every key it touches, so nothing downstream has to ask

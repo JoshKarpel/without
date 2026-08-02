@@ -88,15 +88,13 @@ async def pay_out(
     in the loop above `approval_over`.
 
     Written as the straight line it is. The durability is in the four `run` calls and
-    nowhere else: each step's name is what its result is filed under, so the second
-    pass after a crash re-reaches this same line and picks the result back up. The
-    capture keys carry their sku, which is what lets a fan-out of unknown width resume
-    item by item rather than all-or-nothing.
+    nowhere else: each step's name is what its result is filed under, so the second pass
+    after a crash re-reaches this same line and picks the result back up. The capture
+    keys carry their sku, which is what lets a fan-out of unknown width resume item by
+    item rather than all-or-nothing.
 
-    Each step names its parser alongside its key, which is where the parsing already
-    happened before `step` took one: what changed is that it is now inside the call
-    that produces the value rather than wrapped around it, so a step whose result is
-    used without being parsed is no longer expressible.
+    Each step names its parser alongside its key, so a step whose result is used without
+    being parsed is not expressible.
     """
     items = await run.step("items", lambda: services.items(order_id), parse_items)
     skus = sorted(items)

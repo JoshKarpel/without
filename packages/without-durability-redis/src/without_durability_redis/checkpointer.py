@@ -1,30 +1,19 @@
-# The one place that knows Redis: the `Checkpointer` implementation the durable runner
-# talks to. A workflow is one Redis hash, a completed step is one field in it, and the
-# vocabulary is small, because the shape `CompiledGraph.stream` emits (a mapping of name
-# to result) is already the shape a hash holds. Nothing above this module mentions Redis,
-# and nothing in it mentions the workflow's domain.
+# The `Checkpointer` implementation the durable runner talks to. A workflow is one Redis
+# hash, a completed step is one field in it, and the vocabulary is small, because the
+# shape `CompiledGraph.stream` emits (a mapping of name to result) is already the shape a
+# hash holds. Nothing above this module mentions Redis, and nothing in it mentions the
+# workflow's domain.
 #
-# What a step's result *becomes* on the way into that hash is not this module's decision
-# either: it is a `CheckpointCodec` the caller injects, defaulting to the stdlib's JSON.
-# The default is the one that makes a checkpoint readable by an operator with `redis-cli`
-# and by a service written in another language, at the cost of restricting node results to
-# JSON-native values; swapping in a pydantic `TypeAdapter` or a msgspec codec changes the
-# store's construction and nothing else. This file only requires that the encoding be
-# text, which is what a hash field holds.
+# Every write here is a Lua script, and each is a script for the same reason: what it
+# does is only correct as *one* step. Checking whether a workflow is free and taking it,
+# checking a fencing token and applying the write it guards, testing whether a key is
+# already recorded and reading back the winner. Split any of those into two round trips
+# and the gap between them is where the guarantee leaks.
 #
-# Three of the four writes here are Lua scripts, and each is a script for the same
-# reason: what it does is only correct as *one* step. Checking whether a workflow is
-# free and taking it, checking a fencing token and applying the write it guards,
-# testing whether a key is already recorded and reading back the winner. Split any of
-# those into two round trips and the gap between them is where the guarantee leaks.
-# This is the whole of what Temporal's server and DBOS's Postgres are doing for their
-# users, at the scale this app needs it: exclusion has to be enforced by whatever holds
-# the data, because that is the only party that sees every writer.
-#
-# The keys are hash-tagged (`workflow:{id}`, `workflow:{id}:pass`) so that the tagged
-# id decides the slot and a workflow's two keys always land on the same one. Without
-# that, `record` (which touches both) is a cross-slot command that Redis Cluster
-# refuses, so the tag is what keeps this correct on more than a single node.
+# The keys are hash-tagged (`workflow:{id}`, `workflow:{id}:pass`) so that the tagged id
+# decides the slot and a workflow's two keys always land on the same one. Without that,
+# `record` (which touches both) is a cross-slot command that Redis Cluster refuses, so
+# the tag is what keeps this correct on more than a single node.
 
 from __future__ import annotations
 
@@ -56,17 +45,13 @@ from without_durability.seams import check_duration
 # entirely; if its id is then reused, a counter would hand the new incarnation token 1
 # while some pass stalled since before the expiry still holds token 3, and the corpse
 # would outrank the living. Seeding from the wall clock closes that without coupling the
-# two keys' lifetimes: any later claim is stamped with a later millisecond, so a token
-# from a previous incarnation is always behind. Taking `previous + 1` when that is
-# larger keeps it strictly monotonic within one incarnation even if the clock steps
-# backwards under it.
+# two keys' lifetimes, and taking `previous + 1` when that is larger keeps it strictly
+# monotonic within one incarnation even if the clock steps backwards under it.
 #
-# The precision is the limit of that half. Two claims separated by an expiry but not by
-# a millisecond would be stamped the same, and equal tokens do not fence each other,
-# since the current holder has to be able to write with its own. What makes that
-# unreachable is not the arithmetic but the `ttl`: an expiry cannot happen in under a
-# day, so the millisecond is bought by a margin of eight orders of magnitude. It is
-# worth knowing the guarantee rests on that rather than on the token alone.
+# The precision is the limit of that half: two claims separated by an expiry but not by a
+# millisecond would be stamped the same, and equal tokens do not fence each other. What
+# makes that unreachable is the `ttl` rather than the arithmetic, since an expiry cannot
+# happen in under a day. The guarantee rests on that margin, not on the token alone.
 #
 #   KEYS[1]  the workflow's pass hash
 #   ARGV[1]  lease, in milliseconds
@@ -89,12 +74,10 @@ return token
 # settles, so a caller that lost the race learns the winner's value instead of carrying
 # on with its own.
 #
-# It reports *who won* alongside that value, which is the one thing the caller cannot work
-# out afterwards: a result crosses the codec on the way in and out, so comparing what came
-# back against what went in answers a different question (see `Recorded`). The comparison
-# that decides it is between encodings, here, where both are in hand. Two passes that ran
-# the same effect and produced the same encoding have nothing to disagree about, so that
-# counts as winning for both rather than as a race.
+# It reports *who won* alongside that value, which is the one thing the caller cannot
+# work out afterwards (see `Recorded`). The comparison that decides it is between
+# encodings, here, where both are in hand, so two passes that ran the same effect and
+# produced the same encoding count as winning for both rather than as a race.
 #
 #   KEYS[1]  the workflow's steps hash
 #   KEYS[2]  the workflow's pass hash
@@ -162,8 +145,8 @@ def fenced(error: ResponseError) -> bool:
     else (a `WRONGTYPE`, a script that will not load, a server out of memory) means the
     checkpoint is unusable and must reach the caller. redis-py surfaces a script's
     `error_reply` as the server's string verbatim, so the message *starts* with the code
-    exactly as Redis's own do, and a value carrying the word further in cannot be
-    mistaken for one.
+    exactly as Redis's own do, and a recorded value carrying the word further in cannot
+    be mistaken for one.
     """
     return str(error).startswith(FENCED)
 
@@ -173,18 +156,15 @@ class LuaEffect:
     """
     A piece of work this Redis can do, written as the Lua it would be on its own.
 
-    The `Effect` type for `RedisCheckpointer`, and the shape of the answer to "what can a
-    store commit alongside its record". `source` is an ordinary script body: it reads
-    `KEYS` and `ARGV` from index 1 as if it were the only thing running, and it MUST
-    return whatever the store's `CheckpointCodec` decodes, since what it returns is
-    written into the checkpoint verbatim and read back through that codec like any step.
-    Under the default `JsonCodec` that means JSON text, and `cjson.encode` is the usual
-    way to produce it. That is the one place an effect has to know which codec its store
-    was built with, and it is unavoidable: the encoding happens in the server, where the
-    Python codec cannot reach.
-    `RedisCheckpointer.transact` splices it into a wrapper that supplies the fence check
-    and the record, and rebinds those two tables so the numbering an author sees is the
-    numbering they wrote.
+    The `Effect` type for `RedisCheckpointer`. `source` is an ordinary script body: it
+    reads `KEYS` and `ARGV` from index 1 as if it were the only thing running, because
+    `transact` splices it into a wrapper that supplies the fence check and the record and
+    rebinds those two tables. It MUST return whatever the store's `CheckpointCodec`
+    decodes, since what it returns is written into the checkpoint verbatim; under the
+    default `JsonCodec` that means JSON text, and `cjson.encode` is the usual way to
+    produce it. That is the one place an effect has to know which codec its store was
+    built with, and it is unavoidable, because the encoding happens in the server where
+    the Python codec cannot reach.
 
     Its `keys` MUST hash to the workflow's own slot, which on a single node is free and
     on a cluster means carrying the same `{id}` tag. That is not a quirk of the wrapper:
@@ -228,7 +208,14 @@ if tonumber(ARGV[2]) < fence then
   return redis.error_reply('FENCED pass ' .. ARGV[2] .. ' superseded by ' .. fence)
 end
 local already = redis.call('HGET', KEYS[1], ARGV[1])
-if already then return already end
+if already then
+  -- Re-armed on the way out, exactly as `RECORD` does, because a replay is the *only*
+  -- thing that reaches this branch: a workflow whose passes all land on steps already
+  -- transacted would otherwise write nothing, and expire while it was being worked on.
+  redis.call('EXPIRE', KEYS[1], ARGV[3])
+  redis.call('EXPIRE', KEYS[2], ARGV[3])
+  return already
+end
 local result = (function()
   local KEYS = {unpack(outer_keys, 3)}
   local ARGV = {unpack(outer_args, 4)}
@@ -246,48 +233,45 @@ class RedisCheckpointer:
     """
     A workflow's completed steps as one Redis hash, and its claim as another.
 
-    The client MUST be built with `decode_responses=True`. That is this app's choice
-    to make (it owns both ends of this hash), and making it once here is what keeps
-    every read from carrying a bytes-or-text branch it would never take. It is also what
-    fixes `codec` to a `CheckpointCodec[str]`: a hash field can hold bytes, but a client
+    The client MUST be built with `decode_responses=True`. That is this app's choice to
+    make (it owns both ends of this hash), and making it once here is what keeps every
+    read from carrying a bytes-or-text branch it would never take. It is also what fixes
+    `codec` to a `CheckpointCodec[str]`: a hash field can hold bytes, but a client
     decoding every reply has already decided this store speaks text.
 
     `codec` is how a step's result becomes a hash field and comes back, and it defaults
-    to the stdlib's JSON. Change it to widen what a step may return (a pydantic
-    `TypeAdapter` carries domain values that `json.dumps` refuses) or to speed the
+    to the stdlib's JSON. Change it to widen what a step may return or to speed the
     encoding up; what it MUST keep is the round trip, since a resumed pass reads what it
     produced. A `LuaEffect` under `transact` has to agree with it, which is the one thing
     the type cannot check, because that encoding happens in the server.
 
-    `namespace` keeps the workflow keys clear of whatever else shares the database,
-    and `ttl` is the answer to the question a checkpoint store cannot dodge: these
-    records outlive the process that wrote them, so something has to decide when a
-    workflow is beyond resuming. It is set on the hash rather than swept, so a
-    finished or abandoned workflow expires on its own and the store needs no
-    control plane of its own.
+    `namespace` keeps the workflow keys clear of whatever else shares the database, and
+    `ttl` is the answer to the question a checkpoint store cannot dodge: these records
+    outlive the process that wrote them, so something has to decide when a workflow is
+    beyond resuming. Setting it on the hash rather than sweeping is what lets a finished
+    or abandoned workflow expire on its own.
 
     It is re-armed only on a write, which makes it a bound on how long a workflow may
-    *wait* as much as on how long a finished one is kept: a workflow suspended for
-    longer than `ttl` writes nothing meanwhile, so its checkpoint expires while its
-    entry in the sleeping set (which carries no expiry) survives, and the wakeup it
-    eventually gets finds nothing recorded. So `ttl` MUST exceed the longest sleep or
-    approval any workflow using this store can sit in.
+    *wait* as much as on how long a finished one is kept: a workflow suspended for longer
+    than `ttl` writes nothing meanwhile, so its checkpoint expires while its entry in the
+    sleeping set (which carries no expiry) survives, and the wakeup it eventually gets
+    finds nothing recorded. So `ttl` MUST exceed the longest sleep or approval any
+    workflow using this store can sit in.
 
     How durable a write actually is stops at what the server is configured for. It
     returns when Redis has accepted the write, which with the default snapshotting and
     asynchronous replication is not the same as surviving a failover, and nothing here
     asks for more with `WAIT`. `run_durably`'s reasoning about the window between an
-    effect and its record assumes that gap is closed; closing it is this store's job,
-    not the runner's.
+    effect and its record assumes that gap is closed; closing it is this store's job, not
+    the runner's.
 
     ## What a workflow id has to be
 
-    A workflow id becomes *key structure* here rather than data, which is what gives it
-    a contract at all. It is not checked at run time, deliberately: the ordinary id is a
+    A workflow id becomes *key structure* here rather than data, which is what gives it a
+    contract at all. It is not checked at run time, deliberately: the ordinary id is a
     UUID or a ULID and satisfies all of this without anyone thinking about it, so paying
     for a validation on every call to catch a caller who went out of their way would be
-    the wrong trade. Enforce it where ids are minted if you need to, which for the API
-    is the one extractor that reads the `Idempotency-Key` header.
+    the wrong trade. Enforce it where ids are minted if you need to.
 
     - It MUST NOT contain `{` or `}`. Those delimit the cluster hash tag, so an id
       carrying its own braces makes Redis take some prefix of it as the tag instead of
@@ -297,25 +281,26 @@ class RedisCheckpointer:
     - It SHOULD be bounded in length. Redis keys are held in memory and an id appears in
       two of them per workflow, plus any key an effect derives from `hash_key`.
 
-    Both of those are about *this* store. `run_saga` adds one that is not (an id ending
-    in `:unwind` addresses another workflow's rollback), and it is documented there,
-    since deriving a sibling id by suffixing is true of that runner against any store.
-
-    Note what is *not* on this list. The queue (`scheduler`, `schedule`) holds a workflow
-    id as a value rather than in a key name, so none of this applies there, and
-    `postgres.PostgresCheckpointer` binds the id as a query parameter and so asks nothing
-    of it at all. This is a property of building keys by interpolation, not of workflow
-    ids.
+    Both of those are about *this* store, and neither applies to a scheduler here, which
+    holds an id as a stream field or a sorted-set member rather than in a key name. A SQL
+    store binds it as a query parameter and so asks nothing of it at all, which is the
+    tell: this is a property of building keys by interpolation, not of workflow ids.
+    `run_saga` adds the one constraint that *is* about ids rather than keys (an id ending
+    in `:unwind` addresses another workflow's rollback), and states it there.
     """
 
     redis: Redis
     namespace: str = "workflow"
     ttl: timedelta = timedelta(days=1)
     codec: CheckpointCodec[str] = JSON
-    # Registered once at construction, the way `RedisStreamScheduler` registers its own: this
-    # precomputes each digest and holds the client, so a call sends the digest and falls
-    # back to the source only when the server has not seen it.
-    scripts: tuple[AsyncScript, ...] = field(init=False, repr=False, compare=False)
+    # Registered once at construction: this precomputes each digest and holds the client,
+    # so a call sends the digest and falls back to the source only when the server has
+    # not seen it. One field per script rather than a tuple read by index, so the name a
+    # call site uses is checked against the script it was registered with.
+    take: AsyncScript = field(init=False, repr=False, compare=False)
+    write: AsyncScript = field(init=False, repr=False, compare=False)
+    offer: AsyncScript = field(init=False, repr=False, compare=False)
+    hand_back: AsyncScript = field(init=False, repr=False, compare=False)
     # The expiry every write re-arms, rendered once rather than per call: `ttl` is fixed
     # at construction and every `record`, `supply`, and `transact` sends it, so computing
     # it per step is work on the one path that scales with traffic.
@@ -328,25 +313,11 @@ class RedisCheckpointer:
 
     def __post_init__(self) -> None:
         check_duration("a ttl", self.ttl)
-        registered = tuple(self.redis.register_script(source) for source in (CLAIM, RECORD, SUPPLY, RELEASE))
-        object.__setattr__(self, "scripts", registered)
+        object.__setattr__(self, "take", self.redis.register_script(CLAIM))
+        object.__setattr__(self, "write", self.redis.register_script(RECORD))
+        object.__setattr__(self, "offer", self.redis.register_script(SUPPLY))
+        object.__setattr__(self, "hand_back", self.redis.register_script(RELEASE))
         object.__setattr__(self, "ttl_seconds", int(self.ttl.total_seconds()))
-
-    @property
-    def take(self) -> AsyncScript:
-        return self.scripts[0]
-
-    @property
-    def write(self) -> AsyncScript:
-        return self.scripts[1]
-
-    @property
-    def offer(self) -> AsyncScript:
-        return self.scripts[2]
-
-    @property
-    def hand_back(self) -> AsyncScript:
-        return self.scripts[3]
 
     def hash_key(self, workflow: str) -> str:
         # The braces are Redis Cluster's hash tag: the slot comes from what is inside
@@ -391,10 +362,9 @@ class RedisCheckpointer:
         The wrapper script for one effect body, spliced and digested once.
 
         It cannot be built at construction, because it is the *effect* that decides the
-        body and a store cannot precompile scripts it has not been handed. What it can do
-        is build each one only the first time it sees it: the splice and the SHA are pure
-        functions of the source, and an application's effects are written in its source
-        rather than derived from a request, so the set is small and fixed.
+        body. What it can do is build each one only the first time it sees it: the splice
+        and the SHA are pure functions of the source, and an application's effects are
+        written in its source rather than derived from a request, so the set is small.
         """
         built = self.transactions.get(source)
         if built is None:

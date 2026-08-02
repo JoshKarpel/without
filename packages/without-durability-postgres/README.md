@@ -34,17 +34,12 @@ means.
 own business write and its checkpoint commit together: exactly-once for that step,
 over the application's own tables. `PostgresDurable` extends that to the seam
 above, committing a value's arrival and the workflow's wakeup at once, which is
-what makes "you need no second system" a claim this can actually make.
-
-It is also where "one datastore" stops meaning "Postgres". A transaction is local
-on a single node; on a sharded deployment the checkpoint, claim, and queue tables
-must be distributed by the workflow id and co-located, or that one commit becomes
-a two-phase commit across nodes. `PostgresDurable` requires its two stores to
-share a pool, checked at construction, which is the necessary half of that answer
-rather than the sufficient one.
+what makes "you need no second system" a claim this can actually make. It is also
+where "one datastore" stops meaning "Postgres", since a transaction is local only
+on a single node.
 
 See the
 [`without-durability-postgres` guide](https://without.help/without-durability-postgres/)
 (with the [API reference](https://without.help/without-durability-postgres/reference/))
-for the statements, the schema, and what a deployment still owes (a sweep, and a
-real migration tool).
+for the statements, the schema, what co-location a sharded deployment owes, and
+what a deployment still owes anyway (a sweep, and a real migration tool).

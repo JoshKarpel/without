@@ -95,3 +95,11 @@ the ordinary case when two processes share the file.
   exclusive transaction, which is enough to boot concurrently and nothing like enough
   to change the shape of these tables later. `user_version` is where SQLite keeps
   that, and a deployment that needs it should use it.
+- **It needs SQLite 3.42 or newer, and nothing checks.** Every clock read is
+  `unixepoch('now', 'subsec')`, and the `subsec` modifier arrived in 3.42
+  (2023-05-16); without it those reads are whole seconds, so a lease and a
+  visibility can round together and two workers polling within the same second can
+  both find a row visible. `requires-python` cannot express this: Python bundles a
+  recent SQLite on Windows and macOS, but on Linux `sqlite3` links whatever
+  `libsqlite3` the distribution ships. Check `sqlite3.sqlite_version` on the
+  machine that will run it.

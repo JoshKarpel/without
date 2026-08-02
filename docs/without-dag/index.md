@@ -193,11 +193,11 @@ checkpoint rather than to this package, since the store is the only party that
 sees every writer, and it is what Temporal builds a server for and DBOS requires
 Postgres for.
 
-`integration.durable` is the worked example, and carries both halves: the same
-loop against a store (a Redis hash, or a table in Postgres), a claim on the
-workflow that every write is fenced against, and the saga (compensation) half,
-where a failed run's checkpoint is parsed into "how far did we get" and drives a
-rollback graph that is itself checkpointed.
+[`without-durability`](../without-durability/index.md) is that loop, written
+once, with the missing half supplied: `run_durably` runs it against an injected
+store under a claim every write is fenced against, and `run_saga` adds the
+compensating half, where a failed run's checkpoint is parsed into "how far did we
+get" and drives a rollback graph that is itself checkpointed.
 
 ## Lifting into a Processor
 

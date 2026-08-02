@@ -30,15 +30,10 @@ this store shares a filesystem, so the exclusion holds across the processes on o
 box and not across a fleet. That is the deployment this is for rather than a
 defect to apologise for: a CLI that resumes, a desktop app, an agent on a laptop,
 a single node that would rather not run Postgres to remember what it was doing.
-Reach for another store when a second machine appears.
-
-`connect` opens with `journal_mode=WAL` and `synchronous=FULL`. The usual advice
-under WAL is `NORMAL`, and it trades away exactly the property this package
-exists for, so this pays the fsync.
 
 See the
 [`without-durability-sqlite` guide](https://without.help/without-durability-sqlite/)
 (with the [API reference](https://without.help/without-durability-sqlite/reference/))
-for the statements, why an effect here is a synchronous callback where the
-Postgres store's is `async`, and how the blocking driver is kept off the event
-loop.
+for the statements, why `connect` pays the fsync that the usual WAL advice trades
+away, why an effect here is a synchronous callback where the Postgres store's is
+`async`, and how the blocking driver is kept off the event loop.

@@ -17,7 +17,9 @@ server and client (`without-http/index.md`, with cookie handling split out into
 `without-http/cookies.md`), the opinionated router (`without-web/index.md`), the
 config sources (`without-env/index.md`, `without-configmap/index.md`), the DAG
 executor (`without-dag/index.md`), and durable workflows
-(`without-durability/index.md`, with one page per store in
+(`without-durability/index.md`, with the store contract in
+`without-durability/guarantees.md` and the comparison to Temporal and DBOS in
+`without-durability/alternatives.md`, plus one page per store in
 `without-durability-redis/`, `without-durability-postgres/`, and
 `without-durability-sqlite/`). Those guides carry the design narrative;
 each package's `README.md` is now a short orientation that links to them, and the

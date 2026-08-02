@@ -152,7 +152,7 @@ async def test_a_submitted_order_runs_to_its_first_wait_and_schedules_the_wakeup
     recorded = await checkpointer.load(WORKFLOW)
     assert set(recorded) == {"order", "total", "settling"}
     assert "paid" not in recorded, "the settlement window has not elapsed"
-    # The worker read the deadline off `Suspended` and handed it to the store's
+    # The worker read the deadline off `ScheduledWakeup` and handed it to the store's
     # sleeping set; nothing polls the workflow in the meantime.
     assert list(scheduler.sleeping) == [WORKFLOW]
     assert scheduler.sleeping[WORKFLOW] == datetime.fromisoformat(str(recorded["settling"]))

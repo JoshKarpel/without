@@ -1,19 +1,15 @@
-# The API half of the pair: three endpoints, none of which runs a workflow. Submitting
-# an order and confirming a payout are the same one-line move, and that symmetry is the
+# The API half of the pair: three endpoints, none of which runs a workflow. Submitting an
+# order and confirming a payout are the same one-line move, and that symmetry is the
 # design rather than a coincidence:
 #
 #   a value the workflow was waiting on has arrived.
 #
 # A submission supplies the order the workflow is waiting on; a confirmation supplies the
-# approval it is waiting on. Both are values some *other* process wrote, which is
-# exactly what `Run.awaiting` reads, so the API needs no notion of starting a workflow
-# versus resuming one, and no channel to a running process. The worker finds out the
-# same way either time.
-#
-# One line rather than two because `Durable.arrive` names the transition. It was two
-# (record the value, then make the workflow ready), which put the burden of ordering them
-# on every caller and left a crash window nothing in the types mentioned. Whether the
-# pair is atomic is now the store's business to state rather than this module's to hope.
+# approval it is waiting on. Both are values some *other* process wrote, which is exactly
+# what `Run.awaiting` reads, so the API needs no notion of starting a workflow versus
+# resuming one, and no channel to a running process. One line rather than two because
+# `Durable.arrive` names the transition, which leaves whether the pair is atomic to the
+# store to state rather than to this module to hope.
 #
 # It records rather than writing under a claim, because these writes come from outside
 # any pass. An approval that failed because a worker happened to be mid-pass would be an
@@ -21,10 +17,9 @@
 # write. What it does keep is first-writer-wins, which is what makes a resubmission
 # harmless.
 #
-# That is what replaces a client library talking to a workflow server: the API writes
-# two rows and holds nothing. It can be restarted mid-flight, scaled to any number of
-# instances, or deployed separately from the worker, because the only state it touches
-# is the store both share.
+# That is what replaces a client library talking to a workflow server: the API writes two
+# rows and holds nothing, so it can be restarted mid-flight, scaled to any number of
+# instances, or deployed separately from the worker.
 #
 # The workflow id is the request's `Idempotency-Key`, so a resubmitted order is not a
 # second workflow: the second submission records the same order over the same key and
@@ -84,8 +79,8 @@ class Payments:
     them.
 
     Injected as router state, so the endpoints are functions of values and the app is
-    assembled once at the entrypoint (`payments_app`), which is also what lets the
-    tests drive it against dicts.
+    assembled once at the entrypoint (`payments_app`), which is also what lets the tests
+    drive it against dicts.
     """
 
     durable: Durable
@@ -93,18 +88,44 @@ class Payments:
 
 order_body = body(SubmittedOrder.model_validate_json, schema=SubmittedOrder)
 confirmation_body = body(Confirmation.model_validate_json, schema=Confirmation)
-# The workflow id *is* the idempotency key, so submitting twice cannot start two
-# payouts: the same key names the same checkpoint, and the pass it triggers finds
-# the work already recorded.
+# The workflow id *is* the idempotency key, so submitting twice cannot start two payouts:
+# the same key names the same checkpoint, and the pass it triggers finds the work already
+# recorded. It is also the one place a client's own text becomes a workflow id, which is
+# why a bound is enforced *here* rather than in a store: one extractor deciding once, on
+# the only path an id arrives on, instead of a check every store pays on every call.
 #
-# It is also the one place a client's own text becomes a workflow id, so it is where an
-# id contract would be enforced if a deployment wanted one (see `RedisCheckpointer` for
-# what the Redis store asks of an id, and `run_saga` for the one constraint that holds
-# whatever the store is). This takes the header as given, because the ids that matter
-# are UUIDs their senders generated and every constraint on the list is one they meet
-# without trying. Parsing here rather than in the store is the point: it would be one
-# extractor deciding once, not a check on every call.
-idempotency_key = header_param("idempotency-key", once(bytes.decode), schema={"type": "string"}, required=True)
+# The bound is deliberately not the full list. `RedisCheckpointer` asks two things of an
+# id and `run_saga` asks a third, and every one is met without trying by the UUID a sender
+# actually generates. What a length cap answers is different in kind: an id becomes *key
+# structure* in Redis and a `text` column everywhere else, so an unbounded one is
+# unbounded storage a client chooses. That is the one property no sender's good behaviour
+# establishes, so it is the one worth a comparison.
+MAX_WORKFLOW_ID = 200
+
+
+def as_workflow_id(value: bytes) -> str:
+    """
+    The `Idempotency-Key` header as a workflow id, or a rejection naming the header.
+
+    A `ValueError` here (from the decode or from the bound) becomes an `ExtractionError`
+    tagged with this field, which `recover` turns into a 422. So a client that sends
+    something unusable is told which header it was, rather than the store failing later
+    under an id nobody chose.
+    """
+    key = value.decode()
+    if not key:
+        raise ValueError("an idempotency key must not be empty")
+    if len(key) > MAX_WORKFLOW_ID:
+        raise ValueError(f"an idempotency key must be at most {MAX_WORKFLOW_ID} characters, but got {len(key)}")
+    return key
+
+
+idempotency_key = header_param(
+    "idempotency-key",
+    once(as_workflow_id),
+    schema={"type": "string", "maxLength": MAX_WORKFLOW_ID},
+    required=True,
+)
 workflow_id = path_param("workflow", STR)
 
 
@@ -117,16 +138,15 @@ async def submit_order(payments: Payments, order: SubmittedOrder, workflow: str)
     order is durable and someone will pick it up. The status URL is where the client
     watches it happen.
 
-    Resubmitting under the same key is not an update. The first order recorded is the
-    one the workflow runs, so a client that retries with a changed basket gets the
-    original back, which is what an idempotency key promises and the alternative
-    (letting the second overwrite) would break for a workflow already spending it.
+    Resubmitting under the same key is not an update. The first order recorded is the one
+    the workflow runs, so a client that retries with a changed basket gets the original
+    back, which is what an idempotency key promises and the alternative (letting the
+    second overwrite) would break for a workflow already spending it.
 
-    That retry is also what covers the one failure a split store can still have here.
+    That retry is also what covers the one failure a `SplitDurable` can still have here.
     If `arrive` is two writes and this process dies between them, the order is recorded
     and nothing is queued; the client sees no `202` and sends the same key again, which
-    records nothing new and queues the workflow. Over a `Durable` that commits both at
-    once there is no window to cover.
+    records nothing new and queues the workflow.
     """
     await payments.durable.arrive(workflow, "order", order.items)
     return json_response(202, {"workflow": workflow, "status": f"/orders/{workflow}"})

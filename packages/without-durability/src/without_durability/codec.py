@@ -2,16 +2,10 @@
 #
 # It is a seam rather than a constant because it is a *boundary* decision, and the
 # boundary belongs to the application: what a workflow's steps return, what an operator
-# needs to be able to read out of the store, and what a service written in another
-# language has to be able to parse are all questions this library cannot answer. Baking
-# `json.dumps` into four stores would answer them four times, identically, and wrongly for
-# anyone whose steps return a domain value the stdlib encoder has never heard of.
-#
-# What makes it worth naming as a protocol rather than a pair of callables is the round
-# trip. The stores do not merely encode: they compare encodings to decide who won a race
-# (`Checkpointer.record`), and they hand the *decoded* form back so a pass reads the same
-# value the next pass will. Both of those are statements about `decode(encode(x))`, which
-# is a property of the pair and not of either half.
+# needs to read out of the store, and what a service written in another language has to
+# parse are questions this library cannot answer. Baking `json.dumps` into four stores
+# would answer them four times, identically, and wrongly for anyone whose steps return a
+# domain value the stdlib encoder has never heard of.
 
 from __future__ import annotations
 
@@ -40,19 +34,17 @@ class CheckpointCodec[Encoded](Protocol):
       decides who won a race by comparing encodings, so a codec that renders one value
       two ways reports a conflict that did not happen.
 
-    Both are properties of the pair, so a codec is one object rather than two functions.
+    Both are properties of the pair, which is why a codec is one object rather than two
+    functions: the stores do not merely encode, they compare encodings to decide who won
+    a race and hand the *decoded* form back so a pass reads what the next pass will.
 
     Only the encoded side is a parameter, and that asymmetry is real rather than an
-    oversight. `Encoded` genuinely varies: the three stores here hold text, and one that
-    held bytes would say so. The decoded side cannot vary, because a checkpoint is
-    heterogeneous by construction: a workflow's `"charged"` holds a string, its `"items"`
-    a mapping, its `"settling"` a deadline, and one codec carries all of them. So a
-    store's field is a codec over `object`, and the point is sharper than "`object` in
-    practice": a `Decoded` parameter would sit in `encode`'s argument *and* `decode`'s
-    return, making it invariant, so a `CheckpointCodec[Step, str]` would be refused by
-    the very store it was written for. A parameter only one type can inhabit is not
-    carrying information, and this one would have to be threaded through `Checkpointer`,
-    `Durable`, and `Run` to get there.
+    oversight. `Encoded` genuinely varies: the stores here hold text, and one that held
+    bytes would say so. The decoded side cannot, because a checkpoint is heterogeneous by
+    construction: a workflow's `"charged"` holds a string, its `"items"` a mapping, its
+    `"settling"` a deadline, and one codec carries all of them. A `Decoded` parameter
+    would sit in `encode`'s argument *and* `decode`'s return, making it invariant, so a
+    `CheckpointCodec[Step, str]` would be refused by the very store it was written for.
 
     Precision belongs inside a codec instead, where it costs nothing: a pydantic codec's
     `TypeAdapter` can be as exact as it likes about what a workflow returns while still

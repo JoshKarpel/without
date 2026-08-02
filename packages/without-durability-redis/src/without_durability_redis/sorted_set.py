@@ -33,9 +33,8 @@
 #
 # The cost is real and it is latency. `XREADGROUP BLOCK` parks a worker inside Redis, so
 # an idle one costs nothing and a submitted order is picked up the instant it lands; a
-# sorted set has no blocking read, so this polls, and the poll interval is a floor under
-# how fast anything starts. That is the trade in one line: a stream is cheaper to wait
-# on, a sorted set is cheaper to reason about.
+# sorted set has no blocking read, so this polls. That is the trade in one line: a stream
+# is cheaper to wait on, a sorted set is cheaper to reason about.
 
 from __future__ import annotations
 
@@ -56,7 +55,7 @@ from without_durability.seams import check_duration
 from without_durability.stepwise import now_utc
 
 # How often a worker with nothing to do asks again. This is the price of losing the
-# blocking read, so it is the one number to look at if scheduler feel slow.
+# blocking read, so it is the one number to look at if wakeups feel slow.
 POLL = timedelta(milliseconds=50)
 
 # Take the first workflow that is visible and push it a lease into the future, in one
@@ -125,7 +124,10 @@ class RedisSetScheduler:
     # the lease is measured by the server (in `TAKE`) and a deadline was chosen by the
     # workflow itself. Injected so a test can place a wakeup in a clock it controls.
     now: Callable[[], datetime] = now_utc
-    scripts: tuple[AsyncScript, ...] = field(init=False, repr=False, compare=False)
+    # One field per script rather than a tuple read by index, so the name a call site uses
+    # is checked against the script it was registered with instead of agreeing by position.
+    take: AsyncScript = field(init=False, repr=False, compare=False)
+    finish: AsyncScript = field(init=False, repr=False, compare=False)
     # The two durations as the numbers the wire and `asyncio.sleep` actually want,
     # rendered once at construction. Both are read inside `next_ready`'s poll loop, which
     # is the one place here that runs more than once per unit of work.
@@ -135,18 +137,10 @@ class RedisSetScheduler:
     def __post_init__(self) -> None:
         check_duration("a lease", self.lease)
         check_duration("a poll interval", self.poll)
-        registered = tuple(self.redis.register_script(source) for source in (TAKE, DONE))
-        object.__setattr__(self, "scripts", registered)
+        object.__setattr__(self, "take", self.redis.register_script(TAKE))
+        object.__setattr__(self, "finish", self.redis.register_script(DONE))
         object.__setattr__(self, "lease_ms", int(self.lease.total_seconds() * 1000))
         object.__setattr__(self, "poll_seconds", self.poll.total_seconds())
-
-    @property
-    def take(self) -> AsyncScript:
-        return self.scripts[0]
-
-    @property
-    def finish(self) -> AsyncScript:
-        return self.scripts[1]
 
     @property
     def schedule_key(self) -> str:

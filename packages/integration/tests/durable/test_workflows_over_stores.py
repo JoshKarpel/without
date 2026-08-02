@@ -27,8 +27,8 @@ from stores import durable  # noqa: F401 - the parametrized fixture every test h
 from without_dag import CompiledGraph
 from without_durability import Checkpointer
 from without_durability import Durable
+from without_durability import InputNeeded
 from without_durability import Run
-from without_durability import Suspended
 from without_durability import claimed
 from without_durability import now_utc
 from without_durability import resume
@@ -143,7 +143,7 @@ async def test_a_workflow_suspended_on_an_approval_resumes_when_another_process_
     async def body(run: Run) -> dict[str, object]:
         return await pay_out(run, "ord-42", paying(asked), settling=timedelta(), approval_over=10_000)
 
-    with pytest.raises(Suspended) as suspension:
+    with pytest.raises(InputNeeded) as suspension:
         await passing(checkpointer, workflow, body)
 
     assert suspension.value.key == "approved-by"

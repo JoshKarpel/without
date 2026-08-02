@@ -19,13 +19,20 @@
 # store shares a filesystem, which means the exclusion holds across the processes on one
 # box and not across a fleet. That is not a defect to apologise for, it is the deployment
 # this store is for: a CLI that resumes, a desktop app, an agent on a laptop, a single
-# node that would rather not run Postgres to remember what it was doing. Reach for one of
-# the others when a second machine appears.
+# node that would rather not run Postgres to remember what it was doing.
 #
 # `sqlite3` is a blocking API, so every call here hops to a thread. The connection is not
 # thread-safe across concurrent use, so one `asyncio.Lock` serializes access to it, which
 # costs less than it looks: SQLite serializes writers anyway, and the transactions here
 # are single-digit statements over indexed rows.
+#
+# Requires SQLite 3.42 or newer (2023-05-16), which is where the `subsec` modifier
+# arrives. Every clock read below is `unixepoch('now', 'subsec')`, and without `subsec`
+# that is whole seconds: a lease and a visibility would round to the same second, so two
+# workers polling within one second of each other could both find a row visible. It is
+# not a floor `requires-python` can enforce, because Python bundles a recent SQLite on
+# Windows and macOS but on Linux `sqlite3` links whatever `libsqlite3` the distribution
+# ships. `sqlite3.sqlite_version` is what a deployment should check.
 
 from __future__ import annotations
 
@@ -95,12 +102,11 @@ CREATE INDEX IF NOT EXISTS workflow_queue_visible_at ON workflow_queue (namespac
 # the `WHERE` on `DO UPDATE` is the "is it free" check, and a conflicting row whose lease
 # has not elapsed fails it, so nothing is written and `RETURNING` yields no row.
 #
-# The clock is the database's, which here is a formality worth naming rather than a
-# guarantee. Redis and Postgres read their server's clock because the claimant is a
-# different machine and a lease compared against the caller's own clock is only as good
-# as the agreement between the two. SQLite *is* the caller's machine, so that argument
-# does not apply; keeping the clock in SQL anyway costs nothing and keeps the three
-# stores reading the same.
+# The clock is the database's, which here is a formality rather than a guarantee. Redis
+# and Postgres read their server's clock because the claimant is a different machine and
+# a lease compared against the caller's own clock is only as good as the agreement
+# between the two. SQLite *is* the caller's machine, so that argument does not apply;
+# keeping the clock in SQL anyway costs nothing and keeps the three stores reading alike.
 CLAIM = """
 INSERT INTO workflow_claim (workflow, token, held_until)
 VALUES (:workflow, 1, unixepoch('now', 'subsec') + :lease)
@@ -119,12 +125,10 @@ RETURNING token
 # therefore returns the row that was already stored, which is how a caller that lost the
 # race learns the winner's value instead of carrying on with its own.
 #
-# The second returned column is who won, which the caller cannot work out afterwards: a
-# result crosses the codec on the way in and out, so comparing what came back against what
-# went in answers a different question (see `Recorded`). Comparing the stored *text*
-# against the text this call offered answers the right one, in the statement, where both
-# are in hand. Two passes that ran the same effect and encoded it identically both count
-# as having won, which is correct: there is nothing for them to disagree about.
+# The second returned column is who won, which the caller cannot work out afterwards (see
+# `Recorded`). Comparing the stored *text* against the text this call offered answers it
+# in the statement, where both are in hand, and two passes that ran the same effect and
+# encoded it identically both count as having won: there is nothing to disagree about.
 RECORD = """
 INSERT INTO workflow_checkpoint (workflow, step, value)
 SELECT :workflow, :step, :value FROM workflow_claim
@@ -283,9 +287,9 @@ class SqliteCheckpointer:
     A workflow's completed steps as rows in one file, and its claim as a row beside them.
 
     The `Checkpointer` implementation for a deployment that is one machine, and the one
-    that needs nothing installed. It meets the same four requirements as the others, by
-    the simplest route any of them take: SQLite admits one writer, so a single statement
-    or a single `BEGIN IMMEDIATE` transaction is already all the exclusion this needs.
+    that needs nothing installed. It meets the same requirements as the others by the
+    simplest route any of them take: SQLite admits one writer, so a single statement or a
+    single `BEGIN IMMEDIATE` transaction is already all the exclusion this needs.
 
     `SqliteEffect` is a callback over the open transaction's cursor, so a step whose
     effect is a write to *this* file happens exactly once. Since the file is the whole

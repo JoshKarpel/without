@@ -8,6 +8,7 @@ from typing import Never
 
 import httpx
 import pytest
+from integration.durable.api import MAX_WORKFLOW_ID
 from integration.durable.api import Payments
 from integration.durable.api import payments_app
 from without_durability import MemoryCheckpointer
@@ -99,6 +100,41 @@ async def test_an_order_without_an_idempotency_key_is_rejected(client: httpx.Asy
 
     assert response.status_code == 422
     assert json.loads(response.text)["field"] == "idempotency-key"
+
+
+async def test_an_order_whose_idempotency_key_is_empty_is_rejected(
+    client: httpx.AsyncClient,
+    payments: Payments,
+) -> None:
+    # A header that is present and blank, which is not the same as absent: it reaches the
+    # parser as a value, and it would name a workflow every empty key shared.
+    response = await client.post("/orders", json=ORDER, headers={"idempotency-key": ""})
+
+    assert response.status_code == 422
+    assert json.loads(response.text)["field"] == "idempotency-key"
+    assert workflows(payments) == [], "no workflow was opened under the empty id"
+
+
+async def test_an_order_whose_idempotency_key_is_too_long_is_rejected(
+    client: httpx.AsyncClient,
+    payments: Payments,
+) -> None:
+    # The one thing a well-behaved sender's UUID does not establish: an id becomes key
+    # structure in the store, so an unbounded one is unbounded storage the client picks.
+    response = await client.post("/orders", json=ORDER, headers={"idempotency-key": "k" * (MAX_WORKFLOW_ID + 1)})
+
+    assert response.status_code == 422
+    assert json.loads(response.text)["field"] == "idempotency-key"
+    assert await recorded(payments) == {}, "nothing reached the store under the id it refused"
+
+
+async def test_an_order_whose_idempotency_key_is_as_long_as_the_bound_allows_is_accepted(
+    client: httpx.AsyncClient,
+) -> None:
+    # The bound itself, so a change to it cannot silently become off-by-one.
+    response = await client.post("/orders", json=ORDER, headers={"idempotency-key": "k" * MAX_WORKFLOW_ID})
+
+    assert response.status_code == 202
 
 
 async def test_an_order_whose_body_does_not_parse_is_rejected(client: httpx.AsyncClient) -> None:

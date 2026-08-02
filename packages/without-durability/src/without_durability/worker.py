@@ -2,61 +2,36 @@
 # workflow ready again. It is a `Sink` over a `Stream` and a background task, which is
 # the whole shape:
 #
-#   deliveries ──▶ pool of N passes ──▶ Suspended? ──▶ wake_at (a clock)
-#         ▲                          │             └──▶ nothing (a confirmation)
+#   deliveries ──▶ pool of N passes ──▶ ScheduledWakeup ──▶ wake_at (a clock)
+#         ▲                          │  InputNeeded     ──▶ nothing (a confirmation)
 #         │                          └──▶ done (this wakeup is answered for)
 #   reclaim one, else read one
 #   timer ──▶ wake_due (one move, in the store)
 #
-# The two arms of the `Suspended` branch are the two ways a workflow waits, and the
-# value says which: a `due` means the workflow chose the wait itself, so the worker
-# schedules the wakeup; no `due` means it is waiting on the outside world, so nobody
+# The two arms of the `Suspended` branch are the two ways a workflow waits, and its type
+# says which: a `ScheduledWakeup` is a deadline the workflow chose, so the worker
+# schedules it; an `InputNeeded` is a value the outside world owes it, so nobody
 # schedules anything and the API's confirmation is what queues it. Nothing polls a
 # workflow to ask whether it can proceed.
-#
-# Acknowledging is the crash-safety half. A delivery stays outstanding in the store
-# until `done`, so the ack goes *after* the pass and after its error handling, on every
-# path this process actually observed: a completed pass, a suspended one, and a workflow
-# whose step raised are all outcomes it saw and can answer for. Cancellation is the one
-# path that skips the ack, deliberately: a worker shutting down mid-pass has not
-# finished the work, so leaving the delivery outstanding is what lets another worker
-# reclaim it. That is why the ack is not in a `finally`.
 #
 # The delivery stream merges two sources, which is where fan-in belongs: new work, and
 # work a dead worker was holding. `reclaim` assigns the latter to *this* worker, so
 # whoever claims them must also run them, and yielding them into the same sink is
-# exactly that.
+# exactly that. Backpressure then comes free, which is the point of driving a queue as a
+# `Stream`: the pool pulls from a *lazy* source only when a slot frees, and every pull
+# takes exactly one delivery, so at `limit` passes in flight the reads simply stop and
+# the work stays where another worker can take it.
 #
-# Backpressure comes free with that shape, and is worth naming because it is the point
-# of driving a queue as a `Stream`. The pool pulls from a *lazy* source only when a slot
-# frees, and every pull takes exactly one delivery, whether it comes from the abandoned
-# pile or the stream. So a worker holds precisely as many wakeups as it is working on,
-# never more: at `limit` passes in flight the reads simply stop, the work stays in the
-# stream where another worker can take it, and nothing buffers ahead. "Pull one at a
-# time" and "run twenty at a time" are the same sentence.
-#
-# The timer is control plane and the passes are data plane, so the timer runs on its
-# own tick rather than being triggered by traffic. It is safe in every worker at once
+# The timer is control plane and the passes are data plane, so the timer runs on its own
+# tick rather than being triggered by traffic. It is safe in every worker at once
 # (see `wake_due`).
 #
 # Two claims, not one, and they answer different questions. The delivery is claimed from
 # the queue, which decides who owes an answer for this *wakeup*; the workflow is claimed
 # from the checkpoint store, which decides who may write to it. Only the second is a
-# safety property. Two `make_ready` calls for one workflow put two entries in the stream
-# and the group hands them to two workers, which is ordinary rather than exceptional
-# (the submit-then-confirm flow does it every time), so the workflow claim is what stops
-# both of them running the same unrecorded step. The loser does not queue behind the
-# winner: it schedules itself a little later and lets go, because the pass in flight may
-# well finish the work, and holding a slot to find out would spend the pool on waiting.
-#
-# Losing that claim has two arrival times and one answer. It is refused up front when
-# someone already holds the workflow, and it surfaces mid-pass as `Fenced` when this
-# pass's lease lapsed and another worker took over between two steps. Both mean the same
-# thing (somebody else is advancing this workflow), so both take the same path out, and
-# neither is a failure to warn about.
-#
-# There is still no retry policy: a workflow whose step raises is logged and
-# acknowledged, and comes back only when something wakes it.
+# safety property, and it has to exist because two wakeups for one workflow are ordinary
+# rather than exceptional: the submit-then-confirm flow produces them every time, and the
+# group hands them to two workers.
 
 from __future__ import annotations
 
@@ -82,6 +57,7 @@ from without_durability.seams import Fenced
 from without_durability.seams import Scheduler
 from without_durability.seams import check_duration
 from without_durability.stepwise import Run
+from without_durability.stepwise import ScheduledWakeup
 from without_durability.stepwise import Suspended
 from without_durability.stepwise import now_utc
 from without_durability.stepwise import resume
@@ -112,33 +88,33 @@ def passes(
     """
     The data plane: up to `limit` passes at once, and one delivery pulled per free slot.
 
-    A `Sink` because a pass produces nothing another stage consumes; what it produces
-    is recorded. A pass that raises is logged rather than propagated, since a workflow
+    A `Sink` because a pass produces nothing another stage consumes; what it produces is
+    recorded. A pass that raises is logged rather than propagated, since a workflow
     failing is this service's *data* (a gateway declined) and not a bug in the loop that
-    ran it, and taking the worker down over one workflow would stop every other. What
-    does propagate is a failure of the loop itself (the store refusing an ack), because
-    that is not something to keep running through.
+    ran it. What does propagate is a failure of the loop itself, such as the store
+    refusing an ack.
 
     The pool is `limit_concurrency` over a *lazy* mapping of the delivery stream, which
-    is what keeps "pull one at a time" and "run twenty at a time" the same statement:
-    the generator that turns a delivery into a pass is only advanced when a slot frees,
-    so the queue is never read past what this worker can start. A worker holds `limit`
-    unacknowledged deliveries at most, and the rest stay in the stream where another
-    worker can take them.
+    is what keeps "pull one at a time" and "run twenty at a time" the same statement: the
+    generator that turns a delivery into a pass is only advanced when a slot frees, so
+    the queue is never read past what this worker can start.
 
     The acknowledgement comes last, on every path this process saw through: a completed
     pass, a suspended one, a failed one, and a contended one are all answers. Only
-    cancellation skips it, which is the point, since a half-run pass should be reclaimed
-    rather than forgotten. Releasing the claim is not on that list: it happens on the way
-    out of every path including cancellation, because a shutting-down worker that keeps
-    its claim makes every other worker wait out the lease for nothing.
+    cancellation skips it, which is why it is not in a `finally`, since a half-run pass
+    should be reclaimed rather than forgotten. Releasing the claim *is* attempted on
+    every path including cancellation, because a shutting-down worker that keeps its
+    claim makes every other worker wait out the lease for nothing. On that path the
+    release is best effort: its `await` is a suspension point inside a task already being
+    cancelled, so a second cancellation can interrupt it, and nothing is lost when it
+    does because the claim expires with its lease anyway. That is why it is worth an
+    attempt and not worth shielding.
 
     Losing the workflow is handled by name rather than falling into the failure arm, and
-    it has to be: `Fenced` and `Contended` are `Interruption`s, so `except Exception` no
-    longer reaches them, and treating them as failures was never right anyway. They say
-    another pass owns the workflow, which is the same thing a refused claim says and gets
-    the same answer, so the two paths share `look_again`. What they do not get is a
-    warning, because nothing went wrong.
+    it has to be, since `Fenced` and `Contended` are `Interruption`s that `except
+    Exception` no longer reaches. They say another pass owns the workflow, which is what
+    a refused claim says too, so the two paths share `look_again` and neither gets a
+    warning.
     """
     check_duration("a lease", lease)
     check_duration("a contended interval", contended)
@@ -160,9 +136,17 @@ def passes(
         try:
             await resume(holder, durable.checkpointer, body)
         except Suspended as pause:
-            if pause.due is not None:
-                await durable.scheduler.wake_at(delivery.workflow, pause.due)
-            logger.info(f"{delivery.workflow} suspended at {pause.key}")
+            # The two ways a workflow waits, and the whole of what the worker owes each.
+            # A deadline the workflow chose is the worker's to schedule; an `InputNeeded`
+            # is not, because no clock satisfies it and whoever writes the value is what
+            # queues the workflow. That is why the wait's kind is a type rather than a
+            # nullable field: there is nothing here to ask about a `due` that may not be.
+            match pause:
+                case ScheduledWakeup(due=due):
+                    await durable.scheduler.wake_at(delivery.workflow, due)
+                case _:
+                    pass
+            logger.info(f"{delivery.workflow} {pause}")
         except (Fenced, Contended) as lost:
             # The claim lapsed mid-pass and someone else took the workflow, which is the
             # same situation as losing it outright, discovered later. So it gets the same
@@ -191,7 +175,7 @@ async def ready(
     idle: timedelta = LEASE,
 ) -> AsyncGenerator[Delivery]:
     """
-    The stream of scheduler this worker should act on: taken over, then new.
+    The stream of deliveries this worker should act on: taken over, then new.
 
     A source stream like any other, so everything downstream is ordinary wiring, and
     swapping one queue for another changes this function alone. It merges the two
@@ -261,7 +245,7 @@ async def work(
 
     Both halves are also the same shape, which is the point of the vocabulary: a sink
     over a stream. One consumes deliveries, the other consumes moments, and a deployment
-    that wants a third (trimming a Redis stream, sweeping old checkpointer) adds a task to
+    that wants a third (trimming a Redis stream, sweeping old checkpoints) adds a task to
     this group rather than a mechanism.
 
     The lease is the scheduler's rather than an argument here, and it is the one number

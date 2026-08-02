@@ -108,6 +108,8 @@ nav:
       - Reference: without-dag/reference.md
   - without-durability:
       - without-durability/index.md
+      - without-durability/guarantees.md
+      - without-durability/alternatives.md
       - Reference: without-durability/reference.md
   - without-durability-redis:
       - without-durability-redis/index.md

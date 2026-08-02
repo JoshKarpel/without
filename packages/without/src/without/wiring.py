@@ -71,6 +71,16 @@ async def ticks(every: timedelta, *, now: Callable[[], datetime] = utc_now) -> A
     later, and it never ends on its own: drive it inside a `background_task`, a task
     group, or anything else that will cancel it.
 
+    The sleep goes *after* the yield rather than being measured from it, so the period is
+    `every` plus however long the consumer took, and the moments drift later by that much
+    each time. That is the right trade for the work this drives: a sweep that runs on a
+    fixed period instead of a fixed cadence can never overlap itself, where a scheduler
+    that chased a wall-clock grid would fire back-to-back to catch up after one slow pass,
+    which is exactly the wrong response to a dependency that has gone slow. What it means
+    for a caller is that `every` is a floor on the gap between events rather than a
+    promise about when each one lands, so a consumer that needs the true elapsed time
+    reads the moment it is handed rather than counting ticks.
+
     An interval that is not positive is refused rather than run, for the same reason
     `drive` refuses a `limit` below one: it has no sensible reading, and taken literally
     it is a loop that yields as fast as the sink can consume, which pins a core to do

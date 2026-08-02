@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
 from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
@@ -24,22 +23,18 @@ from without_durability.seams import check_duration
 # Both seams over ordinary dicts, shipped rather than kept in a test directory, because
 # the whole design says a store is injected and this is the store a test should inject.
 # They are doubles rather than mocks: every mechanism (the load, the record, the resume,
-# the queue, the timer's claim, the codec) runs for real and only the storage is swapped,
-# so a test against them exercises the same code paths a server-backed one does.
+# the queue, the timer's claim, the codec) runs for real and only the storage is swapped.
 #
 # The codec is on that list for a reason worth stating plainly, because leaving it off is
 # the natural thing to do and it is what makes a double lie. A dict can hold a value
 # directly, so encoding into it looks like ceremony; but then a step's result comes back
 # by identity here and through a round trip everywhere else, and every property that
-# depends on the round trip (what a resumed pass reads, whether two encodings agree)
-# passes in the suite and fails in production. So `hashes` holds *encoded* values, exactly
-# as a Redis hash or a `TEXT` column does, and reading a checkpoint means `load`.
+# depends on the round trip passes in the suite and fails in production. So `hashes`
+# holds *encoded* values, exactly as a Redis hash or a `TEXT` column does.
 #
 # What that buys is a suite with no container in it. What it costs is the one thing a
-# single process cannot stand in for: these hold their state in this process's memory, so
-# nothing here says whether a *second* process would see the same exclusion. That is
-# exactly what the store-backed suites are for, and it is why meeting the protocol's
-# requirements here is not optional (see `MemoryCheckpointer`).
+# single process cannot stand in for: nothing here says whether a *second* process would
+# see the same exclusion, which is exactly what the store-backed suites are for.
 
 # What an effect is for a store whose datastore is a dict: a function over that dict,
 # returning the value to record. A Redis store's is a Lua script and a SQL store's is a
@@ -57,23 +52,22 @@ class MemoryCheckpointer:
     only way a test against it says anything about a real store: tokens rise per
     workflow, a write below the fence raises `Fenced`, and a key already recorded is
     never overwritten. Every method is synchronous between its `await`s, which is this
-    store's version of a Lua script or a transaction: nothing can interleave halfway
-    through a claim or a conditional write, so it enforces atomicity the way a real store
-    does rather than pretending the question does not arise.
+    store's version of a Lua script or a transaction.
 
     A workflow whose checkpoint is a dict in this process is durable across exactly
     nothing, so this is for tests and for driving a workflow in a script, not for a
-    deployment. Every other store here is the same code with the dict somewhere else.
-
-    `hashes` holds what the codec produced, not what a step returned, so reading a
-    checkpoint back means `load` rather than reaching into it. That is the same distance
-    a real store puts between a caller and its bytes, and keeping it here is what makes a
-    test against this double say anything about a test against Redis.
+    deployment. `hashes` holds what the codec produced rather than what a step returned,
+    so reading a checkpoint back means `load` rather than reaching into it.
     """
 
-    hashes: dict[str, dict[str, str]] = field(default_factory=lambda: defaultdict(dict))
-    tokens: dict[str, int] = field(default_factory=lambda: defaultdict(int))
-    held_until: dict[str, float] = field(default_factory=lambda: defaultdict(float))
+    # Plain dicts rather than `defaultdict`s, because the annotation is the contract: a
+    # `defaultdict` field typed as `dict` accepts a `dict` at construction and then fails
+    # on the first write, which is a store the type says you may build and the code says
+    # you may not. What the default lookup bought was two characters at each read, and
+    # what it cost was that every read of an unknown workflow silently grew the mapping.
+    hashes: dict[str, dict[str, str]] = field(default_factory=dict)
+    tokens: dict[str, int] = field(default_factory=dict)
+    held_until: dict[str, float] = field(default_factory=dict)
     codec: CheckpointCodec[str] = JSON
     # This store's *other* data, standing in for the application tables that live
     # alongside a checkpoint. `transact` is only meaningful over something like it, and
@@ -83,20 +77,22 @@ class MemoryCheckpointer:
     data: dict[str, object] = field(default_factory=dict)
 
     async def load(self, workflow: str) -> dict[str, object]:
-        # `get` rather than the `defaultdict`'s own lookup: reading a workflow is not
-        # creating one, and this is the call a status endpoint makes for an id nobody
-        # has ever submitted, so indexing here would grow the mapping by one empty
-        # entry per miss for as long as the process lives.
+        # Reading a workflow is not creating one, and this is the call a status endpoint
+        # makes for an id nobody has ever submitted.
         return {key: self.codec.decode(encoded) for key, encoded in self.hashes.get(workflow, {}).items()}
 
     async def claim(self, workflow: str, lease: timedelta) -> Pass | None:
-        if self.held_until[workflow] > monotonic():
+        if self.held_until.get(workflow, 0.0) > monotonic():
             return None
-        self.tokens[workflow] += 1
+        token = self.tokens.get(workflow, 0) + 1
+        self.tokens[workflow] = token
         self.held_until[workflow] = monotonic() + lease.total_seconds()
-        return Pass(workflow=workflow, token=self.tokens[workflow])
+        return Pass(workflow=workflow, token=token)
 
     async def record(self, holder: Pass, key: str, value: object) -> Recorded:
+        # Indexed rather than defaulted, here and in `transact` and `release`: a `Pass`
+        # exists only because `claim` wrote a token for that workflow, so a miss is a
+        # broken invariant and worth a `KeyError` rather than a `0` that fences nobody.
         if holder.token < self.tokens[holder.workflow]:
             raise Fenced(f"pass {holder.token} of {holder.workflow!r} was superseded")
         encoded = self.codec.encode(value)
@@ -104,7 +100,7 @@ class MemoryCheckpointer:
         # handing back what is now stored: ours when we won, and the earlier writer's
         # when we did not. Comparing encodings rather than values is what makes a tie
         # (two passes that ran the same effect) count as winning for both.
-        stored = self.hashes[holder.workflow].setdefault(key, encoded)
+        stored = self.hashes.setdefault(holder.workflow, {}).setdefault(key, encoded)
         return Recorded(value=self.codec.decode(stored), first=stored == encoded)
 
     async def transact(self, holder: Pass, key: str, effect: MemoryEffect) -> object:
@@ -112,20 +108,21 @@ class MemoryCheckpointer:
         Run `effect` over this store's own data and record it, without an `await` between.
 
         The in-memory answer to the question Redis answers with a script and SQL with a
-        transaction: this
-        store's datastore is `data`, so an effect is a function over `data`, and single
-        threaded code with no suspension point is its transaction. Which is the point of
-        `Effect` being a type parameter, since nothing about `LuaEffect` would fit here.
+        transaction: this store's datastore is `data`, so an effect is a function over
+        `data`, and single-threaded code with no suspension point is its transaction.
+        Which is the point of `Effect` being a type parameter, since nothing about
+        `LuaEffect` would fit here.
         """
         if holder.token < self.tokens[holder.workflow]:
             raise Fenced(f"pass {holder.token} of {holder.workflow!r} was superseded")
-        recorded = self.hashes[holder.workflow]
+        recorded = self.hashes.setdefault(holder.workflow, {})
         if key not in recorded:
             recorded[key] = self.codec.encode(effect(self.data))
         return self.codec.decode(recorded[key])
 
     async def supply(self, workflow: str, key: str, value: object) -> object:
-        return self.codec.decode(self.hashes[workflow].setdefault(key, self.codec.encode(value)))
+        stored = self.hashes.setdefault(workflow, {}).setdefault(key, self.codec.encode(value))
+        return self.codec.decode(stored)
 
     async def release(self, holder: Pass) -> None:
         # The token stays, so the next claim outranks this one: releasing hands the

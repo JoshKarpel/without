@@ -4,10 +4,8 @@
 # `(node key, result)` as each step lands, and `checkpoint=` takes that same mapping
 # back. The engine is a loop.
 #
-# What this is *not* is a workflow framework. There is no scheduler, no worker fleet,
-# no retry policy: the caller decides when to run and how often, and a run is just an
-# `await`. That keeps the control flow visible in the caller's code, which is the same
-# reason `without` is a library rather than a framework.
+# There is no scheduler here, no worker fleet, and no retry policy: the caller decides
+# when to run and how often, and a run is just an `await`.
 #
 # This is the only module here that depends on `without-dag`. The other mechanism
 # (`stepwise`) needs no graph at all, and the two share nothing but the `Checkpointer`
@@ -58,46 +56,28 @@ async def run_durably[*Ins, Out](
     value: the graph handed its own to the node's dependents the moment the node
     finished, so the run is already downstream of a value the store rejected, and
     the only honest move left is to stop. Holding a claim makes that rare, and it
-    is `Fenced` rather than this when the claim has lapsed.
+    is `Fenced` rather than this when the claim has lapsed. Whether the store took
+    the value is `Recorded.first` rather than something inferred by comparison,
+    since a result crosses a `CheckpointCodec` and a run that won outright can be
+    handed back something unequal.
 
-    The store says whether it took the value; this does not infer it by comparing
-    what came back. A node's result crosses a `CheckpointCodec`, so a run that won
-    outright can still be handed back something unequal (a tuple returns as a list
-    under the default JSON codec), and reading that as a lost race would report a
-    second pass that does not exist. `Recorded.first` is the store's own answer.
-
-    With that separated out, the comparison itself becomes the *other* check worth
-    making, and this is the one place able to make it. A graph hands a node's result
-    straight to its dependents, so a node computed in this pass feeds them `fn`'s
-    own return value while the same node restored from the store would feed them
-    whatever the codec rebuilt. If those differ, the workflow is not resumable and
-    nothing later can tell: the dependents would see a `tuple` on the pass that
-    computed it and a `list` on the pass that restored it, and no crash is needed
-    for the two to disagree. Here both values are in hand at once, so a node whose
+    With that separated out, the comparison becomes the *other* check worth making,
+    and this is the one place able to make it, because it holds both values at once.
+    A graph feeds a node's result straight to its dependents, so without it they see
+    a `tuple` on the pass that computed the node and a `list` on the pass that
+    restored it, with no crash needed for the two to disagree. So a node whose
     result does not survive its own store is refused on the pass that wrote it,
-    naming the node, rather than going wrong quietly on a pass days later.
-
-    That is why the graph needs no per-node parser where `stepwise` does. Verifying
-    beats parsing when you still hold what you sent, and `run.step` does not:
-    `Run.awaiting` reads a value some *other* process wrote, so there is nothing to
-    compare it against and a parser is the only thing that can establish its shape.
-    The check here is also inductive rather than per-pass, since every value in a
-    checkpoint this runner wrote passed it on the way in.
-
-    The exactly-once claim reaches exactly as far as that write: a crash between a
-    node's effect and its record leaves the effect done and unrecorded, so the
-    resumed run repeats it. That is at-least-once, and the answer for anything
-    that leaves the datastore is the one every durable engine gives: make the
-    effect itself idempotent, by passing the workflow as the payment gateway's
-    idempotency key, rather than pretending the gap is closable here.
+    naming the node. That is also why a graph needs no per-node parser where
+    `stepwise` does: verifying beats parsing when you still hold what you sent.
 
     A graph gets no `transact`, and the reason is the graph rather than the store.
-    `Checkpointer.transact` closes that gap for effects the store can perform
-    itself, but it closes it by making the effect and the record one call, and a
-    node is an ordinary async function this runner only sees the *result* of. The
-    stepwise mechanism reaches it because a step names its effect at the call site
+    Closing the at-least-once gap means making the effect and the record one call,
+    and a node is an ordinary async function this runner only sees the *result* of.
+    A step reaches it because it names its effect at the call site
     (`run.transact(...)`); expressing that here would mean a node type that hands
-    the graph an effect instead of running one.
+    the graph an effect instead of running one. So a crash between a node's effect
+    and its record repeats the effect, and the answer for anything leaving the
+    datastore is the ordinary one: make it idempotent under the workflow id.
 
     A graph whose output is one of its own *entries* is refused rather than run.
     `evaluate` supports that identity plan, because an entry it was handed is a
@@ -160,23 +140,20 @@ async def run_saga[In, Out, Reached, Undone](
     failure *inside* the compensation propagates in its place, carrying the original
     as its context, since a half-unwound saga is the more urgent problem.
 
-    Cancellation is not caught, and neither is any other `Interruption`. They are not
-    failed workflows but stopped passes, and each stops for a reason that makes
-    unwinding actively wrong rather than merely unnecessary. Cancellation would fire
-    the compensations while their forward steps may still be running. `Fenced` and
-    `Contended` are worse: they say another pass holds this workflow and is advancing
-    it, so a loser that compensated would refund a charge the winner is still
-    building on, and would do it under a claim on `:unwind` that the winner has no
-    reason to be holding. Descending from `BaseException` is what keeps the `except
-    Exception` below from reaching them, so the rule is enforced by the exceptions'
-    own shape rather than by a list of types kept correct here.
+    Cancellation is not caught, and neither is any other `Interruption`. Each stops
+    for a reason that makes unwinding actively wrong: cancellation would fire the
+    compensations while their forward steps may still be running, and `Fenced` or
+    `Contended` says another pass holds this workflow and is advancing it, so a loser
+    that compensated would refund a charge the winner is still building on.
+    Descending from `BaseException` is what keeps the `except Exception` below from
+    reaching them, so the rule is enforced by the exceptions' own shape rather than
+    by a list of types kept correct here.
 
     The rollback's id is the workflow's own with `:unwind` appended, which puts one
     constraint on ids in exchange for needing no second namespace: an id that already
     ends in `:unwind` addresses another workflow's rollback. Deriving a sibling by
-    suffixing is what makes that true, so it holds against any store rather than being
-    a property of how one of them builds keys, and like the rest of the id contract it
-    is stated rather than checked.
+    suffixing is what makes that true against any store rather than being a property
+    of how one of them builds keys, and it is stated rather than checked.
     """
     try:
         return await run_durably(forward, checkpointer, holder, value)
