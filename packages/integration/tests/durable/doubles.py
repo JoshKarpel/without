@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict
 from collections import deque
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from dataclasses import field
@@ -14,6 +15,11 @@ from time import monotonic
 from integration.durable.shell import Fenced
 from integration.durable.shell import Pass
 from integration.durable.wakeups import Delivery
+
+# What an effect is for a store whose datastore is a dict: a function over that dict,
+# returning the value to record. The Redis store's is a Lua script; a Postgres one's
+# would take a session. Nothing is shared between them but the position in `transact`.
+type MemoryEffect = Callable[[dict[str, object]], object]
 
 # The two stores the durable toys talk through, in memory. They are doubles rather
 # than mocks: every mechanism here (the load, the record, the resume, the queue, the
@@ -38,6 +44,9 @@ class MemoryCheckpoints:
     hashes: dict[str, dict[str, object]] = field(default_factory=lambda: defaultdict(dict))
     tokens: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     held_until: dict[str, float] = field(default_factory=lambda: defaultdict(float))
+    # This store's *other* data, standing in for the application tables that live
+    # alongside a checkpoint. `transact` is only meaningful over something like it.
+    data: dict[str, object] = field(default_factory=dict)
 
     async def load(self, workflow: str) -> dict[str, object]:
         return dict(self.hashes[workflow])
@@ -53,6 +62,23 @@ class MemoryCheckpoints:
         if holder.token < self.tokens[holder.workflow]:
             raise Fenced(f"pass {holder.token} of {holder.workflow!r} was superseded")
         return await self.supply(holder.workflow, key, value)
+
+    async def transact(self, holder: Pass, key: str, effect: MemoryEffect) -> object:
+        """
+        Run `effect` over this store's own data and record it, without an `await` between.
+
+        The in-memory answer to the same question Redis answers with a script: this
+        store's datastore is `data`, so an effect is a function over `data`, and single
+        threaded code with no suspension point is its transaction. Which is the point of
+        `Effect` being a type parameter, since nothing about `LuaEffect` would fit here.
+        """
+        if holder.token < self.tokens[holder.workflow]:
+            raise Fenced(f"pass {holder.token} of {holder.workflow!r} was superseded")
+        recorded = self.hashes[holder.workflow]
+        if key in recorded:
+            return recorded[key]
+        recorded[key] = effect(self.data)
+        return recorded[key]
 
     async def supply(self, workflow: str, key: str, value: object) -> object:
         return self.hashes[workflow].setdefault(key, value)

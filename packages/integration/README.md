@@ -22,7 +22,10 @@ and the answer it arrives at is a dict lookup, a queue, and a handful of small
 Lua scripts. Those scripts are the point: exclusion has to be enforced by
 whatever holds the data, which is what Temporal builds a server for and DBOS
 requires Postgres for, and here it is stated as requirements on the store seam.
-It is a validation artifact rather than a substitute for either:
+The same reasoning gets exactly-once out of Redis, since a script is an atomic
+commit over Redis data and the real constraint on co-committing an effect with
+its checkpoint is that both live in one datastore, not that one of them is
+Postgres. It is a validation artifact rather than a substitute for either:
 [`durable/README.md`](src/integration/durable/README.md) is the design, where the
 guarantee lives, the gaps that remain, and how it sits against those systems.
 

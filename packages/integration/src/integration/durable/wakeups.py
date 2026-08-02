@@ -126,6 +126,12 @@ class Wakeups(Protocol):
 # oldest entries are the ones nobody has run yet. A queue that sheds unread work under
 # load is worse than one that grows. What bounds it instead is trimming by `MINID` once
 # entries are acknowledged, which is a control-plane job this toy leaves out.
+#
+#   KEYS[1]  the sleeping sorted set, scored by deadline
+#   KEYS[2]  the ready stream
+#   ARGV[1]  now, as a unix timestamp in seconds
+#   ARGV[2]  how many to move at most, so one tick cannot drain an unbounded backlog
+#   returns  the workflows moved, empty when another timer got to them first
 WAKE_DUE = """
 local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
 for _, workflow in ipairs(due) do

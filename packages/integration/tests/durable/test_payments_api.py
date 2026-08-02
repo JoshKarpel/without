@@ -4,6 +4,7 @@ import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import timedelta
+from typing import Never
 
 import httpx
 import pytest
@@ -152,6 +153,11 @@ class BrokenCheckpoints:
         return Pass(workflow=workflow, token=1)
 
     async def record(self, holder: Pass, key: str, value: object) -> object:  # pragma: no cover - same
+        raise RuntimeError("the store is down")
+
+    async def transact(self, holder: Pass, key: str, effect: Never) -> object:  # pragma: no cover - uncallable
+        # `Never` is how a store says it cannot co-commit anything: no caller can produce
+        # an argument for this, so the method exists without being reachable.
         raise RuntimeError("the store is down")
 
     async def release(self, holder: Pass) -> None:  # pragma: no cover - same

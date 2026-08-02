@@ -80,6 +80,29 @@
   to look again rather than run beside them. What this does not reach is the gap between an effect
   and its record, which stays at-least-once: closing that needs the step and the checkpoint in one
   transaction, which is what DBOS gets from Postgres and no Redis store can offer.
+- **`integration`**: `Run.transact`, which performs an effect and records it in one commit, making
+  that step exactly-once rather than at-least-once. `step` runs an effect and then writes the
+  record, so a crash between them leaves the effect done and unrecorded and the next pass repeats
+  it; `transact` hands the store an effect it can perform itself, so there is no in-between. The
+  reason this works on Redis is worth stating, because the usual framing (that exactly-once needs
+  Postgres) is wrong about why: a Lua script is an atomic commit over Redis data, and the real
+  constraint is that you can only transact within one datastore. Postgres wins only for effects
+  that live in that Postgres, and loses for everything else exactly as Redis does. So `Checkpoints`
+  is now generic over the type of effect a store can commit: `LuaEffect` for Redis (a script
+  spliced into a wrapper supplying the fence check and the record, with `KEYS` and `ARGV` rebound
+  so it is written as if it ran alone), a function over its own dict for the in-memory double, a
+  session callback for a Postgres store that does not exist yet. The parameter defaults to `Never`,
+  so a store with nothing to offer says so in its type and `transact` becomes uncallable rather
+  than absent, and code that never transacts keeps the bare `Checkpoints` annotation. On a cluster
+  the effect's keys must carry the workflow's own hash tag, since a script spanning two slots is a
+  distributed transaction wearing a local disguise.
+- **`integration`**: a workflow's fencing token is now `max(now_ms, previous + 1)`, a hybrid
+  logical clock rather than a counter. The checkpoint and the claim expire together, so a workflow
+  quiet for longer than the TTL is forgotten entirely; a counter would then hand a reused id token
+  1 while a pass stalled since before the expiry still held token 3, and the corpse would outrank
+  the living. Seeding from the server clock closes that without coupling the two keys' lifetimes,
+  and falling back to `previous + 1` keeps it strictly monotonic within one incarnation even if the
+  clock steps backwards.
 - **`integration`**: `durable.schedule`, a second `Wakeups` that replaces the stream and the
   sleeping sorted set with one sorted set scored by when each workflow becomes visible. Queued now
   is a score in the past, sleeping is a score in the future, and being worked on is a score one

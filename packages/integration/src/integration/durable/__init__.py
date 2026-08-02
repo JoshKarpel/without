@@ -31,6 +31,7 @@ from integration.durable.stepwise import Suspended
 from integration.durable.stepwise import now_utc
 from integration.durable.stepwise import parse_deadline
 from integration.durable.stepwise import resume
+from integration.durable.store import LuaEffect
 from integration.durable.store import RedisCheckpoints
 from integration.durable.wakeups import Delivery
 from integration.durable.wakeups import RedisWakeups
@@ -48,6 +49,7 @@ __all__ = [
     "Contended",
     "Delivery",
     "Fenced",
+    "LuaEffect",
     "Order",
     "Pass",
     "Payments",

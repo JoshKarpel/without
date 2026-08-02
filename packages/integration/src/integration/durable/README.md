@@ -23,7 +23,7 @@ core.py      a fulfilment graph and its compensations (pure)
 shell.py     run_durably / run_saga over a Checkpoints seam
 stepwise.py  the same durability for an ordinary async function
 payout.py    a workflow the graph cannot express (pure)
-store.py     Checkpoints as a Redis hash, JSON-encoded, plus the claim
+store.py     Checkpoints as a Redis hash, JSON-encoded: the claim, and LuaEffect
 wakeups.py   a Redis stream of ready ids and a deadline-scored sorted set
 schedule.py  the same Wakeups as one sorted set, as a drop-in alternative
 worker.py    the queue worker and its timer
@@ -178,25 +178,55 @@ implementations are *not* interchangeable, and the bottom row is why.
 | Exclusive pass with a fencing token | `HINCRBY` plus a lease, in a script | advisory lock or `SELECT FOR UPDATE` | one pass at a time, holding even when a process stalls past its lease |
 | Step and checkpoint in one commit | a Lua script, for effects in *this* Redis | a transaction, for effects in *this* database | exactly-once for that step |
 
-The first three are implemented here, in `store.py`. The fourth is not, and the
-reason is worth stating precisely, because the obvious phrasing is wrong. It is
-not that Redis lacks what Postgres has: a Lua script is an atomic commit over
-Redis data, so a step whose effect *is* a Redis write could record itself in the
-same script exactly as DBOS records itself in the same transaction. The real
-constraint is that you can only transact within a single datastore. Postgres
-wins this row only for effects that live in that Postgres, and loses it for
-everything else in precisely the same way Redis does.
+All four are implemented, and the fourth is worth stating carefully because the
+obvious phrasing is wrong. It is not that Redis lacks what Postgres has: a Lua
+script is an atomic commit over Redis data, so a step whose effect *is* a Redis
+write records itself in the same script exactly as DBOS records itself in the
+same transaction. The real constraint is that you can only transact within a
+single datastore. Postgres wins this row only for effects that live in that
+Postgres, and loses it for everything else in precisely the way Redis does.
 
-That reframes what a family of stores is for. `without-durability-redis` and
-`without-durability-postgres` would not be one good implementation and one
-compromise; they would be the same offer made to two populations, each able to
-co-commit for effects that live where its checkpoint lives. What neither can do
-is the distributed transaction, which nobody can, and which is why the effects
-that cross a boundary (a payment gateway, a carrier) stay at-least-once and lean
-on an idempotency key. The seam does not currently have a way to *ask* for the
-fourth row, though. That is the concrete next piece of design: a `record` variant
-that hands the caller the transaction, which on Redis is a script and on Postgres
-is a session.
+`Run.transact` is where that lands. `step` performs an effect and then writes the
+record, so a crash in between leaves the effect done and unrecorded and the next
+pass repeats it. `transact` hands the store an effect it can perform itself, and
+the store does the work and writes the record in one commit, so there is no
+in-between for a crash to occupy:
+
+```python
+await run.transact(
+    "reserved",
+    LuaEffect(
+        source="return cjson.encode(redis.call('HINCRBY', KEYS[1], ARGV[1], tonumber(ARGV[2])))",
+        keys=(f"{checkpoints.hash_key(workflow)}:ledger",),
+        args=("piano", 1),
+    ),
+)
+```
+
+That step is exactly-once on Redis. Run the workflow ten times and the ledger
+moves once, without an idempotency key and without the effect being written to
+tolerate repetition.
+
+What it costs is that the effect has to be something the store can perform, which
+means it has to live in the store. An effect that leaves the datastore (a payment
+gateway, a carrier) cannot be in the commit, is not a transaction anyone can
+offer, and belongs in `step` behind an idempotency key. On a Redis Cluster the
+same constraint appears as a slot: an effect's keys must carry the workflow's own
+`{id}` tag, because a script spanning two slots is a distributed transaction
+wearing a local disguise.
+
+This is why `Checkpoints` is generic. `Checkpoints[Effect]` names the type of
+thing *this* store can commit alongside a record, and there is no shared answer:
+Redis takes a Lua script, an in-memory store takes a function over its own dict
+(`tests/durable/doubles.py`), and a Postgres one would take a callback handed the
+session. `Effect` defaults to `Never`, so a store with nothing to offer here says
+so in its type and `transact` becomes uncallable rather than absent, while code
+that never transacts keeps writing the bare `Checkpoints` and still accepts every
+store.
+
+So a family of stores is not one good implementation and one compromise. It is
+the same offer made to two populations, each able to co-commit for the effects
+that live where its checkpoint lives.
 
 Three notes on the shape that took, since none of them is obvious:
 
@@ -232,6 +262,18 @@ rather than anything wrong with a single structure.
 The braces are Redis Cluster's hash tag, so the first two land on one slot and a
 script may touch both. The last two are shared by every workflow, which is why
 they carry the queue's namespace rather than a workflow's id.
+
+That split decides where a workflow id is *structure* and where it is merely
+data. In the two per-workflow keys it is interpolated into the key name, so it
+carries a contract: no braces (they would delimit the hash tag instead of it),
+bounded length, and not ending in `:unwind`, which is how `run_saga` names a
+rollback. In the queue it is a stream field or a sorted-set member, so none of
+that applies. `RedisCheckpoints` documents the contract and does not enforce it,
+on the grounds that a UUID satisfies it without trying and validating every call
+to catch someone who went out of their way is the wrong trade. A store that bound
+the id as a query parameter rather than concatenating it would have no contract
+at all, which is the tell that this is a property of building keys by
+interpolation rather than of workflow ids.
 
 ### One order, end to end
 
@@ -291,18 +333,18 @@ which is what lets `GET /orders/{id}` be `HGETALL` with no filtering.
 
 **The claim** is born on the first `claim` and has a fixed two-field shape.
 `token` only rises, `until` moves forward on a claim and to zero on a release. It
-shares the checkpoint's TTL and is re-armed alongside it, which is deliberate:
-the fence must not outlive the checkpoint it protects, and must not die before it
-either.
+shares the checkpoint's TTL and is re-armed alongside it.
 
-That second half is where the one genuinely sharp edge is. Because both keys
-expire together, a workflow that goes quiet for longer than the TTL loses its
-fence *and* its checkpoint, and the counter restarts at 1. A pass still holding
-token 3 from before could then write into a fresh workflow that reused the id,
-because 3 outranks 1. It needs an expiry, an id reuse, and a pass stalled for
-longer than a day all at once, so it is remote rather than likely, but it is the
-honest reading of tying the two lifetimes together and it is why the TTL is not
-merely a retention knob.
+Sharing that lifetime is what makes the token's arithmetic worth a second look.
+Both keys expire together, so a workflow quiet for longer than the TTL is
+forgotten entirely, fence included. Were the token a plain counter, a reused id
+would restart it at 1 while a pass stalled since before the expiry still held
+token 3, and the corpse would outrank the living. So the token is
+`max(now_ms, previous + 1)`: a hybrid logical clock rather than a counter, seeded
+from the server's wall clock so that any later claim is stamped with a later
+millisecond, and falling back to `previous + 1` to stay strictly monotonic within
+one incarnation even if the clock steps backwards. That closes the hazard without
+having to couple the two keys' lifetimes at all.
 
 **The queue** is the one with no lifetime at all. Every `make_ready` and every
 `wake_due` appends, and nothing removes. Trimming has to be by `MINID` behind
@@ -378,13 +420,14 @@ is shorter than the sleep semantics this same package advertises.
 
 The rest are ordinary missing features, expected in something this size:
 
-- **An effect is still at-least-once.** The claim stops a second pass from
-  starting, and the fence stops a superseded one from writing, but neither
-  reaches the gap between an effect happening and its record landing. A pass that
-  crashes in that window leaves the gateway charged and the checkpoint silent,
-  and the next pass charges again. Only the bottom row of the table above closes
-  that, and only for effects in the same database. Everything else makes the
-  effect itself idempotent, which is what the workflow id is for.
+- **An effect outside the store is still at-least-once.** The claim stops a
+  second pass from starting, and the fence stops a superseded one from writing,
+  but neither reaches the gap between an effect happening and its record landing.
+  A pass that crashes in that window leaves the gateway charged and the
+  checkpoint silent, and the next pass charges again. `transact` closes that, but
+  only for effects the store can perform itself, which a payment gateway is not.
+  For everything that crosses a boundary the answer is the ordinary one: make the
+  effect idempotent, which is what the workflow id is for.
 - **The lease is a guess, not a bound.** `LEASE` has to exceed the longest a pass
   can honestly take. Set it too short and a slow pass is fenced mid-flight and
   has to be re-run; too long and a crashed worker's workflow waits that long.

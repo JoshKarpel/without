@@ -8,6 +8,7 @@ from datetime import timedelta
 
 import pytest
 from doubles import MemoryCheckpoints
+from doubles import MemoryEffect
 from integration.durable import Contended
 from integration.durable import Fenced
 from integration.durable import Payouts
@@ -312,6 +313,73 @@ async def test_a_step_returns_what_the_store_holds_rather_than_what_its_effect_p
     run = Run(holder=holder, checkpoints=checkpoints, recorded={})
 
     assert await run.step("charged", lambda: answering("ch-just-now")) == "ch-recorded-earlier"
+
+
+def tallying(counter: str) -> MemoryEffect:
+    """An effect over the store's own data: bump a counter, record what it reached."""
+
+    def bump(data: dict[str, object]) -> object:
+        running = data.get(counter, 0)
+        assert isinstance(running, int)
+        data[counter] = running + 1
+        return data[counter]
+
+    return bump
+
+
+async def test_a_step_whose_record_never_lands_runs_its_effect_again() -> None:
+    # The at-least-once bound, made concrete, so the next test has something to beat.
+    # `step` performs the effect and *then* writes the record, and a pass that dies in
+    # between leaves the effect done and unrecorded, so the next pass repeats it.
+    checkpoints = MemoryCheckpoints()
+    holder = await claimed(checkpoints, ORDER)
+    run = Run(holder=holder, checkpoints=checkpoints, recorded={})
+    effect = tallying("charges")
+
+    async def charge() -> object:
+        return effect(checkpoints.data)
+
+    await run.step("charged", charge)
+    checkpoints.hashes[ORDER].clear()  # the record that a crash lost
+    await Run(holder=holder, checkpoints=checkpoints, recorded={}).step("charged", charge)
+
+    assert checkpoints.data["charges"] == 2, "the card was charged twice, which is what an idempotency key is for"
+
+
+async def test_a_transacted_step_cannot_be_run_without_being_recorded() -> None:
+    # Exactly-once, because there is no in-between for a crash to land in: the effect and
+    # its record are one commit, so a record that is missing means the effect did not
+    # happen either. Losing the record the way the test above does is not something a
+    # crash can produce here, so the only way to re-reach this step is a fresh pass, and
+    # a fresh pass finds it recorded and performs nothing.
+    checkpoints = MemoryCheckpoints()
+    holder = await claimed(checkpoints, ORDER)
+
+    first = await Run(holder=holder, checkpoints=checkpoints, recorded={}).transact("charged", tallying("charges"))
+    again = await Run(
+        holder=holder,
+        checkpoints=checkpoints,
+        recorded=await checkpoints.load(ORDER),
+    ).transact("charged", tallying("charges"))
+    fresh = await Run(holder=holder, checkpoints=checkpoints, recorded={}).transact("charged", tallying("charges"))
+
+    assert (first, again, fresh) == (1, 1, 1), "one effect, however many passes reach it"
+    assert checkpoints.data["charges"] == 1
+    assert checkpoints.hashes[ORDER] == {"charged": 1}
+
+
+async def test_a_transacted_step_is_refused_from_a_superseded_pass() -> None:
+    # The fence covers `transact` as it covers `record`, and it has to: a stalled pass
+    # performing its effect is worse here than a stalled write, since the effect is real.
+    checkpoints = MemoryCheckpoints()
+    stalled = await claimed(checkpoints, ORDER)
+    await checkpoints.release(stalled)
+    await claimed(checkpoints, ORDER)
+
+    with pytest.raises(Fenced):
+        await Run(holder=stalled, checkpoints=checkpoints, recorded={}).transact("charged", tallying("charges"))
+
+    assert checkpoints.data == {}, "refused before the effect ran, not after"
 
 
 async def test_a_deadline_recorded_as_something_else_fails_loudly() -> None:

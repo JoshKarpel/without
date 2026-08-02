@@ -26,6 +26,7 @@ from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
+from typing import Never
 from typing import Protocol
 from typing import cast
 
@@ -69,9 +70,20 @@ class Fenced(Exception):
     """
 
 
-class Checkpoints(Protocol):
+class Checkpoints[Effect = Never](Protocol):
     """
     Where a workflow's completed work is kept, and who is currently allowed to add to it.
+
+    `Effect` is how *this* store expresses a piece of work it can perform and record in
+    one commit, and it is a type parameter because there is no shared answer: a Redis
+    store takes a Lua script over keys in that same Redis, a Postgres one would take a
+    callback handed the transaction's session, and an in-memory one takes a function over
+    its own dict. A store with nothing to offer here uses `Never`, which makes `transact`
+    uncallable rather than absent, since a caller cannot produce a value of that type.
+    That is also the default, so bare `Checkpoints` reads as "any store, never mind what
+    it can co-commit". An effect only ever goes *in*, so the parameter is contravariant
+    and `Checkpoints[Never]` is the supertype every concrete store satisfies: code that
+    does not transact keeps the plain annotation and still accepts all of them.
 
     The narrow seam a durable runner talks through, so the store is injected rather than
     reached for: a Redis hash in production (`store.RedisCheckpoints`), a plain dict in a
@@ -97,10 +109,22 @@ class Checkpoints(Protocol):
       least agree on its result rather than diverging.
     - `record` and `supply` MUST make the value durable before returning.
 
-    What no implementation can offer is a `record` that runs in the same transaction as
-    the effect it is recording, unless the effect writes to the same store. That gap is
-    what keeps every step at-least-once (see `run_durably`), and it is the one thing on
-    this list that a store can be *unable* to provide rather than merely fail to.
+    `transact` is the one that changes the guarantee rather than protecting it, and it
+    is why `Effect` exists. `record` is a second round trip after an effect already
+    happened, so a crash in between leaves the effect done and unrecorded: at-least-once,
+    the bound every durable engine lands on. `transact` closes that for the effects it
+    can, by performing the work and writing the record in a single commit. It MUST run
+    the effect at most once across every pass of a workflow, returning the recorded value
+    without re-running when the step is already recorded, and it MUST NOT leave the
+    effect applied without its record or the reverse.
+
+    What bounds it is not this seam and not the store's feature list: you can only
+    transact within one datastore. A Lua script commits atomically over Redis data, a
+    Postgres transaction over Postgres data, and neither reaches the other or a payment
+    gateway. So `transact` is available exactly for effects that live where the
+    checkpoint lives, and everything else stays `record` plus an idempotent effect keyed
+    by the workflow id. Postgres is not privileged here, it just tends to be where the
+    data already is.
     """
 
     async def load(self, workflow: str) -> dict[str, object]: ...
@@ -108,6 +132,8 @@ class Checkpoints(Protocol):
     async def claim(self, workflow: str, lease: timedelta) -> Pass | None: ...
 
     async def record(self, holder: Pass, key: str, value: object) -> object: ...
+
+    async def transact(self, holder: Pass, key: str, effect: Effect) -> object: ...
 
     async def supply(self, workflow: str, key: str, value: object) -> object: ...
 
@@ -160,13 +186,19 @@ async def run_durably[*Ins, Out](
     is `Fenced` rather than this when the claim has lapsed.
 
     The exactly-once claim reaches exactly as far as that write: a crash between a
-    step's effect and its record leaves the effect done and unrecorded, so the
-    resumed run repeats it. That is at-least-once, the same bound every durable
-    engine lands on unless the effect and the record share a transaction, which
-    this seam cannot offer (see `Checkpoints`). The answer is the one they all
-    give: make the effect itself idempotent, by passing the workflow as the
-    payment gateway's idempotency key, rather than pretending the gap is closable
-    here.
+    node's effect and its record leaves the effect done and unrecorded, so the
+    resumed run repeats it. That is at-least-once, and the answer for anything
+    that leaves the datastore is the one every durable engine gives: make the
+    effect itself idempotent, by passing the workflow as the payment gateway's
+    idempotency key, rather than pretending the gap is closable here.
+
+    A graph gets no `transact`, and the reason is the graph rather than the store.
+    `Checkpoints.transact` closes that gap for effects the store can perform
+    itself, but it closes it by making the effect and the record one call, and a
+    node is an ordinary async function this runner only sees the *result* of. The
+    stepwise mechanism reaches it because a step names its effect at the call site
+    (`run.transact(...)`); expressing that here would mean a node type that hands
+    the graph an effect instead of running one.
     """
     checkpoint = await checkpoints.load(holder.workflow)
     async for key, value in run.stream(*values, checkpoint=checkpoint):
@@ -214,6 +246,13 @@ async def run_saga[In, Out, Reached, Undone](
     Cancellation is not caught. It is not a failed workflow but a stopped one, and
     unwinding on the way out would fire the compensations while their forward steps
     may still be running.
+
+    The rollback's id is the workflow's own with `:unwind` appended, which puts one
+    constraint on ids in exchange for needing no second namespace: an id that already
+    ends in `:unwind` addresses another workflow's rollback. Deriving a sibling by
+    suffixing is what makes that true, so it holds against any store rather than being
+    a property of how one of them builds keys, and like the rest of the id contract it
+    is stated rather than checked.
     """
     try:
         return await run_durably(forward, checkpoints, holder, value)

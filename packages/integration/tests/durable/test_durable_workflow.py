@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import timedelta
+from typing import Never
 
 import pytest
 from doubles import MemoryCheckpoints
@@ -214,6 +215,9 @@ class Preempted:
 
     async def record(self, holder: Pass, key: str, value: object) -> object:
         return self.already.setdefault(key, value)
+
+    async def transact(self, holder: Pass, key: str, effect: Never) -> object:  # pragma: no cover - uncallable
+        raise NotImplementedError
 
     async def supply(self, workflow: str, key: str, value: object) -> object:  # pragma: no cover - unused here
         return self.already.setdefault(key, value)

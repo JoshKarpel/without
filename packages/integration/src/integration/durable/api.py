@@ -92,6 +92,14 @@ confirmation_body = body(Confirmation.model_validate_json, schema=Confirmation)
 # The workflow id *is* the idempotency key, so submitting twice cannot start two
 # payouts: the same key names the same checkpoint, and the pass it triggers finds
 # the work already recorded.
+#
+# It is also the one place a client's own text becomes a workflow id, so it is where an
+# id contract would be enforced if a deployment wanted one (see `RedisCheckpoints` for
+# what the Redis store asks of an id, and `run_saga` for the one constraint that holds
+# whatever the store is). This takes the header as given, because the ids that matter
+# are UUIDs their senders generated and every constraint on the list is one they meet
+# without trying. Parsing here rather than in the store is the point: it would be one
+# extractor deciding once, not a check on every call.
 idempotency_key = header_param("idempotency-key", once(bytes.decode), schema={"type": "string"}, required=True)
 workflow_id = path_param("workflow", STR)
 

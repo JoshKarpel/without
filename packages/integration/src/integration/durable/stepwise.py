@@ -22,6 +22,13 @@
 # instead of blocking, which is what buys the things a graph cannot express at all: a
 # three-day settlement window, and a value another process has yet to write. Both are
 # the same idea as a recorded result, so both are just entries in the same mapping.
+#
+# `Run.transact` is the one place a step is more than bookkeeping. Naming the effect at
+# the call site is what makes it possible: `step` is handed a thunk and can only run it
+# and write afterwards, where `transact` is handed something the *store* can perform, so
+# the work and the record become one commit and that step stops being at-least-once. It
+# is available exactly for effects that live in the store, which is a fact about
+# distributed transactions rather than about any store's feature list.
 
 from __future__ import annotations
 
@@ -32,6 +39,7 @@ from dataclasses import field
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
+from typing import Never
 from typing import cast
 
 from integration.durable.shell import Checkpoints
@@ -67,7 +75,7 @@ def now_utc() -> datetime:
 
 
 @dataclass(frozen=True, slots=True)
-class Run:
+class Run[Effect = Never]:
     """
     One pass at a workflow: what it has already committed to, and how to commit more.
 
@@ -83,7 +91,7 @@ class Run:
     """
 
     holder: Pass
-    checkpoints: Checkpoints
+    checkpoints: Checkpoints[Effect]
     recorded: dict[StepKey, object]
     now: Callable[[], datetime] = now_utc
     claimed: set[StepKey] = field(default_factory=set)
@@ -117,6 +125,35 @@ class Run:
         stored = await self.checkpoints.record(self.holder, key, await effect())
         self.recorded[key] = stored
         return cast(T, stored)
+
+    async def transact(self, key: StepKey, effect: Effect) -> object:
+        """
+        Perform `effect` and record it in one commit, so the step is *exactly* once.
+
+        The difference from `step` is the failure it removes rather than the work it
+        does. `step` runs the effect and then writes the record, so a crash in between
+        leaves the effect done and unrecorded and the next pass repeats it: at-least-once.
+        Here the store performs the work and writes the record together, so there is no
+        in-between for a crash to land in, and re-running the workflow performs nothing.
+
+        The price is that `effect` has to be something the *store* can perform, which
+        means it has to live in the store: a Lua script over keys in the same Redis, a
+        callback over the same Postgres session. An effect that leaves the datastore (a
+        payment gateway, a carrier) cannot be in the commit, is not a transaction anyone
+        can offer, and belongs in `step` with an idempotency key. That boundary is a fact
+        about distributed transactions rather than a limitation of this seam, which is
+        why `Effect` is a type parameter and not a shared interface.
+
+        The result comes back as `object` rather than the effect's own type, because
+        what is returned is what the *store* holds after the commit: read back from the
+        record on a later pass, so it round-trips through the codec like any step.
+        """
+        self.claim(key)
+        if key in self.recorded:
+            return self.recorded[key]
+        stored = await self.checkpoints.transact(self.holder, key, effect)
+        self.recorded[key] = stored
+        return stored
 
     async def sleep(self, key: StepKey, duration: timedelta) -> None:
         """
@@ -173,10 +210,10 @@ def parse_deadline(key: StepKey, recorded: object) -> datetime:
     return datetime.fromisoformat(recorded)
 
 
-async def resume[T](
+async def resume[T, Effect](
     holder: Pass,
-    checkpoints: Checkpoints,
-    body: Callable[[Run], Awaitable[T]],
+    checkpoints: Checkpoints[Effect],
+    body: Callable[[Run[Effect]], Awaitable[T]],
     *,
     now: Callable[[], datetime] = now_utc,
 ) -> T:

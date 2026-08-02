@@ -17,6 +17,7 @@ import httpx
 import pytest
 from integration.durable import Contended
 from integration.durable import Fenced
+from integration.durable import LuaEffect
 from integration.durable import Order
 from integration.durable import Payouts
 from integration.durable import Reached
@@ -353,6 +354,31 @@ async def test_a_write_from_a_pass_that_lost_the_workflow_is_refused_by_redis(
     assert await checkpoints.load(workflow) == {"paid": "pay-real"}
 
 
+async def test_a_workflow_whose_keys_expired_still_outranks_a_pass_from_before(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # These keys expire, so a workflow quiet for longer than the ttl is forgotten. If its
+    # id is then reused, a plain counter would hand the new incarnation token 1 while a
+    # pass stalled since before the expiry still held token 3, and the corpse would
+    # outrank the living. Seeding the token from the server clock is what closes that.
+    checkpoints = RedisCheckpoints(redis=redis)
+    before = await claimed(checkpoints, workflow)
+
+    await redis.delete(checkpoints.pass_key(workflow), checkpoints.hash_key(workflow))
+    # The seeding is the server's clock, so the guarantee is "a later claim gets a later
+    # millisecond", and the deletion above has to actually take one. A real expiry takes
+    # the `ttl`, which buys this by a margin of about a day; a test that deletes the keys
+    # by hand has to buy it explicitly.
+    await asyncio.sleep(0.005)
+    after = await claimed(checkpoints, workflow)
+
+    assert after.token > before.token, "the workflow was forgotten, but its fence did not rewind"
+
+    with pytest.raises(Fenced):
+        await checkpoints.record(before, "paid", "pay-from-a-previous-life")
+
+
 async def test_a_step_already_recorded_is_never_overwritten_and_hands_back_the_winner(
     redis: Redis,
     workflow: str,
@@ -408,6 +434,70 @@ async def test_a_second_worker_preparing_the_same_queue_is_not_an_error(redis: R
     assert delivered is not None
     assert delivered.workflow == "wf-after-two-prepares"
     assert await wakeups.next_ready(timedelta(milliseconds=50)) is None, "and nothing is delivered twice"
+
+
+async def test_an_effect_in_this_redis_is_performed_and_recorded_in_one_commit(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # Exactly-once, on Redis, which the usual framing says needs Postgres. It does not:
+    # a Lua script is an atomic commit over Redis data, so a step whose effect *is* a
+    # Redis write records itself in the same script. What actually bounds this is that
+    # you can only transact within one datastore, and Postgres is only privileged because
+    # that is usually where the data already is.
+    checkpoints = RedisCheckpoints(redis=redis)
+    holder = await claimed(checkpoints, workflow)
+    # Tagged into the workflow's own slot, which is what "the same datastore" reduces to
+    # once the datastore is partitioned.
+    ledger = f"{checkpoints.hash_key(workflow)}:ledger"
+    reserve = LuaEffect(
+        source="return cjson.encode(redis.call('HINCRBY', KEYS[1], ARGV[1], tonumber(ARGV[2])))",
+        keys=(ledger,),
+        args=("piano", 1),
+    )
+
+    first = await Run(holder=holder, checkpoints=checkpoints, recorded={}).transact("reserved", reserve)
+    again = await Run(holder=holder, checkpoints=checkpoints, recorded={}).transact("reserved", reserve)
+
+    assert (first, again) == (1, 1), "the second pass read the record rather than reserving again"
+    assert await redis.hget(ledger, "piano") == "1", "the stock moved once, however many passes reached the step"
+    assert await checkpoints.load(workflow) == {"reserved": 1}
+    assert key_slot(ledger.encode()) == key_slot(checkpoints.hash_key(workflow).encode())
+
+
+async def test_a_transacted_effect_is_refused_from_a_superseded_pass(redis: Redis, workflow: str) -> None:
+    checkpoints = RedisCheckpoints(redis=redis)
+    stalled = await claimed(checkpoints, workflow, timedelta(milliseconds=1))
+    await asyncio.sleep(0.05)
+    await claimed(checkpoints, workflow)
+    ledger = f"{checkpoints.hash_key(workflow)}:ledger"
+
+    with pytest.raises(Fenced):
+        await Run(holder=stalled, checkpoints=checkpoints, recorded={}).transact(
+            "reserved",
+            LuaEffect(
+                source="return cjson.encode(redis.call('HINCRBY', KEYS[1], ARGV[1], 1))",
+                keys=(ledger,),
+                args=("piano",),
+            ),
+        )
+
+    assert await redis.exists(ledger) == 0, "the fence is checked before the effect runs, not after"
+
+
+async def test_a_transact_error_that_is_not_the_fence_is_not_swallowed(redis: Redis, workflow: str) -> None:
+    # As for `record`: the script's own refusal is the one error this reads, and taking
+    # a broken store for "another pass took over" would tell a workflow to stand down
+    # when the truth is that its checkpoint is unusable.
+    checkpoints = RedisCheckpoints(redis=redis)
+    holder = await claimed(checkpoints, workflow)
+    await redis.set(checkpoints.hash_key(workflow), "not a hash at all")
+
+    with pytest.raises(ResponseError, match="WRONGTYPE"):
+        await Run(holder=holder, checkpoints=checkpoints, recorded={}).transact(
+            "reserved",
+            LuaEffect(source="return cjson.encode(1)"),
+        )
 
 
 def scheduled(redis: Redis, workflow: str, lease: timedelta = timedelta(seconds=30)) -> RedisSchedule:

@@ -40,19 +40,42 @@ from integration.durable.shell import Fenced
 from integration.durable.shell import Pass
 
 # Take the workflow if nobody holds it, and stamp the taking with a number that only
-# ever goes up. `HINCRBY` is what makes the token a *fence* rather than a name: it is
-# the store, not the claimant, that decides the ordering, so two processes cannot mint
-# the same one. The expiry is read from the server's own clock rather than a caller's,
+# ever goes up. It is the store, not the claimant, that decides the ordering, so two
+# processes cannot mint the same one. The clock is the server's rather than a caller's,
 # because a lease compared against the claimant's clock is only as good as the agreement
 # between the two, which is exactly what fails when a machine is unhealthy enough to
 # stall mid-pass.
+#
+# The token is `max(now, previous + 1)`, which is a hybrid logical clock and not merely
+# a counter, and the difference is the one hazard a plain counter leaves open. These
+# keys expire, so a workflow that goes quiet for longer than the `ttl` is forgotten
+# entirely; if its id is then reused, a counter would hand the new incarnation token 1
+# while some pass stalled since before the expiry still holds token 3, and the corpse
+# would outrank the living. Seeding from the wall clock closes that without coupling the
+# two keys' lifetimes: any later claim is stamped with a later millisecond, so a token
+# from a previous incarnation is always behind. Taking `previous + 1` when that is
+# larger keeps it strictly monotonic within one incarnation even if the clock steps
+# backwards under it.
+#
+# The precision is the limit of that half. Two claims separated by an expiry but not by
+# a millisecond would be stamped the same, and equal tokens do not fence each other,
+# since the current holder has to be able to write with its own. What makes that
+# unreachable is not the arithmetic but the `ttl`: an expiry cannot happen in under a
+# day, so the millisecond is bought by a margin of eight orders of magnitude. It is
+# worth knowing the guarantee rests on that rather than on the token alone.
+#
+#   KEYS[1]  the workflow's pass hash
+#   ARGV[1]  lease, in milliseconds
+#   ARGV[2]  expiry for the pass hash, in seconds
+#   returns  the fencing token, or nil if another pass holds the workflow
 CLAIM = """
 local now = redis.call('TIME')
 local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
 local held_until = tonumber(redis.call('HGET', KEYS[1], 'until') or '0')
 if held_until > now_ms then return nil end
-local token = redis.call('HINCRBY', KEYS[1], 'token', 1)
-redis.call('HSET', KEYS[1], 'until', now_ms + tonumber(ARGV[1]))
+local previous = tonumber(redis.call('HGET', KEYS[1], 'token') or '0')
+local token = math.max(now_ms, previous + 1)
+redis.call('HSET', KEYS[1], 'token', token, 'until', now_ms + tonumber(ARGV[1]))
 redis.call('EXPIRE', KEYS[1], ARGV[2])
 return token
 """
@@ -61,6 +84,14 @@ return token
 # a step that is already recorded, and hand back whatever is stored once the dust
 # settles, so a caller that lost the race learns the winner's value instead of carrying
 # on with its own.
+#
+#   KEYS[1]  the workflow's steps hash
+#   KEYS[2]  the workflow's pass hash
+#   ARGV[1]  step name, the hash field to write
+#   ARGV[2]  the step's result, JSON-encoded
+#   ARGV[3]  the writing pass's fencing token
+#   ARGV[4]  expiry for both hashes, in seconds
+#   returns  the JSON stored after the call, or a FENCED error if the pass is superseded
 RECORD = """
 local fence = tonumber(redis.call('HGET', KEYS[2], 'token') or '0')
 if tonumber(ARGV[3]) < fence then
@@ -76,6 +107,12 @@ return redis.call('HGET', KEYS[1], ARGV[1])
 # The same conditional write without the fence, for a value that comes from outside any
 # pass. It is deliberately not gated on a claim: an approval must not fail because a
 # worker happens to be mid-pass, and first-writer-wins is the whole guarantee it needs.
+#
+#   KEYS[1]  the workflow's steps hash
+#   ARGV[1]  step name, the hash field to write
+#   ARGV[2]  the value, JSON-encoded
+#   ARGV[3]  expiry for the steps hash, in seconds
+#   returns  the JSON stored after the call, this caller's or the earlier winner's
 SUPPLY = """
 local written = redis.call('HSETNX', KEYS[1], ARGV[1], ARGV[2])
 redis.call('EXPIRE', KEYS[1], ARGV[3])
@@ -86,11 +123,84 @@ return redis.call('HGET', KEYS[1], ARGV[1])
 # Give the workflow back early, but keep the token. Zeroing the deadline rather than
 # deleting the key is what preserves the fence across a clean handover: the next claim
 # gets the next number up, so a pass that comes back from the dead still loses.
+#
+#   KEYS[1]  the workflow's pass hash
+#   ARGV[1]  the releasing pass's fencing token
+#   returns  0 always; a release by a superseded pass is a no-op, not an error
 RELEASE = """
 if tonumber(redis.call('HGET', KEYS[1], 'token') or '0') == tonumber(ARGV[1]) then
   redis.call('HSET', KEYS[1], 'until', 0)
 end
 return 0
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class LuaEffect:
+    """
+    A piece of work this Redis can do, written as the Lua it would be on its own.
+
+    The `Effect` type for `RedisCheckpoints`, and the shape of the answer to "what can a
+    store commit alongside its record". `source` is an ordinary script body: it reads
+    `KEYS` and `ARGV` from index 1 as if it were the only thing running, and it MUST
+    return JSON, since what it returns is written into the checkpoint verbatim and read
+    back through the same codec as any step (`cjson.encode` is the usual way).
+    `RedisCheckpoints.transact` splices it into a wrapper that supplies the fence check
+    and the record, and rebinds those two tables so the numbering an author sees is the
+    numbering they wrote.
+
+    Its `keys` MUST hash to the workflow's own slot, which on a single node is free and
+    on a cluster means carrying the same `{id}` tag. That is not a quirk of the wrapper:
+    it is what "the same datastore" reduces to once the datastore is partitioned, and a
+    script spanning two slots is a distributed transaction wearing a local disguise.
+    """
+
+    source: str
+    keys: tuple[str, ...] = ()
+    # Whatever Redis will put on the wire, which is narrower than `object` on purpose:
+    # a script argument that needs encoding is a codec decision, and this store already
+    # made one for step results. An effect that wants to pass a structure encodes it.
+    args: tuple[str | int | float | bytes, ...] = ()
+
+
+# Perform an effect and record it in one commit, which is the whole of exactly-once and
+# the only thing here that is more than bookkeeping. The order matters: fence first (a
+# superseded pass must not act), then the *existence* check (a step already recorded must
+# not run again, which is what makes a replay perform nothing at all), then the effect,
+# then the record, all in one script, so no crash can land between the work and its
+# receipt.
+#
+# The effect's own source is spliced in rather than loaded at run time, because
+# `loadstring` is not available in Redis's sandbox and because a script's text is a value
+# this app supplies rather than anything a request carries. Rebinding `KEYS` and `ARGV`
+# inside the wrapper is what lets that source be written as if it ran alone.
+#
+#   KEYS[1]   the workflow's steps hash
+#   KEYS[2]   the workflow's pass hash
+#   KEYS[3..] the effect's own keys, which it sees as KEYS[1..]
+#   ARGV[1]   step name, the hash field to write
+#   ARGV[2]   the acting pass's fencing token
+#   ARGV[3]   expiry for both hashes, in seconds
+#   ARGV[4..] the effect's own arguments, which it sees as ARGV[1..]
+#   returns   the JSON stored after the call, the effect's result or an earlier one,
+#             or a FENCED error if the pass is superseded
+TRANSACT = """
+local outer_keys, outer_args = KEYS, ARGV
+local fence = tonumber(redis.call('HGET', KEYS[2], 'token') or '0')
+if tonumber(ARGV[2]) < fence then
+  return redis.error_reply('FENCED pass ' .. ARGV[2] .. ' superseded by ' .. fence)
+end
+local already = redis.call('HGET', KEYS[1], ARGV[1])
+if already then return already end
+local result = (function()
+  local KEYS = {unpack(outer_keys, 3)}
+  local ARGV = {unpack(outer_args, 4)}
+  %s
+end)()
+redis.call('HSET', KEYS[1], ARGV[1], result)
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+redis.call('EXPIRE', KEYS[2], ARGV[3])
+return result
 """
 
 
@@ -123,6 +233,33 @@ class RedisCheckpoints:
     asks for more with `WAIT`. `run_durably`'s reasoning about the window between an
     effect and its record assumes that gap is closed; closing it is this store's job,
     not the runner's.
+
+    ## What a workflow id has to be
+
+    A workflow id becomes *key structure* here rather than data, which is what gives it
+    a contract at all. It is not checked at run time, deliberately: the ordinary id is a
+    UUID or a ULID and satisfies all of this without anyone thinking about it, so paying
+    for a validation on every call to catch a caller who went out of their way would be
+    the wrong trade. Enforce it where ids are minted if you need to, which for the API
+    is the one extractor that reads the `Idempotency-Key` header.
+
+    - It MUST NOT contain `{` or `}`. Those delimit the cluster hash tag, so an id
+      carrying its own braces makes Redis take some prefix of it as the tag instead of
+      the whole id. Both of a workflow's keys still agree on that prefix, so nothing
+      breaks, but the slot is then chosen by an arbitrary fragment and keys stop
+      spreading evenly across a cluster.
+    - It SHOULD be bounded in length. Redis keys are held in memory and an id appears in
+      two of them per workflow, plus any key an effect derives from `hash_key`.
+
+    Both of those are about *this* store. `run_saga` adds one that is not (an id ending
+    in `:unwind` addresses another workflow's rollback), and it is documented there,
+    since deriving a sibling id by suffixing is true of that runner against any store.
+
+    Note what is *not* on this list. The queue (`wakeups`, `schedule`) holds a workflow
+    id as a value rather than in a key name, so none of this applies there, and a store
+    that bound the id as a query parameter rather than concatenating it would have no
+    constraints at all. This is a property of building keys by interpolation, not of
+    workflow ids.
     """
 
     redis: Redis
@@ -185,6 +322,26 @@ class RedisCheckpoints:
         except ResponseError as error:
             # The script's own refusal, which redis-py surfaces as the server's string.
             # Anything else is a real problem with the store and must not be swallowed.
+            if "FENCED" not in str(error):
+                raise
+            raise Fenced(f"{holder.workflow!r} moved on while this pass held it: {error}") from error
+        return json.loads(cast(str, stored))
+
+    async def transact(self, holder: Pass, key: str, effect: LuaEffect) -> object:
+        """
+        Run `effect` and record it as `key`, in one script, so the step happens once.
+
+        The script is built and registered per call rather than at construction, because
+        it is the *effect* that decides its body: a store cannot precompile scripts it
+        has not been handed. `register_script` is local work, so the cost is the digest,
+        and Redis caches the body after the first call the same as any other script.
+        """
+        try:
+            stored = await self.redis.register_script(TRANSACT % effect.source)(
+                keys=[self.hash_key(holder.workflow), self.pass_key(holder.workflow), *effect.keys],
+                args=[key, holder.token, int(self.ttl.total_seconds()), *effect.args],
+            )
+        except ResponseError as error:
             if "FENCED" not in str(error):
                 raise
             raise Fenced(f"{holder.workflow!r} moved on while this pass held it: {error}") from error

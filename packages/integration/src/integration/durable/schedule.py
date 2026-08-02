@@ -66,6 +66,11 @@ POLL = timedelta(milliseconds=50)
 # step, so two workers polling at the same instant cannot both take it. The clock is the
 # server's, as it is for the checkpoint claim, because a lease compared against the
 # taker's own clock is only as good as the agreement between the two.
+#
+#   KEYS[1]  the schedule
+#   ARGV[1]  lease, in milliseconds
+#   returns  {workflow, receipt}, where the receipt is the score just written,
+#            or nil if nothing is visible yet
 TAKE = """
 local now = redis.call('TIME')
 local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
@@ -78,6 +83,11 @@ return {due[1], string.format('%.0f', held_until)}
 
 # Finish, but only if nothing asked for another pass in the meantime. Anything that did
 # wrote a different score, so the comparison is the whole check.
+#
+#   KEYS[1]  the schedule
+#   ARGV[1]  the workflow
+#   ARGV[2]  the receipt, which is the score this pass took
+#   returns  1 if the workflow was dropped, 0 if it was left for another pass
 DONE = """
 local score = redis.call('ZSCORE', KEYS[1], ARGV[1])
 if score and tonumber(score) == tonumber(ARGV[2]) then
