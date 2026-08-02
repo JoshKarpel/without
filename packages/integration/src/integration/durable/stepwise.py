@@ -35,6 +35,7 @@ from datetime import timedelta
 from typing import cast
 
 from integration.durable.shell import Checkpoints
+from integration.durable.shell import Pass
 
 type StepKey = str
 
@@ -75,13 +76,21 @@ class Run:
     inferred from a decorator. `recorded` is the checkpoint loaded once at the top of
     the pass and kept current as the pass adds to it, so a step reads memory rather
     than the store.
+
+    `holder` is this pass's claim on the workflow, and carrying it is what lets a step
+    write: there is no way to record without one, which is the invariant made
+    structural rather than remembered.
     """
 
-    workflow: str
+    holder: Pass
     checkpoints: Checkpoints
     recorded: dict[StepKey, object]
     now: Callable[[], datetime] = now_utc
     claimed: set[StepKey] = field(default_factory=set)
+
+    @property
+    def workflow(self) -> str:
+        return self.holder.workflow
 
     async def step[T](self, key: StepKey, effect: Callable[[], Awaitable[T]]) -> T:
         """
@@ -93,14 +102,21 @@ class Run:
         the same constraint the graph's nodes carry). The record is written before the
         step returns, so the workflow never proceeds on a result the store has not
         accepted.
+
+        What comes back from `record` is what the *store* holds, not necessarily what
+        this effect returned, and this returns that. The difference shows up when two
+        passes both ran the effect: the first to record wins, the second is handed the
+        winner's value, and from there they proceed identically instead of two
+        workflows diverging on which capture id is real. The duplicate effect is not
+        prevented by that, only made harmless downstream; preventing it is what the
+        claim is for, and the two together are why a step is written this way.
         """
         self.claim(key)
         if key in self.recorded:
             return cast(T, self.recorded[key])
-        value = await effect()
-        await self.checkpoints.record(self.workflow, key, value)
-        self.recorded[key] = value
-        return value
+        stored = await self.checkpoints.record(self.holder, key, await effect())
+        self.recorded[key] = stored
+        return cast(T, stored)
 
     async def sleep(self, key: StepKey, duration: timedelta) -> None:
         """
@@ -158,14 +174,14 @@ def parse_deadline(key: StepKey, recorded: object) -> datetime:
 
 
 async def resume[T](
-    workflow: str,
+    holder: Pass,
     checkpoints: Checkpoints,
     body: Callable[[Run], Awaitable[T]],
     *,
     now: Callable[[], datetime] = now_utc,
 ) -> T:
     """
-    Make one pass at `workflow`, from whatever it has already recorded.
+    Make one pass at a claimed workflow, from whatever it has already recorded.
 
     Call it after a crash, after a wakeup, or after a value it was waiting on arrives:
     each call runs `body` from the top and reaches further than the last, and calling
@@ -173,7 +189,12 @@ async def resume[T](
     the pass stops short, leaving what happens next to the caller (schedule a wakeup,
     do nothing until the approval lands, hold the process open until `due`), because
     that policy belongs to whoever is driving rather than to this function.
+
+    It takes a claim rather than making one, for the same reason. Whether to wait for a
+    contended workflow, come back later, or fail is the driver's call: a worker holding
+    a queue delivery wants one answer and a test driving a workflow it owns wants
+    another. `shell.claimed` is the second of those.
     """
     return await body(
-        Run(workflow=workflow, checkpoints=checkpoints, recorded=await checkpoints.load(workflow), now=now)
+        Run(holder=holder, checkpoints=checkpoints, recorded=await checkpoints.load(holder.workflow), now=now)
     )

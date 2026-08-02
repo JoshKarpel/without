@@ -178,9 +178,19 @@ reading of what a rename means and the reason engines like Temporal grow
 in user space the same job is done by versioning the workflow id, or the graph,
 and deciding deliberately how the old ones drain.
 
-`integration.durable` is the worked example: the same loop against a Redis hash,
-including the saga (compensation) half, where a failed run's checkpoint is parsed
-into "how far did we get" and drives a rollback graph that is itself checkpointed.
+What that loop does not give you is exclusion. It makes an *interrupted* run
+resumable, which is a statement about one runner over time; it says nothing about
+two runners at once, and two processes driving the same workflow id both read a
+step as unfinished and both perform its effect. That belongs to whatever holds the
+checkpoint rather than to this package, since the store is the only party that
+sees every writer, and it is what Temporal builds a server for and DBOS requires
+Postgres for.
+
+`integration.durable` is the worked example, and carries both halves: the same
+loop against a Redis hash, a claim on the workflow that every write is fenced
+against, and the saga (compensation) half, where a failed run's checkpoint is
+parsed into "how far did we get" and drives a rollback graph that is itself
+checkpointed.
 
 ## Lifting into a Processor
 

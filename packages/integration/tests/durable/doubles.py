@@ -11,6 +11,8 @@ from datetime import timedelta
 from itertools import count
 from time import monotonic
 
+from integration.durable.shell import Fenced
+from integration.durable.shell import Pass
 from integration.durable.wakeups import Delivery
 
 # The two stores the durable toys talk through, in memory. They are doubles rather
@@ -21,15 +23,45 @@ from integration.durable.wakeups import Delivery
 
 @dataclass(frozen=True, slots=True)
 class MemoryCheckpoints:
-    """A `Checkpoints` keeping one dict per workflow."""
+    """
+    A `Checkpoints` keeping one dict per workflow, and one claim beside it.
+
+    It meets the protocol's requirements rather than approximating them, which is the
+    only way a test against it says anything about the Redis one: tokens rise per
+    workflow, a write below the fence raises `Fenced`, and a key already recorded is
+    never overwritten. Every method is synchronous between its `await`s, which is this
+    double's version of the Lua scripts: nothing can interleave halfway through a claim
+    or a conditional write, so it enforces atomicity the way the real store does rather
+    than pretending the question does not arise.
+    """
 
     hashes: dict[str, dict[str, object]] = field(default_factory=lambda: defaultdict(dict))
+    tokens: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    held_until: dict[str, float] = field(default_factory=lambda: defaultdict(float))
 
     async def load(self, workflow: str) -> dict[str, object]:
         return dict(self.hashes[workflow])
 
-    async def record(self, workflow: str, key: str, value: object) -> None:
-        self.hashes[workflow][key] = value
+    async def claim(self, workflow: str, lease: timedelta) -> Pass | None:
+        if self.held_until[workflow] > monotonic():
+            return None
+        self.tokens[workflow] += 1
+        self.held_until[workflow] = monotonic() + lease.total_seconds()
+        return Pass(workflow=workflow, token=self.tokens[workflow])
+
+    async def record(self, holder: Pass, key: str, value: object) -> object:
+        if holder.token < self.tokens[holder.workflow]:
+            raise Fenced(f"pass {holder.token} of {holder.workflow!r} was superseded")
+        return await self.supply(holder.workflow, key, value)
+
+    async def supply(self, workflow: str, key: str, value: object) -> object:
+        return self.hashes[workflow].setdefault(key, value)
+
+    async def release(self, holder: Pass) -> None:
+        # The token stays, so the next claim outranks this one: releasing hands the
+        # workflow back, it does not rewind the fence.
+        if holder.token == self.tokens[holder.workflow]:
+            self.held_until[holder.workflow] = 0.0
 
 
 @dataclass(frozen=True, slots=True)

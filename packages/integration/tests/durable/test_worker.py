@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from collections.abc import Awaitable
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC
 from datetime import datetime
@@ -10,10 +12,12 @@ from datetime import timedelta
 import pytest
 from doubles import MemoryCheckpoints
 from doubles import MemoryWakeups
+from integration.durable.shell import claimed
 from integration.durable.stepwise import Run
 from integration.durable.stepwise import Suspended
 from integration.durable.stepwise import now_utc
 from integration.durable.wakeups import Delivery
+from integration.durable.worker import CONTENDED
 from integration.durable.worker import LEASE
 from integration.durable.worker import passes
 from integration.durable.worker import ready
@@ -49,6 +53,15 @@ async def as_stream(*workflows: str) -> AsyncIterator[Delivery]:
         yield Delivery(workflow=workflow, receipt=f"receipt-{number}")
 
 
+def recording(ran: list[str]) -> Callable[[Run], Awaitable[None]]:
+    """A workflow body that does nothing but say it ran, so a test can count passes."""
+
+    async def counting(run: Run) -> None:
+        ran.append(run.workflow)
+
+    return counting
+
+
 async def one_pass(checkpoints: MemoryCheckpoints, wakeups: MemoryWakeups, workflow: str = WORKFLOW) -> None:
     """Drive the worker's sink over exactly one delivered workflow, as the queue would."""
     await passes(checkpoints, wakeups, BODY)(as_stream(workflow))
@@ -68,7 +81,7 @@ async def test_a_workflow_nobody_has_submitted_waits_without_being_scheduled() -
 async def test_a_submitted_order_runs_to_its_first_wait_and_schedules_the_wakeup() -> None:
     checkpoints = MemoryCheckpoints()
     wakeups = MemoryWakeups()
-    await checkpoints.record(WORKFLOW, "order", SMALL)
+    await checkpoints.supply(WORKFLOW, "order", SMALL)
 
     await one_pass(checkpoints, wakeups)
 
@@ -84,7 +97,7 @@ async def test_a_submitted_order_runs_to_its_first_wait_and_schedules_the_wakeup
 async def test_a_second_pass_after_the_wait_finishes_a_small_payout() -> None:
     checkpoints = MemoryCheckpoints()
     wakeups = MemoryWakeups()
-    await checkpoints.record(WORKFLOW, "order", SMALL)
+    await checkpoints.supply(WORKFLOW, "order", SMALL)
 
     await one_pass(checkpoints, wakeups)
     await asyncio.sleep(SETTLING.total_seconds() * 2)  # the workflow's own window, waited out for real
@@ -98,7 +111,7 @@ async def test_a_second_pass_after_the_wait_finishes_a_small_payout() -> None:
 async def test_a_large_payout_stops_at_the_confirmation_and_resumes_once_it_is_recorded() -> None:
     checkpoints = MemoryCheckpoints()
     wakeups = MemoryWakeups()
-    await checkpoints.record(WORKFLOW, "order", LARGE)
+    await checkpoints.supply(WORKFLOW, "order", LARGE)
 
     await one_pass(checkpoints, wakeups)
     await asyncio.sleep(SETTLING.total_seconds() * 2)
@@ -108,7 +121,7 @@ async def test_a_large_payout_stops_at_the_confirmation_and_resumes_once_it_is_r
     assert "paid" not in checkpoints.hashes[WORKFLOW]
     assert wakeups.sleeping == {}, "the wait is on a person now, so this pass scheduled nothing"
 
-    await checkpoints.record(WORKFLOW, "approved-by", "auditor-7")
+    await checkpoints.supply(WORKFLOW, "approved-by", "auditor-7")
     await one_pass(checkpoints, wakeups)
 
     assert checkpoints.hashes[WORKFLOW]["paid"] == f"pay-{WORKFLOW}-90000"
@@ -128,6 +141,38 @@ async def test_a_workflow_whose_step_raises_does_not_take_the_worker_down() -> N
     await passes(checkpoints, wakeups, declining)(as_stream("wf-doomed", "wf-fine"))
 
     assert reached == ["wf-doomed", "wf-fine"]
+
+
+async def test_a_wakeup_for_a_workflow_someone_else_is_passing_over_is_deferred_not_run() -> None:
+    # The submit-then-confirm flow produces exactly this: a second wakeup arrives while
+    # the first pass is still in flight. Running it would put two passes on one workflow,
+    # both finding the same step unrecorded, so the second is scheduled to look again.
+    checkpoints = MemoryCheckpoints()
+    wakeups = MemoryWakeups()
+    clock = Clock()
+    ran: list[str] = []
+
+    held = await claimed(checkpoints, WORKFLOW)
+    try:
+        await passes(checkpoints, wakeups, recording(ran), now=clock)(as_stream(WORKFLOW))
+    finally:
+        await checkpoints.release(held)
+
+    assert ran == [], "the claim was held elsewhere, so no pass ran"
+    assert wakeups.sleeping == {WORKFLOW: STARTED_AT + CONTENDED}
+    assert wakeups.outstanding == {}, "and the delivery was answered for rather than left to be reclaimed"
+
+
+async def test_a_deferred_wakeup_runs_once_the_claim_is_free() -> None:
+    checkpoints = MemoryCheckpoints()
+    wakeups = MemoryWakeups()
+    ran: list[str] = []
+
+    await passes(checkpoints, wakeups, recording(ran))(as_stream(WORKFLOW))
+
+    assert ran == [WORKFLOW]
+    assert wakeups.sleeping == {}, "nothing was deferred, because nothing else held the workflow"
+    assert await checkpoints.claim(WORKFLOW, LEASE) is not None, "the pass let go of its claim on the way out"
 
 
 async def test_the_pool_pulls_exactly_as_many_workflows_as_it_can_work_on() -> None:
@@ -228,7 +273,7 @@ async def test_the_worker_carries_a_submitted_order_through_its_own_wait() -> No
     # workflow back and forth until it is done, with nobody driving it.
     checkpoints = MemoryCheckpoints()
     wakeups = MemoryWakeups()
-    await checkpoints.record(WORKFLOW, "order", SMALL)
+    await checkpoints.supply(WORKFLOW, "order", SMALL)
     await wakeups.make_ready(WORKFLOW)
 
     worker = asyncio.create_task(work(checkpoints, wakeups, tick=BRIEF, body=BODY))
@@ -247,8 +292,12 @@ async def test_the_deployed_workflow_reads_its_order_out_of_the_checkpoint() -> 
     # deployment's own settlement window without waiting for it: reaching the wait is
     # the assertion.
     checkpoints = MemoryCheckpoints()
-    await checkpoints.record(WORKFLOW, "order", SMALL)
-    run = Run(workflow=WORKFLOW, checkpoints=checkpoints, recorded=await checkpoints.load(WORKFLOW))
+    await checkpoints.supply(WORKFLOW, "order", SMALL)
+    run = Run(
+        holder=await claimed(checkpoints, WORKFLOW),
+        checkpoints=checkpoints,
+        recorded=await checkpoints.load(WORKFLOW),
+    )
 
     with pytest.raises(Suspended, match="suspended at 'settling'"):
         await submitting()(run)

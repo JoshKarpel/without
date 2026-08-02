@@ -2,13 +2,19 @@
 # an order and confirming a payout are the same two-line move, and that symmetry is the
 # design rather than a coincidence:
 #
-#   record one value into the workflow's checkpoint, then make the workflow ready.
+#   supply one value into the workflow's checkpoint, then make the workflow ready.
 #
-# A submission records the order the workflow is waiting on; a confirmation records the
+# A submission supplies the order the workflow is waiting on; a confirmation supplies the
 # approval it is waiting on. Both are values some *other* process wrote, which is
 # exactly what `Run.awaiting` reads, so the API needs no notion of starting a workflow
 # versus resuming one, and no channel to a running process. The worker finds out the
 # same way either time.
+#
+# `supply` rather than `record` because these writes come from outside any pass, and
+# deliberately do not take the workflow's claim. An approval that failed because a worker
+# happened to be mid-pass would be an API that gets slower the busier the system is, for
+# a value nothing is racing it to write. What it does keep is first-writer-wins, which is
+# what makes a resubmission harmless.
 #
 # That is what replaces a client library talking to a workflow server: the API writes
 # to a hash and a list, and holds nothing. It can be restarted mid-flight, scaled to
@@ -93,13 +99,18 @@ workflow_id = path_param("workflow", STR)
 @post("/orders", order_body, idempotency_key, summary="Submit an order for payout")
 async def submit_order(payments: Payments, order: SubmittedOrder, workflow: str) -> Response:
     """
-    Record the order as the value the workflow is waiting on, then make it ready.
+    Supply the order as the value the workflow is waiting on, then make it ready.
 
     The `202` is honest: nothing has been paid, and the only claim made is that the
     order is durable and someone will pick it up. The status URL is where the client
     watches it happen.
+
+    Resubmitting under the same key is not an update. The first order recorded is the
+    one the workflow runs, so a client that retries with a changed basket gets the
+    original back, which is what an idempotency key promises and the alternative
+    (letting the second overwrite) would break for a workflow already spending it.
     """
-    await payments.checkpoints.record(workflow, "order", order.items)
+    await payments.checkpoints.supply(workflow, "order", order.items)
     await payments.wakeups.make_ready(workflow)
     return json_response(202, {"workflow": workflow, "status": f"/orders/{workflow}"})
 
@@ -113,7 +124,7 @@ async def confirm_order(payments: Payments, workflow: str, confirmation: Confirm
     the workflow cannot produce for itself. Nothing here knows whether a workflow is
     actually waiting; recording an approval nobody asked for leaves an unread field.
     """
-    await payments.checkpoints.record(workflow, "approved-by", confirmation.approved_by)
+    await payments.checkpoints.supply(workflow, "approved-by", confirmation.approved_by)
     await payments.wakeups.make_ready(workflow)
     return json_response(202, {"workflow": workflow, "status": f"/orders/{workflow}"})
 

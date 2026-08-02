@@ -39,12 +39,18 @@
 # own tick rather than being triggered by traffic. It is safe in every worker at once
 # (see `wake_due`).
 #
-# What a real one adds, and this deliberately does not: a lease per *workflow*, so a
-# confirmation landing mid-pass cannot start a second pass beside the first. `reclaim`
-# bounds that risk for a crashed worker; nothing bounds it for a racing wakeup, and the
-# duplicate re-runs whatever step went unrecorded, which is the at-least-once bound the
-# mechanism already carries. There is no retry policy either: a workflow whose step
-# raises is logged and acknowledged, and comes back only when something wakes it.
+# Two claims, not one, and they answer different questions. The delivery is claimed from
+# the queue, which decides who owes an answer for this *wakeup*; the workflow is claimed
+# from the checkpoint store, which decides who may write to it. Only the second is a
+# safety property. Two `make_ready` calls for one workflow put two entries in the stream
+# and the group hands them to two workers, which is ordinary rather than exceptional
+# (the submit-then-confirm flow does it every time), so the workflow claim is what stops
+# both of them running the same unrecorded step. The loser does not queue behind the
+# winner: it schedules itself a little later and lets go, because the pass in flight may
+# well finish the work, and holding a slot to find out would spend the pool on waiting.
+#
+# There is still no retry policy: a workflow whose step raises is logged and
+# acknowledged, and comes back only when something wakes it.
 
 from __future__ import annotations
 
@@ -82,10 +88,16 @@ BLOCKING = timedelta(seconds=1)
 # else (a gateway, the store), so the useful number is far above the core count and is
 # bounded by what the dependencies will take rather than by this process.
 POOL = 20
-# How long a delivery may go unacknowledged before another worker takes it over. It has
-# to exceed the longest a pass can honestly take, since overtaking one that is merely
-# slow runs it twice; a minute is generous for passes whose steps are single calls.
+# How long a delivery may go unacknowledged before another worker takes it over, and how
+# long a claim on a workflow is good for. One constant for both because they answer the
+# same question, how long a pass may honestly take, and because a reclaim that beats the
+# workflow claim to expiring just hands the work to someone who cannot yet do it. A
+# minute is generous for passes whose steps are single calls.
 LEASE = timedelta(minutes=1)
+# How long a worker that lost the claim waits before looking again. Long enough that the
+# pass holding it has a fair chance to finish (and to make this wakeup redundant), short
+# enough that a claim dropped immediately afterwards is not left sitting.
+CONTENDED = timedelta(seconds=1)
 
 
 def submitting(
@@ -142,6 +154,10 @@ def passes(
     wakeups: Wakeups,
     body: Callable[[Run], Awaitable[object]] = submitted,
     limit: int = POOL,
+    *,
+    lease: timedelta = LEASE,
+    contended: timedelta = CONTENDED,
+    now: Callable[[], datetime] = now_utc,
 ) -> Sink[Delivery]:
     """
     The data plane: up to `limit` passes at once, and one delivery pulled per free slot.
@@ -161,19 +177,33 @@ def passes(
     worker can take them.
 
     The acknowledgement comes last, on every path this process saw through: a completed
-    pass, a suspended one, and a failed one are all answers. Only cancellation skips it,
-    which is the point, since a half-run pass should be reclaimed rather than forgotten.
+    pass, a suspended one, a failed one, and a contended one are all answers. Only
+    cancellation skips it, which is the point, since a half-run pass should be reclaimed
+    rather than forgotten. Releasing the claim is not on that list: it happens on the way
+    out of every path including cancellation, because a shutting-down worker that keeps
+    its claim makes every other worker wait out the lease for nothing.
     """
 
     async def advance(delivery: Delivery) -> None:
+        holder = await checkpoints.claim(delivery.workflow, lease)
+        if holder is None:
+            # Someone else is mid-pass. Whatever this wakeup carried is in the store
+            # already, so the pass in flight may cover it; ask again shortly rather than
+            # blocking a slot, and answer for the delivery so it is not reclaimed too.
+            logger.info(f"{delivery.workflow} is held by another pass; looking again in {contended}")
+            await wakeups.wake_at(delivery.workflow, now() + contended)
+            await wakeups.done(delivery)
+            return
         try:
-            await resume(delivery.workflow, checkpoints, body)
+            await resume(holder, checkpoints, body)
         except Suspended as pause:
             if pause.due is not None:
                 await wakeups.wake_at(delivery.workflow, pause.due)
             logger.info(f"{delivery.workflow} suspended at {pause.key}")
         except Exception as error:  # noqa: BLE001 - a workflow's failure is data here, not a fault in the loop
             logger.warning(f"{delivery.workflow} failed: {error!r}")
+        finally:
+            await checkpoints.release(holder)
         await wakeups.done(delivery)
 
     async def pool(deliveries: Stream[Delivery]) -> None:
@@ -218,6 +248,11 @@ async def waking(wakeups: Wakeups, *, tick: timedelta = TICK, now: Callable[[], 
     question about the clock and not about the request that happens to arrive. Safe to
     run in every worker, and safe to be killed at any point in it, because the move is
     the store's single operation rather than this loop's two (see `wake_due`).
+
+    Whether it does anything is the queue's business. Over `RedisWakeups` this is what
+    carries a workflow from the sleepers to the stream; over `RedisSchedule` it spins
+    against a no-op, because there being due and being ready are one score and nothing
+    has to move. The worker runs it either way rather than asking which queue it has.
     """
     while True:
         await wakeups.wake_due(now())
@@ -232,6 +267,7 @@ async def work(
     idle: timedelta = LEASE,
     limit: int = POOL,
     body: Callable[[Run], Awaitable[object]] = submitted,
+    now: Callable[[], datetime] = now_utc,
 ) -> None:
     """
     Run the worker: the timer alongside the pass loop, until cancelled.
@@ -244,8 +280,8 @@ async def work(
     await wakeups.prepare()
 
     async def advance_ready() -> None:
-        await passes(checkpoints, wakeups, body, limit)(ready(wakeups, idle=idle))
+        await passes(checkpoints, wakeups, body, limit, lease=idle, now=now)(ready(wakeups, idle=idle))
 
     async with asyncio.TaskGroup() as group:
-        group.create_task(waking(wakeups, tick=tick))
+        group.create_task(waking(wakeups, tick=tick, now=now))
         group.create_task(advance_ready())

@@ -8,9 +8,12 @@ from datetime import timedelta
 
 import pytest
 from doubles import MemoryCheckpoints
+from integration.durable import Contended
+from integration.durable import Fenced
 from integration.durable import Payouts
 from integration.durable import Run
 from integration.durable import Suspended
+from integration.durable import claimed
 from integration.durable import now_utc
 from integration.durable import parse_approver
 from integration.durable import parse_deadline
@@ -75,12 +78,22 @@ async def paying(
     *,
     settling: timedelta = timedelta(),
 ) -> dict[str, object]:
-    """One pass at the payout workflow, with the knobs every test here shares."""
+    """
+    One pass at the payout workflow, with the knobs every test here shares.
+
+    Claim, run, release, which is what a worker does around every pass: holding the
+    claim for the whole pass is the exclusion, and letting it go at the end is what
+    makes the *next* pass in these tests a resumption rather than a contended one.
+    """
 
     async def body(run: Run) -> dict[str, object]:
         return await pay_out(run, ORDER, ledger.services(), settling=settling, approval_over=APPROVAL_OVER)
 
-    return await resume(ORDER, checkpoints, body, now=clock)
+    holder = await claimed(checkpoints, ORDER)
+    try:
+        return await resume(holder, checkpoints, body, now=clock)
+    finally:
+        await checkpoints.release(holder)
 
 
 async def test_a_workflow_performs_each_effect_once_and_returns_its_payout() -> None:
@@ -201,7 +214,7 @@ async def test_a_payout_over_the_threshold_waits_for_an_approval_another_process
 
     # Whoever took the approval writes one field into the workflow's checkpoint. It
     # shares nothing with the suspended pass, which is gone.
-    await checkpoints.record(ORDER, "approved-by", "auditor-7")
+    await checkpoints.supply(ORDER, "approved-by", "auditor-7")
     ledger.calls.clear()
 
     payout = await paying(ledger, checkpoints, Clock())
@@ -219,11 +232,86 @@ async def test_a_pass_refuses_two_steps_sharing_a_name() -> None:
         await run.step("charged", lambda: answering("second"))
 
     with pytest.raises(ValueError, match="'charged' was already used in this pass"):
-        await resume(ORDER, checkpoints, body, now=Clock())
+        await resume(await claimed(checkpoints, ORDER), checkpoints, body, now=Clock())
 
 
 async def answering(value: str) -> str:
     return value
+
+
+async def test_a_workflow_already_being_passed_over_cannot_be_claimed_again() -> None:
+    # The property the whole seam exists for. Without it, two wakeups for one workflow
+    # (which the submit-then-confirm flow produces every time) run two passes side by
+    # side, and both find the same step unrecorded.
+    checkpoints = MemoryCheckpoints()
+
+    holder = await claimed(checkpoints, ORDER)
+
+    assert await checkpoints.claim(ORDER, timedelta(minutes=1)) is None
+    with pytest.raises(Contended, match=f"another pass holds {ORDER!r}"):
+        await claimed(checkpoints, ORDER)
+
+    await checkpoints.release(holder)
+
+    assert await checkpoints.claim(ORDER, timedelta(minutes=1)) is not None, "released, so the next pass may run"
+
+
+async def test_a_claim_outranks_every_claim_before_it() -> None:
+    checkpoints = MemoryCheckpoints()
+
+    first = await claimed(checkpoints, ORDER)
+    await checkpoints.release(first)
+    second = await claimed(checkpoints, ORDER)
+
+    assert second.token > first.token, "releasing hands the workflow back, it does not rewind the fence"
+
+
+async def test_a_write_from_a_superseded_pass_is_refused_rather_than_applied() -> None:
+    # A lease alone cannot do this: a pass that stalls past its lease still believes it
+    # holds the workflow, and only the store knows better. The token is what tells it.
+    checkpoints = MemoryCheckpoints()
+    stalled = await claimed(checkpoints, ORDER)
+    await checkpoints.release(stalled)
+    took_over = await claimed(checkpoints, ORDER)
+
+    with pytest.raises(Fenced, match=f"pass {stalled.token} of {ORDER!r} was superseded"):
+        await checkpoints.record(stalled, "paid", "pay-from-the-dead")
+
+    assert await checkpoints.record(took_over, "paid", "pay-real") == "pay-real"
+    assert checkpoints.hashes[ORDER] == {"paid": "pay-real"}
+
+    await checkpoints.release(stalled)
+
+    assert await checkpoints.claim(ORDER, timedelta(minutes=1)) is None, (
+        "and a superseded pass cannot hand back a workflow that is no longer its to give"
+    )
+
+
+async def test_two_passes_that_both_ran_a_step_agree_on_its_result() -> None:
+    # The cheaper half of the guarantee, and the one that still matters when exclusion
+    # has already failed: the effect happened twice (nothing here can prevent that), but
+    # the second pass is handed the first's value rather than overwriting it, so the two
+    # do not carry different capture ids into everything downstream.
+    checkpoints = MemoryCheckpoints()
+    holder = await claimed(checkpoints, ORDER)
+
+    won = await checkpoints.record(holder, "captured:widget", "cap-from-the-winner")
+    lost = await checkpoints.record(holder, "captured:widget", "cap-from-the-loser")
+
+    assert won == "cap-from-the-winner"
+    assert lost == "cap-from-the-winner", "the loser learns the winner's value instead of clobbering it"
+
+
+async def test_a_step_returns_what_the_store_holds_rather_than_what_its_effect_produced() -> None:
+    # The same property seen from inside a workflow, which is where it does its work:
+    # `run.step` hands back the recorded value, so a pass whose effect ran a second time
+    # still proceeds on the one result everybody agrees on.
+    checkpoints = MemoryCheckpoints()
+    await checkpoints.supply(ORDER, "charged", "ch-recorded-earlier")
+    holder = await claimed(checkpoints, ORDER)
+    run = Run(holder=holder, checkpoints=checkpoints, recorded={})
+
+    assert await run.step("charged", lambda: answering("ch-just-now")) == "ch-recorded-earlier"
 
 
 async def test_a_deadline_recorded_as_something_else_fails_loudly() -> None:

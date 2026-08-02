@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import timedelta
 
 import httpx
 import pytest
 from doubles import MemoryCheckpoints
 from doubles import MemoryWakeups
+from integration.durable import Pass
 from integration.durable.api import Payments
 from integration.durable.api import payments_app
 from without_http import serving
@@ -65,6 +67,24 @@ async def test_submitting_the_same_key_twice_addresses_the_same_workflow(
     assert queue(payments) == [WORKFLOW, WORKFLOW], "a second pass is harmless: it finds the work recorded"
 
 
+async def test_resubmitting_a_changed_basket_under_one_key_does_not_replace_the_order(
+    client: httpx.AsyncClient,
+    payments: Payments,
+) -> None:
+    # What an idempotency key promises, and what a plain overwrite would break: a
+    # workflow that has already captured against the first basket must not find a
+    # different one underneath it on the next pass.
+    await client.post("/orders", json=ORDER, headers={"idempotency-key": WORKFLOW})
+    second = await client.post(
+        "/orders",
+        json={"items": {"piano": 90_000}},
+        headers={"idempotency-key": WORKFLOW},
+    )
+
+    assert second.status_code == 202
+    assert hashes(payments)[WORKFLOW] == {"order": ORDER["items"]}, "the first order recorded is the one that runs"
+
+
 async def test_an_order_without_an_idempotency_key_is_rejected(client: httpx.AsyncClient) -> None:
     response = await client.post("/orders", json=ORDER)
 
@@ -94,8 +114,8 @@ async def test_the_status_endpoint_shows_what_the_workflow_has_recorded(
     client: httpx.AsyncClient,
     payments: Payments,
 ) -> None:
-    await payments.checkpoints.record(WORKFLOW, "order", ORDER["items"])
-    await payments.checkpoints.record(WORKFLOW, "paid", "pay-2000")
+    await payments.checkpoints.supply(WORKFLOW, "order", ORDER["items"])
+    await payments.checkpoints.supply(WORKFLOW, "paid", "pay-2000")
 
     response = await client.get(f"/orders/{WORKFLOW}")
 
@@ -128,7 +148,16 @@ class BrokenCheckpoints:
     async def load(self, workflow: str) -> dict[str, object]:  # pragma: no cover - present to satisfy the protocol
         return {}
 
-    async def record(self, workflow: str, key: str, value: object) -> None:
+    async def claim(self, workflow: str, lease: timedelta) -> Pass | None:  # pragma: no cover - same
+        return Pass(workflow=workflow, token=1)
+
+    async def record(self, holder: Pass, key: str, value: object) -> object:  # pragma: no cover - same
+        raise RuntimeError("the store is down")
+
+    async def release(self, holder: Pass) -> None:  # pragma: no cover - same
+        return None
+
+    async def supply(self, workflow: str, key: str, value: object) -> object:
         raise RuntimeError("the store is down")
 
 

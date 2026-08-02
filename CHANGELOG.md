@@ -57,6 +57,43 @@
   so it holds precisely as many wakeups as it is working on and stops reading at capacity. The
   end-to-end test submits over HTTP, waits out a real one-second window, confirms, and reads the
   payout back.
+- **`integration`**: `durable`'s `Checkpoints` seam now states the guarantees a store has to
+  provide, and the Redis one provides them. A protocol of `load` and `record` was too weak to run
+  a workflow safely at any scale: it had no way to say "only if nobody else is running this" or
+  "only if I am still the one who may write", so two wakeups for one workflow (which the
+  submit-then-confirm flow produces every time) ran two passes that both found a step unrecorded
+  and both performed its effect. `claim` now takes the right to run a pass and `record` carries the
+  `Pass` it was granted, which makes "you cannot write without holding the workflow" structural
+  rather than remembered. The token is a *fencing* number minted by the store, because a lease
+  alone is not exclusion: a process that stalls past its lease still believes it holds the
+  workflow, and only the store knows better, so a write from a superseded pass is refused
+  (`Fenced`) rather than applied. `record` is also conditional, never overwriting a recorded step
+  and returning whatever is stored after the call, so two passes that both ran an effect at least
+  agree on its result; `Run.step` hands that value back rather than its own. `supply` is the
+  unclaimed half for values that come from outside a pass (the API's order and approval), which
+  keeps first-writer-wins without making an approval fail because a worker is mid-pass, and makes
+  a resubmitted order genuinely idempotent rather than an overwrite. In `RedisCheckpoints` each of
+  these is one Lua script, for the reason `wake_due` already was: checking whether a workflow is
+  free and taking it, or checking a token and applying the write it guards, are only correct as a
+  single step, and the keys are hash-tagged so a workflow's two land on one slot. The worker claims
+  before each pass and releases after, and a wakeup for a workflow someone else holds is scheduled
+  to look again rather than run beside them. What this does not reach is the gap between an effect
+  and its record, which stays at-least-once: closing that needs the step and the checkpoint in one
+  transaction, which is what DBOS gets from Postgres and no Redis store can offer.
+- **`integration`**: `durable.schedule`, a second `Wakeups` that replaces the stream and the
+  sleeping sorted set with one sorted set scored by when each workflow becomes visible. Queued now
+  is a score in the past, sleeping is a score in the future, and being worked on is a score one
+  lease ahead, so there is nothing to move between structures: `wake_due`, `reclaim`, and `prepare`
+  all become no-ops, the timer has nothing to do, and the unbounded stream stops being a gap
+  because a sorted set holds each workflow once however many wakeups arrive. Holding it once is
+  also the catch, since a wakeup landing mid-pass has nowhere to go but on top of the entry that
+  pass is holding, and removing that entry afterwards would throw it away. The score a pass took
+  *is* its receipt, so finishing removes the workflow only if the score is unchanged, and anything
+  that wanted another pass (a confirmation, the pass's own `wake_at`, another worker taking over an
+  overrun) wrote a different one and survives. What it costs is the blocking read: `XREADGROUP
+  BLOCK` parks a worker inside Redis, a sorted set has none, so this polls and the interval is a
+  floor under how fast anything starts. It is a drop-in, and the end-to-end test now runs the same
+  API and worker over both queues to keep it one.
 - **`without-web`**: reverse routing. `url_for(route, values)` renders a route back to a concrete
   path from the values for its path parameters, the inverse of the trie walk. It is a plain
   function of the route *value* (routes are identified by value, no registry), each value fed back

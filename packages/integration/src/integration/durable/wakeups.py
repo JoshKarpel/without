@@ -76,16 +76,29 @@ class Wakeups(Protocol):
     Where a workflow's *right to run* is kept, apart from what it has done.
 
     The seam the API and the worker share: the API makes a workflow ready, a worker
-    takes the next ready one and says when it is `done` with it, `reclaim` picks up
-    what a dead worker was holding, and the timer moves the slept-out ones across.
-    Injected like the checkpoint store, so the worker is drivable from a dict in a test.
+    takes the next ready one and says when it is `done` with it. Injected like the
+    checkpoint store, so the worker is drivable from a dict in a test.
 
-    Two requirements a lossy implementation would miss. `wake_due` MUST move each
-    workflow it reports in one durable step, since one that removes a deadline and then
-    queues the workflow loses it whenever it dies in between. And a delivery MUST stay
-    outstanding until `done`, so that a worker which dies mid-pass leaves it for
-    `reclaim` rather than taking it to the grave. A lost wakeup is a workflow that never
-    runs again.
+    The requirements are about *not losing a wakeup*, since a lost one is a workflow
+    that never runs again, and they are stated as properties rather than as mechanics
+    because the two implementations here reach them by different routes.
+    `RedisWakeups` is a stream beside a sorted set; `RedisSchedule` is one sorted set
+    scored by visibility, where `wake_due`, `reclaim`, and `prepare` all have nothing to
+    do. An implementation MUST guarantee that:
+
+    - a workflow passed to `make_ready` is eventually yielded by some `next_ready`, even
+      if the worker holding it dies mid-pass, and even if the wakeup arrives *while* a
+      pass on that workflow is running;
+    - `wake_due` moves each workflow it reports in one durable step, since one that
+      removes a deadline and then queues the workflow loses it whenever it dies in
+      between (an implementation with nothing to move satisfies this trivially);
+    - a `wake_at` survives a `done` for a delivery taken before it, because the worker
+      calls them in that order and the acknowledgement must not undo the scheduling.
+
+    What is deliberately *not* required is that a workflow reach only one worker at a
+    time. The stream will happily deliver two wakeups for one workflow to two consumers,
+    and that is safe because exclusion belongs to `Checkpoints.claim` rather than here:
+    this seam answers "who owes a pass", the checkpoint store answers "who may write".
     """
 
     async def prepare(self) -> None: ...

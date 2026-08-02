@@ -17,7 +17,12 @@ from integration.durable.payout import Payouts
 from integration.durable.payout import parse_approver
 from integration.durable.payout import parse_items
 from integration.durable.payout import pay_out
+from integration.durable.schedule import RedisSchedule
 from integration.durable.shell import Checkpoints
+from integration.durable.shell import Contended
+from integration.durable.shell import Fenced
+from integration.durable.shell import Pass
+from integration.durable.shell import claimed
 from integration.durable.shell import run_durably
 from integration.durable.shell import run_saga
 from integration.durable.stepwise import Run
@@ -40,14 +45,18 @@ __all__ = [
     "Cents",
     "Checkpoints",
     "Confirmation",
+    "Contended",
     "Delivery",
+    "Fenced",
     "Order",
+    "Pass",
     "Payments",
     "Payout",
     "Payouts",
     "Reached",
     "Receipt",
     "RedisCheckpoints",
+    "RedisSchedule",
     "RedisWakeups",
     "Rollback",
     "Run",
@@ -56,6 +65,7 @@ __all__ = [
     "SubmittedOrder",
     "Suspended",
     "Wakeups",
+    "claimed",
     "fulfilment",
     "now_utc",
     "parse_approver",
