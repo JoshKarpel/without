@@ -63,10 +63,26 @@ the difference from `SqlEffect` rather than an oversight. The whole transaction 
 on one worker thread, so an effect is ordinary blocking code there and awaiting
 inside it would be both impossible and pointless.
 
-`sqlite3` is a blocking API, so every call hops to a thread via `asyncio.to_thread`.
-The connection is not safe under concurrent use, so one `asyncio.Lock` serializes
-access to it, which costs less than it looks: SQLite serializes writers anyway, and
-these transactions are single-digit statements over indexed rows.
+`sqlite3` is a blocking API, so every call hops to a thread via `asyncio.to_thread`,
+and that hop is where the concurrency comes from. A single-threaded event loop does
+_not_ serialize these calls, because the whole point of the hop is to get them off
+that thread: twenty passes are twenty pool workers inside one connection at once. One
+`asyncio.Lock` puts them back in a queue.
+
+What the lock is for is narrower than "the connection is not thread-safe", and worth
+being exact about, because SQLite's own answer sounds like it covers the case. The
+library is normally built serialized (`sqlite3.threadsafety == 3`), so sharing a
+connection across threads is already safe from corruption. What serialized mode
+promises is that calls behave "as if they had all been made in the same order from a
+single thread": linearization, not isolation. A transaction is connection state, so a
+caller landing mid-`BEGIN IMMEDIATE` joins that transaction rather than waiting for
+it, and its write succeeds, reads back, and then vanishes when the other caller rolls
+back. That is what the lock removes, and no threading mode removes it.
+
+The lock is also held until the worker *thread* finishes rather than until the calling
+coroutine returns, since a thread cannot be cancelled: a cancelled caller that let go
+of the connection would hand it to the next one mid-statement, which is the same
+failure by another route.
 
 ## Durability is the point, so it is not tuned away
 
@@ -89,6 +105,15 @@ the ordinary case when two processes share the file.
   is not even a `LISTEN`/`NOTIFY` left on the table: within one process an
   `asyncio.Event` would do it, across processes on one machine it would take a
   filesystem watch, and neither is here.
+- **One connection gives up the half of WAL worth having.** WAL exists so one writer
+  runs alongside many readers, and funnelling everything through a single connection
+  serializes reads too: `load` and `next_ready` queue behind whatever commit is in
+  flight, `synchronous=FULL` fsync included. Buying that back means more connections
+  (a reader pool, or one per thread, against the same file) rather than a cleverer
+  lock, since the lock exists to keep transactions from interleaving on one
+  connection and a second connection has no such problem. That is a larger store than
+  this one, and the reason it has not been paid for is that a single node running one
+  worker rarely notices.
 - **Nothing sweeps.** Rows stay until something deletes them, so a long-running
   deployment needs a job that removes finished workflows. Nothing here is that job.
 - **`migrate` is not a migration tool.** It runs the schema under SQLite's own

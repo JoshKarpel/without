@@ -21,10 +21,27 @@
 # this store is for: a CLI that resumes, a desktop app, an agent on a laptop, a single
 # node that would rather not run Postgres to remember what it was doing.
 #
-# `sqlite3` is a blocking API, so every call here hops to a thread. The connection is not
-# thread-safe across concurrent use, so one `asyncio.Lock` serializes access to it, which
-# costs less than it looks: SQLite serializes writers anyway, and the transactions here
-# are single-digit statements over indexed rows.
+# `sqlite3` is a blocking API, so every call here hops to a thread, and that hop is what
+# creates the concurrency this store has to answer for. A single-threaded event loop does
+# not serialize these: `asyncio.to_thread` exists to get the work *off* that thread, so
+# twenty passes are twenty pool workers inside one connection at once. One `asyncio.Lock`
+# puts them back in a queue.
+#
+# What that lock is for is worth stating exactly, because SQLite's own answer sounds like
+# it covers the case and does not. The library is built serialized here (`THREADSAFE=1`,
+# `sqlite3.threadsafety == 3`), so concurrent use of one connection is already safe from
+# corruption; what it promises is that the calls behave "as if they had all been made in
+# the same order from a single thread", which is *linearization, not isolation*. A
+# transaction is connection state, so a second caller landing mid-`BEGIN IMMEDIATE` joins
+# that transaction rather than waiting for it: its write succeeds, reads back, and then
+# disappears when the other caller rolls back. That is the failure the lock removes, and
+# no threading mode removes it.
+#
+# What the lock costs is the other half of WAL. WAL exists so one writer runs alongside
+# many readers, and one connection gives that up: `load` and `next_ready` queue behind
+# whatever commit is in flight, `synchronous=FULL` fsync included. Buying it back means
+# more connections (a reader pool, or one per thread) rather than a different lock, which
+# is a bigger store than this one.
 #
 # Requires SQLite 3.42 or newer (2023-05-16), which is where the `subsec` modifier
 # arrives. Every clock read below is `unixepoch('now', 'subsec')`, and without `subsec`
@@ -203,9 +220,11 @@ class Database:
 
     The analogue of the Postgres store's connection pool, and the opposite shape for the
     opposite reason: a pool exists so several statements run at once, and this exists so
-    they do not. A SQLite connection is not safe under concurrent use, and SQLite admits
-    one writer regardless, so serializing here costs little and removes a whole class of
-    question about what two coroutines can do to each other.
+    they do not. Not because a connection would corrupt (SQLite is built serialized here,
+    so it would not), but because a transaction belongs to the *connection*: without this,
+    a caller arriving mid-`BEGIN IMMEDIATE` writes into somebody else's transaction and
+    loses its write to that transaction's rollback. See the note at the top of this
+    module for why the event loop's single thread does not already prevent that.
 
     Build it with `connect`, which applies the pragmas that make this durable rather than
     merely persistent. Share one between the checkpoint store and the queue: that is what
@@ -216,9 +235,35 @@ class Database:
     guard: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
 
     async def run[T](self, work: Callable[[sqlite3.Connection], T]) -> T:
-        """Do `work` against the connection, on a thread, with nobody else inside it."""
-        async with self.guard:
-            return await asyncio.to_thread(work, self.connection)
+        """
+        Do `work` against the connection, on a thread, with nobody else inside it.
+
+        Cancellation is where "nobody else" has to be arranged rather than assumed, and
+        it is the reason this is not simply `async with self.guard`. A thread is not
+        cancellable: cancelling the caller unwinds this coroutine at once while the
+        thread runs on, so releasing the guard on the way out would hand the connection
+        to the next caller while the last one is still inside it. That is not a
+        theoretical race. The statement in flight may be a `BEGIN IMMEDIATE`
+        transaction, and a write that lands in somebody else's open transaction is
+        committed or rolled back with it: `record` returns, a read sees the row, and the
+        rollback takes it away again, which is precisely the guarantee this store
+        exists to make.
+
+        So the guard is released by the *thread finishing* rather than by this coroutine
+        returning. The work is a task, the caller awaits a shield of it (so cancelling
+        the caller leaves the task alone), and a done-callback lets go of the connection
+        when it is genuinely free. A cancelled caller still unwinds immediately; what it
+        no longer does is take the connection with it.
+
+        What the shield adds beyond that is the reporting. A statement that fails after
+        its caller has gone has nobody left to raise to, and `shield` hands it to the
+        loop's exception handler rather than dropping it, so a write that failed on the
+        way out of a process is in the log instead of nowhere.
+        """
+        await self.guard.acquire()
+        running = asyncio.ensure_future(asyncio.to_thread(work, self.connection))
+        running.add_done_callback(lambda _finished: self.guard.release())
+        return await asyncio.shield(running)
 
 
 def connect(path: Path | str, *, timeout: timedelta = timedelta(seconds=5)) -> Database:
@@ -298,9 +343,9 @@ class SqliteCheckpointer:
     for an application that never needed Postgres.
 
     A workflow id carries no constraints at all: it is bound as a query parameter, never
-    parsed as key structure. The only constraint that survives is the one `run_saga`
-    states about any store, that an id ending in `:unwind` addresses another workflow's
-    rollback.
+    parsed as key structure. Nothing here derives one id from another either, so an
+    application is free to name a workflow's sibling (a saga's rollback, say) however it
+    likes out of its own namespace.
 
     `codec` is how a step's result becomes the `TEXT` in a row and comes back, defaulting
     to the stdlib's JSON. Swap it to widen what a step may return or to speed the encoding

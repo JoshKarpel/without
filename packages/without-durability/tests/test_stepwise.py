@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import UTC
@@ -21,6 +22,7 @@ from without_durability import Outcome
 from without_durability import Recorded
 from without_durability import Run
 from without_durability import Sleeping
+from without_durability import Suspended
 from without_durability import Waiting
 from without_durability import claimed
 from without_durability import now_utc
@@ -50,11 +52,15 @@ class Clock:
 
 @dataclass(slots=True)
 class Ledger:
-    """The outside world: records every effect, and fails where told to."""
+    """The outside world: records every effect, and fails or parks where told to."""
 
     items: dict[str, int] = field(default_factory=lambda: dict(ITEMS))
     calls: list[str] = field(default_factory=list)
     broken: set[str] = field(default_factory=set)
+    # A capture named here parks until something cancels it, and says so when that
+    # happens. It is how a failing sibling is made deterministic (a parked effect can
+    # never win the race to complete) and how the cancelling itself is observed.
+    blocked: set[str] = field(default_factory=set)
 
     def services(self) -> Payouts:
         async def items(order_id: str) -> dict[str, int]:
@@ -62,6 +68,12 @@ class Ledger:
             return self.items
 
         async def capture(sku: str, amount: int) -> str:
+            if f"capture:{sku}" in self.blocked:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.calls.append(f"cancelled:{sku}")
+                    raise
             self.perform(f"capture:{sku}")
             return f"cap-{sku}-{amount}"
 
@@ -489,3 +501,37 @@ async def test_the_default_clock_reads_an_aware_utc_time() -> None:
     # Deadlines are compared and serialized, so a naive clock would compare against an
     # aware deadline read back from the store and raise at the comparison.
     assert now_utc().tzinfo is UTC
+
+
+async def test_a_suspension_resume_cannot_report_becomes_that_workflows_failure() -> None:
+    # `Suspended` is public so a workflow author knows what must not be caught, not so it
+    # can be raised: `Outcome` has an arm for each of its two subclasses and none for the
+    # base. Raised anyway it would travel as an `Interruption`, which every driver's
+    # `except Exception` is built to miss, so one workflow's mistake would take down the
+    # loop running everyone else's. It comes back as an ordinary exception instead.
+    checkpointer = MemoryCheckpointer()
+    holder = await claimed(checkpointer, ORDER)
+
+    async def confused(run: Run) -> None:
+        raise Suspended("somewhere", "for something nobody named")
+
+    with pytest.raises(TypeError, match="Suspended is not a suspension a pass can report"):
+        await resume(holder, checkpointer, confused)
+
+
+async def test_a_failed_capture_takes_its_siblings_down_with_the_pass() -> None:
+    # `gather` raises the first failure and leaves the rest running, which here would mean
+    # a capture still in flight after the pass that spawned it is over: it would record
+    # into a claim the driver has already released, under a token the store has stopped
+    # honouring, and nobody would be waiting to see it fail. The fan-out is owned instead,
+    # so its survivors end when it does.
+    checkpointer = MemoryCheckpointer()
+    ledger = Ledger(broken={"capture:gizmo"}, blocked={"capture:widget"})
+
+    with pytest.raises(RuntimeError, match="capture:gizmo is down"):
+        await paying(ledger, checkpointer, Clock())
+
+    assert "cancelled:widget" in ledger.calls, "the sibling was cancelled rather than left running"
+    assert [key for key in await checkpointer.load(ORDER) if key.startswith("captured:")] == [], (
+        "and neither capture recorded, so the next pass runs both"
+    )

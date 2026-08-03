@@ -61,9 +61,10 @@ and `without-dag`:
 `MemoryCheckpointer` and `MemoryScheduler` ship here too, so a test injects a dict
 rather than starting a container.
 
-The same interface carries a second mechanism: `run_durably` and `run_saga` run a
+The same interface carries a second mechanism: `run_durably` runs a
 `without-dag` `CompiledGraph` against it, recording each `(node key, result)`
-before pulling the next. `work(durable, body)` turns either into a running
+before pulling the next. A saga needs no third one, since a rollback is another
+graph run through the same call. `work(durable, body)` turns either into a running
 service, a pool of passes plus a timer, with backpressure that falls out of
 pulling one delivery per free slot.
 

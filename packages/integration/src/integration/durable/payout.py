@@ -21,6 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 
+from without import cancel_futures
 from without_durability import Run
 
 type Cents = dict[str, int]
@@ -99,9 +100,33 @@ async def pay_out(
     items = await run.step("items", lambda: services.items(order_id), parse_items)
     skus = sorted(items)
 
-    captures = await asyncio.gather(
-        *(run.step(f"captured:{sku}", capturing(services, sku, items[sku]), parse_reference) for sku in skus)
-    )
+    # Spawned into a list rather than gathered straight off a generator, so the fan-out
+    # has an owner. `gather` raises the first failure and leaves its siblings running,
+    # which here means captures still writing into a pass that is already over: whatever
+    # they record lands after `resume` reported an outcome and after the worker released
+    # the claim, under a token the store has stopped honouring. Cancelling the survivors
+    # on the way out is what ends the fan-out when the pass ends, and it is the same
+    # shape `without_dag.drive` uses for the same reason.
+    #
+    # A `TaskGroup` would cancel them too, and would change what a failure *is*: it wraps
+    # children in an `ExceptionGroup`, so a `Fenced` raised by one capture would reach the
+    # worker as a group that its `except (Fenced, Contended)` cannot see, and losing the
+    # workflow would be logged as the workflow failing. The exception's *type* is
+    # load-bearing here, so the cancelling is done by hand and the type is left alone.
+    capturing_each = [
+        asyncio.ensure_future(run.step(f"captured:{sku}", capturing(services, sku, items[sku]), parse_reference))
+        for sku in skus
+    ]
+    try:
+        captures: list[str] = await asyncio.gather(*capturing_each)
+    finally:
+        # The ones still running, rather than all of them: `cancel_futures` cancels the
+        # set and then awaits each so its teardown finishes, and awaiting one that has
+        # already *failed* re-raises there, before the awaits behind it. The failure is
+        # the ordinary case here (it is what brought us into this `finally`), and it is
+        # already in flight to the caller, so re-raising it costs nothing and skipping
+        # the rest of the list costs the cancellation this whole shape exists for.
+        await cancel_futures(capture for capture in capturing_each if not capture.done())
 
     total = sum(items.values())
     await run.sleep("settling", settling)

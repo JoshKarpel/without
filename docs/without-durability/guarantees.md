@@ -199,11 +199,13 @@ handle a declined gateway must not absorb one.
 life that matters: the part where it is travelling up through the workflow author's own
 code, past whatever they wrapped their steps in.
 
-The case that forced it is `run_saga`. It compensates on failure, and a `Fenced`
-forward run is not a failure: it says another pass holds this workflow and is
-advancing it, so a loser that compensated would refund a charge the winner is still
-building on. Making the exception's own shape enforce that beats keeping a list of
-types correct at every `except` site.
+The case that forced it is a saga, which is an `except Exception` around a forward run
+that drives a rollback. A `Fenced` forward run is not a failure: it says another pass
+holds this workflow and is advancing it, so a loser that compensated would refund a
+charge the winner is still building on. Making the exception's own shape enforce that
+beats keeping a list of types correct at every `except` site, which matters more here
+than it would inside a library, since the `except` in question is one an application
+wrote (see [Sagas are not a feature here](index.md#sagas-are-not-a-feature-here)).
 
 ## One interface or two
 

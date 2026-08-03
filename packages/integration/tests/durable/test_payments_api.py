@@ -128,6 +128,23 @@ async def test_an_order_whose_idempotency_key_is_too_long_is_rejected(
     assert await recorded(payments) == {}, "nothing reached the store under the id it refused"
 
 
+@pytest.mark.parametrize("key", ["{tenant}-9f2", "idem-{", "idem-}"])
+async def test_an_order_whose_idempotency_key_carries_a_hash_tag_is_rejected(
+    client: httpx.AsyncClient,
+    payments: Payments,
+    key: str,
+) -> None:
+    # Braces delimit Redis Cluster's hash tag, so an id carrying its own decides which
+    # slot its workflow lands on. Correctness survives that (a workflow's two keys still
+    # agree on the tag), but a sender that puts the same tag on every request puts the
+    # whole deployment on one node, which is not a choice the sender gets to make.
+    response = await client.post("/orders", json=ORDER, headers={"idempotency-key": key})
+
+    assert response.status_code == 422
+    assert json.loads(response.text)["field"] == "idempotency-key"
+    assert workflows(payments) == [], "no workflow was opened under an id the store would have to parse"
+
+
 async def test_an_order_whose_idempotency_key_is_as_long_as_the_bound_allows_is_accepted(
     client: httpx.AsyncClient,
 ) -> None:

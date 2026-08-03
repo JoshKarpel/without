@@ -34,7 +34,7 @@ from without_durability import Waiting
 from without_durability import claimed
 from without_durability import now_utc
 from without_durability import resume
-from without_durability import run_saga
+from without_durability import run_durably
 from without_durability import work
 from without_http import serving
 
@@ -83,9 +83,23 @@ async def saga[In, Out, Reaches, Undone](
     workflow: str,
     value: In,
 ) -> Out:
+    """
+    A saga as a second `run_durably` under a second id, which is all one is.
+
+    Spelled out here rather than imported, and run against every store, so the claim
+    that a compensation needs no mechanism is tested rather than asserted: what makes
+    a rollback resumable is the same checkpoint and the same claim the forward run uses.
+    """
     holder = await claimed(checkpointer, workflow)
     try:
-        return await run_saga(forward, unwind, reaches, checkpointer, holder, value)
+        return await run_durably(forward, checkpointer, holder, value)
+    except Exception:
+        undoing = await claimed(checkpointer, f"{workflow}:unwind")
+        try:
+            await run_durably(unwind, checkpointer, undoing, reaches(await checkpointer.load(workflow)))
+        finally:
+            await checkpointer.release(undoing)
+        raise
     finally:
         await checkpointer.release(holder)
 

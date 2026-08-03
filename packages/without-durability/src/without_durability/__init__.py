@@ -2,7 +2,6 @@ from without_durability.codec import JSON
 from without_durability.codec import CheckpointCodec
 from without_durability.codec import JsonCodec
 from without_durability.graph import run_durably
-from without_durability.graph import run_saga
 from without_durability.interfaces import LEASE
 from without_durability.interfaces import Checkpointer
 from without_durability.interfaces import Contended
@@ -71,7 +70,6 @@ __all__ = [
     "ready",
     "resume",
     "run_durably",
-    "run_saga",
     "waking",
     "work",
 ]

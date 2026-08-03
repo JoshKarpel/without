@@ -16,7 +16,7 @@ Where that atomicity comes from is the interesting part, and it has its own page
 
 ```text
 interfaces.py  the three interfaces: Checkpointer, Scheduler, Durable
-graph.py     run_durably / run_saga over a without-dag CompiledGraph
+graph.py     run_durably over a without-dag CompiledGraph
 stepwise.py  the same durability for an ordinary async function
 codec.py     what a step's result becomes in a store, and how it comes back
 worker.py    the queue worker and its timer
@@ -44,17 +44,53 @@ is the application's.
 in a test. `Scheduler` beside it holds the other half of a workflow's state, its right
 to run, and `Durable` is the pair plus the moves that have to cross both at once.
 
-`run_durably` is the graph mechanism. It loads the checkpoint, streams a
-`CompiledGraph`, records each `(key, result)` before pulling the next, and returns the
-output, so re-running a finished workflow performs no effects. `run_saga` adds the
-compensating half: on failure it parses the checkpoint into how far the run got and
-drives a rollback graph under its own key, itself checkpointed, so an interrupted
-rollback resumes instead of refunding twice. Which step compensates which is domain
-knowledge written by hand, as it is in every engine that formalizes sagas.
+`run_durably` is the graph mechanism, and the whole of it. It loads the checkpoint,
+streams a `CompiledGraph`, records each `(key, result)` before pulling the next, and
+returns the output, so re-running a finished workflow performs no effects.
 `integration.durable.core` is the worked example: fulfilling an order charges the card
 and reserves the stock concurrently, ships, and renders a receipt, with every effect
 injected and every node named in the source, so a result is stored under a key that
 means the same thing after a crash.
+
+### Sagas are not a feature here
+
+A compensating transaction needs no mechanism, because a rollback is another workflow:
+a second graph, run through `run_durably` under a second id. That makes it checkpointed
+on exactly the same terms as the forward run, so a crash partway through a rollback
+resumes it rather than refunding twice. Written out, it is this:
+
+```python
+try:
+    return await run_durably(forward, checkpointer, holder, order)
+except Exception:
+    undoing = await claimed(checkpointer, f"{holder.workflow}:rollback")
+    try:
+        reached = Reached.of(await checkpointer.load(holder.workflow))
+        await run_durably(unwind, checkpointer, undoing, reached)
+    finally:
+        await checkpointer.release(undoing)
+    raise
+```
+
+Two of its properties fall out of shapes that are already there rather than being
+arranged. `except Exception` is the right net without a list of types to keep correct,
+because cancellation and every `Interruption` descend from `BaseException`, and each of
+those stops for a reason that makes unwinding actively wrong: a `Fenced` loser that
+compensated would refund a charge the winner is still building on. And deciding what to
+give back is a pure function of a value, since the checkpoint _is_ a mapping of results,
+so `Reached.of` parses it into the question the rollback asks rather than interrogating
+a replay log or a running engine.
+
+What is left is which step compensates which, which is domain knowledge written by hand,
+as it is in every engine that formalizes sagas. So there is nothing for a library
+function to hold except the rollback's id, and that is a name in the _application's_
+namespace: reserving a suffix for it would oblige every place that mints an id to know
+the reservation and refuse it, on pain of one workflow addressing another's
+compensation.
+
+So the suffix above is `:rollback` for no reason at all, and `integration`'s suite
+(which runs this same shape against every store) uses `:unwind` for no reason either.
+Neither is a convention, and nothing below this line knows which one you picked.
 
 `stepwise` is the same durability without the graph, and the two sit together
 deliberately: one checkpoint, two ways to spend it. A workflow is an ordinary async

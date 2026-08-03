@@ -91,15 +91,24 @@ confirmation_body = body(Confirmation.model_validate_json, schema=Confirmation)
 # The workflow id *is* the idempotency key, so submitting twice cannot start two payouts:
 # the same key names the same checkpoint, and the pass it triggers finds the work already
 # recorded. It is also the one place a client's own text becomes a workflow id, which is
-# why a bound is enforced *here* rather than in a store: one extractor deciding once, on
-# the only path an id arrives on, instead of a check every store pays on every call.
+# why every constraint on one is enforced *here* rather than in a store: one extractor
+# deciding once, on the only path an id arrives on, instead of a check every store pays on
+# every call. `RedisCheckpointer` states both of them and says to enforce them where ids
+# are minted; this is that place.
 #
-# The bound is deliberately not the full list. `RedisCheckpointer` asks two things of an
-# id and `run_saga` asks a third, and every one is met without trying by the UUID a sender
-# actually generates. What a length cap answers is different in kind: an id becomes *key
-# structure* in Redis and a `text` column everywhere else, so an unbounded one is
-# unbounded storage a client chooses. That is the one property no sender's good behaviour
-# establishes, so it is the one worth a comparison.
+# What makes them worth checking despite the docs calling them unlikely is *who chooses*.
+# A sender generating a UUID meets both without thinking about it, so a check aimed at
+# that sender would be dead weight. A sender choosing its own text is a different
+# question, and each of these is something it could choose:
+#
+#   - length, because an id becomes key structure in Redis and a `text` column everywhere
+#     else, so an unbounded one is unbounded storage picked by the client;
+#   - braces, because they delimit Redis Cluster's hash tag, so an id carrying its own
+#     decides which slot its workflow lands on, and a client sending one tag for every
+#     request puts the whole deployment on one node.
+#
+# Neither is a correctness bug in a store: each is a store's documented shape being chosen
+# by whoever sends the header, which is exactly what a boundary is for.
 MAX_WORKFLOW_ID = 200
 
 
@@ -107,16 +116,18 @@ def as_workflow_id(value: bytes) -> str:
     """
     The `Idempotency-Key` header as a workflow id, or a rejection naming the header.
 
-    A `ValueError` here (from the decode or from the bound) becomes an `ExtractionError`
-    tagged with this field, which `recover` turns into a 422. So a client that sends
-    something unusable is told which header it was, rather than the store failing later
-    under an id nobody chose.
+    A `ValueError` here (from the decode or from any of the bounds) becomes an
+    `ExtractionError` tagged with this field, which `recover` turns into a 422. So a
+    client that sends something unusable is told which header it was, rather than the
+    store failing later under an id nobody chose.
     """
     key = value.decode()
     if not key:
         raise ValueError("an idempotency key must not be empty")
     if len(key) > MAX_WORKFLOW_ID:
         raise ValueError(f"an idempotency key must be at most {MAX_WORKFLOW_ID} characters, but got {len(key)}")
+    if "{" in key or "}" in key:
+        raise ValueError("an idempotency key must not contain '{' or '}'")
     return key
 
 

@@ -73,6 +73,12 @@ class Suspended(Interruption):
     Being an `Interruption` is what makes that structural rather than a rule to
     remember, and it is why these stay public despite `resume` absorbing them: a
     workflow author needs to know what must not be caught.
+
+    Public to *name*, then, and not to raise. The two ways of waiting are its
+    subclasses, and each carries what a driver needs to answer it; this base carries
+    only the fact that a pass stopped, which no driver can act on. `resume` turns one
+    raised directly into an ordinary failure of that workflow rather than letting it
+    through (see there for why that is the kinder of the two).
     """
 
     def __init__(self, key: StepKey, waiting: str) -> None:
@@ -334,6 +340,14 @@ async def resume[T, Effect](
     workflow is not an outcome of a pass but a statement that this pass was never
     entitled to one.
 
+    A `Suspended` that is neither of the two is the one thing rewritten rather than
+    passed along, and the reason is what it would otherwise cost. `Outcome` has no arm
+    for it and a driver has no way to answer it, so it can only travel outward; and it
+    travels as an `Interruption`, which every sensible `except Exception` in a driver is
+    built to miss, so one workflow raising it would take down the loop running every
+    other workflow. Re-raised as an ordinary exception it is what it actually is: that
+    workflow's mistake, and nobody else's.
+
     It takes a claim rather than making one, for the same reason it returns rather than
     raises. Whether to wait for a contended workflow, come back later, or fail is the
     driver's call: a worker holding a queue delivery wants one answer and a test driving
@@ -346,3 +360,8 @@ async def resume[T, Effect](
         return Sleeping(key=wakeup.key, due=wakeup.due)
     except InputNeeded as needed:
         return Waiting(key=needed.key)
+    except Suspended as unreportable:
+        raise TypeError(
+            f"{type(unreportable).__name__} is not a suspension a pass can report: "
+            f"a workflow waits with `Run.sleep` or `Run.awaiting`"
+        ) from unreportable

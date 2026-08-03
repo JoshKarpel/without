@@ -29,7 +29,6 @@ from without_durability import Recorded
 from without_durability import SplitDurable
 from without_durability import claimed
 from without_durability import run_durably
-from without_durability import run_saga
 
 ORDER = Order(order_id="o-7", sku="widget", cents=2500)
 
@@ -61,12 +60,55 @@ async def saga[In, Out, Reaches, Undone](
     workflow: str,
     value: In,
 ) -> Out:
-    """The same, for the compensating runner, which takes its rollback's claim itself."""
+    """
+    Run `forward`, and on failure compensate with `unwind` before re-raising.
+
+    Written out here rather than imported, because there is no saga runner to import:
+    a compensation is another graph, so unwinding is a second `run_durably` under a
+    second id. This is the whole of it, and it is this short because the checkpoint is
+    a *value*: what the forward run achieved is a mapping of results, so deciding what
+    to give back is a pure function of it (`reaches`) rather than a replay log or an
+    engine to interrogate.
+
+    The rollback goes through `run_durably` too, so it is checkpointed exactly like the
+    forward run and a crash partway through it resumes rather than refunding twice. Its
+    id is `:unwind` beside the workflow's here, but that is this driver's choice out of
+    its own namespace and nothing in the library knows the string.
+
+    Two things fall out of the shapes rather than being arranged. The original failure
+    is re-raised once the compensation lands, since compensating does not make the
+    workflow succeed, and a failure *inside* the compensation propagates in its place,
+    carrying the original as context, because a half-unwound saga is the more urgent
+    problem. And `except Exception` is already the right net: cancellation and every
+    `Interruption` descend from `BaseException`, and each of them stops for a reason
+    that makes unwinding actively wrong (a `Fenced` loser that compensated would refund
+    a charge the winner is still building on).
+    """
     holder = await claimed(checkpointer, workflow)
     try:
-        return await run_saga(forward, unwind, reaches, checkpointer, holder, value)
+        return await compensating(forward, unwind, reaches, checkpointer, holder, value)
     finally:
         await checkpointer.release(holder)
+
+
+async def compensating[In, Out, Reaches, Undone](
+    forward: CompiledGraph[In, Out],
+    unwind: CompiledGraph[Reaches, Undone],
+    reaches: Callable[[Mapping[str, object]], Reaches],
+    checkpointer: Checkpointer,
+    holder: Pass,
+    value: In,
+) -> Out:
+    """The saga itself, under a claim somebody else took, which is where the shapes show."""
+    try:
+        return await run_durably(forward, checkpointer, holder, value)
+    except Exception:
+        undoing = await claimed(checkpointer, f"{holder.workflow}:unwind")
+        try:
+            await run_durably(unwind, checkpointer, undoing, reaches(await checkpointer.load(holder.workflow)))
+        finally:
+            await checkpointer.release(undoing)
+        raise
 
 
 @dataclass(slots=True)
@@ -307,7 +349,7 @@ async def test_a_pass_that_lost_the_workflow_mid_run_does_not_compensate() -> No
     await claimed(checkpointer, "wf-lost")  # the winner, which outranks the stalled pass
 
     with pytest.raises(Fenced):
-        await run_saga(fulfilment(services), unwinding(services), Reached.of, checkpointer, stalled, ORDER)
+        await compensating(fulfilment(services), unwinding(services), Reached.of, checkpointer, stalled, ORDER)
 
     assert "refund" not in gateway.calls, "the loser left the winner's charge alone"
     assert await checkpointer.load("wf-lost:unwind") == {}, "and took no claim on the rollback"

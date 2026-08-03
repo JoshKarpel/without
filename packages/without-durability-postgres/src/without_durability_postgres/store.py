@@ -266,9 +266,9 @@ class PostgresCheckpointer:
     the window between an effect and its record assumes.
 
     A workflow id carries no constraints here at all, since it is bound as a query parameter
-    rather than parsed as key structure. The only constraint that survives is the one
-    `run_saga` states about any store: an id ending in `:unwind` addresses another
-    workflow's rollback.
+    rather than parsed as key structure. Nothing here derives one id from another either,
+    so an application is free to name a workflow's sibling (a saga's rollback, say)
+    however it likes out of its own namespace.
 
     `codec` is how a step's result becomes the document in a `jsonb` column and comes
     back, defaulting to the stdlib's JSON. The column type narrows what a codec here may

@@ -7,25 +7,29 @@
 # There is no scheduler here, no worker fleet, and no retry policy: the caller decides
 # when to run and how often, and a run is just an `await`.
 #
+# There is no saga here either, and that is a claim rather than a gap. A compensation is
+# another graph, so unwinding one workflow is running a second one: a `try` around this
+# call and another call to it in the `except`, under an id the application chose. Shipping
+# that as a function would add nothing but a name for the rollback's workflow, which is a
+# name in the *caller's* id namespace, so the library would be reserving a suffix that
+# every id-minting site then has to know about and refuse. The pairing of a step with its
+# undo is domain knowledge either way (every engine that formalizes sagas leaves the
+# author to write both halves), so what is left to abstract is the eight lines that hold
+# them. See docs/without-durability/index.md, which writes them out.
+#
 # This is the only module here that depends on `without-dag`. The other mechanism
 # (`stepwise`) needs no graph at all, and the two share nothing but the `Checkpointer`
 # interface, which is the point: one checkpoint, two ways to spend it.
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from collections.abc import Mapping
-from datetime import timedelta
 from typing import cast
 
 from without_dag import CompiledGraph
-from without_dag import NodeKey
 
-from without_durability.interfaces import LEASE
 from without_durability.interfaces import Checkpointer
 from without_durability.interfaces import Contended
 from without_durability.interfaces import Pass
-from without_durability.interfaces import claimed
 
 
 async def run_durably[*Ins, Out](
@@ -107,60 +111,3 @@ async def run_durably[*Ins, Out](
     # is read from the checkpoint rather than from the call, because a fully
     # recorded workflow runs nothing and so has nothing to return.
     return cast(Out, checkpoint[run.output])
-
-
-async def run_saga[In, Out, Reached, Undone](
-    forward: CompiledGraph[In, Out],
-    unwind: CompiledGraph[Reached, Undone],
-    reached: Callable[[Mapping[NodeKey, object]], Reached],
-    checkpointer: Checkpointer,
-    holder: Pass,
-    value: In,
-    *,
-    lease: timedelta = LEASE,
-) -> Out:
-    """
-    Run `forward` durably, and on failure compensate with `unwind` before re-raising.
-
-    The saga, and it is this short because the checkpoint is a *value*: what the
-    forward run achieved is a mapping of results, so deciding what to give back is
-    a pure function of it (`reached` parses that mapping into whatever the
-    compensation needs) rather than a replay log or an engine to interrogate. There
-    is nothing automatic about which step compensates which, and deliberately so:
-    that pairing is domain knowledge, and even the engines that formalize sagas
-    leave the author to write both halves.
-
-    The rollback runs through `run_durably` too, under its own key and its own
-    claim, so it is checkpointed exactly like the forward run: a crash mid-rollback
-    resumes it instead of refunding twice. Its claim is separate because it is a
-    separate workflow, and taking it can fail the same way any claim can, which is
-    the honest outcome: two processes compensating the same saga at once is what
-    the exclusion exists to prevent. The original failure is re-raised once the
-    compensation lands, because compensating does not make the workflow succeed; a
-    failure *inside* the compensation propagates in its place, carrying the original
-    as its context, since a half-unwound saga is the more urgent problem.
-
-    Cancellation is not caught, and neither is any other `Interruption`. Each stops
-    for a reason that makes unwinding actively wrong: cancellation would fire the
-    compensations while their forward steps may still be running, and `Fenced` or
-    `Contended` says another pass holds this workflow and is advancing it, so a loser
-    that compensated would refund a charge the winner is still building on.
-    Descending from `BaseException` is what keeps the `except Exception` below from
-    reaching them, so the rule is enforced by the exceptions' own shape rather than
-    by a list of types kept correct here.
-
-    The rollback's id is the workflow's own with `:unwind` appended, which puts one
-    constraint on ids in exchange for needing no second namespace: an id that already
-    ends in `:unwind` addresses another workflow's rollback. Deriving a sibling by
-    suffixing is what makes that true against any store rather than being a property
-    of how one of them builds keys, and it is stated rather than checked.
-    """
-    try:
-        return await run_durably(forward, checkpointer, holder, value)
-    except Exception:
-        unwinding = await claimed(checkpointer, f"{holder.workflow}:unwind", lease)
-        try:
-            await run_durably(unwind, checkpointer, unwinding, reached(await checkpointer.load(holder.workflow)))
-        finally:
-            await checkpointer.release(unwinding)
-        raise

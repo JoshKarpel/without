@@ -284,9 +284,9 @@ class RedisCheckpointer:
     Both of those are about *this* store, and neither applies to a scheduler here, which
     holds an id as a stream field or a sorted-set member rather than in a key name. A SQL
     store binds it as a query parameter and so asks nothing of it at all, which is the
-    tell: this is a property of building keys by interpolation, not of workflow ids.
-    `run_saga` adds the one constraint that *is* about ids rather than keys (an id ending
-    in `:unwind` addresses another workflow's rollback), and states it there.
+    tell: this is a property of building keys by interpolation, not of workflow ids. And
+    nothing in `without-durability` derives one id from another, so these two are the
+    whole list rather than the part of it one store happens to care about.
     """
 
     redis: Redis

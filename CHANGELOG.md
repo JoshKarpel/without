@@ -17,10 +17,12 @@
   the graph. `stream` being pull-driven makes the store write a barrier: nothing downstream of a
   completed step starts until the consumer asks for the next result.
 - **`without-durability`** (new package): durable workflows over a checkpoint any process can read.
-  Two mechanisms spend the one checkpoint. `run_durably` and `run_saga` drive a `without-dag`
+  Two mechanisms spend the one checkpoint. `run_durably` drives a `without-dag`
   `CompiledGraph`, recording each `(node key, result)` before pulling the next, so a resumed run
-  re-enters only what had not finished and a failed one can drive a compensating graph that is
-  itself checkpointed. `stepwise` needs no graph: a workflow is an ordinary async function whose
+  re-enters only what had not finished. A saga is not a third mechanism: a rollback is another
+  graph, so compensating is an `except Exception` around that call and a second call to it under
+  an id the application chose, which leaves the library reserving no name in anyone else's
+  namespace (the guide writes the eight lines out). `stepwise` needs no graph: a workflow is an ordinary async function whose
   effects are named (`await run.step("charged", charge, as_text)`), resuming calls it again, and
   each step hands back what is recorded. It asks one thing in return, because the code *between*
   steps re-runs: effects live in steps, the code around them is pure, which Temporal and DBOS state
@@ -159,9 +161,12 @@
 - **`without-durability`**: `Interruption`, a `BaseException` base for `Fenced`, `Contended`, and
   `Suspended`, for the reason `asyncio.CancelledError` has one. Each says something about whether
   *this pass* may continue rather than about the work, so an `except Exception` written to handle a
-  declined gateway must not absorb one. The case that forced it is `run_saga`, which compensates on
-  failure: a `Fenced` forward run is not a failure but a lost race, and a loser that unwound would
-  refund a charge the winner is still building on. The worker has a matching arm, treating a claim
+  declined gateway must not absorb one. The case that forced it is a saga, whose `except Exception`
+  compensates on failure: a `Fenced` forward run is not a failure but a lost race, and a loser that
+  unwound would refund a charge the winner is still building on. That the rule is carried by the
+  exceptions' own shape matters more once the saga is application code rather than a shipped
+  runner, since the `except` it has to survive is one somebody else wrote. The worker has a
+  matching arm, treating a claim
   lost mid-pass as the deferral it already applies to a claim refused up front, rather than as a
   workflow that failed.
 - **`without-durability`**: the two ways of waiting are separate types rather than one carrying a

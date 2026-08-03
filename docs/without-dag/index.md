@@ -195,9 +195,9 @@ Postgres for.
 
 [`without-durability`](../without-durability/index.md) is that loop, written
 once, with the missing half supplied: `run_durably` runs it against an injected
-store under a claim every write is fenced against, and `run_saga` adds the
-compensating half, where a failed run's checkpoint is parsed into "how far did we
-get" and drives a rollback graph that is itself checkpointed.
+store under a claim every write is fenced against. Compensation needs nothing
+further, since a rollback is another graph: parse a failed run's checkpoint into
+"how far did we get" and drive that graph through the same call.
 
 ## Lifting into a Processor
 

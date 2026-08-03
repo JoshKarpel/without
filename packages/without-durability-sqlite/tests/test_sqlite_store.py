@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
+import time
 from collections.abc import AsyncIterator
 from datetime import timedelta
 from pathlib import Path
@@ -321,3 +323,36 @@ async def test_the_queue_holds_one_row_per_workflow_however_many_wakeups_arrive(
     assert rows == (1,)
     assert await queue.wake_due(now_utc()) == (), "being due and being ready are the same visibility"
     await queue.prepare()  # already migrated, and running it again is a no-op
+
+
+async def test_a_cancelled_caller_does_not_hand_the_connection_to_the_next_one(
+    database: Database,
+    checkpointer: SqliteCheckpointer,
+) -> None:
+    # A thread is not cancellable, so the caller unwinds while the statement runs on.
+    # Releasing the connection there would put the next caller *inside* the transaction
+    # still open on it: its write would be committed or rolled back with somebody else's,
+    # which is exactly the guarantee this store exists to make.
+    holder = await claimed(checkpointer, WORKFLOW)
+    # A `threading.Event`, because it is waited on from the loop and set from the pool
+    # thread: the point of the test is that those are two threads inside one connection.
+    inside = threading.Event()
+
+    def slow_and_doomed(cursor: sqlite3.Cursor) -> object:
+        cursor.execute("INSERT INTO stock_ledger (sku, reserved) VALUES ('widget', 1)")
+        inside.set()
+        time.sleep(BRIEFLY.total_seconds())
+        raise RuntimeError("this transaction rolls back, taking its own writes with it")
+
+    doomed = asyncio.ensure_future(checkpointer.transact(holder, "reserved", slow_and_doomed))
+    await asyncio.to_thread(inside.wait)
+    doomed.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await doomed
+
+    # The write that follows is the one at risk: it must be its own transaction, not a
+    # passenger in the doomed one.
+    await checkpointer.record(holder, "charged", "ch-1")
+
+    assert await checkpointer.load(WORKFLOW) == {"charged": "ch-1"}, "the second write survived the first's rollback"
+    assert await reserved(database, "widget") is None, "and the rolled-back effect left nothing behind"

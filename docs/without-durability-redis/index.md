@@ -57,10 +57,9 @@ they carry the queue's namespace rather than a workflow's id.
 
 That split decides where a workflow id is *structure* and where it is merely
 data. In the two per-workflow keys it is interpolated into the key name, so it
-carries constraints: no braces (they would delimit the hash tag instead of it),
-bounded length, and not ending in `:unwind`, which is how `run_saga` names a
-rollback. In the queue it is a stream field or a sorted-set member, so none of
-that applies. `RedisCheckpointer` documents them and does not enforce them,
+carries two constraints: no braces (they would delimit the hash tag instead of
+it), and bounded length. In the queue it is a stream field or a sorted-set
+member, so neither applies. `RedisCheckpointer` documents them and does not enforce them,
 on the grounds that a UUID satisfies them without trying and validating every call
 to catch someone who went out of their way is the wrong trade. A store that bound
 the id as a query parameter rather than concatenating it would have no constraints
