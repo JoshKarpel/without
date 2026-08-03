@@ -54,6 +54,8 @@ from without_durability.interfaces import Delivery
 from without_durability.interfaces import check_duration
 from without_durability.stepwise import now_utc
 
+from without_durability_redis.units import milliseconds
+
 # How often a worker with nothing to do asks again. This is the price of losing the
 # blocking read, so it is the one number to look at if wakeups feel slow.
 POLL = timedelta(milliseconds=50)
@@ -62,6 +64,18 @@ POLL = timedelta(milliseconds=50)
 # step, so two workers polling at the same instant cannot both take it. The clock is the
 # server's, as it is for the checkpoint claim, because a lease compared against the
 # taker's own clock is only as good as the agreement between the two.
+#
+# The half millisecond is what keeps the receipt a receipt. `done` removes the entry only
+# when the score is still the one this take wrote, on the premise that anything wanting
+# another pass writes a *different* score, and a score is a number rather than a version:
+# a deadline that happens to land on the same millisecond as this lease is the same
+# number, so the comparison passes and the acknowledgement throws that wakeup away. It is
+# not a remote coincidence either, since `Run.sleep(key, LEASE)` under a scheduler holding
+# the same `LEASE` computes a deadline a millisecond or two from the take.
+#
+# Only a take writes a half, and every other writer here writes whole milliseconds
+# (`score`), so the two can no longer collide. Half a millisecond of extra invisibility is
+# not a number anything else is measured against.
 #
 #   KEYS[1]  the schedule
 #   ARGV[1]  lease, in milliseconds
@@ -72,9 +86,9 @@ local now = redis.call('TIME')
 local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
 local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now_ms, 'LIMIT', 0, 1)
 if #due == 0 then return nil end
-local held_until = now_ms + tonumber(ARGV[1])
+local held_until = now_ms + tonumber(ARGV[1]) + 0.5
 redis.call('ZADD', KEYS[1], held_until, due[1])
-return {due[1], string.format('%.0f', held_until)}
+return {due[1], string.format('%.1f', held_until)}
 """
 
 # Finish, but only if nothing asked for another pass in the meantime. Anything that did
@@ -88,6 +102,27 @@ DONE = """
 local score = redis.call('ZSCORE', KEYS[1], ARGV[1])
 if score and tonumber(score) == tonumber(ARGV[2]) then
   redis.call('ZREM', KEYS[1], ARGV[1])
+  return 1
+end
+return 0
+"""
+
+# Suspend until a deadline, under the same comparison and for the same reason. A workflow
+# holds one entry here, so writing the deadline unconditionally would land on top of a
+# `make_ready` that arrived while the pass was ending and push a confirmation out to a
+# deadline that may be days away. Anything that asked for another pass wrote a different
+# score, and this leaves that alone: the wakeup it wanted is the sooner of the two, and
+# the deadline is recorded in the checkpoint, so the pass that runs writes it again.
+#
+#   KEYS[1]  the schedule
+#   ARGV[1]  the workflow
+#   ARGV[2]  the receipt, which is the score this pass took
+#   ARGV[3]  when the workflow should next be visible
+#   returns  1 if the deadline was written, 0 if a fresher wakeup was left in place
+SUSPEND = """
+local score = redis.call('ZSCORE', KEYS[1], ARGV[1])
+if score and tonumber(score) == tonumber(ARGV[2]) then
+  redis.call('ZADD', KEYS[1], tonumber(ARGV[3]), ARGV[1])
   return 1
 end
 return 0
@@ -128,6 +163,7 @@ class RedisSetScheduler:
     # is checked against the script it was registered with instead of agreeing by position.
     take: AsyncScript = field(init=False, repr=False, compare=False)
     finish: AsyncScript = field(init=False, repr=False, compare=False)
+    suspend: AsyncScript = field(init=False, repr=False, compare=False)
     # The two durations as the numbers the wire and `asyncio.sleep` actually want,
     # rendered once at construction. Both are read inside `next_ready`'s poll loop, which
     # is the one place here that runs more than once per unit of work.
@@ -139,7 +175,12 @@ class RedisSetScheduler:
         check_duration("a poll interval", self.poll)
         object.__setattr__(self, "take", self.redis.register_script(TAKE))
         object.__setattr__(self, "finish", self.redis.register_script(DONE))
-        object.__setattr__(self, "lease_ms", int(self.lease.total_seconds() * 1000))
+        object.__setattr__(self, "suspend", self.redis.register_script(SUSPEND))
+        # Rounded up rather than truncated: a lease under a millisecond would otherwise be
+        # sent as zero, which writes a score of *now* on the workflow it just took, so
+        # every worker polling takes the same delivery with the same receipt and the first
+        # `done` drops the entry out from under the rest (see `units`).
+        object.__setattr__(self, "lease_ms", milliseconds(self.lease))
         object.__setattr__(self, "poll_seconds", self.poll.total_seconds())
 
     @property
@@ -159,10 +200,22 @@ class RedisSetScheduler:
         is correct too: the workflow wakes, finds its wait unfinished, and reschedules
         itself.
         """
-        await self.redis.zadd(self.schedule_key, {workflow: milliseconds(self.now())})
+        await self.redis.zadd(self.schedule_key, {workflow: score(self.now())})
 
-    async def wake_at(self, workflow: str, when: datetime) -> None:
-        await self.redis.zadd(self.schedule_key, {workflow: milliseconds(when)})
+    async def wake_at(self, delivery: Delivery, when: datetime) -> None:
+        """
+        Suspend the workflow until `when`, unless something asked for a pass meanwhile.
+
+        The receipt is the score this pass took, so anything that rescheduled the workflow
+        since (a confirmation, another worker taking over an overrun) wrote a different
+        one and this leaves it be. Which is the right answer rather than a concession: the
+        deadline lives in the workflow's checkpoint, so the pass that runs sooner reaches
+        the same `sleep` and writes it again.
+        """
+        await self.suspend(
+            keys=[self.schedule_key],
+            args=[delivery.workflow, delivery.receipt, score(when)],
+        )
 
     async def wake_due(self, now: datetime) -> tuple[str, ...]:
         """Nothing to do: a workflow whose score has passed is already visible."""
@@ -205,5 +258,12 @@ class RedisSetScheduler:
         await self.finish(keys=[self.schedule_key], args=[delivery.workflow, delivery.receipt])
 
 
-def milliseconds(when: datetime) -> int:
+def score(when: datetime) -> int:
+    """
+    A moment as this set's score, which is when the workflow becomes visible.
+
+    Whole milliseconds, which is half of what keeps a receipt unambiguous: a take writes
+    the only fractional scores here (see `TAKE`), so no deadline a caller names can be
+    mistaken for the lease a pass is holding.
+    """
     return int(when.timestamp() * 1000)

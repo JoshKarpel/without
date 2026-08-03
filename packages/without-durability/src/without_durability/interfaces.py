@@ -237,8 +237,18 @@ class Scheduler(Protocol):
     - `wake_due` moves each workflow it reports in one durable step, since one that
       removes a deadline and then queues the workflow loses it whenever it dies in
       between (an implementation with nothing to move satisfies this trivially);
-    - a `wake_at` survives a `done` for a delivery taken before it, because the worker
-      calls them in that order and the acknowledgement must not undo the scheduling.
+    - `wake_at` answers for its delivery and sets the workflow's next pass in one step,
+      and MUST NOT overwrite a wakeup that arrived since that delivery was taken.
+
+    That last one is why `wake_at` takes a `Delivery` rather than a workflow id, and it
+    is the same move `wake_due` and `Durable.arrive` make. Scheduling and acknowledging
+    were two calls with a rule about their order, which a protocol cannot enforce and a
+    caller can get wrong; worse, on a store that holds one entry per workflow they are a
+    read-modify-write over a value somebody else may have just written, so a confirmation
+    that landed while the pass was ending was overwritten by the deadline the pass chose
+    and waited days for a clock instead of running at once. Naming the transition instead
+    means the store compares the receipt it handed out, which is the one thing that can
+    tell the two apart.
 
     What is deliberately *not* required is that a workflow reach only one worker at a
     time. The stream will happily hand two deliveries for one workflow to two consumers,
@@ -269,7 +279,7 @@ class Scheduler(Protocol):
 
     async def make_ready(self, workflow: str) -> None: ...
 
-    async def wake_at(self, workflow: str, when: datetime) -> None: ...
+    async def wake_at(self, delivery: Delivery, when: datetime) -> None: ...
 
     async def wake_due(self, now: datetime) -> tuple[str, ...]: ...
 

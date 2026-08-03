@@ -32,6 +32,9 @@ from without_durability.interfaces import Pass
 from without_durability.interfaces import Recorded
 from without_durability.interfaces import check_duration
 
+from without_durability_redis.units import milliseconds
+from without_durability_redis.units import seconds
+
 # Take the workflow if nobody holds it, and stamp the taking with a number that only
 # ever goes up. It is the store, not the claimant, that decides the ordering, so two
 # processes cannot mint the same one. The clock is the server's rather than a caller's,
@@ -317,7 +320,7 @@ class RedisCheckpointer:
         object.__setattr__(self, "write", self.redis.register_script(RECORD))
         object.__setattr__(self, "offer", self.redis.register_script(SUPPLY))
         object.__setattr__(self, "hand_back", self.redis.register_script(RELEASE))
-        object.__setattr__(self, "ttl_seconds", int(self.ttl.total_seconds()))
+        object.__setattr__(self, "ttl_seconds", seconds(self.ttl))
 
     def hash_key(self, workflow: str) -> str:
         # The braces are Redis Cluster's hash tag: the slot comes from what is inside
@@ -336,7 +339,7 @@ class RedisCheckpointer:
     async def claim(self, workflow: str, lease: timedelta) -> Pass | None:
         token = await self.take(
             keys=[self.pass_key(workflow)],
-            args=[int(lease.total_seconds() * 1000), self.ttl_seconds],
+            args=[milliseconds(lease), self.ttl_seconds],
         )
         if token is None:
             return None

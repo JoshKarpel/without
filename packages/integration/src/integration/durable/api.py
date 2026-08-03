@@ -31,9 +31,12 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import Annotated
+from urllib.parse import quote
 
 from pydantic import BaseModel
 from pydantic import ConfigDict
+from pydantic import Field
 from pydantic import ValidationError
 from without_asgi import ASGIApp
 from without_asgi import HttpScope
@@ -55,13 +58,27 @@ from without_web import post
 
 from integration.responses import json_response
 
+type StrictPositiveCents = Annotated[int, Field(strict=True, gt=0)]
+
 
 class SubmittedOrder(BaseModel):
-    """An order as it arrives: a sku-to-cents mapping, which is what the workflow reads."""
+    """
+    An order as it arrives: a sku-to-cents mapping, which is what the workflow reads.
+
+    Strict and positive, rather than `dict[str, int]`, because both of the coercions the
+    lax default allows are ways of paying an amount nobody wrote down. `true` is an `int`
+    to pydantic and would be captured as one cent; a negative amount nets against the
+    others, so a basket can capture far more than the total its approval gate compares.
+    Refused here, at the boundary the client writes to, and again in `parse_items` where
+    the workflow reads what a store handed back.
+    """
 
     model_config = ConfigDict(frozen=True)
 
-    items: dict[str, int]
+    # Non-empty, because an order with nothing in it is not a small payout but a workflow
+    # that should never have started: it captures nothing, pays a gateway zero, and
+    # records a `paid` for it.
+    items: dict[str, StrictPositiveCents] = Field(min_length=1)
 
 
 class Confirmation(BaseModel):
@@ -105,11 +122,23 @@ confirmation_body = body(Confirmation.model_validate_json, schema=Confirmation)
 #     else, so an unbounded one is unbounded storage picked by the client;
 #   - braces, because they delimit Redis Cluster's hash tag, so an id carrying its own
 #     decides which slot its workflow lands on, and a client sending one tag for every
-#     request puts the whole deployment on one node.
+#     request puts the whole deployment on one node;
+#   - anything a URL path segment does not carry as written, because *this* app puts the
+#     id in a path. It answers the submission with `/orders/{workflow}` and takes the
+#     approval on `/orders/{workflow}/confirmation`, so a key holding a `/` or a `?`
+#     produces a durable workflow whose status URL resolves to nothing and whose payout
+#     can never be approved. That one is this module's own constraint rather than a
+#     store's, which is why it is checked in the same place: the id has to satisfy every
+#     shape it is about to be used in.
 #
-# Neither is a correctness bug in a store: each is a store's documented shape being chosen
-# by whoever sends the header, which is exactly what a boundary is for.
+# None is a correctness bug in a store: each is a shape being chosen by whoever sends the
+# header, which is exactly what a boundary is for.
 MAX_WORKFLOW_ID = 200
+# What a URL path segment carries beyond the characters `quote` never escapes: RFC 3986's
+# sub-delimiters, plus `:` and `@`. Spelled out because `quote`'s own default is about
+# building a *path*, so it holds back the delimiters that separate segments, and an id is
+# only ever one segment.
+PATH_SAFE = "!$&'()*+,;=:@"
 
 
 def as_workflow_id(value: bytes) -> str:
@@ -120,6 +149,26 @@ def as_workflow_id(value: bytes) -> str:
     `ExtractionError` tagged with this field, which `recover` turns into a 422. So a
     client that sends something unusable is told which header it was, rather than the
     store failing later under an id nobody chose.
+
+    The path check is stated as an identity rather than as a list of forbidden
+    characters, which is the difference between a rule that holds and a rule that held
+    when it was written: an id is usable in a path exactly when percent-encoding it
+    changes nothing, and asking that directly cannot miss a delimiter. A UUID, or any of
+    the letters, digits, `-`, `_`, `.` and `~` a generated key is made of, passes it
+    without knowing it is there.
+
+    `PATH_SAFE` is the rest of what a path segment carries, and naming it is what keeps
+    the rule from being stricter than its own sentence. `quote`'s default escapes every
+    sub-delimiter along with `:` and `@`, none of which a segment minds, so without them a
+    base64-shaped key (`order+7`) or a scoped one (`tenant:7`) would be refused for
+    nothing the routing needed.
+
+    The dot segments are the one thing this shape of check cannot see, and they are the
+    reason it is a check *and* two names. `.` and `..` survive percent-encoding untouched
+    and are then removed by every client that resolves a reference, so `/orders/..`
+    resolves to `/` before it is ever sent: a workflow named that captures money against
+    an id whose status URL is somebody else's resource and whose confirmation endpoint
+    cannot be reached at all.
     """
     key = value.decode()
     if not key:
@@ -128,6 +177,10 @@ def as_workflow_id(value: bytes) -> str:
         raise ValueError(f"an idempotency key must be at most {MAX_WORKFLOW_ID} characters, but got {len(key)}")
     if "{" in key or "}" in key:
         raise ValueError("an idempotency key must not contain '{' or '}'")
+    if quote(key, safe=PATH_SAFE) != key:
+        raise ValueError(f"an idempotency key must be usable as a URL path segment as written, but got {key!r}")
+    if key in {".", ".."}:
+        raise ValueError(f"an idempotency key must name a path segment a client can ask for, but got {key!r}")
     return key
 
 
@@ -168,10 +221,24 @@ async def confirm_order(payments: Payments, workflow: str, confirmation: Confirm
     """
     Record the approval the workflow suspended on, then make it ready.
 
-    Identical to submitting, because it is the same act: a value arrives that the
-    workflow cannot produce for itself. Nothing here knows whether a workflow is
-    actually waiting; recording an approval nobody asked for leaves an unread field.
+    Almost identical to submitting, because it is almost the same act: a value arrives
+    that the workflow cannot produce for itself. What differs is that an order *starts* a
+    workflow and an approval answers one, so an id nobody has submitted has nothing to
+    approve, and this refuses it rather than writing the first row of a checkpoint for a
+    workflow that does not exist. Otherwise any id at all becomes a workflow with an
+    approval in it, which a status read then reports as real.
+
+    What this deliberately does *not* check is whether the workflow has reached its wait,
+    and that is the mechanism rather than an oversight: `Run.awaiting` reads a recorded
+    value rather than receiving a message, so an approval that lands early is waiting in
+    the checkpoint when the pass gets there. What that costs is worth saying plainly,
+    since this endpoint is the whole of the human in the loop: it is unauthenticated here,
+    so nothing stops the submitter from approving its own payout. Deciding *who* may
+    confirm is the job this toy leaves out, and no amount of ordering inside the workflow
+    substitutes for it.
     """
+    if not await payments.durable.checkpointer.load(workflow):
+        return json_response(404, {"error": f"no workflow {workflow}"})
     await payments.durable.arrive(workflow, "approved-by", confirmation.approved_by)
     return json_response(202, {"workflow": workflow, "status": f"/orders/{workflow}"})
 

@@ -31,8 +31,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable
 from collections.abc import Callable
+from collections.abc import Iterator
+from contextlib import suppress
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import UTC
@@ -41,6 +44,8 @@ from datetime import timedelta
 from typing import Never
 
 from without_durability.interfaces import Checkpointer
+from without_durability.interfaces import Contended
+from without_durability.interfaces import Fenced
 from without_durability.interfaces import Interruption
 from without_durability.interfaces import Pass
 
@@ -137,6 +142,11 @@ class Run[Effect = Never]:
     recorded: dict[StepKey, object]
     now: Callable[[], datetime] = now_utc
     claimed: set[StepKey] = field(default_factory=set)
+    # The deadlines this pass has written and not yet reached, which `resume` reports when
+    # no `ScheduledWakeup` arrives to report them. A `sleep` in one branch of a task group
+    # is cancelled the instant another branch raises, and the record is durable by then, so
+    # the exception is the one part of a suspension that can go missing. See `resume`.
+    waking: dict[StepKey, datetime] = field(default_factory=dict)
 
     @property
     def workflow(self) -> str:
@@ -170,11 +180,49 @@ class Run[Effect = Never]:
         which is what the claim is for. Which of the two happened is on the `Recorded`
         and is deliberately ignored: a step has no dependents holding the loser's
         value, where `run_durably` fed its node's result downstream before the write.
+
+        Cancellation is what separates those two sentences, and the write is held past
+        it deliberately. Once `effect` has returned, the thing it did has happened:
+        cancelling the write now does not undo the charge, it only removes the record
+        of it, so the next pass performs it again. And a step is cancelled in the
+        ordinary course of a fan-out, not only in a crash, since a workflow that spawns
+        a capture per line item ends its siblings when one of them is declined. Every
+        sibling that had already called the gateway would be charged twice.
+
+        So the write is a task the step *shields* rather than an ordinary await, and a
+        cancelled step waits for it before unwinding. It is still cancellation: what
+        the caller waits for is one store round trip, which is the same bound the
+        worker's own release has, rather than whatever the cancelled effect was stuck
+        on. The claim is still held while it lands (a release keeps the token, so a
+        write in flight is not fenced by it), which is what makes the record valid.
+
+        It waits through *repeated* cancellation, which is not stubbornness but the
+        ordinary case. One cancelled pass delivers two: a fan-out gathered under
+        `asyncio.gather` cancels its children when the pass is cancelled, and the gather
+        returns as soon as the first child answers, so the caller's own teardown cancels
+        the rest a second time. Honouring the second one is dropping a write whose
+        gateway call has already happened, which is the charge this whole shape exists
+        to keep. The wait is still bounded by the store, not by the workflow.
         """
         self.claim(key)
         if key in self.recorded:
             return parse(self.recorded[key])
-        recorded = await self.checkpointer.record(self.holder, key, await effect())
+        recording = asyncio.ensure_future(self.checkpointer.record(self.holder, key, await effect()))
+        try:
+            recorded = await asyncio.shield(recording)
+        except asyncio.CancelledError:
+            # `wait` rather than an `await`, because this one is finishing somebody
+            # else's business: the write's own failure belongs to the pass being torn
+            # down, and raising it here would replace the cancellation with it.
+            while not recording.done():
+                with suppress(asyncio.CancelledError):
+                    await asyncio.wait([recording])
+            # A write that landed is part of this pass whether or not the step that made
+            # it survived to say so, and the mapping is what the rest of the pass reads:
+            # `sleep` looks here for the deadline it was cancelled before it could raise.
+            if recording.exception() is None:
+                self.recorded[key] = recording.result().value
+            raise
         self.recorded[key] = recorded.value
         return parse(recorded.value)
 
@@ -216,13 +264,29 @@ class Run[Effect = Never]:
         point: a crash on day two of a three-day wait must not restart the clock. The
         first pass computes and stores it, every later pass reads it back, and the
         wait ends when a pass arrives after it.
+
+        The deadline is noted on the `Run`, and noted on the cancellation path too,
+        because the raise is the part that can go missing. A `sleep` in one branch of a
+        task group is cancelled the moment another branch raises, and the write is held
+        past that cancellation (see `step`), so the ordinary way to end up with a durable
+        deadline and no `ScheduledWakeup` is not a crash but an ordinary fan-out. Left
+        unnoted, no pass reports it and no driver schedules it: the workflow holds a
+        deadline that was supposed to end a wait, and waits out a clock that will never
+        fire.
         """
 
         async def deadline_from_now() -> str:
             return (self.now() + duration).isoformat()
 
-        deadline = await self.step(key, deadline_from_now, parsing_deadline(key))
+        try:
+            deadline = await self.step(key, deadline_from_now, parsing_deadline(key))
+        except asyncio.CancelledError:
+            recorded = self.recorded.get(key)
+            if recorded is not None:
+                self.waking[key] = parse_deadline(key, recorded)
+            raise
         if self.now() < deadline:
+            self.waking[key] = deadline
             raise ScheduledWakeup(key, due=deadline)
 
     async def awaiting[T](self, key: StepKey, parse: Parse[T]) -> T:
@@ -352,16 +416,119 @@ async def resume[T, Effect](
     raises. Whether to wait for a contended workflow, come back later, or fail is the
     driver's call: a worker holding a queue delivery wants one answer and a test driving
     a workflow it owns wants another. `claimed` is the second of those.
+
+    An interruption raised inside a task group arrives wrapped, and is unwrapped here
+    rather than being left to the driver, because wrapped is exactly where the harm is. A
+    workflow that fans its steps out with `asyncio.TaskGroup` raises a
+    `BaseExceptionGroup` when one of them suspends or loses the claim, and a group whose
+    leaves are `BaseException`s is not itself an `Exception`: it is neither an `Outcome`,
+    nor something a driver's `except (Fenced, Contended)` matches, nor something its
+    `except Exception` can reach. So the one workflow that fanned out would take down the
+    loop running every other one, whichever of the two happened to it. Both are unwrapped,
+    for the same reason and by the same rule.
+
+    Losing the claim wins over everything else in the group. It says this pass may not
+    write at all, so a sibling's failure beside it is a consequence rather than a second
+    piece of news, and reporting the sibling instead would tell a driver to log a workflow
+    failure for a workflow that is fine and being advanced by somebody else.
+
+    Several branches can suspend in one group, and a pass has one outcome, so a deadline
+    wins over a wait for input. Both are answered eventually (the wakeup fires, and
+    whoever writes the value queues the workflow either way), but only the deadline is
+    answered by *this* driver: reporting the wait would leave nothing scheduled for a
+    branch that asked for a clock. The earliest deadline wins among several, since a pass
+    that wakes too early suspends again and one that wakes too late has kept a branch
+    waiting for nothing.
+
+    A deadline `Run.sleep` recorded counts even when its own suspension never arrived,
+    which is what `waking` is for. A group cancels its remaining branches the instant one
+    of them raises, so a branch that had just written its deadline can be cancelled
+    between the write and the raise: the deadline is durable, and without this nothing
+    reports it, so the driver schedules nothing and a workflow waits out a clock that will
+    never fire. Reading it off the `Run` instead of off the exception is what makes the
+    deadline-wins rule deliverable rather than merely stated.
     """
     run = Run(holder=holder, checkpointer=checkpointer, recorded=await checkpointer.load(holder.workflow), now=now)
     try:
         return Completed(await body(run))
-    except ScheduledWakeup as wakeup:
-        return Sleeping(key=wakeup.key, due=wakeup.due)
-    except InputNeeded as needed:
-        return Waiting(key=needed.key)
-    except Suspended as unreportable:
-        raise TypeError(
-            f"{type(unreportable).__name__} is not a suspension a pass can report: "
-            f"a workflow waits with `Run.sleep` or `Run.awaiting`"
-        ) from unreportable
+    except Fenced, Contended:
+        raise
+    except Suspended as raised:
+        return stopped_at([raised], run.waking)
+    except BaseExceptionGroup as group:
+        return unwound(group, run.waking)
+
+
+def leaves(group: BaseException) -> Iterator[BaseException]:
+    """Every exception in a group, however deeply the task groups nested it."""
+    if isinstance(group, BaseExceptionGroup):
+        for nested in group.exceptions:
+            yield from leaves(nested)
+    else:
+        yield group
+
+
+def unwound(group: BaseExceptionGroup[BaseException], waking: dict[StepKey, datetime]) -> Sleeping | Waiting:
+    """
+    What a pass came to when its fan-out raised, or the failure re-raised without its
+    suspensions.
+
+    The split is by what each leaf says about *this pass's right to run*. A lost claim is
+    raised bare, so a driver's `except (Fenced, Contended)` sees what it was written to
+    see. Anything else that is not a suspension is a genuine failure of the workflow, and
+    is re-raised with the suspensions taken out: left in, they would keep the group a
+    `BaseExceptionGroup` and it would be invisible to the driver all over again.
+
+    Taking them out is what this can do rather than a guarantee about what is left. A leaf
+    that is a `BaseException` and neither a suspension nor a lost claim (a helper that
+    called `sys.exit`, say) keeps the remainder a `BaseExceptionGroup` and so keeps it past
+    a driver's `except Exception`, which for a worker means the process ends. That is the
+    right answer for `SystemExit` and a poor one for the workflow, which is left to be
+    retried into the next worker; a workflow that wants to fail should raise an ordinary
+    exception.
+    """
+    for lost in leaves(group):
+        if isinstance(lost, Fenced | Contended):
+            raise lost from group
+    _suspensions, failures = group.split(Suspended)
+    if failures is not None:
+        raise failures from None
+    return stopped_at([each for each in leaves(group) if isinstance(each, Suspended)], waking)
+
+
+def stopped_at(suspensions: list[Suspended], waking: dict[StepKey, datetime]) -> Sleeping | Waiting:
+    """
+    What a pass that stopped came to, given every suspension that reached its edge and
+    every deadline it wrote on the way.
+
+    The two sources are not redundant. `waking` holds what `Run.sleep` recorded, including
+    a deadline whose suspension was cancelled before it could be raised, which is the one
+    a driver would otherwise never hear about; the raised `ScheduledWakeup`s cover a
+    workflow that raised one itself rather than through `sleep`. Neither is filtered by
+    whether the deadline has since matured, because a wakeup scheduled for a moment
+    already past is answered by a pass that runs immediately, finds the wait over, and
+    carries on. Nothing is lost by being early.
+
+    A `Suspended` that is neither of the two kinds is the one thing rewritten rather than
+    passed along, and the reason is what it would otherwise cost. `Outcome` has no arm for
+    it and a driver has no way to answer it, so it can only travel outward; and it travels
+    as an `Interruption`, which every sensible `except Exception` in a driver is built to
+    miss, so one workflow raising it would take down the loop running every other
+    workflow. Re-raised as an ordinary exception it is what it actually is: that
+    workflow's mistake, and nobody else's.
+    """
+    deadlines = dict(waking)
+    for each in suspensions:
+        if isinstance(each, ScheduledWakeup):
+            deadlines.setdefault(each.key, each.due)
+    if deadlines:
+        key, due = min(deadlines.items(), key=lambda waiting: (waiting[1], waiting[0]))
+        return Sleeping(key=key, due=due)
+    for each in suspensions:
+        if isinstance(each, InputNeeded):
+            return Waiting(key=each.key)
+    unreportable = suspensions[0]
+    raise TypeError(
+        f"{type(unreportable).__name__} is not a suspension a pass can report: "
+        f"a workflow waits with `Run.sleep` or `Run.awaiting`"
+    ) from unreportable

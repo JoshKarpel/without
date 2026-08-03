@@ -22,6 +22,7 @@ from without_durability import Suspended
 from without_durability import claimed
 from without_durability import now_utc
 from without_durability.worker import CONTENDED
+from without_durability.worker import halves
 from without_durability.worker import passes
 from without_durability.worker import ready
 from without_durability.worker import waking
@@ -305,7 +306,14 @@ async def test_the_pool_pulls_exactly_as_many_workflows_as_it_can_work_on() -> N
 async def test_the_timer_makes_a_slept_out_workflow_ready_exactly_once() -> None:
     scheduler = MemoryScheduler()
     clock = Clock()
-    await scheduler.wake_at(WORKFLOW, STARTED_AT + timedelta(seconds=30))
+    # Suspended the way a pass suspends it: taken off the queue, then handed back with a
+    # deadline. The event is what the timer's arrival is observed on below, so the one the
+    # submission set is cleared first.
+    await scheduler.make_ready(WORKFLOW)
+    held = await scheduler.next_ready(BRIEF)
+    assert held is not None
+    await scheduler.wake_at(held, STARTED_AT + timedelta(seconds=30))
+    scheduler.arrived.clear()
 
     async def sweep() -> None:
         await waking(scheduler)(ticks(BRIEF, now=clock))
@@ -466,6 +474,57 @@ async def test_the_worker_defers_a_contended_wakeup_for_the_interval_it_was_give
     assert scheduler.sleeping == {WORKFLOW: STARTED_AT + BRIEF}, f"the interval it was given, not {CONTENDED}"
 
 
+@dataclass(frozen=True, slots=True)
+class RefusingWakeAt(MemoryScheduler):
+    """The queue double, briefly unreachable for exactly the call under test."""
+
+    async def wake_at(self, delivery: Delivery, when: datetime) -> None:
+        raise ConnectionError("the queue was briefly unreachable")
+
+
+async def delivered(delivery: Delivery) -> AsyncIterator[Delivery]:
+    """One delivery a queue really handed out, receipt and all, as a stream of one."""
+    yield delivery
+
+
+async def test_a_queue_that_refuses_a_wakeup_fails_the_loop_rather_than_dropping_the_workflow() -> None:
+    # Scheduling a slept-out workflow is the *worker's* call to its own queue, so its
+    # failure is a failure of the loop exactly as a refused acknowledgement is, and not
+    # the workflow failing. Swallowing it would be worse than either: the pass succeeded
+    # and recorded its deadline, and the acknowledgement that follows would then leave a
+    # workflow that is in no queue, holds no delivery, and nothing will ever wake.
+    checkpointer = MemoryCheckpointer()
+    scheduler = RefusingWakeAt()
+    await checkpointer.supply(WORKFLOW, "order", SMALL)
+    await scheduler.make_ready(WORKFLOW)
+    taken = await scheduler.next_ready(BRIEF)
+    assert taken is not None
+
+    with pytest.raises(ConnectionError, match="the queue was briefly unreachable"):
+        await passes(SplitDurable(checkpointer, scheduler), BODY)(delivered(taken))
+
+    assert "settling" in await checkpointer.load(WORKFLOW), "the pass itself was fine; only the scheduling failed"
+    assert list(scheduler.outstanding) == [taken.receipt], (
+        "so the delivery is unanswered, and another worker will reclaim it"
+    )
+
+
+async def test_the_worker_measures_a_workflows_deadlines_on_the_clock_it_was_given() -> None:
+    # The clock is injected so a test (or a simulation) can drive time, and it has to
+    # reach every decision the worker makes about time, including the ones inside the
+    # pass. A `sleep` computed against the wall clock and a `wake_due` compared against
+    # the injected one never meet, so a seam that covers two of the three hangs the
+    # workflow rather than controlling it.
+    checkpointer = MemoryCheckpointer()
+    scheduler = MemoryScheduler()
+    await checkpointer.supply(WORKFLOW, "order", SMALL)
+
+    await passes(SplitDurable(checkpointer, scheduler), BODY, now=Clock())(as_stream(WORKFLOW))
+
+    assert scheduler.sleeping == {WORKFLOW: STARTED_AT + SETTLING}
+    assert (await checkpointer.load(WORKFLOW))["settling"] == (STARTED_AT + SETTLING).isoformat()
+
+
 async def test_the_worker_carries_a_submitted_order_through_its_own_wait() -> None:
     # The assembled thing: submitting is enough. The timer and the pass loop hand the
     # workflow back and forth until it is done, with nobody driving it.
@@ -501,3 +560,75 @@ async def test_a_body_driven_without_the_worker_suspends_the_same_way() -> None:
         await BODY(run)
 
     assert (await checkpointer.load(WORKFLOW))["total"] == sum(SMALL.values())
+
+
+async def test_a_pass_that_raised_leaves_its_wakeup_for_another_worker() -> None:
+    # A pass raises for two very different reasons and the worker cannot tell them apart:
+    # the workflow's own code failed, or the store it was reading was briefly unreachable,
+    # since `load` and every `record` raise ordinary exceptions from inside the pass.
+    # Answering for the delivery would be right for the first and permanent workflow loss
+    # for the second, so it is left unanswered and comes back when the lease elapses.
+    checkpointer = MemoryCheckpointer()
+    scheduler = MemoryScheduler()
+
+    async def declining(run: Run) -> None:
+        raise RuntimeError("the gateway declined")
+
+    await scheduler.make_ready(WORKFLOW)
+    taken = await scheduler.next_ready(BRIEF)
+    assert taken is not None
+
+    await passes(SplitDurable(checkpointer, scheduler), declining)(delivered(taken))
+
+    assert list(scheduler.outstanding) == [taken.receipt], "the wakeup outlives the pass that could not use it"
+    assert await scheduler.reclaim(timedelta()) is not None, "so another worker takes it over"
+
+
+async def test_a_wakeup_that_arrives_while_a_pass_is_ending_is_not_pushed_out_to_its_deadline() -> None:
+    # The window this closes: a pass decides to sleep, and a confirmation lands before the
+    # deadline is written. Scheduling and acknowledging as two calls made that a
+    # read-modify-write over a value somebody else had just written, so on a store holding
+    # one entry per workflow the confirmation was overwritten by a deadline days away.
+    # `wake_at` takes the delivery, so the store can tell the two apart.
+    checkpointer = MemoryCheckpointer()
+    scheduler = MemoryScheduler()
+    await checkpointer.supply(WORKFLOW, "order", SMALL)
+    await scheduler.make_ready(WORKFLOW)
+    taken = await scheduler.next_ready(BRIEF)
+    assert taken is not None
+
+    await scheduler.make_ready(WORKFLOW)  # the confirmation, arriving mid-pass
+    await passes(SplitDurable(checkpointer, scheduler), BODY, now=Clock())(delivered(taken))
+
+    assert list(scheduler.queue) == [WORKFLOW], "the wakeup that arrived is still there to be taken"
+    assert scheduler.outstanding == {}, "and the delivery the pass held is answered for"
+
+
+async def test_a_half_cancelled_by_something_other_than_the_worker_ends_the_worker() -> None:
+    # A task group treats a child that ends *cancelled* as a child that finished, so it
+    # exits that one and carries on with the other. That is right when the group did the
+    # cancelling (a shutdown) and is how a worker would go quietly half-dead otherwise:
+    # a timer with no pass loop behind it, still running and still reporting itself
+    # healthy while the queue backs up, with nothing to alarm on but throughput.
+    async def cancelled_by_somebody_else() -> None:
+        raise asyncio.CancelledError
+
+    with pytest.raises(RuntimeError, match="was cancelled by something other than this worker"):
+        await halves(cancelled_by_somebody_else)
+
+
+async def test_a_half_the_worker_cancelled_itself_ends_quietly() -> None:
+    # The other side of the same question: a shutdown cancels both halves, and each one
+    # unwinding is the shutdown working rather than a failure to report.
+    stopping = asyncio.Event()
+
+    async def waiting() -> None:
+        stopping.set()
+        await asyncio.Event().wait()
+
+    half = asyncio.ensure_future(halves(waiting))
+    await stopping.wait()
+    half.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await half

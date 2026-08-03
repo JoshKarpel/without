@@ -49,6 +49,11 @@ from without_http import serving
 
 pytestmark = pytest.mark.compose
 
+
+class Unwound(Exception):
+    """A workflow that was compensated, and so must not be run again under its own id."""
+
+
 ORDER = Order(order_id="o-42", sku="gizmo", cents=1999)
 
 
@@ -89,7 +94,16 @@ async def saga[In, Out, Reaches, Undone](
     Spelled out here rather than imported, and run against every store, so the claim
     that a compensation needs no mechanism is tested rather than asserted: what makes
     a rollback resumable is the same checkpoint and the same claim the forward run uses.
+    A compensated workflow is *finished*, and saying so is the driver's job because the
+    id namespace is the driver's. Nothing in the forward checkpoint records that its
+    steps were given back, so a client retrying the same idempotency key would resume it,
+    find every node recorded, and ship against a charge that has been refunded and stock
+    that has been released. The rollback records `unwound` under the forward id, and this
+    refuses to run a workflow carrying it: one key, written where the run that must not
+    happen again would look.
     """
+    if "unwound" in await checkpointer.load(workflow):
+        raise Unwound(f"{workflow!r} was compensated, so its steps have been given back")
     holder = await claimed(checkpointer, workflow)
     try:
         return await run_durably(forward, checkpointer, holder, value)
@@ -97,6 +111,7 @@ async def saga[In, Out, Reaches, Undone](
         undoing = await claimed(checkpointer, f"{workflow}:unwind")
         try:
             await run_durably(unwind, checkpointer, undoing, reaches(await checkpointer.load(workflow)))
+            await checkpointer.supply(workflow, "unwound", True)
         finally:
             await checkpointer.release(undoing)
         raise
@@ -111,12 +126,20 @@ async def test_a_workflow_resumes_from_a_checkpoint_left_by_a_dead_process(
     # The whole point of naming steps, end to end: the first "process" leaves a
     # checkpoint behind, and a second one that shares nothing with it but the workflow's
     # id picks the run up from that checkpoint alone.
+    #
+    # The first process *dies* rather than failing, which is the distinction the saga
+    # driver draws and the reason this one runs the graph directly: a run that failed and
+    # was compensated has had its steps given back and must not be resumed, where a run
+    # whose process disappeared has a checkpoint and nothing else, and is exactly what
+    # resumption is for.
     checkpointer = durable.checkpointer
     crashed = Gateway(broken={"ship"})
-    services = crashed.services()
+    holder = await claimed(checkpointer, workflow)
 
     with pytest.raises(RuntimeError, match="ship is down"):
-        await saga(fulfilment(services), unwinding(services), Reached.of, checkpointer, workflow, ORDER)
+        await run_durably(fulfilment(crashed.services()), checkpointer, holder, ORDER)
+
+    await checkpointer.release(holder)
 
     assert await checkpointer.load(workflow) == {"charged": "ch-o-42", "reserved": "rs-gizmo"}
 
@@ -168,7 +191,13 @@ async def test_a_workflow_suspended_on_an_approval_resumes_when_another_process_
     suspension = await passing(checkpointer, workflow, body)
 
     assert suspension == Waiting(key="approved-by")
-    assert set(await checkpointer.load(workflow)) == {"items", "captured:piano", "captured:stool", "settling"}
+    assert set(await checkpointer.load(workflow)) == {
+        "items",
+        "captured:piano",
+        "captured:stool",
+        "settling",
+        "held-for-approval",
+    }
     assert asked == ["items", "capture:piano", "capture:stool"], "the money moved, the payout did not"
 
     await checkpointer.supply(workflow, "approved-by", "auditor-7")
@@ -238,3 +267,29 @@ async def test_an_order_submitted_to_the_api_is_carried_to_payout_by_the_worker(
         worker.cancel()
         with suppress(asyncio.CancelledError):
             await worker
+
+
+async def test_a_compensated_workflow_is_not_resumed_under_its_own_id(
+    durable: Durable,  # noqa: F811
+    workflow: str,
+) -> None:
+    # The other half of resumption, over every store: a run that failed and was
+    # compensated has had its steps given back, and every node is still recorded with the
+    # id it recorded. Resuming that would ship against a refunded charge and released
+    # stock, which is the recovery path the design rests on turned into the worst outcome
+    # available. The rollback writes one key under the forward id, and the driver reads it.
+    checkpointer = durable.checkpointer
+    gateway = Gateway(broken={"ship"})
+    services = gateway.services()
+
+    with pytest.raises(RuntimeError, match="ship is down"):
+        await saga(fulfilment(services), unwinding(services), Reached.of, checkpointer, workflow, ORDER)
+
+    assert "refund" in gateway.calls
+    gateway.broken.clear()
+    gateway.calls.clear()
+
+    with pytest.raises(Unwound, match="was compensated"):
+        await saga(fulfilment(services), unwinding(services), Reached.of, checkpointer, workflow, ORDER)
+
+    assert gateway.calls == [], "and the retry performed nothing rather than shipping"

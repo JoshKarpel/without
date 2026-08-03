@@ -83,14 +83,35 @@ class Reached:
     recorded results) rather than a replay of a history or an inspection of a running
     engine, so `of` parses that raw mapping into the typed question the unwinding asks
     and nothing downstream re-checks the store.
+
+    `tracking` is here because a compensation has to be able to decline. Shipping has no
+    undo, which is why it is the last effect the workflow performs, but "last effect" is
+    not "last thing that can fail": the node that folds the receipt runs after it. A
+    `Reached` that could not say whether the parcel is in the air would answer such a
+    failure by refunding a customer whose order is on its way, and no driver could avoid
+    it, because the fact never reached the value the driver decides from.
+
+    What it covers is bounded by where it is read from, and the bound is worth stating
+    because it is the same window `run_durably` documents. `tracking` is read out of the
+    *checkpoint*, so it can only say "in the air" once the record of the shipment landed,
+    and that record is a second round trip after the carrier already took the parcel. A
+    failure in between still unwinds a shipped order. Closing that needs an intent
+    recorded *before* the effect, so the question becomes "may be in the air" rather than
+    "shipped", which is a different workflow from this one and the honest reason this
+    example does not claim it.
     """
 
     charge_id: str | None
     reservation_id: str | None
+    tracking: str | None
 
     @classmethod
     def of(cls, checkpoint: Mapping[NodeKey, object]) -> Reached:
-        return cls(charge_id=recorded_id(checkpoint, "charged"), reservation_id=recorded_id(checkpoint, "reserved"))
+        return cls(
+            charge_id=recorded_id(checkpoint, "charged"),
+            reservation_id=recorded_id(checkpoint, "reserved"),
+            tracking=recorded_id(checkpoint, "shipped"),
+        )
 
 
 def recorded_id(checkpoint: Mapping[NodeKey, object], key: NodeKey) -> str | None:
@@ -142,15 +163,23 @@ def unwinding(services: Services) -> CompiledGraph[Reached, Rollback]:
     anything to undo, because that is a question about one effect and belongs with
     it; the two undos are independent, so they run concurrently, and neither
     depends on the forward graph's shape beyond the ids it recorded.
+
+    A shipped order unwinds to nothing at all, and that is the compensation's answer
+    rather than an omission. Once the parcel is in the air, refunding the charge and
+    releasing the stock would leave the customer holding goods nobody was paid for and
+    the warehouse believing it still has them: the failure that got us here is later than
+    the last point where undoing was the right move, so it belongs to whoever reads the
+    alarm. This is the shape a compensation needs and a `try`/`except` alone cannot
+    express, which is why what was reached is a value.
     """
 
     async def refund(reached: Reached) -> str | None:
-        if reached.charge_id is None:
-            return None  # the charge never landed, so there is nothing to give back
+        if reached.tracking is not None or reached.charge_id is None:
+            return None  # already in the air, or never charged: either way, nothing to give back
         return await services.refund(reached.charge_id)
 
     async def release(reached: Reached) -> str | None:
-        if reached.reservation_id is None:
+        if reached.tracking is not None or reached.reservation_id is None:
             return None
         return await services.release(reached.reservation_id)
 

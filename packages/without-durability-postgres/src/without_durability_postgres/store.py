@@ -197,7 +197,18 @@ RETURNING recorded.value::text
 # transaction worth having.
 FENCE = "SELECT token FROM workflow_claim WHERE workflow = %s FOR UPDATE"
 ALREADY = "SELECT value::text FROM workflow_checkpoint WHERE workflow = %s AND step = %s"
-WRITE = "INSERT INTO workflow_checkpoint (workflow, step, value) VALUES (%s, %s, %s::jsonb) RETURNING value::text"
+# `ON CONFLICT DO NOTHING` rather than a plain insert, because `supply` is deliberately not
+# gated on the claim and so is the one writer this transaction's fence does not exclude. An
+# approval landing between the `ALREADY` read and this write would otherwise turn a step
+# into a duplicate-key error, which `transact` MUST not answer with: the step is recorded,
+# so the contract is to hand back what is recorded. Returning no row says that happened,
+# and the caller rolls the effect back rather than committing work whose record belongs to
+# somebody else.
+WRITE = """
+INSERT INTO workflow_checkpoint (workflow, step, value) VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (workflow, step) DO NOTHING
+RETURNING value::text
+"""
 
 LOAD = "SELECT step, value::text FROM workflow_checkpoint WHERE workflow = %s"
 # Hand the workflow back early, but keep the token, so the next claim gets the next
@@ -220,6 +231,16 @@ RELEASE = "UPDATE workflow_claim SET held_until = now() WHERE workflow = %s AND 
 # `LuaEffect` it returns an ordinary Python value rather than an encoding, because it runs
 # in this process where the codec is.
 type SqlEffect = Callable[[AsyncCursor[TupleRow]], Awaitable[object]]
+
+
+class Supplied(Exception):
+    """
+    Something outside the pass recorded this step first, so the effect must not stand.
+
+    Control flow rather than a failure, and it never leaves `transact`: raising is how the
+    effect's transaction is rolled back, since the value to return is a value the *other*
+    writer committed and reading it is a separate transaction's job.
+    """
 
 
 async def migrate(pool: AsyncConnectionPool) -> None:
@@ -276,6 +297,30 @@ class PostgresCheckpointer:
     that is what `jsonb` will accept. What that still leaves free is the library and the
     value mapping, which is the part worth changing. What it MUST keep, as everywhere, is
     the round trip.
+
+    The column narrows the *values* too, and this is the one place where "store it as
+    `jsonb`" is not free. `jsonb` holds a parsed document rather than the text it was
+    given, so what comes back is `jsonb`'s rendering of the value rather than the codec's,
+    and three things change with it:
+
+    - a number goes through `numeric`, so a step returning `1e16` is read back as the
+      integer `10000000000000000`. Above 2^53 it is not even the same number, since
+      `json.dumps` writes the shortest decimal that round-trips *as a float* and `numeric`
+      keeps that decimal exactly: `2.024478232766865e+16` returns as
+      `20244782327668650`, which is a different value and not merely a different type.
+    - keys are reordered by `jsonb`'s own rule (length, then bytes), so a mapping comes
+      back in an order the codec did not choose. Equality survives it; iteration order
+      does not, so a workflow that iterates a recorded mapping should sort it.
+    - a string `jsonb` cannot hold is refused outright rather than narrowed: a `NUL`
+      escape or a lone surrogate is valid JSON and valid to every other store here, and
+      `record` raises on the cast.
+
+    Nothing about the codec can repair any of it, since it happens after `encode` and
+    before `decode`. So the round trip a step result MUST survive here is `jsonb`'s and
+    not only JSON's. `run_durably` catches the first of the three rather than a comment,
+    by comparing what a node returned against what the store reads back, type included,
+    on the pass that wrote it; `Run.step`'s parser is where a stepwise workflow says what
+    it expects.
     """
 
     pool: AsyncConnectionPool
@@ -332,18 +377,55 @@ class PostgresCheckpointer:
         will see it. A step that returns something `jsonb` renders differently (a tuple,
         which comes back a list) then does so on the first pass rather than surprising the
         second.
+
+        The fence is held for as long as the effect runs, which is what makes it a fence
+        and is worth stating because of what it costs elsewhere: `claim` takes the same
+        row, so a worker trying to take this workflow over *waits* for the effect rather
+        than being told the workflow is held, and each one that waits holds a pool
+        connection while it does. A long effect and a small pool is a worker that stops
+        pulling work for unrelated namespaces. Size the pool for the passes a deployment
+        runs concurrently plus the takeovers it expects, or keep the effects short.
+
+        The fence excludes every other *pass*, and one writer is left over: `supply` is
+        ungated on purpose, so an approval can land under this key between the read and the
+        write. That is what the retry below is for. The insert declines to overwrite, the
+        transaction rolls back so the effect goes with it, and the value that did land is
+        read and returned, which is what "the recorded value without re-running" means when
+        the recording was somebody else's. Rare enough to pay a second transaction for, and
+        it costs nothing on the path that wins.
         """
+        try:
+            async with self.pool.connection() as connection, connection.cursor() as cursor:
+                await cursor.execute(FENCE, (holder.workflow,))
+                fence = await cursor.fetchone()
+                if fence is None or holder.token < fence[0]:
+                    raise Fenced(f"{holder.workflow!r} moved on while this pass held it")
+                await cursor.execute(ALREADY, (holder.workflow, key))
+                recorded = await cursor.fetchone()
+                if recorded is not None:
+                    return self.codec.decode(cast(str, recorded[0]))
+                await cursor.execute(WRITE, (holder.workflow, key, self.codec.encode(await effect(cursor))))
+                written = await cursor.fetchone()
+                if written is None:
+                    raise Supplied
+                return self.codec.decode(cast(str, written[0]))
+        except Supplied:
+            pass
         async with self.pool.connection() as connection, connection.cursor() as cursor:
-            await cursor.execute(FENCE, (holder.workflow,))
-            fence = await cursor.fetchone()
-            if fence is None or holder.token < fence[0]:
-                raise Fenced(f"{holder.workflow!r} moved on while this pass held it")
             await cursor.execute(ALREADY, (holder.workflow, key))
-            recorded = await cursor.fetchone()
-            if recorded is not None:
-                return self.codec.decode(cast(str, recorded[0]))
-            await cursor.execute(WRITE, (holder.workflow, key, self.codec.encode(await effect(cursor))))
-            return self.codec.decode(cast(tuple[str], await cursor.fetchone())[0])
+            landed = await cursor.fetchone()
+        if landed is None:
+            # The conflict was with the effect's *own* uncommitted insert, so the rollback
+            # took that away too and there is nothing to read back. Said plainly here,
+            # because the alternative is a `NoneType` error from a line that looks like
+            # ordinary decoding, and because the cure is on the caller's side: the
+            # application's tables are what an effect writes, and the step's own row is
+            # the store's to write from what the effect returned.
+            raise ValueError(
+                f"the effect for {key!r} wrote that step's own checkpoint row, so its transaction "
+                f"could not record the step and was rolled back; an effect writes the application's tables"
+            )
+        return self.codec.decode(cast(str, landed[0]))
 
     async def supply(self, workflow: str, key: str, value: object) -> object:
         async with self.pool.connection() as connection, connection.cursor() as cursor:
@@ -363,6 +445,21 @@ class PostgresCheckpointer:
 # next visible row. Without `SKIP LOCKED` a pool of workers polling one queue serializes
 # on its head; with it, they fan out. It is also why nothing here needs a consumer group.
 #
+# `AS MATERIALIZED` is what makes `LIMIT 1` mean one row, and it is load-bearing rather
+# than a hint. A `LIMIT` bounds what a sub-select *returns*, not how many times the planner
+# may evaluate it: written as a plain sub-select in the `FROM`, it can land on the inner
+# side of a nested loop and be rescanned per outer row, and a rescanned `SKIP LOCKED` scan
+# does not repeat itself, since it passes over the rows this same statement has already
+# locked. Each rescan would then yield a *different* workflow, and the statement would
+# lease several while `next_ready` reads one row and drops the rest, leaving the others
+# invisible for a full lease with no delivery in anyone's hands.
+#
+# Which plan a version of Postgres picks for which statistics is not a thing this store
+# should have an opinion about, and that is the argument for materializing rather than for
+# trusting the shape: the CTE is evaluated once, before the update, so the count is a
+# property of the statement instead of a property of the plan. It is also the idiom the
+# queue-in-Postgres pattern is usually written with, for this reason.
+#
 # The new `visible_at` is returned because it *is* the receipt, which is the trick
 # `RedisSetScheduler` documents at length: a workflow appears once, so a wakeup arriving
 # mid-pass lands on top of the entry that pass is holding, and finishing has to be
@@ -370,15 +467,16 @@ class PostgresCheckpointer:
 #
 #   returns  the workflow and its new visibility, or no row when nothing is visible yet
 TAKE = """
-UPDATE workflow_queue AS entry
-SET visible_at = now() + %(lease)s
-FROM (
+WITH due AS MATERIALIZED (
     SELECT workflow FROM workflow_queue
     WHERE namespace = %(namespace)s AND visible_at <= now()
     ORDER BY visible_at
     FOR UPDATE SKIP LOCKED
     LIMIT 1
-) AS due
+)
+UPDATE workflow_queue AS entry
+SET visible_at = now() + %(lease)s
+FROM due
 WHERE entry.namespace = %(namespace)s AND entry.workflow = due.workflow
 RETURNING entry.workflow, entry.visible_at
 """
@@ -396,6 +494,17 @@ ON CONFLICT (namespace, workflow) DO UPDATE SET visible_at = EXCLUDED.visible_at
 # Finish, but only if nothing asked for another pass in the meantime. Anything that did
 # wrote a different `visible_at`, so the equality is the whole check.
 FINISH = "DELETE FROM workflow_queue WHERE namespace = %s AND workflow = %s AND visible_at = %s"
+
+# Suspend until a deadline, under the same comparison and for the same reason. A workflow
+# holds one row here, so writing the deadline unconditionally would land on top of a
+# `make_ready` that arrived while the pass was ending and push a confirmation out to a
+# deadline that may be days away. The row anything else wrote carries a different
+# `visible_at`, and this leaves it alone: the sooner wakeup is the one that was wanted,
+# and the deadline is in the checkpoint, so the pass that runs writes it again.
+SUSPEND = """
+UPDATE workflow_queue SET visible_at = %(when)s
+WHERE namespace = %(namespace)s AND workflow = %(workflow)s AND visible_at = %(receipt)s
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -462,8 +571,26 @@ class PostgresScheduler:
     async def make_ready(self, workflow: str) -> None:
         await self.schedule(workflow, self.now())
 
-    async def wake_at(self, workflow: str, when: datetime) -> None:
-        await self.schedule(workflow, when)
+    async def wake_at(self, delivery: Delivery, when: datetime) -> None:
+        """
+        Suspend the workflow until `when`, unless something asked for a pass meanwhile.
+
+        The receipt is the visibility this pass took, so anything that rescheduled the
+        workflow since (a confirmation, another worker taking over an overrun) wrote a
+        different one and this leaves it be. Which is the right answer rather than a
+        concession: the deadline lives in the workflow's checkpoint, so the pass that runs
+        sooner reaches the same `sleep` and writes it again.
+        """
+        async with self.pool.connection() as connection:
+            await connection.execute(
+                SUSPEND,
+                {
+                    "namespace": self.namespace,
+                    "workflow": delivery.workflow,
+                    "receipt": datetime.fromisoformat(delivery.receipt),
+                    "when": when,
+                },
+            )
 
     async def schedule(self, workflow: str, visible_at: datetime) -> None:
         async with self.pool.connection() as connection:

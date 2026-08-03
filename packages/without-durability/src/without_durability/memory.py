@@ -112,12 +112,34 @@ class MemoryCheckpointer:
         `data`, and single-threaded code with no suspension point is its transaction.
         Which is the point of `Effect` being a type parameter, since nothing about
         `LuaEffect` would fit here.
+
+        Having no suspension point is only half a transaction, and the other half is the
+        rollback. An effect that raises partway, or one whose result the codec refuses,
+        would otherwise leave `data` moved and nothing recorded, which is the state the
+        protocol forbids outright and the state a replay then compounds by running the
+        effect again over data it already moved. So the mapping is snapshotted first and
+        put back on any exception, which is what `transacted` gets from `ROLLBACK` in the
+        SQLite store and a script gets from Redis running it to completion or not at all.
+
+        The snapshot is shallow, which bounds what this double can stand in for: an
+        effect that reaches *inside* a value in `data` (appending to a list it holds)
+        mutates something the restore hands back unchanged. That is the same bound the
+        rest of this store has, since a dict is not a datastore, and an effect written
+        the way a real one is (replace the entry, do not edit it in place) stays inside
+        it.
         """
         if holder.token < self.tokens[holder.workflow]:
             raise Fenced(f"pass {holder.token} of {holder.workflow!r} was superseded")
         recorded = self.hashes.setdefault(holder.workflow, {})
         if key not in recorded:
-            recorded[key] = self.codec.encode(effect(self.data))
+            before = dict(self.data)
+            try:
+                encoded = self.codec.encode(effect(self.data))
+            except BaseException:
+                self.data.clear()
+                self.data.update(before)
+                raise
+            recorded[key] = encoded
         return self.codec.decode(recorded[key])
 
     async def supply(self, workflow: str, key: str, value: object) -> object:
@@ -165,8 +187,12 @@ class MemoryScheduler:
         self.queue.append(workflow)
         self.arrived.set()
 
-    async def wake_at(self, workflow: str, when: datetime) -> None:
-        self.sleeping[workflow] = when
+    async def wake_at(self, delivery: Delivery, when: datetime) -> None:
+        # Two structures, so there is nothing to compare: a wakeup that arrived while the
+        # pass was running is in `queue`, and this writes to `sleeping`. Answering for the
+        # delivery is the whole of what it shares with `done`.
+        self.sleeping[delivery.workflow] = when
+        self.outstanding.pop(delivery.receipt, None)
 
     async def wake_due(self, now: datetime) -> tuple[str, ...]:
         # No `await` between the removal and the enqueue, which is this double's

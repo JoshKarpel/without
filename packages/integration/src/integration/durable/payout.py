@@ -53,13 +53,39 @@ def parse_items(recorded: object) -> Cents:
     """
     if not isinstance(recorded, dict):
         raise TypeError(f"the line items were recorded as {recorded!r}, which is not a mapping")
+    if not recorded:
+        raise ValueError("the line items are empty, and an order with nothing in it has no payout to make")
     return {str(sku): as_cents(sku, amount) for sku, amount in recorded.items()}
 
 
 def as_cents(sku: object, amount: object) -> int:
-    if not isinstance(amount, int):
+    """
+    One line item's amount, which is a positive whole number of cents or nothing at all.
+
+    Positive is the load-bearing half, and it is checked here because here is where the
+    workflow reads it. The approval gate is a comparison against the *sum*, so an amount
+    allowed to be negative makes the sum a net rather than a total, and a basket that
+    captures 90,000 cents against a 5,000-cent line of credit passes a gate that only ever
+    saw 5,000 while the gateway moves the full amount. A `bool` is refused for the same
+    reason it is a surprise: it is an `int` in Python and would be captured as one.
+    """
+    if not isinstance(amount, int) or isinstance(amount, bool):
         raise TypeError(f"the amount recorded for {sku!r} is {amount!r}, which is not a whole number of cents")
+    if amount <= 0:
+        raise ValueError(f"the amount recorded for {sku!r} is {amount}, and a line item must be worth something")
     return amount
+
+
+async def over(total: int, approval_over: int) -> bool:
+    """Whether this payout needs a person, decided once and recorded like any other step."""
+    return total > approval_over
+
+
+def parse_held(recorded: object) -> bool:
+    """Whether a pass already decided this payout waits for a person."""
+    if not isinstance(recorded, bool):
+        raise TypeError(f"the approval gate holds {recorded!r}, which does not say whether a person is needed")
+    return recorded
 
 
 def parse_approver(recorded: object) -> str:
@@ -101,18 +127,21 @@ async def pay_out(
     skus = sorted(items)
 
     # Spawned into a list rather than gathered straight off a generator, so the fan-out
-    # has an owner. `gather` raises the first failure and leaves its siblings running,
-    # which here means captures still writing into a pass that is already over: whatever
-    # they record lands after `resume` reported an outcome and after the worker released
-    # the claim, under a token the store has stopped honouring. Cancelling the survivors
-    # on the way out is what ends the fan-out when the pass ends, and it is the same
-    # shape `without_dag.drive` uses for the same reason.
+    # has an owner: `gather` raises the first failure and leaves its siblings running,
+    # which here would mean captures still writing into a pass that is already over,
+    # landing after `resume` reported an outcome and after the worker released the claim.
+    #
+    # Cancelling is safe to do here precisely because it is not `run.step`'s whole story:
+    # a sibling that is *inside* its gateway call has charged nothing and should end, and
+    # one that has charged and is writing the record keeps writing it, because `step`
+    # holds that write past the cancellation. Without that, one declined line item would
+    # re-charge every line item that happened to be mid-record beside it.
     #
     # A `TaskGroup` would cancel them too, and would change what a failure *is*: it wraps
     # children in an `ExceptionGroup`, so a `Fenced` raised by one capture would reach the
     # worker as a group that its `except (Fenced, Contended)` cannot see, and losing the
     # workflow would be logged as the workflow failing. The exception's *type* is
-    # load-bearing here, so the cancelling is done by hand and the type is left alone.
+    # load-bearing here, so the draining is done by hand and the type is left alone.
     capturing_each = [
         asyncio.ensure_future(run.step(f"captured:{sku}", capturing(services, sku, items[sku]), parse_reference))
         for sku in skus
@@ -130,7 +159,15 @@ async def pay_out(
 
     total = sum(items.values())
     await run.sleep("settling", settling)
-    approved_by = await run.awaiting("approved-by", parse_approver) if total > approval_over else None
+    # The gate is *recorded*, not recomputed, and it is the one decision here that has to
+    # be. `approval_over` is a deployment's setting rather than the workflow's own value,
+    # so a pass after a deploy that raised it would find a held payout no longer held and
+    # pay it with nobody in the loop, leaving a checkpoint that shows no approval and no
+    # trace that one was ever wanted. It is the same argument `sleep` makes by recording
+    # its deadline instead of its duration: what a later pass must agree with is the
+    # decision, not the input it was made from.
+    held = await run.step("held-for-approval", lambda: over(total, approval_over), parse_held)
+    approved_by = await run.awaiting("approved-by", parse_approver) if held else None
 
     reference = await run.step("paid", lambda: services.pay(order_id, total), parse_reference)
 

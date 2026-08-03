@@ -10,17 +10,21 @@ from datetime import timedelta
 import pytest
 from integration.durable import Payouts
 from integration.durable import parse_approver
+from integration.durable import parse_held
 from integration.durable import parse_items
 from integration.durable import parse_reference
 from integration.durable import pay_out
 from without_durability import Completed
 from without_durability import Contended
 from without_durability import Fenced
+from without_durability import InputNeeded
 from without_durability import MemoryCheckpointer
 from without_durability import MemoryEffect
 from without_durability import Outcome
+from without_durability import Pass
 from without_durability import Recorded
 from without_durability import Run
+from without_durability import ScheduledWakeup
 from without_durability import Sleeping
 from without_durability import Suspended
 from without_durability import Waiting
@@ -28,6 +32,8 @@ from without_durability import claimed
 from without_durability import now_utc
 from without_durability import parse_deadline
 from without_durability import resume
+from without_durability.stepwise import stopped_at
+from without_durability.stepwise import unwound
 
 ORDER = "ord-88"
 ITEMS = {"widget": 1200, "gizmo": 800}
@@ -160,6 +166,7 @@ async def test_a_pass_that_fails_partway_leaves_the_steps_that_finished_recorded
         "captured:gizmo": "cap-gizmo-800",
         "captured:widget": "cap-widget-1200",
         "settling": STARTED_AT.isoformat(),
+        "held-for-approval": False,
     }
 
     ledger.broken.clear()
@@ -489,6 +496,13 @@ async def test_line_items_recorded_as_something_else_fail_loudly() -> None:
     with pytest.raises(TypeError, match="the amount recorded for 'widget' is '1200'"):
         parse_items({"widget": "1200"})
 
+    # A line item worth nothing or less is refused here as well as at the API, because
+    # this is where the *workflow* reads it: the approval gate compares a sum, so a
+    # negative amount makes that a net rather than a total and lets a basket capture far
+    # more than the gate ever saw.
+    with pytest.raises(ValueError, match="the amount recorded for 'widget' is -1200"):
+        parse_items({"widget": -1200})
+
 
 async def test_an_approval_recorded_as_something_else_fails_loudly() -> None:
     # The one value here that a *different* process writes, so the one most worth
@@ -535,3 +549,343 @@ async def test_a_failed_capture_takes_its_siblings_down_with_the_pass() -> None:
     assert [key for key in await checkpointer.load(ORDER) if key.startswith("captured:")] == [], (
         "and neither capture recorded, so the next pass runs both"
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ParkedWrites(MemoryCheckpointer):
+    """
+    The double, with a `record` that parks mid-write so a cancellation can land inside it.
+
+    Every real store's `record` is a round trip to a server, which is a suspension point;
+    the in-memory one's is not, so this is the one shape a test cannot reach by driving the
+    double as it comes.
+    """
+
+    writing: asyncio.Event = field(default_factory=asyncio.Event)
+    proceed: asyncio.Event = field(default_factory=asyncio.Event)
+    # A store that is reachable and then is not, which is the other thing a write can do
+    # while a step is being torn down around it.
+    refuse: bool = False
+
+    async def record(self, holder: Pass, key: str, value: object) -> Recorded:
+        self.writing.set()
+        await self.proceed.wait()
+        if self.refuse:
+            raise ConnectionError("the store was briefly unreachable")
+        return await super().record(holder, key, value)
+
+
+async def test_a_step_cancelled_while_writing_still_records_the_effect_it_performed() -> None:
+    # Cancelling a step that has already called the gateway does not undo the charge, it
+    # only removes the record of it, so the next pass charges again. And a step is
+    # cancelled in the ordinary course of a fan-out (the test above is exactly that), not
+    # only in a crash, so the sibling parked in its write is the common case rather than
+    # an exotic one.
+    checkpointer = ParkedWrites()
+    holder = await claimed(checkpointer, ORDER)
+    charging = asyncio.ensure_future(
+        Run(holder=holder, checkpointer=checkpointer, recorded={}).step("charged", lambda: answering("ch-1"), as_text)
+    )
+    await checkpointer.writing.wait()
+
+    charging.cancel()
+    checkpointer.proceed.set()
+    with pytest.raises(asyncio.CancelledError):
+        await charging
+
+    assert await checkpointer.load(ORDER) == {"charged": "ch-1"}, "the effect happened, so its record has to land"
+
+
+async def test_a_suspension_raised_under_a_task_group_is_still_an_outcome() -> None:
+    # A workflow that fans its steps out with a `TaskGroup` raises a `BaseExceptionGroup`,
+    # which is neither an `Outcome` nor anything a driver's `except Exception` reaches, so
+    # the one workflow that suspended under a group would take down the loop running every
+    # other one. The suspension is unwrapped instead, and the pass reports what it stopped
+    # at exactly as a bare one does.
+    checkpointer = MemoryCheckpointer()
+    holder = await claimed(checkpointer, ORDER)
+
+    async def body(run: Run) -> None:
+        async with asyncio.TaskGroup() as group:
+            group.create_task(run.step("charged", lambda: answering("ch-1"), as_text))
+            group.create_task(run.sleep("settling", SETTLING))
+
+    outcome = await resume(holder, checkpointer, body, now=Clock())
+
+    assert outcome == Sleeping(key="settling", due=STARTED_AT + SETTLING)
+    assert (await checkpointer.load(ORDER))["charged"] == "ch-1", "the sibling's own step still landed"
+
+
+async def test_a_suspension_nested_two_task_groups_deep_is_still_an_outcome() -> None:
+    # Groups nest, so the group a suspension arrives in can hold another group rather than
+    # the suspension itself. Reading only the outer layer would report the workflow as
+    # having raised something unreportable, which is the same harm one layer down.
+    checkpointer = MemoryCheckpointer()
+    holder = await claimed(checkpointer, ORDER)
+
+    async def inner(run: Run) -> None:
+        async with asyncio.TaskGroup() as group:
+            group.create_task(run.sleep("settling", SETTLING))
+
+    async def body(run: Run) -> None:
+        async with asyncio.TaskGroup() as group:
+            group.create_task(inner(run))
+
+    assert await resume(holder, checkpointer, body, now=Clock()) == Sleeping(key="settling", due=STARTED_AT + SETTLING)
+
+
+async def test_a_task_group_that_both_suspends_and_fails_reports_the_failure() -> None:
+    # The suspension is not an excuse to swallow the error beside it: `except*` takes the
+    # arm it understands and re-raises the rest, which arrives as an ordinary
+    # `ExceptionGroup` (every leaf left is an `Exception`) and so is caught by a driver as
+    # that workflow's failure.
+    checkpointer = MemoryCheckpointer()
+    holder = await claimed(checkpointer, ORDER)
+
+    async def declining() -> None:
+        raise RuntimeError("the gateway declined")
+
+    async def body(run: Run) -> None:
+        async with asyncio.TaskGroup() as group:
+            group.create_task(run.sleep("settling", SETTLING))
+            group.create_task(declining())
+
+    with pytest.raises(ExceptionGroup) as raised:
+        await resume(holder, checkpointer, body, now=Clock())
+
+    assert [type(each) for each in raised.value.exceptions] == [RuntimeError]
+
+
+async def test_several_suspensions_at_once_report_the_earliest_deadline() -> None:
+    # A pass has one outcome and a group can stop at several waits. A deadline wins over a
+    # wait for input, because a wakeup is the only one of the two this driver can answer;
+    # the earliest wins among deadlines, because a pass that wakes early suspends again
+    # and one that wakes late kept a branch waiting for nothing.
+    #
+    # Asserted on the choice itself rather than through a task group, because a group
+    # cancels its siblings the instant one of them raises: which suspensions arrive
+    # together is a race, and what to do with the ones that did is not.
+    raised = [
+        InputNeeded("approved-by"),
+        ScheduledWakeup("settling", due=STARTED_AT + SETTLING),
+        ScheduledWakeup("clearing", due=STARTED_AT + timedelta(hours=1)),
+    ]
+    recorded = {"settling": STARTED_AT + SETTLING, "clearing": STARTED_AT + timedelta(hours=1)}
+
+    assert stopped_at(raised, recorded) == Sleeping(key="clearing", due=STARTED_AT + timedelta(hours=1))
+
+
+async def test_only_a_wait_for_input_reports_a_waiting_pass() -> None:
+    # The other half of the choice above: with no deadline among them there is nothing to
+    # schedule, and the driver is told to leave the workflow alone until somebody writes
+    # the value.
+    assert stopped_at([InputNeeded("approved-by"), InputNeeded("countersigned-by")], {}) == Waiting(key="approved-by")
+
+
+async def test_a_transacted_effect_that_fails_leaves_the_stores_data_alone() -> None:
+    # `transact` MUST NOT leave the effect applied without its record, and an effect that
+    # moves the data and *then* raises is the way to reach that state: without a rollback
+    # the next pass finds nothing recorded and runs the effect again over data it has
+    # already moved. The double owes this like any store, or every test written against it
+    # is a test of something production does not do.
+    checkpointer = MemoryCheckpointer(data={"balance": 100})
+    holder = await claimed(checkpointer, ORDER)
+
+    def debit(data: dict[str, object]) -> object:
+        balance = data["balance"]
+        assert isinstance(balance, int)
+        data["balance"] = balance - 20
+        raise RuntimeError("the ledger refused the debit")
+
+    with pytest.raises(RuntimeError, match="refused the debit"):
+        await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("debited", debit, as_count)
+
+    assert checkpointer.data == {"balance": 100}, "the effect went back with the record that never landed"
+    assert await checkpointer.load(ORDER) == {}
+
+
+async def test_losing_the_claim_under_a_task_group_still_arrives_as_the_interruption_it_is() -> None:
+    # The same harm as a wrapped suspension, one door along: a group whose only leaf is a
+    # `Fenced` is a `BaseExceptionGroup`, so a driver's `except (Fenced, Contended)` does
+    # not match it and its `except Exception` cannot reach it, and the workflow that
+    # merely lost its claim takes down the loop running every other one. It is unwrapped
+    # for the same reason suspensions are, and raised bare so the driver sees what it was
+    # written to catch.
+    checkpointer = MemoryCheckpointer()
+    stalled = await claimed(checkpointer, ORDER)
+    await checkpointer.release(stalled)
+    await claimed(checkpointer, ORDER)  # the winner, which outranks the stalled pass
+
+    async def body(run: Run) -> None:
+        async with asyncio.TaskGroup() as group:
+            group.create_task(run.step("charged", lambda: answering("ch-1"), as_text))
+
+    with pytest.raises(Fenced):
+        await resume(stalled, checkpointer, body, now=Clock())
+
+
+def test_a_lost_claim_is_reported_over_a_sibling_that_failed_beside_it() -> None:
+    # A pass that may not write has nothing to say about a gateway declining: the decline
+    # is a consequence, and reporting it would have a driver log a workflow failure for a
+    # workflow that is fine and being advanced by whoever holds the claim.
+    #
+    # Asserted on the rule rather than through a task group, because a group cancels its
+    # siblings the instant one of them raises: which leaves end up in it together is a
+    # race, and what to do with the ones that did is not.
+    lost = Fenced("pass 1 was superseded")
+
+    with pytest.raises(Fenced) as raised:
+        unwound(BaseExceptionGroup("fan-out", [RuntimeError("the gateway declined"), lost]), {})
+
+    assert raised.value is lost
+
+
+def test_a_fan_out_that_only_failed_is_re_raised_without_its_suspensions() -> None:
+    # The other half: with no claim lost, the failures are the news. They come back as an
+    # ordinary `ExceptionGroup` rather than the `BaseExceptionGroup` they arrived in,
+    # because a suspension left among them would keep the group invisible to the driver's
+    # `except Exception`, which is the whole harm being repaired.
+    with pytest.raises(ExceptionGroup) as raised:
+        unwound(
+            BaseExceptionGroup("fan-out", [InputNeeded("approved-by"), RuntimeError("the gateway declined")]),
+            {},
+        )
+
+    assert [type(each) for each in raised.value.exceptions] == [RuntimeError]
+    assert isinstance(raised.value, Exception), "a driver's `except Exception` has to be able to see it"
+
+
+async def test_a_deadline_whose_suspension_was_cancelled_is_still_reported() -> None:
+    # `sleep` records the deadline and *then* raises, and a task group cancels its other
+    # branches the instant one of them raises, so the branch that had just written its
+    # deadline can be cancelled in between. The record is durable by then. Without the
+    # deadline being noted on the pass, nothing reports it: the driver hears `Waiting`,
+    # schedules no wakeup, and the workflow waits out a clock that will never fire while
+    # its checkpoint holds the deadline that was supposed to end the wait.
+    checkpointer = ParkedWrites()
+    holder = await claimed(checkpointer, ORDER)
+
+    async def waiting_on_a_person(run: Run) -> None:
+        # Held until the sleeping branch is *inside* its write, then let go, so the
+        # cancellation lands exactly where the defect lives rather than wherever the
+        # scheduler happens to put it. That instant is the one that produces a durable
+        # deadline with no suspension to report it: the write is held past the
+        # cancellation, and the raise that would have announced it never runs.
+        await checkpointer.writing.wait()
+        checkpointer.proceed.set()
+        await run.awaiting("approved-by", parse_approver)
+
+    async def body(run: Run) -> None:
+        async with asyncio.TaskGroup() as group:
+            group.create_task(run.sleep("timing-out", SETTLING))
+            group.create_task(waiting_on_a_person(run))
+
+    outcome = await resume(holder, checkpointer, body, now=Clock())
+
+    assert outcome == Sleeping(key="timing-out", due=STARTED_AT + SETTLING), (
+        "the branch that asked for a clock is the one a driver can answer"
+    )
+    assert (await checkpointer.load(ORDER))["timing-out"] == (STARTED_AT + SETTLING).isoformat()
+
+
+async def test_a_step_cancelled_twice_still_records_the_effect_it_performed() -> None:
+    # One cancelled pass delivers two cancellations, which is the ordinary case rather
+    # than a caller being emphatic: a fan-out gathered under `asyncio.gather` cancels its
+    # children when the pass is cancelled, and the gather returns as soon as the first
+    # child answers, so the caller's own teardown cancels the rest again. Honouring the
+    # second one drops a write whose gateway call has already happened, which is the
+    # charge the first one was held for.
+    checkpointer = ParkedWrites()
+    holder = await claimed(checkpointer, ORDER)
+    charging = asyncio.ensure_future(
+        Run(holder=holder, checkpointer=checkpointer, recorded={}).step("charged", lambda: answering("ch-1"), as_text)
+    )
+    await checkpointer.writing.wait()
+
+    charging.cancel()
+    await asyncio.sleep(0)  # a turn for the step to reach the wait that holds the write
+    charging.cancel()
+    checkpointer.proceed.set()
+    with pytest.raises(asyncio.CancelledError):
+        await charging
+
+    assert await checkpointer.load(ORDER) == {"charged": "ch-1"}, "the effect happened, so its record has to land"
+
+
+async def test_a_step_cancelled_over_a_write_that_failed_records_nothing() -> None:
+    # The other half of holding the write past a cancellation: a write that did not land
+    # leaves nothing behind. Its failure belongs to the pass being torn down rather than
+    # to whoever cancelled it, so it is dropped rather than raised in the cancellation's
+    # place, and the key stays absent so a later pass performs the effect again, which is
+    # the at-least-once bound `step` already documents.
+    checkpointer = ParkedWrites(refuse=True)
+    holder = await claimed(checkpointer, ORDER)
+    run = Run(holder=holder, checkpointer=checkpointer, recorded={})
+    charging = asyncio.ensure_future(run.step("charged", lambda: answering("ch-1"), as_text))
+    await checkpointer.writing.wait()
+
+    charging.cancel()
+    checkpointer.proceed.set()
+    with pytest.raises(asyncio.CancelledError):
+        await charging
+
+    assert run.recorded == {}, "a write that failed is not a record"
+    assert await checkpointer.load(ORDER) == {}
+
+
+async def test_a_sleep_cancelled_before_its_deadline_landed_schedules_nothing() -> None:
+    # The deadline is read back off the pass, so there has to be one: a `sleep` cancelled
+    # while its write was still in flight *and* failing has recorded nothing, and there is
+    # no deadline to report. The pass says it is waiting on the value it can name, and the
+    # next pass writes the deadline afresh.
+    checkpointer = ParkedWrites(refuse=True)
+    holder = await claimed(checkpointer, ORDER)
+
+    async def waiting_on_a_person(run: Run) -> None:
+        await checkpointer.writing.wait()
+        checkpointer.proceed.set()
+        await run.awaiting("approved-by", parse_approver)
+
+    async def body(run: Run) -> None:
+        async with asyncio.TaskGroup() as group:
+            group.create_task(run.sleep("timing-out", SETTLING))
+            group.create_task(waiting_on_a_person(run))
+
+    assert await resume(holder, checkpointer, body, now=Clock()) == Waiting(key="approved-by")
+    assert await checkpointer.load(ORDER) == {}
+
+
+async def test_an_order_with_no_line_items_is_refused_where_the_workflow_reads_it() -> None:
+    # The API refuses an empty basket, and so does this: what a store hands back is
+    # external input to the workflow however it got there, and an order with nothing in it
+    # captures nothing, pays a gateway zero, and records a `paid` for it.
+    with pytest.raises(ValueError, match="the line items are empty"):
+        parse_items({})
+
+
+async def test_a_held_payout_stays_held_when_the_threshold_moves_between_passes() -> None:
+    # The approval gate is the one decision here that a later pass must not re-litigate.
+    # `approval_over` is a deployment's setting rather than the workflow's own value, so a
+    # deploy between two passes would otherwise find a held payout no longer held and pay
+    # it with nobody in the loop, leaving a checkpoint that shows neither the approval nor
+    # that one was ever wanted.
+    ledger = Ledger(items=dict(BIG_ITEMS))
+    checkpointer = MemoryCheckpointer()
+
+    async def body(run: Run, over: int) -> dict[str, object]:
+        return await pay_out(run, ORDER, ledger.services(), settling=timedelta(), approval_over=over)
+
+    holder = await claimed(checkpointer, ORDER)
+    assert await resume(holder, checkpointer, lambda run: body(run, APPROVAL_OVER)) == Waiting(key="approved-by")
+    await checkpointer.release(holder)
+
+    raised = await claimed(checkpointer, ORDER)
+    outcome = await resume(raised, checkpointer, lambda run: body(run, 1_000_000))
+
+    assert outcome == Waiting(key="approved-by"), "the pass that held it decided; a later one abides by that"
+    assert "paid" not in await checkpointer.load(ORDER)
+
+
+async def test_an_approval_gate_recorded_as_something_else_fails_loudly() -> None:
+    with pytest.raises(TypeError, match="the approval gate holds 'yes'"):
+        parse_held("yes")

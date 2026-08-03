@@ -199,6 +199,13 @@ ON CONFLICT (namespace, workflow) DO UPDATE SET visible_at = excluded.visible_at
 # different `visible_at`, so the equality is the whole check.
 FINISH = "DELETE FROM workflow_queue WHERE namespace = ? AND workflow = ? AND visible_at = ?"
 
+# Suspend until a deadline, under the same comparison and for the same reason. A workflow
+# holds one row here, so writing the deadline unconditionally would land on top of a
+# `make_ready` that arrived while the pass was ending and push a confirmation out to a
+# deadline that may be days away. The deadline is in the checkpoint either way, so the
+# pass that runs sooner writes it again.
+SUSPEND = "UPDATE workflow_queue SET visible_at = ? WHERE namespace = ? AND workflow = ? AND visible_at = ?"
+
 # What an effect is for a store whose datastore is a SQLite file: a callback handed a
 # cursor already inside `transact`'s transaction.
 #
@@ -299,15 +306,31 @@ def transacted[T](connection: sqlite3.Connection, work: Callable[[sqlite3.Cursor
     of the exclusion: a deferred transaction takes the write lock at its first write, so
     a fence *read* before it would not be protected and could be overtaken. Taking the
     lock up front makes the read and the write it guards one step.
+
+    The commit is inside the `try` because committing is one of the things that can fail:
+    a deferred constraint is checked there, so a `COMMIT` can raise with the transaction
+    still open. Left outside, nothing rolls that back, and the transaction stays open on a
+    connection every later caller shares: their writes join it, return saying they are
+    durable, and are lost when it is finally discarded, while the write lock is held
+    against every other process on the machine for as long as this one lives. That is
+    precisely the failure `Database.run`'s guard exists to prevent, arriving by the one
+    door the guard does not cover.
+
+    The rollback is conditional for the mirror-image reason: SQLite rolls back by itself
+    on a full disk, an I/O error, an interrupt, or being out of memory, so an
+    unconditional `ROLLBACK` raises "cannot rollback - no transaction is active" *over*
+    the error that caused it, and the caller is told the wrong thing about its own
+    failure. Asking the connection is how to tell which of the two happened.
     """
     connection.execute("BEGIN IMMEDIATE")
     try:
         with closing(connection.cursor()) as cursor:
             done = work(cursor)
+        connection.execute("COMMIT")
     except BaseException:
-        connection.execute("ROLLBACK")
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
         raise
-    connection.execute("COMMIT")
     return done
 
 
@@ -482,8 +505,22 @@ class SqliteScheduler:
     async def make_ready(self, workflow: str) -> None:
         await self.schedule(workflow, self.now())
 
-    async def wake_at(self, workflow: str, when: datetime) -> None:
-        await self.schedule(workflow, when)
+    async def wake_at(self, delivery: Delivery, when: datetime) -> None:
+        """
+        Suspend the workflow until `when`, unless something asked for a pass meanwhile.
+
+        The receipt is the visibility this pass took, so anything that rescheduled the
+        workflow since (a confirmation, another worker taking over an overrun) wrote a
+        different one and this leaves it be. Which is the right answer rather than a
+        concession: the deadline lives in the workflow's checkpoint, so the pass that runs
+        sooner reaches the same `sleep` and writes it again.
+        """
+        await self.database.run(
+            lambda connection: connection.execute(
+                SUSPEND,
+                (when.timestamp(), self.namespace, delivery.workflow, float(delivery.receipt)),
+            )
+        )
 
     async def schedule(self, workflow: str, visible_at: datetime) -> None:
         await self.database.run(

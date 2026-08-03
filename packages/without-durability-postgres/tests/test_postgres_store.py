@@ -426,8 +426,8 @@ async def test_a_deadline_set_during_a_pass_outlives_that_passs_acknowledgement(
     held = await queue.next_ready(BRIEFLY)
     assert held is not None
 
-    await queue.wake_at(workflow, now_utc() + timedelta(milliseconds=150))
-    await queue.done(held)
+    await queue.wake_at(held, now_utc() + timedelta(milliseconds=150))
+    await queue.done(held)  # a stale acknowledgement, which the deadline it wrote makes inert
 
     assert await queue.next_ready(timedelta(milliseconds=50)) is None, "not due yet"
     assert await queue.next_ready(timedelta(seconds=2)) is not None, "and still there when it is"
@@ -477,3 +477,102 @@ async def test_the_queue_holds_one_row_per_workflow_however_many_wakeups_arrive(
 
     assert await queue.wake_due(now_utc()) == (), "being due and being ready are the same visibility"
     await queue.prepare()  # already migrated, and running it again is a no-op
+
+
+async def test_taking_one_workflow_leaves_every_other_due_one_visible(
+    pool: AsyncConnectionPool,
+    workflow: str,
+) -> None:
+    # A pull takes one delivery, so a queue with eight due workflows must still have seven
+    # for everybody else. What makes it worth asserting rather than assuming is that
+    # `LIMIT 1` bounds what the subquery *returns* and not how many times the planner
+    # evaluates it: a rescanned `SKIP LOCKED` scan yields a different row each time, so a
+    # statement can lease more workflows than it hands back, and the extras go invisible
+    # for a lease with nobody holding a delivery for them.
+    #
+    # The statement is written so the count cannot depend on the plan. This holds it to
+    # that, and it is stated over the *store* rather than over an `EXPLAIN`, because what
+    # matters is how many rows moved and not how the server decided to move them.
+    queue = scheduled(pool, workflow, lease=timedelta(seconds=30))
+    for number in range(8):
+        await queue.make_ready(f"{workflow}-{number}")
+
+    taken = await queue.next_ready(BRIEFLY)
+
+    assert taken is not None
+    async with pool.connection() as connection, connection.cursor() as cursor:
+        await cursor.execute(
+            "SELECT count(*) FROM workflow_queue WHERE namespace = %s AND visible_at <= now()",
+            (workflow,),
+        )
+        assert await cursor.fetchone() == (7,), "one delivery taken, and the rest still there to be taken"
+
+
+async def test_a_value_supplied_mid_transaction_is_handed_back_rather_than_raised(
+    pool: AsyncConnectionPool,
+    ledger: str,
+    workflow: str,
+) -> None:
+    # `transact`'s fence excludes every other pass, and `supply` is deliberately not a
+    # pass: an approval must not fail because a worker happens to be mid-step, so it can
+    # land under this key between the existence check and the write. The contract is to
+    # hand back what is recorded, so the effect goes back with the transaction that could
+    # not record it and the value that did land is what comes out.
+    checkpointer = PostgresCheckpointer(pool=pool)
+    holder = await claimed(checkpointer, workflow)
+
+    async def supplying_first(cursor: AsyncCursor[TupleRow]) -> object:
+        await checkpointer.supply(workflow, "reserved", "from-outside")
+        return await reserving(workflow, 1)(cursor)
+
+    stored = await checkpointer.transact(holder, "reserved", supplying_first)
+
+    assert stored == "from-outside"
+    assert await reserved(pool, workflow) is None, "and the effect went back with the record it could not write"
+    assert await checkpointer.load(workflow) == {"reserved": "from-outside"}
+
+
+async def test_an_effect_that_writes_its_own_step_row_is_told_what_it_did(
+    pool: AsyncConnectionPool,
+    ledger: str,
+    workflow: str,
+) -> None:
+    # The step's row is the store's to write, from what the effect returned. An effect
+    # that writes it itself makes the store's own insert a conflict with an uncommitted
+    # row of the same transaction, so the record cannot be made and the transaction is
+    # rolled back, taking the effect's write with it. There is then nothing to read back,
+    # and saying so beats a `NoneType` error from a line that looks like ordinary decoding.
+    checkpointer = PostgresCheckpointer(pool=pool)
+    holder = await claimed(checkpointer, workflow)
+
+    async def writes_its_own_row(cursor: AsyncCursor[TupleRow]) -> object:
+        await cursor.execute(
+            "INSERT INTO workflow_checkpoint (workflow, step, value) VALUES (%s, %s, %s::jsonb)",
+            (workflow, "reserved", '"from the effect"'),
+        )
+        return await reserving(workflow, 1)(cursor)
+
+    with pytest.raises(ValueError, match="wrote that step's own checkpoint row"):
+        await checkpointer.transact(holder, "reserved", writes_its_own_row)
+
+    assert await checkpointer.load(workflow) == {}, "the effect went back with the record it could not write"
+    assert await reserved(pool, workflow) is None
+
+
+async def test_a_wakeup_that_arrived_during_a_pass_is_not_overwritten_by_its_deadline(
+    pool: AsyncConnectionPool,
+    workflow: str,
+) -> None:
+    # A workflow holds one row here, so a deadline written unconditionally lands on top of
+    # a `make_ready` that arrived while the pass was ending, and a confirmation waits out
+    # a settlement window it should have interrupted. The receipt is what tells the two
+    # apart: anything that asked for another pass wrote a different visibility.
+    queue = scheduled(pool, workflow)
+    await queue.make_ready(workflow)
+    held = await queue.next_ready(BRIEFLY)
+    assert held is not None
+
+    await queue.make_ready(workflow)  # the confirmation, arriving mid-pass
+    await queue.wake_at(held, now_utc() + timedelta(days=3))
+
+    assert await queue.next_ready(BRIEFLY) is not None, "the wakeup that arrived is still due now"

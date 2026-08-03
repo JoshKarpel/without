@@ -30,9 +30,24 @@ class CheckpointCodec[Encoded](Protocol):
       first pass did not, silently, one crash later. The stdlib `JsonCodec` below does
       *not* round-trip a tuple (it comes back a list) or a mapping with non-string keys,
       which is why a workflow using it must keep its step results JSON-native.
-    - `encode` MUST be deterministic: equal values encode equal. `Checkpointer.record`
-      decides who won a race by comparing encodings, so a codec that renders one value
-      two ways reports a conflict that did not happen.
+    - `encode` MUST be deterministic: values that are equal *and of the same type at every
+      level* encode equal. `Checkpointer.record` decides who won a race by comparing
+      encodings, so a codec that renders one value two ways reports a conflict that did
+      not happen.
+
+      Both qualifiers are load-bearing, and the second is easy to drop. Python holds
+      `1 == 1.0` while JSON tells `1` and `1.0` apart, and a codec cannot both encode them
+      identically and give each of them back, since one of the two would round-trip to the
+      other; so the plain reading is not available to any codec whose format distinguishes
+      what Python's equality does not, and asking for it would be asking for the round trip
+      to be broken. But the same pair inside a container is the same problem with a
+      container around it: `[1]` and `[1.0]` are equal, are both `list`, and still encode
+      apart. So the requirement is the property `without_durability.graph.survives` checks,
+      which is what a graph run already holds its node results to.
+
+      What it leaves is a store comparing text answering `first=False` for a tie between
+      `1` and `1.0` while one comparing `jsonb` answers `first=True`, over values a
+      workflow should not be producing for one key anyway.
 
     Both are properties of the pair, which is why a codec is one object rather than two
     functions: the stores do not merely encode, they compare encodings to decide who won
@@ -74,10 +89,28 @@ class JsonCodec:
     protocol requires. A codec that knows the application's types (a pydantic
     `TypeAdapter`, msgspec with a schema) is how a workflow gets to return domain values,
     and swapping one in changes the store's construction and nothing else.
+
+    Two arguments to `json.dumps` are what make it meet the protocol rather than merely
+    resemble it, and each one is a requirement rather than a preference.
+
+    `sort_keys` is determinism. A mapping's encoding would otherwise follow its *insertion*
+    order, so two passes that computed the same mapping by different routes encode it two
+    ways, and a store deciding who won by comparing encodings (`record`) reports a conflict
+    between values that are equal. Sorting also makes a key order the thing it should be, a
+    fact about the value rather than about how it was built. What it costs is that a mapping
+    whose keys are not mutually orderable (`{1: ..., "a": ...}`) now raises here instead of
+    encoding, which is the round trip failing where it can be seen rather than one crash
+    later.
+
+    `allow_nan` is the round trip. Left on, `float("nan")` encodes to the bare token `NaN`,
+    which is not JSON: it decodes back unequal to itself, the checkpoint stops being
+    readable by anything that parses JSON strictly, and a store whose column is `jsonb`
+    refuses the write at the far end of a workflow the double accepted. Off, the value that
+    cannot survive is refused where it is produced.
     """
 
     def encode(self, value: object) -> str:
-        return json.dumps(value)
+        return json.dumps(value, sort_keys=True, allow_nan=False)
 
     def decode(self, encoded: str) -> object:
         return json.loads(encoded)

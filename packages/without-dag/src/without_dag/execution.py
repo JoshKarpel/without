@@ -11,8 +11,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from graphlib import TopologicalSorter
 
-from without import cancel_futures
-
 # A *name*, not an identity. Any hashable would do to key a run in memory, but a
 # key that outlives the process is what lets a run's `(key, value)` completions be
 # sunk to a store and handed back as a checkpoint, so the interface is narrowed to the
@@ -165,7 +163,29 @@ async def drive(
             ready.extend(sorter.get_ready())
             yield key, value
     finally:
-        await cancel_futures(running)
+        # Tearing the run down must not change what it is reporting, and this is the only
+        # place that can guarantee it. A node in `running` may have *already failed* (a
+        # sibling that raised while the consumer was away between two yields) or may fail
+        # *as it is cancelled* (a node whose own cleanup raises), and either one re-raises
+        # from this `finally` and replaces whatever brought the run down: a caller that
+        # closed this generator on a lost claim is handed a node's error instead, and the
+        # nodes behind it are never awaited at all, so their effects run on past the call
+        # that told the caller to stop.
+        #
+        # So this waits rather than awaits. `asyncio.wait` reports that the tasks are
+        # finished without raising what they finished with, which leaves the exception the
+        # caller came here with intact, and leaves *this* task's own cancellation the only
+        # thing that can interrupt the teardown.
+        for unfinished in running:
+            unfinished.cancel()
+        if running:
+            await asyncio.wait(running)
+        for finished in running:
+            if not finished.cancelled():
+                # Retrieved and dropped: there is nobody left to report a node's failure
+                # to, and an unretrieved one is logged by the loop at some later moment as
+                # an error nothing can act on.
+                finished.exception()
 
 
 async def evaluate(plan: Plan, target: NodeKey, inputs: Mapping[NodeKey, object], limit: int | None) -> object:

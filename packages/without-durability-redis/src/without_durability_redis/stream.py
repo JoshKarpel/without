@@ -53,6 +53,8 @@ from without_durability.interfaces import LEASE
 from without_durability.interfaces import Delivery
 from without_durability.interfaces import check_duration
 
+from without_durability_redis.units import milliseconds
+
 type Entries = list[tuple[str, dict[str, str]]]
 
 # How often the trimmer looks. It is a housekeeping interval rather than a correctness
@@ -127,18 +129,33 @@ class RedisStreamScheduler:
     # call sends the digest and falls back to the source only when the server has not
     # seen it.
     move: AsyncScript = field(init=False, repr=False, compare=False)
+    # Where this worker's sweep of the pending list got to, as a one-element list because
+    # the rest of this is a value and a cursor is not: it is the one thing here that
+    # carries from one call to the next. See `reclaim` for why the sweep is resumed rather
+    # than restarted, and why losing this costs a sweep rather than a delivery.
+    scanned: list[str] = field(default_factory=lambda: ["0-0"], repr=False, compare=False)
 
     def __post_init__(self) -> None:
         check_duration("a lease", self.lease)
         object.__setattr__(self, "move", self.redis.register_script(WAKE_DUE))
 
+    # The braces are Redis Cluster's hash tag, exactly as they are on `RedisCheckpointer`'s
+    # pair, and for a reason that is stronger here: `wake_due` is a script over *both* of
+    # these keys, so untagged they hash to two slots and the cluster refuses the call
+    # before running any of it. That is not a degradation but a queue where nothing
+    # sleeping ever wakes, and it takes the worker with it, since the timer and the pass
+    # loop share a task group.
+    #
+    # The tag is the namespace rather than the workflow, which is the honest scope: a queue
+    # is one shared structure that every worker reads, so it lives on one node whatever the
+    # tag says. What the tag buys is that both halves of it live on the *same* one.
     @property
     def ready_key(self) -> str:
-        return f"{self.namespace}:ready"
+        return f"{{{self.namespace}}}:ready"
 
     @property
     def sleeping_key(self) -> str:
-        return f"{self.namespace}:sleeping"
+        return f"{{{self.namespace}}}:sleeping"
 
     async def prepare(self) -> None:
         """
@@ -160,32 +177,41 @@ class RedisStreamScheduler:
     async def make_ready(self, workflow: str) -> None:
         await self.redis.xadd(self.ready_key, {"workflow": workflow})
 
-    async def wake_at(self, workflow: str, when: datetime) -> None:
-        await self.redis.zadd(self.sleeping_key, {workflow: when.timestamp()})
+    async def wake_at(self, delivery: Delivery, when: datetime) -> None:
+        """
+        Put the workflow among the sleepers, and answer for the delivery that got it there.
+
+        Nothing to compare here, which is the sorted set's problem rather than the
+        stream's: a wakeup that arrived mid-pass is a *new entry* in the stream, so
+        writing a deadline into the sleepers cannot overwrite it and acknowledging this
+        delivery cannot remove it.
+        """
+        await self.redis.zadd(self.sleeping_key, {delivery.workflow: when.timestamp()})
+        await self.done(delivery)
 
     async def wake_due(self, now: datetime) -> tuple[str, ...]:
         woken = await self.move(keys=[self.sleeping_key, self.ready_key], args=[now.timestamp(), self.batch])
         return tuple(cast(list[str], woken))
 
     async def next_ready(self, within: timedelta) -> Delivery | None:
-        read = cast(
-            list[tuple[str, Entries]],
-            await self.redis.xreadgroup(
-                self.group,
-                self.consumer,
-                {self.ready_key: ">"},
-                count=1,
-                block=int(within.total_seconds() * 1000),
-            ),
+        read = await self.redis.xreadgroup(
+            self.group,
+            self.consumer,
+            {self.ready_key: ">"},
+            count=1,
+            # Rounded up rather than truncated, because `BLOCK 0` is not a shorter wait but
+            # an unbounded one: a `within` under a millisecond would park this worker until
+            # an entry arrives, and the bound exists precisely so a cancelled one can
+            # notice (see `units`).
+            block=milliseconds(within),
         )
         if not read:
             return None  # the block elapsed with nothing new
-        _stream, entries = read[0]
         # Indexed rather than guarded, because a reply for this stream carries at least
         # one entry: `>` reads only entries never delivered to this group, and the one
         # thing that removes entries here (`trim`) removes only what every group has
         # acknowledged, so nothing can vanish between the read and this line.
-        return deliveries(entries)[0]
+        return deliveries(read_entries(read, self.ready_key))[0]
 
     async def reclaim(self, idle: timedelta) -> Delivery | None:
         """
@@ -200,18 +226,43 @@ class RedisStreamScheduler:
         running, too long and a crashed worker's workflow waits that long to be picked
         up. Overtaking is survivable and not free, so the bound should exceed how long a
         pass can honestly take.
+
+        The cursor is *kept* rather than discarded or exhausted, because `XAUTOCLAIM`
+        bounds its own work: it scans about ten times `count` pending entries per call and
+        then stops, handing back where it got to. Both of the obvious ways to spend that
+        are wrong, in opposite directions.
+
+        Starting from `0-0` every time gives up after ten entries and reports "nothing
+        abandoned" while a dead worker's deliveries sit behind them, which is not a rare
+        arrangement but one this worker makes for itself: a pool of twenty holds twenty
+        entries whose idle clocks it keeps resetting, so the abandoned ones are exactly
+        the entries furthest down the list. Walking the cursor to the end within one call
+        finds them, and costs a full sweep of the pending list on the path that always
+        runs: with a fleet holding two thousand entries in flight, that is a fifth of a
+        second of round trips before every single pull, and it worsens as the fleet grows.
+
+        One step per call, resumed from where the last one stopped, is what both of those
+        miss. Each pull costs a single round trip, and successive pulls sweep the whole
+        pending list and wrap around, so an abandoned delivery is found within one sweep
+        rather than immediately or never. Holding a cursor makes this scheduler stateful
+        in a way nothing else here is, and the state is a hint rather than a fact: losing
+        it (a restart, a second scheduler over the same group) costs a sweep, not a
+        delivery.
         """
-        _cursor, entries, _deleted = cast(
+        cursor, entries, _deleted = cast(
             tuple[str, Entries, list[str]],
             await self.redis.xautoclaim(
                 self.ready_key,
                 self.group,
                 self.consumer,
-                min_idle_time=int(idle.total_seconds() * 1000),
-                start_id="0-0",
+                min_idle_time=milliseconds(idle),
+                start_id=self.scanned[0],
                 count=1,
             ),
         )
+        # `0-0` is the cursor's way of saying it reached the end of the pending list, and
+        # it is also where the next sweep starts, so there is nothing to special-case.
+        self.scanned[0] = cursor
         taken = deliveries(entries)
         return taken[0] if taken else None
 
@@ -292,6 +343,22 @@ def trimming(scheduler: RedisStreamScheduler) -> Sink[object]:
         await scheduler.trim()
 
     return from_sink(tidy)
+
+
+def read_entries(read: object, stream: str) -> Entries:
+    """
+    The entries a group read for one stream, whichever protocol the client negotiated.
+
+    RESP2 answers `XREADGROUP` with a list of stream-and-entries pairs and RESP3 with a
+    mapping of stream name to entries, and redis-py hands each back as it came rather than
+    normalizing them. Which one arrives is a property of the client a caller built
+    (`Redis(protocol=3)`), so it is read here rather than named as a constraint in a
+    docstring that nothing enforces: an unread reply shape is a worker that dies on its
+    first pull.
+    """
+    if isinstance(read, dict):
+        return cast(dict[str, list[Entries]], read)[stream][0]
+    return cast(list[tuple[str, Entries]], read)[0][1]
 
 
 def deliveries(entries: Entries) -> tuple[Delivery, ...]:

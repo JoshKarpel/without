@@ -15,6 +15,7 @@ from integration.durable.payout import Cents
 from integration.durable.payout import Payout
 from integration.durable.payout import Payouts
 from integration.durable.payout import parse_approver
+from integration.durable.payout import parse_held
 from integration.durable.payout import parse_items
 from integration.durable.payout import parse_reference
 from integration.durable.payout import pay_out
@@ -41,6 +42,7 @@ __all__ = [
     "fulfilment",
     "in_memory",
     "parse_approver",
+    "parse_held",
     "parse_items",
     "parse_reference",
     "pay_out",

@@ -4,6 +4,8 @@ import asyncio
 import os
 from collections.abc import AsyncIterator
 from contextlib import suppress
+from datetime import UTC
+from datetime import datetime
 from datetime import timedelta
 from uuid import uuid4
 
@@ -25,6 +27,8 @@ from without_durability_redis import RedisSetScheduler
 from without_durability_redis import RedisStreamScheduler
 from without_durability_redis import trimming
 from without_durability_redis.checkpointer import fenced
+from without_durability_redis.units import milliseconds
+from without_durability_redis.units import seconds
 
 # `just test` starts the services in compose.yaml and publishes each address; these
 # tests drive the real server it started rather than a fake, and skip when it did not
@@ -436,8 +440,8 @@ async def test_a_deadline_set_during_a_pass_outlives_that_passs_acknowledgement(
     held = await queue.next_ready(BRIEFLY)
     assert held is not None
 
-    await queue.wake_at(workflow, now_utc() + timedelta(milliseconds=150))
-    await queue.done(held)
+    await queue.wake_at(held, now_utc() + timedelta(milliseconds=150))
+    await queue.done(held)  # a stale acknowledgement, which the deadline it wrote makes inert
 
     assert await queue.next_ready(timedelta(milliseconds=50)) is None, "not due yet"
     assert await queue.next_ready(timedelta(seconds=2)) is not None, "and still there when it is"
@@ -486,8 +490,8 @@ async def test_the_schedule_holds_one_entry_per_workflow_however_many_wakeups_ar
 async def test_a_queue_key_holding_something_other_than_a_stream_fails_loudly(redis: Redis, workflow: str) -> None:
     # `prepare` forgives exactly one error, the one that means "another worker got here
     # first". Anything else is a real problem with the queue and must not be swallowed.
-    await redis.set(f"{workflow}:ready", "not a stream at all")
     scheduler = RedisStreamScheduler(redis=redis, namespace=workflow)
+    await redis.set(scheduler.ready_key, "not a stream at all")
 
     with pytest.raises(ResponseError, match="WRONGTYPE"):
         await scheduler.prepare()
@@ -502,7 +506,10 @@ async def test_a_sleeping_workflow_is_moved_to_the_stream_when_it_comes_due(
     # and asleep forever, which is why it is a script.
     scheduler = RedisStreamScheduler(redis=redis, namespace=workflow)
     await scheduler.prepare()
-    await scheduler.wake_at("wf-sleeping", now_utc() + timedelta(seconds=30))
+    await scheduler.make_ready("wf-sleeping")
+    held = await scheduler.next_ready(BRIEFLY)
+    assert held is not None
+    await scheduler.wake_at(held, now_utc() + timedelta(seconds=30))
 
     assert await scheduler.wake_due(now_utc()) == (), "not due yet, so it stays on the sleepers"
     assert await redis.zcard(scheduler.sleeping_key) == 1
@@ -538,3 +545,170 @@ async def test_a_delivery_a_dead_worker_never_answered_for_is_taken_over(
     assert taken_over is not None
     assert taken_over.receipt == abandoned.receipt, "the same delivery, taken over rather than duplicated"
     assert await surviving.reclaim(timedelta(minutes=1)) is None, "and nothing else is outstanding for long"
+
+
+async def test_the_two_queue_keys_share_a_slot_so_the_timers_script_may_touch_both(workflow: str) -> None:
+    # `wake_due` is a script over both of these, because taking a workflow off the
+    # sleepers and appending it to the stream are durable only together. Redis Cluster
+    # refuses a script whose keys hash to two slots, so untagged this is not a queue that
+    # degrades on a cluster but one whose timer cannot run at all, taking the worker with
+    # it: the timer and the pass loop share a task group.
+    queue = RedisStreamScheduler(redis=Redis(), namespace=workflow)
+
+    assert key_slot(queue.ready_key.encode()) == key_slot(queue.sleeping_key.encode())
+
+
+@pytest.mark.parametrize(
+    ("duration", "in_milliseconds", "in_seconds"),
+    [
+        (timedelta(microseconds=500), 1, 1),
+        (timedelta(milliseconds=1500), 1500, 2),
+        (timedelta(minutes=1), 60_000, 60),
+        (timedelta(), 0, 0),
+    ],
+    ids=["under a unit", "part of a unit", "whole units", "none at all"],
+)
+def test_a_duration_is_rendered_without_becoming_one_of_redis_sentinels(
+    duration: timedelta,
+    in_milliseconds: int,
+    in_seconds: int,
+) -> None:
+    # Every duration this store sends crosses the wire as a whole number of Redis's own
+    # units, and each of those units has a zero that means something other than "no time
+    # at all": `EXPIRE key 0` deletes the key, `BLOCK 0` blocks forever, and a lease of
+    # zero milliseconds writes a claim that has already lapsed. Truncating would turn a
+    # duration a caller was careful to make positive into whichever sentinel it landed on,
+    # so anything positive rounds up to one unit.
+    #
+    # A genuine zero survives it, and has to: `reclaim`'s `idle` is a threshold rather
+    # than an interval, and zero there means take over anything outstanding.
+    assert (milliseconds(duration), seconds(duration)) == (in_milliseconds, in_seconds)
+
+
+async def test_a_checkpoint_ttl_shorter_than_a_second_does_not_delete_what_it_expires(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # The same truncation, at its worst: `EXPIRE key 0` does not expire a key soon, it
+    # deletes it now, so a sub-second TTL would erase every claim and every record as it
+    # was written.
+    checkpointer = RedisCheckpointer(redis=redis, ttl=timedelta(milliseconds=500))
+    holder = await claimed(checkpointer, workflow)
+
+    assert await checkpointer.record(holder, "paid", "pay-1") == Recorded(value="pay-1", first=True)
+    assert await checkpointer.load(workflow) == {"paid": "pay-1"}
+
+
+async def test_a_blocking_read_shorter_than_a_millisecond_still_comes_back(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # `BLOCK 0` is not a short wait but an unbounded one, and the bound exists precisely
+    # so a cancelled worker can notice. Truncated, the most careful caller here (one
+    # asking for the shortest possible wait) is the one that hangs forever.
+    queue = RedisStreamScheduler(redis=redis, namespace=workflow)
+    await queue.prepare()
+
+    async with asyncio.timeout(2):
+        assert await queue.next_ready(timedelta(microseconds=500)) is None
+
+
+async def test_a_client_speaking_the_newer_protocol_reads_the_queue_the_same_way(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # `decode_responses` is a documented requirement; the protocol is not, and a client
+    # built with `protocol=3` is an ordinary thing for an application to do. redis-py
+    # hands back what the wire gave it, which for `XREADGROUP` is a mapping under RESP3
+    # and a list of pairs under RESP2, so a worker that reads only one shape dies on its
+    # first pull against a client it never said anything about.
+    reached = redis.connection_pool.connection_kwargs
+    client = Redis(host=reached["host"], port=reached["port"], decode_responses=True, protocol=3)
+    try:
+        queue = RedisStreamScheduler(redis=client, namespace=workflow)
+        await queue.prepare()
+        await queue.make_ready("wf-resp3")
+
+        delivered = await queue.next_ready(timedelta(seconds=1))
+
+        assert delivered is not None
+        assert delivered.workflow == "wf-resp3"
+        await queue.done(delivered)
+    finally:
+        await client.aclose()
+
+
+async def test_a_deadline_landing_on_the_leases_own_millisecond_survives_the_acknowledgement(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # The receipt is a score, and a score is a number rather than a version, so a deadline
+    # that happens to land on the millisecond this pass's lease expires is *the same
+    # number*: the comparison in `done` passes and the acknowledgement removes the entry
+    # the wakeup just wrote. Not a remote coincidence, either, since a workflow sleeping
+    # for the lease under a scheduler holding the same lease lands a millisecond or two
+    # away on every pass.
+    queue = RedisSetScheduler(redis=redis, namespace=workflow)
+    await queue.make_ready("wf-colliding")
+    delivery = await queue.next_ready(BRIEFLY)
+    assert delivery is not None
+    colliding = datetime.fromtimestamp(float(delivery.receipt) / 1000, UTC)
+
+    await queue.wake_at(delivery, colliding)
+    await queue.done(delivery)  # a stale acknowledgement, arriving after the deadline was written
+
+    assert await redis.zscore(queue.schedule_key, "wf-colliding") is not None, (
+        "the acknowledgement must not undo a wakeup that arrived while the pass was ending"
+    )
+
+
+async def test_a_delivery_behind_a_workers_own_pending_entries_is_still_taken_over(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # `XAUTOCLAIM` bounds its own work: it scans about ten times `count` pending entries
+    # and then stops, handing back where it got to. Asking from the beginning every time
+    # therefore gives up after ten and reports that nothing was abandoned, while a dead
+    # worker's deliveries sit behind them. The worker arranges that for itself, since a
+    # pool of twenty holds twenty entries whose idle clocks it keeps resetting.
+    abandoned = timedelta(milliseconds=500)
+    dying = RedisStreamScheduler(redis=redis, namespace=workflow)
+    await dying.prepare()
+    for number in range(12):
+        await dying.make_ready(f"wf-{number}")
+        assert await dying.next_ready(BRIEFLY) is not None  # taken, and never acknowledged
+
+    # Long enough that every one of them is idle by the threshold below, so what the
+    # rescuer can reach is a question about the scan rather than about the clock.
+    await asyncio.sleep(abandoned.total_seconds() * 1.2)
+    surviving = RedisStreamScheduler(redis=redis, namespace=workflow)
+    taken = [delivery.workflow for _ in range(10) if (delivery := await surviving.reclaim(abandoned)) is not None]
+
+    assert len(taken) == 10, "the ten at the front come over one pull at a time, as a pool of twenty would take them"
+    # Each of those ten reset its own idle clock as it was claimed, so the front of the
+    # pending list is now this worker's and not idle enough to take again. What is left is
+    # exactly the shape that made `reclaim` give up: two abandoned deliveries behind ten
+    # entries a scan bounded at ten never reaches.
+    behind = await surviving.reclaim(abandoned)
+
+    assert behind is not None, "the deliveries behind this worker's own entries are still abandoned work"
+    assert behind.workflow not in taken
+
+
+async def test_a_wakeup_that_arrived_during_a_pass_is_not_overwritten_by_its_deadline(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # A workflow holds one member here, so a deadline written unconditionally lands on top
+    # of a `make_ready` that arrived while the pass was ending, and a confirmation waits
+    # out a settlement window it should have interrupted. The receipt is what tells the
+    # two apart: anything that asked for another pass wrote a different score.
+    queue = RedisSetScheduler(redis=redis, namespace=workflow)
+    await queue.make_ready("wf-confirmed")
+    held = await queue.next_ready(BRIEFLY)
+    assert held is not None
+
+    await queue.make_ready("wf-confirmed")  # the confirmation, arriving mid-pass
+    await queue.wake_at(held, now_utc() + timedelta(days=3))
+
+    assert await queue.next_ready(BRIEFLY) is not None, "the wakeup that arrived is still due now"

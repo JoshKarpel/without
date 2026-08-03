@@ -220,14 +220,23 @@ at all, which is the state that was lossy. Making it unrepresentable beats remem
 to do both halves. Recording the value a workflow is waiting on and making the workflow
 runnable are *also* durable only together, so they get the same treatment.
 
-Two more tells that the boundary would be in the wrong place at `Scheduler`. It would
-have to state a cross-call ordering rule in prose ("a `wake_at` survives a `done` for a
-delivery taken before it, because the worker calls them in that order"), and a protocol
-that constrains the order its own methods are called in is carrying coupling it isn't
-expressing. And three of its seven methods are no-ops in every implementation but the
-Redis stream, which says the protocol is shaped around one implementation's mechanism
-(stream, group, pending list, timer) rather than around the question "when may this
-workflow run".
+`Scheduler` needed the same move internally, and the way it was found is worth
+recording, because the argument above predicted it. It used to state a cross-call
+ordering rule in prose ("a `wake_at` survives a `done` for a delivery taken before it,
+because the worker calls them in that order"), and a protocol that constrains the order
+its own methods are called in is carrying coupling it isn't expressing. The coupling was
+real: on a store that holds one entry per workflow, scheduling and acknowledging as two
+calls is a read-modify-write over a value somebody else may have just written, so a
+confirmation that landed while a pass was ending was overwritten by the deadline that
+pass chose, and a workflow that should have run at once waited out a settlement window.
+So `wake_at` takes the `Delivery` rather than a workflow id and answers for it too: one
+call, no order to get right, and the receipt is what lets the store tell its own
+delivery from a wakeup that arrived since.
+
+One more tell that the boundary would be in the wrong place there. Three of its methods
+are no-ops in every implementation but the Redis stream, which says the protocol is
+shaped around one implementation's mechanism (stream, group, pending list, timer) rather
+than around the question "when may this workflow run".
 
 So the answer is not one big implementation, which would bundle a mechanism to
 repair an interface and forfeit the split deployment. It is to **bundle the

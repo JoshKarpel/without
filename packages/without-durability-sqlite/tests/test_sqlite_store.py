@@ -285,8 +285,8 @@ async def test_a_deadline_set_during_a_pass_outlives_that_passs_acknowledgement(
     held = await queue.next_ready(BRIEFLY)
     assert held is not None
 
-    await queue.wake_at(WORKFLOW, now_utc() + timedelta(milliseconds=150))
-    await queue.done(held)
+    await queue.wake_at(held, now_utc() + timedelta(milliseconds=150))
+    await queue.done(held)  # a stale acknowledgement, which the deadline it wrote makes inert
 
     assert await queue.next_ready(timedelta(milliseconds=50)) is None, "not due yet"
     assert await queue.next_ready(timedelta(seconds=2)) is not None, "and still there when it is"
@@ -356,3 +356,42 @@ async def test_a_cancelled_caller_does_not_hand_the_connection_to_the_next_one(
 
     assert await checkpointer.load(WORKFLOW) == {"charged": "ch-1"}, "the second write survived the first's rollback"
     assert await reserved(database, "widget") is None, "and the rolled-back effect left nothing behind"
+
+
+async def test_a_wakeup_that_arrived_during_a_pass_is_not_overwritten_by_its_deadline(database: Database) -> None:
+    # A workflow holds one row here, so a deadline written unconditionally lands on top of
+    # a `make_ready` that arrived while the pass was ending, and a confirmation waits out
+    # a settlement window it should have interrupted. The receipt is what tells the two
+    # apart: anything that asked for another pass wrote a different visibility.
+    queue = SqliteScheduler(database=database)
+    await queue.make_ready(WORKFLOW)
+    held = await queue.next_ready(BRIEFLY)
+    assert held is not None
+
+    await queue.make_ready(WORKFLOW)  # the confirmation, arriving mid-pass
+    await queue.wake_at(held, now_utc() + timedelta(days=3))
+
+    assert await queue.next_ready(BRIEFLY) is not None, "the wakeup that arrived is still due now"
+
+
+async def test_a_failure_after_the_transaction_is_already_gone_is_reported_as_itself(database: Database) -> None:
+    # SQLite ends the transaction itself on a full disk, an I/O error, an interrupt, or
+    # being out of memory, so by the time the handler runs there may be nothing left to
+    # roll back. An unconditional `ROLLBACK` then raises "cannot rollback - no transaction
+    # is active" *over* the error that caused it, and the caller is told the wrong thing
+    # about its own failure. An effect that ends the transaction itself reaches the same
+    # state deterministically, and on every platform.
+    checkpointer = SqliteCheckpointer(database=database)
+    holder = await claimed(checkpointer, WORKFLOW)
+
+    def ends_the_transaction(cursor: sqlite3.Cursor) -> object:
+        cursor.execute("ROLLBACK")
+        raise RuntimeError("the carrier refused the parcel")
+
+    with pytest.raises(RuntimeError, match="the carrier refused the parcel"):
+        await checkpointer.transact(holder, "shipped", ends_the_transaction)
+
+    assert await checkpointer.load(WORKFLOW) == {}
+    assert await checkpointer.record(holder, "charged", "ch-1") == Recorded(value="ch-1", first=True), (
+        "and the connection is usable, rather than stuck in a transaction nobody can end"
+    )

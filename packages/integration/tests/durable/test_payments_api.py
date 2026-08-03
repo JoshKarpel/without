@@ -145,6 +145,41 @@ async def test_an_order_whose_idempotency_key_carries_a_hash_tag_is_rejected(
     assert workflows(payments) == [], "no workflow was opened under an id the store would have to parse"
 
 
+@pytest.mark.parametrize("key", ["tenant-a/order-7", "order?7", "order#7", "order%2F7", "order 7"])
+async def test_an_order_whose_idempotency_key_would_not_survive_a_url_is_rejected(
+    client: httpx.AsyncClient,
+    payments: Payments,
+    key: str,
+) -> None:
+    # This app puts the id in a path: it answers with `/orders/{workflow}` and takes the
+    # approval on `/orders/{workflow}/confirmation`. A key holding a path delimiter would
+    # otherwise open a perfectly good workflow whose status URL resolves to nothing and
+    # whose payout can never be approved, which for a payout above the threshold means one
+    # that can never finish. Percent-escaping does not recover it either, since the header
+    # is stored as sent and the path arrives decoded.
+    response = await client.post("/orders", json=ORDER, headers={"idempotency-key": key})
+
+    assert response.status_code == 422
+    assert json.loads(response.text)["field"] == "idempotency-key"
+    assert workflows(payments) == [], "no workflow was opened under an id this app cannot address"
+
+
+@pytest.mark.parametrize("items", [{"piano": -8500}, {"piano": 0}, {"piano": True}], ids=["negative", "zero", "bool"])
+async def test_an_order_whose_line_items_are_not_positive_amounts_is_rejected(
+    client: httpx.AsyncClient,
+    payments: Payments,
+    items: dict[str, object],
+) -> None:
+    # The approval gate compares a *sum*, so a negative line item makes it a net rather
+    # than a total: a basket of 90,000 and -85,000 captures 90,000 through a gate that
+    # only ever saw 5,000. A `bool` is an `int` in Python and pydantic's lax mode coerces
+    # it, so `true` would be captured as one cent.
+    response = await client.post("/orders", json={"items": items}, headers={"idempotency-key": WORKFLOW})
+
+    assert response.status_code == 422
+    assert await recorded(payments) == {}, "nothing reached the store under an order it refused"
+
+
 async def test_an_order_whose_idempotency_key_is_as_long_as_the_bound_allows_is_accepted(
     client: httpx.AsyncClient,
 ) -> None:
@@ -165,11 +200,27 @@ async def test_confirming_records_the_approval_and_makes_the_workflow_ready(
     client: httpx.AsyncClient,
     payments: Payments,
 ) -> None:
+    await payments.durable.checkpointer.supply(WORKFLOW, "order", ORDER["items"])
+
     response = await client.post(f"/orders/{WORKFLOW}/confirmation", json={"approved_by": "auditor-7"})
 
     assert response.status_code == 202
-    assert await recorded(payments) == {"approved-by": "auditor-7"}
+    assert await recorded(payments) == {"order": ORDER["items"], "approved-by": "auditor-7"}
     assert queue(payments) == [WORKFLOW]
+
+
+async def test_confirming_a_workflow_nobody_submitted_records_nothing(
+    client: httpx.AsyncClient,
+    payments: Payments,
+) -> None:
+    # An approval names a payout, so an id with no order behind it has nothing to approve.
+    # Writing one anyway would mint a checkpoint for a workflow that does not exist, which
+    # the status endpoint then reports as real.
+    response = await client.post("/orders/never-heard-of-it/confirmation", json={"approved_by": "auditor-7"})
+
+    assert response.status_code == 404
+    assert await payments.durable.checkpointer.load("never-heard-of-it") == {}
+    assert queue(payments) == []
 
 
 async def test_the_status_endpoint_shows_what_the_workflow_has_recorded(
@@ -239,3 +290,44 @@ async def test_a_failure_that_is_not_the_requests_fault_is_a_500_not_a_422() -> 
             response = await client.post("/orders", json=ORDER, headers={"idempotency-key": WORKFLOW})
 
     assert response.status_code == 500
+
+
+@pytest.mark.parametrize("key", [".", ".."], ids=["a dot segment", "a parent segment"])
+async def test_an_order_whose_idempotency_key_is_a_dot_segment_is_rejected(
+    client: httpx.AsyncClient,
+    payments: Payments,
+    key: str,
+) -> None:
+    # The one shape percent-encoding cannot see: `.` and `..` survive it untouched and are
+    # then *removed* by every client that resolves a reference, so `/orders/..` resolves
+    # to `/` before it is ever sent. A workflow named that captures money against an id
+    # whose status URL is somebody else's resource and whose confirmation endpoint cannot
+    # be reached at all, which for a payout above the threshold is one that never finishes.
+    response = await client.post("/orders", json=ORDER, headers={"idempotency-key": key})
+
+    assert response.status_code == 422
+    assert json.loads(response.text)["field"] == "idempotency-key"
+    assert workflows(payments) == []
+
+
+@pytest.mark.parametrize("key", ["order+7", "tenant:7", "order,7", "order(7)", "a$b", "x&y"])
+async def test_an_idempotency_key_a_path_segment_carries_is_accepted(client: httpx.AsyncClient, key: str) -> None:
+    # The rule must not be stricter than its own sentence. A path segment carries the
+    # sub-delimiters along with `:` and `@`, so a base64-shaped key or a scoped one is
+    # usable as written and refusing it would cost a client its idempotency key for
+    # nothing the routing needed.
+    submitted = await client.post("/orders", json=ORDER, headers={"idempotency-key": key})
+
+    assert submitted.status_code == 202
+    assert json.loads(submitted.text)["status"] == f"/orders/{key}"
+
+    assert (await client.get(f"/orders/{key}")).status_code == 200
+
+
+async def test_an_order_with_no_line_items_is_rejected(client: httpx.AsyncClient, payments: Payments) -> None:
+    # Not a small payout but a workflow that should never have started: it captures
+    # nothing, pays the gateway zero, and records a `paid` for it.
+    response = await client.post("/orders", json={"items": {}}, headers={"idempotency-key": WORKFLOW})
+
+    assert response.status_code == 422
+    assert await recorded(payments) == {}

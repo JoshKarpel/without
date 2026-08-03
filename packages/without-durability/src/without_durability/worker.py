@@ -59,6 +59,7 @@ from without_durability.interfaces import Fenced
 from without_durability.interfaces import Scheduler
 from without_durability.interfaces import check_duration
 from without_durability.stepwise import Completed
+from without_durability.stepwise import Outcome
 from without_durability.stepwise import Run
 from without_durability.stepwise import Sleeping
 from without_durability.stepwise import Waiting
@@ -127,8 +128,7 @@ def passes(
     async def look_again(delivery: Delivery, why: str) -> None:
         """Hand the workflow back to whoever holds it, and ask for another look shortly."""
         logger.info(f"{delivery.workflow} {why}; looking again in {contended}")
-        await durable.scheduler.wake_at(delivery.workflow, now() + contended)
-        await durable.scheduler.done(delivery)
+        await durable.scheduler.wake_at(delivery, now() + contended)
 
     async def advance(delivery: Delivery) -> None:
         holder = await durable.checkpointer.claim(delivery.workflow, lease)
@@ -138,23 +138,9 @@ def passes(
             # blocking a slot, and answer for the delivery so it is not reclaimed too.
             await look_again(delivery, "is held by another pass")
             return
+        outcome: Outcome[object]
         try:
-            # The three things a pass can come to, and the whole of what the worker owes
-            # each. A deadline the workflow chose is the worker's to schedule; a value
-            # the outside world owes it is not, because no clock satisfies that and
-            # whoever writes the value is what queues the workflow. `assert_never` is
-            # what makes this exhaustive statically, so a fourth outcome would be a type
-            # error here rather than a workflow that quietly stops being woken.
-            match await resume(holder, durable.checkpointer, body):
-                case Sleeping(key=key, due=due):
-                    await durable.scheduler.wake_at(delivery.workflow, due)
-                    logger.info(f"{delivery.workflow} is sleeping at {key!r} until {due.isoformat()}")
-                case Waiting(key=key):
-                    logger.info(f"{delivery.workflow} is waiting at {key!r} to be told")
-                case Completed():
-                    pass
-                case _ as unreachable:
-                    assert_never(unreachable)
+            outcome = await resume(holder, durable.checkpointer, body, now=now)
         except (Fenced, Contended) as lost:
             # The claim lapsed mid-pass and someone else took the workflow, which is the
             # same situation as losing it outright, discovered later. So it gets the same
@@ -165,10 +151,47 @@ def passes(
             await look_again(delivery, f"was taken over mid-pass ({lost!r})")
             return
         except Exception as error:  # noqa: BLE001 - a workflow's failure is data here, not a fault in the loop
+            # A pass raises for two very different reasons and this cannot tell them
+            # apart: the workflow's own code failed, or the store it was reading and
+            # writing was briefly unreachable, since `load` and every `record` raise
+            # ordinary exceptions from inside the pass. So the delivery is left
+            # *unanswered*, which is the only response that is right for both. A store
+            # outage then costs a redelivery once the lease elapses rather than the
+            # workflow, and a workflow that fails on its own code is retried on that same
+            # interval instead of being dropped after one attempt with a log line.
+            #
+            # What that costs is stated rather than hidden: a workflow that fails on every
+            # pass is retried for as long as it keeps failing, once per lease, and nothing
+            # here backs that off or gives up. A deployment that needs a limit keeps the
+            # count where it keeps everything else it needs to survive a crash, which is
+            # the checkpoint.
             logger.warning(f"{delivery.workflow} failed: {error!r}")
+            return
         finally:
             await durable.checkpointer.release(holder)
-        await durable.scheduler.done(delivery)
+        # The three things a pass can come to, and the whole of what the worker owes each.
+        # A deadline the workflow chose is the worker's to schedule; a value the outside
+        # world owes it is not, because no clock satisfies that and whoever writes the
+        # value is what queues the workflow. `assert_never` is what makes this exhaustive
+        # statically, so a fourth outcome would be a type error here rather than a
+        # workflow that quietly stops being woken.
+        #
+        # Both arms answer for the delivery, and `wake_at` is one call rather than a
+        # schedule and an acknowledgement, so there is no order to get right and no window
+        # where a wakeup that arrived mid-pass can be overwritten by the deadline this
+        # pass chose. Failing here propagates, because scheduling is the worker's own call
+        # to its own queue: the delivery stays outstanding and another worker takes it.
+        match outcome:
+            case Sleeping(key=key, due=due):
+                await durable.scheduler.wake_at(delivery, due)
+                logger.info(f"{delivery.workflow} is sleeping at {key!r} until {due.isoformat()}")
+            case Waiting(key=key):
+                await durable.scheduler.done(delivery)
+                logger.info(f"{delivery.workflow} is waiting at {key!r} to be told")
+            case Completed():
+                await durable.scheduler.done(delivery)
+            case _ as unreachable:
+                assert_never(unreachable)
 
     async def pool(deliveries: Stream[Delivery]) -> None:
         async for finished in limit_concurrency((advance(delivery) async for delivery in deliveries), limit):
@@ -284,5 +307,32 @@ async def work(
         )
 
     async with asyncio.TaskGroup() as group:
-        group.create_task(sweep_due())
-        group.create_task(advance_ready())
+        group.create_task(halves(sweep_due))
+        group.create_task(halves(advance_ready))
+
+
+async def halves(run: Callable[[], Awaitable[None]]) -> None:
+    """
+    Run one half of the worker, and let a cancellation nobody asked for end the worker.
+
+    A task group is what makes the two halves live or die together, and it has one blind
+    spot that matters here: a child that ends *cancelled* is not news to it, so the group
+    exits that child and carries on with the other. That is right when the cancellation
+    came from the group itself (a shutdown), and it is how a worker goes quietly
+    half-dead otherwise. A workflow body that awaits something somebody else cancels
+    raises `CancelledError` through the pass loop, which `advance` deliberately does not
+    catch, and the worker is then a timer with nothing behind it: still running, still
+    ticking, still reporting itself healthy, and advancing no workflow ever again. The
+    queue backs up with nothing to alarm on but throughput.
+
+    `cancelling()` is what tells the two apart, since it counts the cancellations aimed at
+    *this* task. Nobody aimed one, so this is a workflow's `CancelledError` wearing the
+    shutdown's clothes, and it is reported as the failure of the loop it is.
+    """
+    try:
+        await run()
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        if current is not None and current.cancelling() == 0:
+            raise RuntimeError(f"{run.__name__} was cancelled by something other than this worker") from None
+        raise
