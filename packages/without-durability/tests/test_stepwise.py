@@ -12,14 +12,16 @@ from integration.durable import parse_approver
 from integration.durable import parse_items
 from integration.durable import parse_reference
 from integration.durable import pay_out
+from without_durability import Completed
 from without_durability import Contended
 from without_durability import Fenced
-from without_durability import InputNeeded
 from without_durability import MemoryCheckpointer
 from without_durability import MemoryEffect
+from without_durability import Outcome
 from without_durability import Recorded
 from without_durability import Run
-from without_durability import ScheduledWakeup
+from without_durability import Sleeping
+from without_durability import Waiting
 from without_durability import claimed
 from without_durability import now_utc
 from without_durability import parse_deadline
@@ -81,7 +83,7 @@ async def paying(
     clock: Clock,
     *,
     settling: timedelta = timedelta(),
-) -> dict[str, object]:
+) -> Outcome[dict[str, object]]:
     """
     One pass at the payout workflow, with the knobs every test here shares.
 
@@ -100,11 +102,17 @@ async def paying(
         await checkpointer.release(holder)
 
 
+def finished[T](outcome: Outcome[T]) -> T:
+    """The payout a pass returned, failing here rather than downstream if it stopped short."""
+    assert isinstance(outcome, Completed), f"the pass did not finish: {outcome}"
+    return outcome.value
+
+
 async def test_a_workflow_performs_each_effect_once_and_returns_its_payout() -> None:
     ledger = Ledger()
     checkpointer = MemoryCheckpointer()
 
-    payout = await paying(ledger, checkpointer, Clock())
+    payout = finished(await paying(ledger, checkpointer, Clock()))
 
     assert payout == {
         "order_id": ORDER,
@@ -145,7 +153,7 @@ async def test_a_pass_that_fails_partway_leaves_the_steps_that_finished_recorded
     ledger.broken.clear()
     ledger.calls.clear()
 
-    payout = await paying(ledger, checkpointer, Clock())
+    payout = finished(await paying(ledger, checkpointer, Clock()))
 
     assert payout["reference"] == "pay-ord-88-2000"
     assert ledger.calls == ["pay"], "the captures were read back rather than re-charged"
@@ -173,15 +181,15 @@ async def test_a_wait_suspends_the_pass_and_resumes_once_its_deadline_has_passed
     checkpointer = MemoryCheckpointer()
     clock = Clock()
 
-    with pytest.raises(ScheduledWakeup) as suspension:
-        await paying(ledger, checkpointer, clock, settling=SETTLING)
+    # The pass comes back as a value saying what it stopped on, rather than raising it:
+    # `Sleeping` carries the deadline a driver would schedule.
+    suspension = await paying(ledger, checkpointer, clock, settling=SETTLING)
 
-    assert suspension.value.key == "settling"
-    assert suspension.value.due == STARTED_AT + SETTLING
+    assert suspension == Sleeping(key="settling", due=STARTED_AT + SETTLING)
     assert "pay" not in ledger.calls
 
     clock.advance(SETTLING)
-    payout = await paying(ledger, checkpointer, clock, settling=SETTLING)
+    payout = finished(await paying(ledger, checkpointer, clock, settling=SETTLING))
 
     assert payout["reference"] == "pay-ord-88-2000"
 
@@ -193,15 +201,13 @@ async def test_a_wait_interrupted_partway_does_not_restart_its_clock() -> None:
     checkpointer = MemoryCheckpointer()
     clock = Clock()
 
-    with pytest.raises(ScheduledWakeup):
-        await paying(ledger, checkpointer, clock, settling=SETTLING)
+    await paying(ledger, checkpointer, clock, settling=SETTLING)
 
     clock.advance(timedelta(days=2))
 
-    with pytest.raises(ScheduledWakeup) as second:
-        await paying(ledger, checkpointer, clock, settling=SETTLING)
+    second = await paying(ledger, checkpointer, clock, settling=SETTLING)
 
-    assert second.value.due == STARTED_AT + SETTLING
+    assert second == Sleeping(key="settling", due=STARTED_AT + SETTLING)
     assert (await checkpointer.load(ORDER))["settling"] == (STARTED_AT + SETTLING).isoformat()
 
 
@@ -209,12 +215,11 @@ async def test_a_payout_over_the_threshold_waits_for_an_approval_another_process
     ledger = Ledger(items=dict(BIG_ITEMS))
     checkpointer = MemoryCheckpointer()
 
-    # `InputNeeded` rather than `ScheduledWakeup`: this wait ends when it is told, not
-    # when a clock says so, and the type is what says which.
-    with pytest.raises(InputNeeded) as suspension:
-        await paying(ledger, checkpointer, Clock())
+    # `Waiting` rather than `Sleeping`: this wait ends when it is told, not when a clock
+    # says so, and the type is what says which. There is no deadline on it to schedule.
+    suspension = await paying(ledger, checkpointer, Clock())
 
-    assert suspension.value.key == "approved-by"
+    assert suspension == Waiting(key="approved-by")
     assert "pay" not in ledger.calls
 
     # Whoever took the approval writes one field into the workflow's checkpoint. It
@@ -222,7 +227,7 @@ async def test_a_payout_over_the_threshold_waits_for_an_approval_another_process
     await checkpointer.supply(ORDER, "approved-by", "auditor-7")
     ledger.calls.clear()
 
-    payout = await paying(ledger, checkpointer, Clock())
+    payout = finished(await paying(ledger, checkpointer, Clock()))
 
     assert payout["approved_by"] == "auditor-7"
     assert payout["total"] == 94_000
@@ -274,7 +279,7 @@ async def test_reading_a_workflow_nobody_has_started_does_not_create_one() -> No
 
 
 async def test_a_workflow_already_being_passed_over_cannot_be_claimed_again() -> None:
-    # The property the whole seam exists for. Without it, two wakeups for one workflow
+    # The property the whole interface exists for. Without it, two wakeups for one workflow
     # (which the submit-then-confirm flow produces every time) run two passes side by
     # side, and both find the same step unrecorded.
     checkpointer = MemoryCheckpointer()

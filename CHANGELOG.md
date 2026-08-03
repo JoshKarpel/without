@@ -8,7 +8,7 @@
   `checkpoint` of `{node key: result}`, the same mapping `stream` emits, and a node named in it is
   not run: its result is taken as given and fed to its dependents, so a run picks up where an
   interrupted one stopped and a checkpoint covering the whole graph performs no effects at all. The
-  execution seam already treated a pre-supplied key as done; what was missing was a key worth
+  execution interface already treated a pre-supplied key as done; what was missing was a key worth
   storing, so `node` now takes one as its first argument (`graph.node("charged", charge, order)`)
   and `NodeKey` is a `str`. A name chosen in the source means the same thing on the other side of a
   crash, where an `object()` minted at build time does not, and it must be distinct from every other
@@ -27,9 +27,15 @@
   as workflow determinism. Keying by name rather than by position keeps that mild, since reordering
   or inserting a step changes nothing, and it buys two shapes a fixed graph cannot express: a
   fan-out whose width comes from a step's *result*, one key per item so a crash resumes item by
-  item, and a step that cannot finish now raising `Suspended` rather than blocking, which is how a
+  item, and a step that cannot finish now stopping the pass rather than blocking, which is how a
   settlement window (`run.sleep`) and a human approval (`run.awaiting`) become ordinary lines.
-- **`without-durability`**: the `Checkpointer`, `Scheduler`, and `Durable` seams, which are where
+  `resume` reports that as an `Outcome` (`Completed`, `Sleeping`, or `Waiting`) rather than
+  raising, so a driver matches over three values and closes with `assert_never` instead of writing
+  an `except` no type checker can call incomplete; the worker does exactly that. Inside a workflow
+  a suspension is still an exception (`Suspended`, and its `ScheduledWakeup`/`InputNeeded` cases),
+  because that is the only way to stop in the middle of straight-line code, and it descends from
+  `BaseException` so an `except Exception` around a step cannot swallow it.
+- **`without-durability`**: the `Checkpointer`, `Scheduler`, and `Durable` interfaces, which are where
   the guarantee lives. A protocol of `load` and `record` is too weak to run a workflow safely at any
   scale: it cannot say "only if nobody else is running this" or "only if I am still the one who may
   write", so two wakeups for one workflow (which the submit-then-confirm flow produces every time)
@@ -60,12 +66,13 @@
   unavailable rather than expensive; sharded Postgres instead escalates silently to a two-phase
   commit under Citus. The escape is one idea on both sides, Redis's hash tag and co-location by
   workflow id, and sharing a pool is its necessary half rather than its sufficient one.
-- **`without-durability`**: `work(durable, body)`, a queue worker over the same seams, and `passes`,
+- **`without-durability`**: `work(durable, body)`, a queue worker over the same interfaces, and `passes`,
   `ready`, and `waking` as the `Sink`-over-`Stream` pieces it composes. A worker runs up to `POOL`
   passes at once through `without`'s `limit_concurrency`, and every pull takes exactly one delivery
   (a reclaimed one if any workflow was abandoned, otherwise a fresh read), so it holds precisely as
-  many wakeups as it is working on and stops reading at capacity. A `ScheduledWakeup` is scheduled,
-  an `InputNeeded` is left for whoever owes the value to queue, and nothing polls a workflow to ask
+  many wakeups as it is working on and stops reading at capacity. It matches on the pass's
+  `Outcome`, closed with `assert_never`: a `Sleeping` is scheduled, a `Waiting` is left for whoever
+  owes the value to queue, a `Completed` needs nothing, and nothing polls a workflow to ask
   whether it can proceed. The acknowledgement lands after the pass on every path but cancellation,
   so a worker that dies mid-pass leaves its delivery to be reclaimed. How long a pass may honestly
   take is one number rather than two, and it lives on the scheduler
@@ -73,7 +80,7 @@
   as long, because the two windows disagreeing fails quietly. The rest of the loop's timings are
   arguments to `work` (`tick`, `within`, `contended`, `limit`), and every duration across the stores
   and the worker is refused at construction unless it is positive.
-- **`without-durability-redis`** (new package): both seams over Redis, where each guarantee is a
+- **`without-durability-redis`** (new package): both interfaces over Redis, where each guarantee is a
   small Lua script, for the reason `wake_due` already was: checking whether a workflow is free and
   taking it, or checking a token and applying the write it guards, are only correct as a single
   step. A workflow's two keys are hash-tagged so they land on one slot, and `LuaEffect` is what this
@@ -90,7 +97,7 @@
   being unchanged. `trim` bounds the stream with `XTRIM ... MAXLEN 0 ACKED` (Redis 8.2+), so the
   *server* decides what every group has finished with; it refuses a stream with no groups, where
   `ACKED` has no effect and the trim would degrade to deleting a queue nobody has read yet.
-- **`without-durability-postgres`** (new package): both seams over three tables in one database,
+- **`without-durability-postgres`** (new package): both interfaces over three tables in one database,
   with `SqlEffect` as the effect type `transact` takes there. It is the other half of the Redis
   store's argument, and what it shows is where the atomic unit came from: every write that had to be
   a Lua script is one statement or one transaction here, because SQL says "check this, then write
@@ -106,7 +113,7 @@
   (`LISTEN`/`NOTIFY` would close that and does not yet), and that `migrate` is three
   `CREATE TABLE IF NOT EXISTS` under an advisory lock rather than a migration tool.
 - **`without-durability-sqlite`** (new package): the same three tables over one file, and the
-  smallest thing that meets every requirement the seam states, with no server and no third-party
+  smallest thing that meets every requirement the interface states, with no server and no third-party
   driver. `BEGIN IMMEDIATE` *is* the exclusion, so it needs neither Postgres's `FOR UPDATE` nor
   Redis's Lua, and because the datastore is a file there is nothing to co-locate, which is DBOS's
   guarantee for an application that never needed Postgres. Its effect type is a *synchronous*
@@ -116,7 +123,7 @@
   deployment it is for rather than a defect, and it needs SQLite 3.42 or newer, which
   `requires-python` cannot express: on Linux `sqlite3` links whatever `libsqlite3` the distribution
   ships.
-- **`without-durability`**: `CheckpointCodec`, the seam deciding what a step's result becomes in a
+- **`without-durability`**: `CheckpointCodec`, the interface deciding what a step's result becomes in a
   store, with `JsonCodec` over the stdlib as every store's default. What a checkpoint is encoded as
   is a boundary decision, so it belongs to the application rather than to four stores answering it
   identically and wrongly for anyone whose steps return a domain value `json.dumps` has never heard
@@ -157,11 +164,11 @@
   refund a charge the winner is still building on. The worker has a matching arm, treating a claim
   lost mid-pass as the deferral it already applies to a claim refused up front, rather than as a
   workflow that failed.
-- **`without-durability`**: `Suspended` is the base of two concrete waits rather than one class with
-  a nullable deadline. `ScheduledWakeup` carries a `due` that is always present and `InputNeeded`
-  carries none, which is the difference a driver has to branch on anyway: the worker schedules the
-  first and leaves the second for whoever owes the value to queue. Catching `Suspended` still means
-  "the pass stopped short".
+- **`without-durability`**: the two ways of waiting are separate types rather than one carrying a
+  nullable deadline, on both sides of `resume`. Inside a pass, `Suspended` is the base of a
+  `ScheduledWakeup` whose `due` is always present and an `InputNeeded` that carries none; coming
+  back out, they are a `Sleeping` and a `Waiting`. It is the difference a driver has to branch on
+  either way, so neither side makes it a field that is sometimes there.
 - **`integration`**: `durable`, the deployment half of the durable-workflow work, which is what
   `without-durability` deliberately does not ship. An order fulfilment graph (charge and reserve
   concurrently, ship, render) and its compensating rollback; a payout workflow written as ordinary
@@ -251,6 +258,11 @@
 
 ### Changed
 
+- **`without`**: the module holding the substrate is `without.interfaces` rather than
+  `without.contracts`. Every name is re-exported from the package's top-level `__init__`, so
+  `from without import Processor` is unaffected and only a direct submodule import has to change.
+  The core called this idea a *contract* while the prose about it called it an *interface*, and
+  one word is worth more than the shade of meaning each carried.
 - **`without-dag`**: `Graph.node` takes the node's key as its first argument
   (`graph.node("charged", charge, order)`), and `NodeKey` is a `str` rather than any `Hashable`.
   A key was previously an `object()` the builder minted, which is unique but means nothing on the

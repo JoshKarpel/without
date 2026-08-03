@@ -26,9 +26,11 @@ from integration.durable import unwinding
 from stores import durable  # noqa: F401 - the parametrized fixture every test here takes
 from without_dag import CompiledGraph
 from without_durability import Checkpointer
+from without_durability import Completed
 from without_durability import Durable
-from without_durability import InputNeeded
+from without_durability import Outcome
 from without_durability import Run
+from without_durability import Waiting
 from without_durability import claimed
 from without_durability import now_utc
 from without_durability import resume
@@ -37,7 +39,7 @@ from without_durability import work
 from without_http import serving
 
 # The same workflows over every store, which is the claim the `Checkpointer` and `Scheduler`
-# seams exist to support and the thing no single-store suite can show. The stores' own
+# interfaces exist to support and the thing no single-store suite can show. The stores' own
 # packages test what each one *is* (its scripts, its statements, its failure modes); this
 # tests that a workflow cannot tell which it got.
 #
@@ -58,13 +60,19 @@ def workflow() -> str:
     return f"test-{uuid4().hex}"
 
 
-async def passing[T](checkpointer: Checkpointer, workflow: str, body: Callable[[Run], Awaitable[T]]) -> T:
+async def passing[T](checkpointer: Checkpointer, workflow: str, body: Callable[[Run], Awaitable[T]]) -> Outcome[T]:
     """One claimed pass, released on the way out, which is what the worker does."""
     holder = await claimed(checkpointer, workflow)
     try:
         return await resume(holder, checkpointer, body)
     finally:
         await checkpointer.release(holder)
+
+
+def finished[T](outcome: Outcome[T]) -> T:
+    """What a pass returned, failing here rather than downstream if it stopped short."""
+    assert isinstance(outcome, Completed), f"the pass did not finish: {outcome}"
+    return outcome.value
 
 
 async def saga[In, Out, Reaches, Undone](
@@ -143,10 +151,9 @@ async def test_a_workflow_suspended_on_an_approval_resumes_when_another_process_
     async def body(run: Run) -> dict[str, object]:
         return await pay_out(run, "ord-42", paying(asked), settling=timedelta(), approval_over=10_000)
 
-    with pytest.raises(InputNeeded) as suspension:
-        await passing(checkpointer, workflow, body)
+    suspension = await passing(checkpointer, workflow, body)
 
-    assert suspension.value.key == "approved-by"
+    assert suspension == Waiting(key="approved-by")
     assert set(await checkpointer.load(workflow)) == {"items", "captured:piano", "captured:stool", "settling"}
     assert asked == ["items", "capture:piano", "capture:stool"], "the money moved, the payout did not"
 
@@ -157,7 +164,7 @@ async def test_a_workflow_suspended_on_an_approval_resumes_when_another_process_
     async def resumed(run: Run) -> dict[str, object]:
         return await pay_out(run, "ord-42", paying(answered), settling=timedelta(), approval_over=10_000)
 
-    payout = await passing(checkpointer, workflow, resumed)
+    payout = finished(await passing(checkpointer, workflow, resumed))
 
     assert payout["approved_by"] == "auditor-7"
     assert payout["captures"] == {"piano": "cap-piano", "stool": "cap-stool"}

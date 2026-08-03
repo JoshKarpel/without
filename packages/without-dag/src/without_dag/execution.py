@@ -15,7 +15,7 @@ from without import cancel_futures
 
 # A *name*, not an identity. Any hashable would do to key a run in memory, but a
 # key that outlives the process is what lets a run's `(key, value)` completions be
-# sunk to a store and handed back as a checkpoint, so the seam is narrowed to the
+# sunk to a store and handed back as a checkpoint, so the interface is narrowed to the
 # one shape every store can hold. A frontend wanting richer keys encodes them.
 type NodeKey = str
 
@@ -25,10 +25,10 @@ class Node:
     """
     One async step in a graph, named by `key` and wired by `dependencies`.
 
-    The narrow seam a graph-defining frontend lowers onto: a `Node` is a value,
-    not a place. `run` receives its dependencies' results as a tuple in
+    The narrow interface a graph-defining frontend lowers onto: a `Node` is a
+    value, not a place. `run` receives its dependencies' results as a tuple in
     `dependencies` order and returns this node's single result. Results cross
-    this seam as `object` (the executor cannot know each step's type); a typed
+    this interface as `object` (the executor cannot know each step's type); a typed
     frontend restores precision above it, exactly as `without-web`'s `Extractor`
     values are collected with `object` values and re-typed by `into`.
     """

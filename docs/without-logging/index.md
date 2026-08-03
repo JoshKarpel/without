@@ -140,7 +140,7 @@ deliberate. Those attributes are not caller-supplied content the way `msg`,
 `LogRecord` factory, gated by module flags (`logThreads`, `logProcesses`,
 `logAsyncioTasks`), so any of them may be `None` or absent, and they exist to feed
 the *formatter's* `%(pathname)s` / `%(thread)d` placeholders rather than as a
-guaranteed per-event contract. Promoting them to typed `Record` fields would couple
+guaranteed per-event property. Promoting them to typed `Record` fields would couple
 the value to stdlib factory internals and force every field to model "maybe
 missing". `created` is the one factory value kept as `timestamp`, because it is
 always present and unconditional.

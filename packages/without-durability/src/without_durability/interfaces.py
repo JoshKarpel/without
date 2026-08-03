@@ -1,4 +1,4 @@
-# The contracts, and nothing else. Every runner here talks through them and every store
+# The interfaces, and nothing else. Every runner here talks through them and every store
 # implements them, and all three live in one file because the third exists to say how
 # the first two compose: a reader deciding what a store owes should not have to visit
 # three files to find out.
@@ -133,7 +133,7 @@ class Checkpointer[Effect = Never](Protocol):
     """
     Where a workflow's completed work is kept, and who is currently allowed to add to it.
 
-    The narrow seam a durable runner talks through, so the store is injected rather than
+    The narrow interface a durable runner talks through, so the store is injected rather than
     reached for: a Redis hash, a Postgres table, or a SQLite file in production, a plain
     dict in a test. Its keys are plain names rather than `without_dag`'s `NodeKey`,
     because the store is the piece the two mechanisms share: a graph records under its
@@ -141,7 +141,7 @@ class Checkpointer[Effect = Never](Protocol):
     (`stepwise`), and the store cannot tell, nor should it.
 
     The requirements are the whole reason this protocol is not just a mapping. A runner
-    cannot construct exclusion out of a seam with no way to express it, so a store that
+    cannot construct exclusion out of an interface with no way to express it, so a store that
     cannot meet them cannot make a workflow safe to run.
 
     - `load` MUST return the values recorded for that workflow so far, and an empty
@@ -167,7 +167,7 @@ class Checkpointer[Effect = Never](Protocol):
     is a second round trip after an effect already happened, so a crash in between leaves
     the effect done and unrecorded: at-least-once, the bound every durable engine lands
     on. Performing the work and writing the record in one commit closes that, for the
-    effects a store can perform itself. What bounds *that* is neither this seam nor a
+    effects a store can perform itself. What bounds *that* is neither this interface nor a
     store's feature list but the fact that you can only transact within one datastore
     (see docs/without-durability/guarantees.md).
 
@@ -220,7 +220,7 @@ class Scheduler(Protocol):
     """
     Where a workflow's *right to run* is kept, apart from what it has done.
 
-    The seam the API and the worker share: the API makes a workflow ready, a worker
+    The interface the API and the worker share: the API makes a workflow ready, a worker
     takes the next ready one and says when it is `done` with it. Injected like the
     checkpoint store, so the worker is drivable from a dict in a test.
 
@@ -243,7 +243,7 @@ class Scheduler(Protocol):
     What is deliberately *not* required is that a workflow reach only one worker at a
     time. The stream will happily hand two deliveries for one workflow to two consumers,
     and that is safe because exclusion belongs to `Checkpointer.claim` rather than here:
-    this seam answers "who owes a pass", the checkpoint store answers "who may write".
+    this interface answers "who owes a pass", the checkpoint store answers "who may write".
 
     `lease` is how long a delivery stays its taker's, and it is on the store rather than
     an argument to every call because the same number has to bound the *checkpoint*
@@ -294,7 +294,7 @@ class Durable[Effect = Never](Protocol):
 
     The two stores stay separate underneath, because they genuinely can be separate: a
     Postgres checkpoint beside an SQS queue is an ordinary deployment, and forbidding it
-    would be bundling a mechanism to fix a contract. What this seam changes is who
+    would be bundling a mechanism to fix an interface. What this interface changes is who
     carries the coupling. Callers get one call with no ordering to get right, and what
     varies between implementations is not whether `arrive` exists but what it
     *guarantees*.

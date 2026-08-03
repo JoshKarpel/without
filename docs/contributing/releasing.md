@@ -9,7 +9,7 @@ rationale and the runbook.
 
 The whole workspace ships at **one shared version**, taken from the release tag.
 Every `without*` distribution bumps together and depends on its siblings at that
-exact version. The packages are a tightly coupled substrate (a core contract
+exact version. The packages are a tightly coupled substrate (a core interface
 plus plugins that speak it), so a single version is simpler to reason about than
 independent cadences, and it matches the single workspace-wide
 [`CHANGELOG.md`](https://github.com/JoshKarpel/without/blob/main/CHANGELOG.md).

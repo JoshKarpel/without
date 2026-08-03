@@ -1,9 +1,9 @@
 # without
 
-The narrow waist of the project: the contracts every plugin speaks, plus the
+The narrow waist of the project: the interfaces every plugin speaks, plus the
 stream connectors and a `with`-scoped background task helper.
 
-Three types carry the whole model (`without.contracts`):
+Three types carry the whole model (`without.interfaces`):
 
 - A `Stream[T]` is an asynchronous sequence of values: the one shape every
   connection takes, whoever does the I/O.

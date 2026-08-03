@@ -120,7 +120,7 @@ async def ws_session(host: str, port: int, path: str) -> AsyncIterator[WebSocket
         await client.aclose()
 
 
-# These are raw ASGI WebSocket apps, the contract `without-http` must serve for
+# These are raw ASGI WebSocket apps, the interface `without-http` must serve for
 # any app (uvicorn-style). The `make_asgi_app` + typed-handler path is exercised
 # end-to-end in the `integration` package.
 async def echo_ws_app(scope: RawScope, receive: Receive, send: Send) -> None:

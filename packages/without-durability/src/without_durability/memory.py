@@ -13,14 +13,14 @@ from time import monotonic
 
 from without_durability.codec import JSON
 from without_durability.codec import CheckpointCodec
-from without_durability.seams import LEASE
-from without_durability.seams import Delivery
-from without_durability.seams import Fenced
-from without_durability.seams import Pass
-from without_durability.seams import Recorded
-from without_durability.seams import check_duration
+from without_durability.interfaces import LEASE
+from without_durability.interfaces import Delivery
+from without_durability.interfaces import Fenced
+from without_durability.interfaces import Pass
+from without_durability.interfaces import Recorded
+from without_durability.interfaces import check_duration
 
-# Both seams over ordinary dicts, shipped rather than kept in a test directory, because
+# Both interfaces over ordinary dicts, shipped rather than kept in a test directory, because
 # the whole design says a store is injected and this is the store a test should inject.
 # They are doubles rather than mocks: every mechanism (the load, the record, the resume,
 # the queue, the timer's claim, the codec) runs for real and only the storage is swapped.
@@ -60,7 +60,7 @@ class MemoryCheckpointer:
     so reading a checkpoint back means `load` rather than reaching into it.
     """
 
-    # Plain dicts rather than `defaultdict`s, because the annotation is the contract: a
+    # Plain dicts rather than `defaultdict`s, because the annotation is the interface: a
     # `defaultdict` field typed as `dict` accepts a `dict` at construction and then fails
     # on the first write, which is a store the type says you may build and the code says
     # you may not. What the default lookup bought was two characters at each read, and

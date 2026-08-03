@@ -11,7 +11,7 @@ drives many concurrent computations, distinct from the stream-level splitting a
 
 Like [`without-asgi`](../without-asgi/index.md), this package handles only the *mechanism*,
 execution, and leaves the graph-defining *policy* to a frontend. The two layers
-live here for now but meet at one narrow seam, so a different frontend (a YAML
+live here for now but meet at one narrow interface, so a different frontend (a YAML
 loader, a signature-inspecting decorator) could be layered on later without either
 side importing the other's opinions.
 
@@ -33,13 +33,13 @@ async def evaluate(plan: Plan, target: NodeKey, inputs: Mapping[NodeKey, object]
 ) -> object: ...
 ```
 
-A `Node` is the seam: a value carrying its `key`, its ordered `dependencies`, and
+A `Node` is the interface: a value carrying its `key`, its ordered `dependencies`, and
 an async `run` that takes its dependencies' results as a tuple and returns its
 own. A `NodeKey` is a `str`: any hashable would do to tell nodes apart in memory,
 but a key that survives the process is what lets a run's `(key, result)` pairs be
-written to a store and handed back later, so the seam is narrowed to the one shape
+written to a store and handed back later, so the interface is narrowed to the one shape
 every store can hold (a frontend wanting richer keys encodes them into one).
-Results cross the seam as `object`, the same honest move `without-web` makes
+Results cross the interface as `object`, the same honest move `without-web` makes
 when it collects a heterogeneous mix of `object`-valued `Extractor`s; the typed frontend
 restores precision above it. There is only the compiled form: a caller runs a
 graph by compiling a `Plan` and reusing it, the way an HTTP client owns one
@@ -114,7 +114,7 @@ result: Report = await run(some_request)
 Passing `parse` a handle whose type does not line up with its parameter is a mypy
 error, not a runtime surprise. Because a step can only depend on handles that
 already exist, a cycle is unrepresentable through this API; graphlib's check is a
-backstop for the object seam.
+backstop for the object interface.
 
 The name leads because a node *is* named before it is defined, and because the key
 is the caller's to choose rather than the builder's to mint. Uniqueness alone would
@@ -131,7 +131,7 @@ general DAG may take several: `graph, (a, b) = Graph.of(A, B)` opens two entries
 and the compiled graph is called `run(a_value, b_value)` with the count and types
 checked. Wrong arity or a mismatched value type is a static error.
 
-`build` compiles the scheduling structure once, into the same object-seam `Plan`:
+`build` compiles the scheduling structure once, into the same object-interface `Plan`:
 the nodes by key, the dependency edges, and the consumer counts are all
 input-independent, so a `CompiledGraph` driven per event runs the nodes without
 re-analyzing the graph each time. `build` *is* the typed graph's `Plan.of`.

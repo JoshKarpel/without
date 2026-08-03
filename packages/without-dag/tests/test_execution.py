@@ -285,7 +285,7 @@ async def test_drive_raises_on_a_dangling_dependency() -> None:
 
 
 async def test_drive_skips_a_node_whose_result_is_already_supplied() -> None:
-    # The resumption primitive at the seam: `inputs` names a *node*, not a source,
+    # The resumption primitive at the interface: `inputs` names a *node*, not a source,
     # so the node does not run, is never yielded, and its supplied value is what
     # its dependents consume.
     ran: list[str] = []

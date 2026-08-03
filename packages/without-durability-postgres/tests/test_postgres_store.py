@@ -204,14 +204,14 @@ async def test_two_passes_that_recorded_the_same_value_both_count_as_the_writer(
     assert await checkpointer.record(holder, "captured", "cap-1") == Recorded(value="cap-1", first=True)
 
 
-async def test_a_workflow_id_needs_no_contract_because_it_is_never_part_of_a_key(
+async def test_a_workflow_id_needs_no_constraints_because_it_is_never_part_of_a_key(
     pool: AsyncConnectionPool,
     workflow: str,
 ) -> None:
     # The Redis store asks an id not to carry braces, because they delimit its cluster
     # hash tag and an id that brings its own splits the key structure. Here the id is a
     # query parameter, so there is nothing for it to break, which is the tell that the
-    # contract was about building keys by interpolation rather than about workflow ids.
+    # constraint was about building keys by interpolation rather than about workflow ids.
     awkward = f"{{{workflow}}} 'quoted' -- ;"
     checkpointer = PostgresCheckpointer(pool=pool)
     holder = await claimed(checkpointer, awkward)

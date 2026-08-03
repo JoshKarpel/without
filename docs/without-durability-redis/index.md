@@ -1,6 +1,6 @@
 # without-durability-redis
 
-[`without-durability`](../without-durability/index.md)'s two seams over Redis: a
+[`without-durability`](../without-durability/index.md)'s two interfaces over Redis: a
 workflow's completed steps as one hash, its claim as another, and a queue of
 workflows that can run now.
 
@@ -57,13 +57,13 @@ they carry the queue's namespace rather than a workflow's id.
 
 That split decides where a workflow id is *structure* and where it is merely
 data. In the two per-workflow keys it is interpolated into the key name, so it
-carries a contract: no braces (they would delimit the hash tag instead of it),
+carries constraints: no braces (they would delimit the hash tag instead of it),
 bounded length, and not ending in `:unwind`, which is how `run_saga` names a
 rollback. In the queue it is a stream field or a sorted-set member, so none of
-that applies. `RedisCheckpointer` documents the contract and does not enforce it,
-on the grounds that a UUID satisfies it without trying and validating every call
+that applies. `RedisCheckpointer` documents them and does not enforce them,
+on the grounds that a UUID satisfies them without trying and validating every call
 to catch someone who went out of their way is the wrong trade. A store that bound
-the id as a query parameter rather than concatenating it would have no contract
+the id as a query parameter rather than concatenating it would have no constraints
 at all, which is the tell that this is a property of building keys by
 interpolation rather than of workflow ids.
 
@@ -85,7 +85,7 @@ worker pulls
   step "captured:*" ─▶ ▪ captured:piano
                     ─▶ ▪ captured:stool
   sleep "settling"  ─▶ ▪ settling=D            (the deadline, not the duration)
-  ScheduledWakeup(D) ─────────────────────────────────────────────────────────▶ ▪ score=D
+  Sleeping(D)       ─────────────────────────────────────────────────────────▶ ▪ score=D
   release           ────────────────────▶ ▪ token=1 until=0
   XACK              ───────────────────────────────────────── ▫ 1-0 acked, still in the stream
 timer, once D passes
@@ -93,7 +93,7 @@ timer, once D passes
 worker pulls again
   claim             ────────────────────▶ ▪ token=2 until=T₂  (the fence advances)
   awaiting          ─  suspends: "approved-by" is not there
-  InputNeeded       ── nothing scheduled: only the world can answer this
+  Waiting           ── nothing scheduled: only the world can answer this
   release, XACK     ────────────────────▶ until=0             ▫ 2-0 acked
 POST /confirmation
   supply("approved-by") ▪ approved-by
@@ -211,7 +211,7 @@ watching, it is the whole budget.
 
 The `Scheduler` protocol carries `prepare`, `wake_due`, and `reclaim` only because
 the stream needs them, and they are no-ops in every other implementation this
-project ships. That is a fair criticism of the seam, and the reason it is not
+project ships. That is a fair criticism of the interface, and the reason it is not
 acted on is this table: a queue with an acknowledgement and a pending list is a
 real shape, so the protocol keeps room for one.
 

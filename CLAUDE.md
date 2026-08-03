@@ -3,10 +3,17 @@
 ## Start here
 
 Before doing anything else, read [`PHILOSOPHY.md`](PHILOSOPHY.md) to get the
-project's mindset: the narrow-waist bet, the stream/processor/context substrate,
-functional-core/imperative-shell, and values-over-places. It is the durable
-rationale for why the code is shaped the way it is, and the right frame for any
-new work.
+project's mindset. It rests on two ideas: the stateful stream processor as a
+universal way to model computation (the narrow-waist bet, the
+stream/processor/context substrate, lifespan as a variable), and an ecosystem of
+thin layers with narrow interfaces, so a user meets one altitude, descends when they
+need to, and can replace a layer without rewriting the rest. The craft
+principles the code leans on (values over places, parse don't validate,
+functional core and imperative shell) are subordinate to those, and the doc
+treats them as tools rather than as the philosophy. It states all of it as the
+standard new work is measured against, and marks where the code does not yet meet
+it, so it is the right frame for a design decision but not the authority on what
+the code currently does.
 
 Then read the per-package guide for the area you are touching. Each package owns
 a directory under [`docs/`](docs) (`docs/<package>/`) holding all of its docs:
@@ -17,7 +24,7 @@ server and client (`without-http/index.md`, with cookie handling split out into
 `without-http/cookies.md`), the opinionated router (`without-web/index.md`), the
 config sources (`without-env/index.md`, `without-configmap/index.md`), the DAG
 executor (`without-dag/index.md`), and durable workflows
-(`without-durability/index.md`, with the store contract in
+(`without-durability/index.md`, with the store interface in
 `without-durability/guarantees.md` and the comparison to Temporal and DBOS in
 `without-durability/alternatives.md`, plus one page per store in
 `without-durability-redis/`, `without-durability-postgres/`, and

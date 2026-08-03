@@ -1,7 +1,7 @@
 # without-durability-sqlite
 
-[`without-durability`](https://pypi.org/project/without-durability/)'s two seams
-over one SQLite file. No server, and no third-party dependency: the driver is in
+[`without-durability`](https://pypi.org/project/without-durability/)'s two
+interfaces over one SQLite file. No server, and no third-party dependency: the driver is in
 the standard library.
 
 ```python
@@ -12,8 +12,8 @@ await migrate(database)
 durable = SqliteDurable(SqliteCheckpointer(database), SqliteScheduler(database))
 ```
 
-It is the smallest thing that still meets every requirement the seam states, which
-is the clearest way to say what the seam is for: a durable workflow does not need
+It is the smallest thing that still meets every requirement the interface states,
+which is the clearest way to say what the interface is for: a durable workflow does not need
 a cluster, a database server, or a dependency.
 
 Two questions the other stores have to answer carefully settle themselves here.

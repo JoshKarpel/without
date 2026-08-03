@@ -11,17 +11,18 @@ a processor's step) so the parts stay reusable.
 Python has many frameworks with similar-but-subtly-different shapes (ASGI apps,
 Kafka consumers, asyncio protocols, config reloaders) that do not interoperate
 because none of them names the shared lower layer. `without` names that layer as
-a narrow contract, so the pieces compose. It is meant to feel like a library
+a narrow interface, so the pieces compose. It is meant to feel like a library
 (your control flow stays visible) rather than a framework.
 
-The [Philosophy](philosophy.md) page is the durable rationale: the narrow-waist
-bet, the stream/processor/context substrate, functional-core/imperative-shell,
-and values-over-places. Read it first to get the mindset the code is shaped
-around.
+The [Philosophy](philosophy.md) page rests on two ideas: the stateful stream
+processor as a universal way to model computation, and an ecosystem of thin
+layers with narrow interfaces, so you meet one altitude, descend when you need to,
+and can replace a layer without rewriting the rest. Read it first to get the
+mindset the code is shaped around.
 
 ## The substrate
 
-Three types carry the whole model (`without.contracts`):
+Three types carry the whole model (`without.interfaces`):
 
 - A `Stream[T]` is an asynchronous sequence of values: the one shape every
   connection takes, whoever does the I/O. A socket, a file watcher, a clock, and
@@ -37,7 +38,7 @@ Three types carry the whole model (`without.contracts`):
 This is a [`uv`](https://docs.astral.sh/uv/) workspace of flat, version-locked
 packages. Each is its own top-level import.
 
-- [`without`](without/index.md): the core contracts every plugin speaks, the
+- [`without`](without/index.md): the core interfaces every plugin speaks, the
   stream connectors, and a `with`-scoped background task helper.
 - [`without-env`](without-env/index.md): a static `Context` parsed from
   environment variables with `pydantic-settings`.
@@ -53,7 +54,7 @@ packages. Each is its own top-level import.
 - [`without-dag`](without-dag/index.md): bounded-concurrency execution of
   DAG-shaped async workflows, liftable straight into a `Processor`.
 - [`without-durability`](without-durability/index.md): durable workflows over a
-  checkpoint any process can read, with the store seams that make one writer at a
+  checkpoint any process can read, with the store interfaces that make one writer at a
   time enforceable. Its stores are
   [Redis](without-durability-redis/index.md),
   [Postgres](without-durability-postgres/index.md), and
@@ -66,7 +67,7 @@ e.g. [`without`](without/reference.md)) is recovered from the source docstrings.
 ## Installing
 
 ```bash
-pip install without-core      # the core contracts (imported as `without`)
+pip install without-core      # the core interfaces (imported as `without`)
 pip install without-web       # plus whichever plugins you need
 ```
 

@@ -39,7 +39,7 @@ async def client(payments: Payments) -> AsyncIterator[httpx.AsyncClient]:
 
 
 async def recorded(payments: Payments, workflow: str = WORKFLOW) -> dict[str, object]:
-    """What the store holds for a workflow, read back through the seam rather than raw."""
+    """What the store holds for a workflow, read back through the interface rather than raw."""
     return await payments.durable.checkpointer.load(workflow)
 
 

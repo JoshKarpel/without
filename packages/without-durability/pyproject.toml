@@ -5,7 +5,7 @@ build-backend = "uv_build"
 [project]
 name = "without-durability"
 version = "0.0.0"
-description = "Durable workflows for without: a checkpoint any process can read, and the store seams that make one writer at a time enforceable."
+description = "Durable workflows for without: a checkpoint any process can read, and the store interfaces that make one writer at a time enforceable."
 readme = "README.md"
 license = "MIT"
 authors = [

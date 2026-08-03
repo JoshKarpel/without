@@ -41,7 +41,7 @@ designed for this toy's own two protocols and look nothing like theirs.
 Where this differs is worth stating plainly, because it is a different position rather
 than a smaller version of the same one:
 
-- **The guarantee lives in the seam, not in the database.** DBOS requires Postgres, and
+- **The guarantee lives in the interface, not in the database.** DBOS requires Postgres, and
   that requirement is what lets it supply the semantics. Here `Checkpointer` states the
   requirements and Postgres is one implementation that meets them, alongside Redis and
   SQLite, which meet them too. What DBOS gets for its choice is that it can assume the
@@ -69,8 +69,8 @@ Each is worth naming with what it costs.
   notices that a workflow's code changed, or that a recorded value's shape did.
   `Run.claim` catches two steps sharing a name within one pass, which is the sharpest
   version of the failure, but only within a pass.
-- **A durable timer and an external signal are the same thing.** `ScheduledWakeup` and
-  `InputNeeded` differ only in whether anyone schedules the wakeup, and both are
+- **A durable timer and an external signal are the same thing.** `Sleeping` and
+  `Waiting` differ only in whether anyone schedules the wakeup, and both are
   satisfied by an entry in the same mapping, which is also why starting a workflow and
   signalling one are the same call in the API. Temporal and DBOS have separate machinery
   for each. What that buys is a smaller vocabulary; what it costs is that the store

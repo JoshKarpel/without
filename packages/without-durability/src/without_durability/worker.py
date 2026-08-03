@@ -2,17 +2,18 @@
 # workflow ready again. It is a `Sink` over a `Stream` and a background task, which is
 # the whole shape:
 #
-#   deliveries ──▶ pool of N passes ──▶ ScheduledWakeup ──▶ wake_at (a clock)
-#         ▲                          │  InputNeeded     ──▶ nothing (a confirmation)
+#   deliveries ──▶ pool of N passes ──▶ Sleeping  ──▶ wake_at (a clock)
+#         ▲                          │  Waiting   ──▶ nothing (a confirmation)
+#         │                          │  Completed ──▶ nothing
 #         │                          └──▶ done (this wakeup is answered for)
 #   reclaim one, else read one
 #   timer ──▶ wake_due (one move, in the store)
 #
-# The two arms of the `Suspended` branch are the two ways a workflow waits, and its type
-# says which: a `ScheduledWakeup` is a deadline the workflow chose, so the worker
-# schedules it; an `InputNeeded` is a value the outside world owes it, so nobody
-# schedules anything and the API's confirmation is what queues it. Nothing polls a
-# workflow to ask whether it can proceed.
+# The three arms are what one pass can come to, and `resume` hands them back as a sealed
+# union rather than raising two of them: a `Sleeping` is a deadline the workflow chose,
+# so the worker schedules it; a `Waiting` is a value the outside world owes it, so
+# nobody schedules anything and the API's confirmation is what queues it. Nothing polls
+# a workflow to ask whether it can proceed.
 #
 # The delivery stream merges two sources, which is where fan-in belongs: new work, and
 # work a dead worker was holding. `reclaim` assigns the latter to *this* worker, so
@@ -42,6 +43,7 @@ from collections.abc import Awaitable
 from collections.abc import Callable
 from datetime import datetime
 from datetime import timedelta
+from typing import assert_never
 
 from without import Sink
 from without import Stream
@@ -49,16 +51,17 @@ from without import from_sink
 from without import limit_concurrency
 from without import ticks
 
-from without_durability.seams import LEASE
-from without_durability.seams import Contended
-from without_durability.seams import Delivery
-from without_durability.seams import Durable
-from without_durability.seams import Fenced
-from without_durability.seams import Scheduler
-from without_durability.seams import check_duration
+from without_durability.interfaces import LEASE
+from without_durability.interfaces import Contended
+from without_durability.interfaces import Delivery
+from without_durability.interfaces import Durable
+from without_durability.interfaces import Fenced
+from without_durability.interfaces import Scheduler
+from without_durability.interfaces import check_duration
+from without_durability.stepwise import Completed
 from without_durability.stepwise import Run
-from without_durability.stepwise import ScheduledWakeup
-from without_durability.stepwise import Suspended
+from without_durability.stepwise import Sleeping
+from without_durability.stepwise import Waiting
 from without_durability.stepwise import now_utc
 from without_durability.stepwise import resume
 
@@ -114,7 +117,9 @@ def passes(
     it has to be, since `Fenced` and `Contended` are `Interruption`s that `except
     Exception` no longer reaches. They say another pass owns the workflow, which is what
     a refused claim says too, so the two paths share `look_again` and neither gets a
-    warning.
+    warning. That they are still caught here while a suspension is not is the honest
+    split: a suspension is something the pass *did*, so it comes back as a value, and
+    losing the claim means there was no pass to have an outcome.
     """
     check_duration("a lease", lease)
     check_duration("a contended interval", contended)
@@ -134,19 +139,22 @@ def passes(
             await look_again(delivery, "is held by another pass")
             return
         try:
-            await resume(holder, durable.checkpointer, body)
-        except Suspended as pause:
-            # The two ways a workflow waits, and the whole of what the worker owes each.
-            # A deadline the workflow chose is the worker's to schedule; an `InputNeeded`
-            # is not, because no clock satisfies it and whoever writes the value is what
-            # queues the workflow. That is why the wait's kind is a type rather than a
-            # nullable field: there is nothing here to ask about a `due` that may not be.
-            match pause:
-                case ScheduledWakeup(due=due):
+            # The three things a pass can come to, and the whole of what the worker owes
+            # each. A deadline the workflow chose is the worker's to schedule; a value
+            # the outside world owes it is not, because no clock satisfies that and
+            # whoever writes the value is what queues the workflow. `assert_never` is
+            # what makes this exhaustive statically, so a fourth outcome would be a type
+            # error here rather than a workflow that quietly stops being woken.
+            match await resume(holder, durable.checkpointer, body):
+                case Sleeping(key=key, due=due):
                     await durable.scheduler.wake_at(delivery.workflow, due)
-                case _:
+                    logger.info(f"{delivery.workflow} is sleeping at {key!r} until {due.isoformat()}")
+                case Waiting(key=key):
+                    logger.info(f"{delivery.workflow} is waiting at {key!r} to be told")
+                case Completed():
                     pass
-            logger.info(f"{delivery.workflow} {pause}")
+                case _ as unreachable:
+                    assert_never(unreachable)
         except (Fenced, Contended) as lost:
             # The claim lapsed mid-pass and someone else took the workflow, which is the
             # same situation as losing it outright, discovered later. So it gets the same

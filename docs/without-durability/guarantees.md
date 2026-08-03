@@ -24,7 +24,7 @@ semantics, and Postgres can. What that buys beyond exclusion is the thing no amo
 of care in user code reproduces: a step's business write and its checkpoint commit
 in one transaction, which makes that step exactly-once rather than at-least-once.
 
-This puts it in the seam, which is a third position rather than a midpoint on that
+This puts it in the interface, which is a third position rather than a midpoint on that
 line: `Checkpointer` states the guarantees as requirements, and an implementation
 says how many of them it can meet. All three stores here meet all of them, which is
 the point of having three. What it costs is that they are still not
@@ -160,7 +160,7 @@ Verifying beats parsing whenever you still hold what you sent. `Run.awaiting` is
 exactly the case that does not: it reads a value some *other* process wrote, so there
 is nothing to compare against and only a parser can establish its shape.
 
-## The codec is a seam too
+## The codec is an interface too
 
 What a step's result *becomes* in the store is a boundary decision, and boundary
 decisions belong to the application: what a workflow's steps return, what an operator
@@ -178,7 +178,7 @@ here holds text, and one holding bytes would say so), while the decoded side can
 a checkpoint is heterogeneous by construction, since one codec carries a workflow's
 string, its mapping, and its deadline alike. Precision belongs inside a codec instead,
 where a pydantic `TypeAdapter` can be as exact as it likes while still presenting
-`object` at the seam, which is the move `without_dag.Node` already makes.
+`object` at the interface, which is the move `without_dag.Node` already makes.
 
 `MemoryCheckpointer` applies the codec too, which is the part that is easy to skip and
 is exactly what makes a double lie. A dict can hold a value directly, so encoding into
@@ -194,13 +194,18 @@ a checkpoint means `load`.
 whether _this pass_ may continue, not about the work; an `except Exception` written to
 handle a declined gateway must not absorb one.
 
+`Suspended` is the one a driver never sees, because `resume` catches it and returns a
+`Sleeping` or a `Waiting`. It still descends from `BaseException` for the half of its
+life that matters: the part where it is travelling up through the workflow author's own
+code, past whatever they wrapped their steps in.
+
 The case that forced it is `run_saga`. It compensates on failure, and a `Fenced`
 forward run is not a failure: it says another pass holds this workflow and is
 advancing it, so a loser that compensated would refund a charge the winner is still
 building on. Making the exception's own shape enforce that beats keeping a list of
 types correct at every `except` site.
 
-## One seam or two
+## One interface or two
 
 A workflow's durable state is two things, what it has done and whether it may run
 now, and they are two protocols on the grounds that they can be two stores. They can:
@@ -222,9 +227,9 @@ Redis stream, which says the protocol is shaped around one implementation's mech
 (stream, group, pending list, timer) rather than around the question "when may this
 workflow run".
 
-So the answer is not one big interface, which would bundle a mechanism to repair a
-contract and forfeit the split deployment. It is to **bundle the contract and leave
-the mechanisms unbundled**. `Durable` owns the two stores and names the transitions
+So the answer is not one big implementation, which would bundle a mechanism to
+repair an interface and forfeit the split deployment. It is to **bundle the
+interface and leave the mechanisms unbundled**. `Durable` owns the two stores and names the transitions
 across them; `Checkpointer` and `Scheduler` are unchanged underneath and are what
 implementations actually are:
 
@@ -245,7 +250,7 @@ wakes, finds nothing recorded, and answers for the delivery, which drops the val
 good.
 
 What this costs: a third named concept, and a `SplitDurable` whose guarantee is
-deliberately weaker than the seam's strongest form. The second is the one to watch,
+deliberately weaker than the interface's strongest form. The second is the one to watch,
 because a weaker guarantee behind an identical signature is how a system teaches people
 to assume the stronger one.
 

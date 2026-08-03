@@ -1,7 +1,7 @@
 # without-durability-redis
 
-[`without-durability`](https://pypi.org/project/without-durability/)'s two seams
-over Redis: a workflow's completed steps as one hash, its claim as another, and a
+[`without-durability`](https://pypi.org/project/without-durability/)'s two
+interfaces over Redis: a workflow's completed steps as one hash, its claim as another, and a
 queue of workflows that can run now.
 
 ```python

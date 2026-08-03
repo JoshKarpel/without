@@ -1,5 +1,5 @@
 # The workflow this deployment runs, and the effects it runs against. It is the piece
-# `without-durability` deliberately does not have: the library supplies the seams, the
+# `without-durability` deliberately does not have: the library supplies the interfaces, the
 # runners, and the worker loop, and what a pass actually *does* is the application's.
 #
 # `work(durable, submitted)` is the whole of the wiring, which is the shape the split is

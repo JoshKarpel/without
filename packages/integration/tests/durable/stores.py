@@ -25,7 +25,7 @@ from without_durability_sqlite import connect
 from without_durability_sqlite import migrate as migrate_sqlite
 
 # Every `Durable` this repo ships, behind one fixture, so a workflow-level test is written
-# once and run against all of them. That is what the seam is *for*, and a suite that
+# once and run against all of them. That is what the interface is *for*, and a suite that
 # proves it is worth more than four suites that each prove it for one store.
 #
 # The two that need a server skip when `just test` has not published its address; the
@@ -38,7 +38,7 @@ from without_durability_sqlite import migrate as migrate_sqlite
 # scoring visibility and has `wake_due`, `reclaim`, and `prepare` do nothing at all. So
 # the stream is the only parameter here that exercises the worker's timer and its
 # takeover arm end to end, and running the same workflows over both is what says the
-# `Scheduler` seam holds across that difference rather than across two spellings of one
+# `Scheduler` interface holds across that difference rather than across two spellings of one
 # design.
 STORES = ("memory", "redis-stream", "redis-set", "postgres", "sqlite")
 

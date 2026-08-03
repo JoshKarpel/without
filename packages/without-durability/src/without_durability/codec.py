@@ -1,6 +1,6 @@
 # How a step's result becomes something a store can hold, and how it comes back.
 #
-# It is a seam rather than a constant because it is a *boundary* decision, and the
+# It is an interface rather than a constant because it is a *boundary* decision, and the
 # boundary belongs to the application: what a workflow's steps return, what an operator
 # needs to read out of the store, and what a service written in another language has to
 # parse are questions this library cannot answer. Baking `json.dumps` into four stores
@@ -49,7 +49,7 @@ class CheckpointCodec[Encoded](Protocol):
     Precision belongs inside a codec instead, where it costs nothing: a pydantic codec's
     `TypeAdapter` can be as exact as it likes about what a workflow returns while still
     presenting `object` here. That is the move `without_dag.Node` already makes, crossing
-    the executor seam as `object` with a typed frontend restoring precision above it.
+    the executor interface as `object` with a typed frontend restoring precision above it.
     """
 
     def encode(self, value: object) -> Encoded: ...

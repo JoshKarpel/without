@@ -1,5 +1,5 @@
 # The piece that is genuinely a service: knowing *when* a workflow can make progress. A
-# checkpoint says what a workflow has done, and a `Suspended` says what it is waiting
+# checkpoint says what a workflow has done, and a pass's outcome says what it is waiting
 # for, but neither brings anyone back. This does, with two Redis structures and no server
 # of our own:
 #
@@ -49,9 +49,9 @@ from redis.commands.core import AsyncScript
 from redis.exceptions import ResponseError
 from without import Sink
 from without import from_sink
-from without_durability.seams import LEASE
-from without_durability.seams import Delivery
-from without_durability.seams import check_duration
+from without_durability.interfaces import LEASE
+from without_durability.interfaces import Delivery
+from without_durability.interfaces import check_duration
 
 type Entries = list[tuple[str, dict[str, str]]]
 
@@ -120,7 +120,7 @@ class RedisStreamScheduler:
     # it over. Here it is genuinely an *argument* to `XAUTOCLAIM` rather than something
     # written into the queue, which is the visibility-scored stores' route to the same
     # property, so the worker passes it back in on every pull. It is on the store anyway,
-    # and for the reason the seam gives: it also bounds the checkpoint claim, and the two
+    # and for the reason the interface gives: it also bounds the checkpoint claim, and the two
     # drift the moment they are set in two places.
     lease: timedelta = LEASE
     # Registered at construction: this precomputes the digest and holds the client, so a

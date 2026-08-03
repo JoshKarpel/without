@@ -9,7 +9,7 @@
 #
 # This is the only module here that depends on `without-dag`. The other mechanism
 # (`stepwise`) needs no graph at all, and the two share nothing but the `Checkpointer`
-# seam, which is the point: one checkpoint, two ways to spend it.
+# interface, which is the point: one checkpoint, two ways to spend it.
 
 from __future__ import annotations
 
@@ -21,11 +21,11 @@ from typing import cast
 from without_dag import CompiledGraph
 from without_dag import NodeKey
 
-from without_durability.seams import LEASE
-from without_durability.seams import Checkpointer
-from without_durability.seams import Contended
-from without_durability.seams import Pass
-from without_durability.seams import claimed
+from without_durability.interfaces import LEASE
+from without_durability.interfaces import Checkpointer
+from without_durability.interfaces import Contended
+from without_durability.interfaces import Pass
+from without_durability.interfaces import claimed
 
 
 async def run_durably[*Ins, Out](

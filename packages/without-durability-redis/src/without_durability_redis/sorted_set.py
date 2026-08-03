@@ -49,9 +49,9 @@ from typing import cast
 
 from redis.asyncio import Redis
 from redis.commands.core import AsyncScript
-from without_durability.seams import LEASE
-from without_durability.seams import Delivery
-from without_durability.seams import check_duration
+from without_durability.interfaces import LEASE
+from without_durability.interfaces import Delivery
+from without_durability.interfaces import check_duration
 from without_durability.stepwise import now_utc
 
 # How often a worker with nothing to do asks again. This is the price of losing the

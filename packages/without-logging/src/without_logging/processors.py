@@ -3,8 +3,8 @@ from __future__ import annotations
 from collections.abc import Awaitable
 from collections.abc import Callable
 
-from without.contracts import Processor
-from without.contracts import from_map
+from without.interfaces import Processor
+from without.interfaces import from_map
 
 from without_logging.record import Record
 

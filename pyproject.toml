@@ -1,7 +1,7 @@
 [project]
 name = "without-workspace"
 version = "0.0.0"
-description = "Workspace root for without: a sans-IO narrow-waist contract for composing stateful stream processors, so independently-written pieces snap together."
+description = "Workspace root for without: a sans-IO narrow-waist interface for composing stateful stream processors, so independently-written pieces snap together."
 readme = "README.md"
 license = "MIT"
 authors = [

@@ -44,6 +44,6 @@ than the graph.
 See the
 [`without-dag` guide](https://without.help/without-dag/)
 (with the [API reference](https://without.help/reference/without_dag/))
-for the full surface: the object-seam execution core (`Plan`, `drive`,
+for the full surface: the object-interface execution core (`Plan`, `drive`,
 `evaluate`), the typed frontend, resuming from a checkpoint, and lifting into a
 processor.

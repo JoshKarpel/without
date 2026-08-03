@@ -1,7 +1,7 @@
 # without-durability-postgres
 
-[`without-durability`](https://pypi.org/project/without-durability/)'s two seams
-over one Postgres: three tables, and no mechanism of its own.
+[`without-durability`](https://pypi.org/project/without-durability/)'s two
+interfaces over one Postgres: three tables, and no mechanism of its own.
 
 ```python
 from psycopg_pool import AsyncConnectionPool
@@ -24,7 +24,7 @@ serializes it against a claim in flight; the queue takes with
 queueing on its head.
 
 Three things that are live questions over Redis do not arise. A workflow id is a
-query parameter rather than key structure, so it carries no contract at all.
+query parameter rather than key structure, so it carries no constraints at all.
 Nothing expires, so the TTL that can lose a suspended workflow is gone, and the
 fencing token can be an ordinary counter. And a default Postgres commits
 synchronously, so `record` returning means what the durable runner assumes it
@@ -32,7 +32,7 @@ means.
 
 `SqlEffect` is a callback handed a cursor inside the open transaction, so a step's
 own business write and its checkpoint commit together: exactly-once for that step,
-over the application's own tables. `PostgresDurable` extends that to the seam
+over the application's own tables. `PostgresDurable` extends that to the interface
 above, committing a value's arrival and the workflow's wakeup at once, which is
 what makes "you need no second system" a claim this can actually make. It is also
 where "one datastore" stops meaning "Postgres", since a transaction is local only

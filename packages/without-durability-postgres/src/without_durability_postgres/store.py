@@ -1,4 +1,4 @@
-# The same two seams as the Redis store, over one Postgres. It is the other half of that
+# The same two interfaces as the Redis store, over one Postgres. It is the other half of that
 # argument, and putting the two side by side is the point: `Checkpointer` and `Scheduler`
 # state the guarantees, and a store says how it reaches them, so a family of stores is
 # not one good implementation and one compromise.
@@ -25,8 +25,8 @@
 # Two consequences fall out of SQL that are worth naming, because both were live
 # questions in the Redis store and neither survives the move.
 #
-# A workflow id is a *parameter* here, never part of a key, so the contract the Redis
-# store asks of one (no braces, bounded length) has nothing to attach to. That is the
+# A workflow id is a *parameter* here, never part of a key, so the constraints the Redis
+# store asks of one (no braces, bounded length) have nothing to attach to. That is the
 # tell the Redis store predicted: it was a property of building keys by concatenation,
 # not of workflow ids.
 #
@@ -62,18 +62,18 @@ from psycopg.rows import TupleRow
 from psycopg_pool import AsyncConnectionPool
 from without_durability.codec import JSON
 from without_durability.codec import CheckpointCodec
-from without_durability.seams import LEASE
-from without_durability.seams import Delivery
-from without_durability.seams import Fenced
-from without_durability.seams import Pass
-from without_durability.seams import Recorded
-from without_durability.seams import check_duration
+from without_durability.interfaces import LEASE
+from without_durability.interfaces import Delivery
+from without_durability.interfaces import Fenced
+from without_durability.interfaces import Pass
+from without_durability.interfaces import Recorded
+from without_durability.interfaces import check_duration
 from without_durability.stepwise import now_utc
 
 # How often a worker with nothing to do asks again, which is the price of having no
 # blocking read. It is restated rather than imported from the Redis store so that running
 # this one pulls in no Redis client at all, which is the whole shape of the offer. The
-# *lease* is not restated: it is `seams.LEASE`, because unlike the poll interval it has
+# *lease* is not restated: it is `interfaces.LEASE`, because unlike the poll interval it has
 # to agree with something outside this store (the checkpoint claim the worker takes for
 # exactly as long).
 POLL = timedelta(milliseconds=50)
@@ -265,7 +265,7 @@ class PostgresCheckpointer:
     rather than only of the client. That is exactly what `run_durably`'s reasoning about
     the window between an effect and its record assumes.
 
-    A workflow id carries no contract here at all, since it is bound as a query parameter
+    A workflow id carries no constraints here at all, since it is bound as a query parameter
     rather than parsed as key structure. The only constraint that survives is the one
     `run_saga` states about any store: an id ending in `:unwind` addresses another
     workflow's rollback.
@@ -452,7 +452,7 @@ class PostgresScheduler:
         Create the tables, which every worker does at boot and all but the first find done.
 
         It creates the *checkpoint* tables too, because there is one database and one DDL
-        for it. That is a little more than this seam is asked for, and it is the right
+        for it. That is a little more than this interface is asked for, and it is the right
         place anyway: the worker already calls `prepare` before reading a queue, so a
         deployment gets its schema from the same call whichever queue it runs, and an
         entrypoint that would rather be explicit calls `migrate` itself.
@@ -531,7 +531,7 @@ class PostgresDurable:
     waiting on and making the workflow runnable are two writes with a crash window
     between them everywhere else; here they are two statements in one transaction, so the
     window does not exist. That is the same capability `transact` offers a step, arriving
-    at the seam above rather than inside a pass, and it is available for the same reason:
+    at the interface above rather than inside a pass, and it is available for the same reason:
     both things live in one datastore.
 
     Which is why the two stores MUST share a pool, checked at construction rather than

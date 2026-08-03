@@ -27,10 +27,10 @@ from redis.commands.core import AsyncScript
 from redis.exceptions import ResponseError
 from without_durability.codec import JSON
 from without_durability.codec import CheckpointCodec
-from without_durability.seams import Fenced
-from without_durability.seams import Pass
-from without_durability.seams import Recorded
-from without_durability.seams import check_duration
+from without_durability.interfaces import Fenced
+from without_durability.interfaces import Pass
+from without_durability.interfaces import Recorded
+from without_durability.interfaces import check_duration
 
 # Take the workflow if nobody holds it, and stamp the taking with a number that only
 # ever goes up. It is the store, not the claimant, that decides the ordering, so two
@@ -267,8 +267,8 @@ class RedisCheckpointer:
 
     ## What a workflow id has to be
 
-    A workflow id becomes *key structure* here rather than data, which is what gives it a
-    contract at all. It is not checked at run time, deliberately: the ordinary id is a
+    A workflow id becomes *key structure* here rather than data, which is what gives it any
+    constraints at all. They are not checked at run time, deliberately: the ordinary id is a
     UUID or a ULID and satisfies all of this without anyone thinking about it, so paying
     for a validation on every call to catch a caller who went out of their way would be
     the wrong trade. Enforce it where ids are minted if you need to.

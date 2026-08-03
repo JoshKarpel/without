@@ -1,6 +1,6 @@
 # without-durability-sqlite
 
-[`without-durability`](../without-durability/index.md)'s two seams over one SQLite
+[`without-durability`](../without-durability/index.md)'s two interfaces over one SQLite
 file. No server, and no third-party dependency: the driver is in the standard
 library.
 
@@ -12,8 +12,8 @@ await migrate(database)
 durable = SqliteDurable(SqliteCheckpointer(database), SqliteScheduler(database))
 ```
 
-It is the smallest thing that still meets every requirement the seam states, which
-is the clearest way to say what the seam is for: a durable workflow does not need a
+It is the smallest thing that still meets every requirement the interface states,
+which is the clearest way to say what the interface is for: a durable workflow does not need a
 cluster, a database server, or a dependency.
 
 ## What settles itself here

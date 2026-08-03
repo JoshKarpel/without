@@ -486,8 +486,9 @@ async def test_the_worker_carries_a_submitted_order_through_its_own_wait() -> No
 
 
 async def test_a_body_driven_without_the_worker_suspends_the_same_way() -> None:
-    # `resume` is what the worker calls, so a body reaches the same wait whether a queue
-    # delivered it or a test drove it by hand. That is what makes the worker optional.
+    # Driving the body directly, below `resume`, is where the suspension is still an
+    # exception: that is how it unwinds straight-line code. `resume` is the boundary that
+    # turns it into a `Sleeping`, which is what every driver above it matches on.
     checkpointer = MemoryCheckpointer()
     await checkpointer.supply(WORKFLOW, "order", SMALL)
     run = Run(

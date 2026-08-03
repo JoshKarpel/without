@@ -15,12 +15,12 @@ Where that atomicity comes from is the interesting part, and it has its own page
 [Where the guarantee lives](guarantees.md).
 
 ```text
-seams.py     the three contracts: Checkpointer, Scheduler, Durable
+interfaces.py  the three interfaces: Checkpointer, Scheduler, Durable
 graph.py     run_durably / run_saga over a without-dag CompiledGraph
 stepwise.py  the same durability for an ordinary async function
 codec.py     what a step's result becomes in a store, and how it comes back
 worker.py    the queue worker and its timer
-memory.py    both seams over dicts, so a test injects a store rather than a container
+memory.py      both interfaces over dicts, so a test injects a store rather than a container
 ```
 
 Stores live in their own packages, so this one depends on nothing but `without` and
@@ -37,7 +37,7 @@ is the application's.
 
 ## Two mechanisms, one checkpoint
 
-`Checkpointer` (in `seams.py`) is the only seam either mechanism talks through:
+`Checkpointer` (in `interfaces.py`) is the only interface either mechanism talks through:
 `claim` takes the right to run a pass, `load` returns what a workflow has recorded,
 `record` adds to it under that claim, `supply` adds to it from outside one, and
 `release` hands it back. A Redis hash or a Postgres table in production, a plain dict
@@ -68,10 +68,10 @@ determinism. Nothing here enforces it (see [Gaps](#gaps)).
 Two things fall out that a fixed graph cannot express, both in
 `integration.durable.payout`. The fan-out is data-dependent at run time (one capture
 step per line item a *step* returned, keyed by sku, so a crash resumes item by item),
-and a step that cannot finish now raises a `Suspended` instead of blocking. That last
-one is what buys a settlement window waited out across crashes (`run.sleep` raises
-`ScheduledWakeup` carrying the *deadline* it recorded, so a crash on day two does not
-restart the clock) and a human approval (`run.awaiting` raises `InputNeeded` until
+and a step that cannot finish now stops the pass instead of blocking. That last one is
+what buys a settlement window waited out across crashes (`run.sleep` comes back as a
+`Sleeping` carrying the *deadline* it recorded, so a crash on day two does not restart
+the clock) and a human approval (`run.awaiting` comes back as a `Waiting` until
 another process writes one field into the workflow's checkpoint, which is a signal
 without a mailbox: the wait outlives the process that was waiting). What the graph
 keeps in exchange is the eager check, since it knows every key before it runs
@@ -98,20 +98,26 @@ The worker is a `Sink` over a `Stream` plus a timer, which is `without`'s own
 vocabulary doing the work:
 
 ```text
-deliveries ──▶ pool of N passes ──▶ ScheduledWakeup ──▶ wake_at (a clock)
-      ▲                         │  InputNeeded     ──▶ nothing to do
+deliveries ──▶ pool of N passes ──▶ Sleeping  ──▶ wake_at (a clock)
+      ▲                         │  Waiting   ──▶ nothing to do
+      │                         │  Completed ──▶ nothing to do
       │                         └─▶ done (this wakeup is answered for)
 reclaim one, else read one
 timer ──▶ wake_due (one move, in the store)
 ```
 
-The two arms of that branch are the two ways a workflow waits, and which `Suspended`
-was raised says which. A `ScheduledWakeup` carries the deadline the workflow chose, so
-the worker schedules it; an `InputNeeded` carries nothing to schedule, because only the
-API's confirmation can queue it. Nothing polls a workflow to ask whether it can
-proceed. The distinction is a type rather than a nullable `due` field for the ordinary
-reason: a driver has to branch on it either way, and two shapes that differ in what
-they carry should not be one shape that sometimes carries it.
+`resume` returns what the pass came to rather than raising two of the three, so the
+worker is a `match` over a sealed union closed with `assert_never`: a fourth outcome
+would be a type error there rather than a workflow that quietly stops being woken. A
+`Sleeping` carries the deadline the workflow chose, so the worker schedules it; a
+`Waiting` carries nothing to schedule, because only the API's confirmation can queue
+it. Nothing polls a workflow to ask whether it can proceed.
+
+The two waits are separate types rather than one with a nullable `due` for the ordinary
+reason: a driver has to branch on it either way, and two shapes that differ in what they
+carry should not be one shape that sometimes carries it. Inside a pass a suspension is
+still an exception (`ScheduledWakeup`, `InputNeeded`), because unwinding straight-line
+code needs one; `resume` is the boundary where it becomes a value.
 
 Concurrency falls out of the same pull-driven shape. A worker runs up to `POOL` passes
 at once through `without`'s `limit_concurrency`, which advances a lazy source only when
@@ -242,7 +248,7 @@ features, expected in something this size:
   rather than merely JSON-serializable: a tuple encodes and comes back a list, which
   breaks the round trip `CheckpointCodec` requires. Swapping in a codec that knows the
   application's types is a constructor argument (`RedisCheckpointer(redis=..., codec=...)`)
-  rather than a change to any store, which is what the seam buys; what it does not buy
+  rather than a change to any store, which is what the interface buys; what it does not buy
   is a shipped alternative, and there is none here. `PostgresCheckpointer` also narrows
   the choice, since a `jsonb` column will only take JSON text.
 

@@ -9,7 +9,7 @@ rest gets a home for tests.
 
 It also hosts validation artifacts that are not meant to be distributed. `kv` is
 a toy line-protocol key-value server (Redis-ish) built on `without`, proving the
-contract supports long-lived processor state and request/response. It splits into
+interface supports long-lived processor state and request/response. It splits into
 `kv.core` (the pure keyspace: parse a line, fold it into an immutable `Store`,
 render a reply) and `kv.shell` (a generic line-server transport plus the wiring
 that runs the core over it), a small demonstration that `without` is a principled
@@ -26,7 +26,7 @@ It is what keeps the substitutability claim honest. `tests/durable/stores.py`
 builds one `Durable` per store (memory, Redis, Postgres, SQLite) behind a single
 fixture, and `test_workflows_over_stores.py` runs the same saga, the same
 suspension, and the same API-plus-worker flow against every one of them. A test
-written once and run four ways says more about the seam than four suites each
+written once and run four ways says more about the interface than four suites each
 proving it for one store. What each store *is* (its scripts, its statements, its
 own failure modes) is tested in that store's own package.
 

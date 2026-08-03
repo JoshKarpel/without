@@ -7,7 +7,7 @@ resuming means calling it again; each step it reaches hands back what is already
 recorded instead of running.
 
 ```python
-from without_durability import MemoryCheckpointer, Run, claimed, resume
+from without_durability import Completed, MemoryCheckpointer, Run, Sleeping, Waiting, claimed, resume
 
 def as_text(recorded: object) -> str:
     if not isinstance(recorded, str):
@@ -21,16 +21,24 @@ async def fulfil(run: Run) -> str:
     return await run.step("paid", lambda: gateway.pay(charge, approver), as_text)
 
 checkpointer = MemoryCheckpointer()
-await resume(await claimed(checkpointer, "order-42"), checkpointer, fulfil)
+match await resume(await claimed(checkpointer, "order-42"), checkpointer, fulfil):
+    case Completed(value=reference): ...   # the workflow finished
+    case Sleeping(due=due): ...            # schedule a wakeup for `due`
+    case Waiting(key=key): ...             # nothing to schedule; someone must write `key`
 ```
+
+A pass comes back as one of those three rather than raising two of them, so what to do
+next is a `match` a type checker can tell you is incomplete. Inside the workflow a
+suspension is still an exception, because that is how you stop in the middle of
+straight-line code; `resume` is the boundary where it becomes a value.
 
 Each read names a parser because a step hands back what the *store* holds, not
 what its effect returned: the value has been through a codec, so a step returning
 a tuple is handed a list on the pass that ran it. A parser makes the return type
 something a function proved rather than something a `cast` asserted.
 
-There is no server here and no engine. What there is instead is a seam, and the
-seam is where the interesting part lives.
+There is no server here and no engine. What there is instead is an interface, and
+the interface is where the interesting part lives.
 
 A protocol of `load` and `record` is too weak to run a workflow safely at any
 scale, because it cannot say "only if nobody else is running this" or "only if I
@@ -39,7 +47,7 @@ implementation says how it meets them: `claim` grants at most one live pass and
 issues strictly increasing fencing tokens, `record` refuses a write from a
 superseded pass and never overwrites a recorded step. That is the same problem
 Temporal answers with a server and DBOS answers by requiring Postgres; here it is
-stated as a contract, so a deployment brings whatever store it already runs.
+stated as an interface, so a deployment brings whatever store it already runs.
 `Scheduler` is the other half of a workflow's state, its right to run, and
 `Durable` is the pair plus the transitions that have to cross both at once.
 
@@ -53,7 +61,7 @@ and `without-dag`:
 `MemoryCheckpointer` and `MemoryScheduler` ship here too, so a test injects a dict
 rather than starting a container.
 
-The same seam carries a second mechanism: `run_durably` and `run_saga` run a
+The same interface carries a second mechanism: `run_durably` and `run_saga` run a
 `without-dag` `CompiledGraph` against it, recording each `(node key, result)`
 before pulling the next. `work(durable, body)` turns either into a running
 service, a pool of passes plus a timer, with backpressure that falls out of

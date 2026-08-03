@@ -1,6 +1,6 @@
 # without-durability-postgres
 
-[`without-durability`](../without-durability/index.md)'s two seams over one
+[`without-durability`](../without-durability/index.md)'s two interfaces over one
 Postgres: three tables, and no mechanism of its own.
 
 ```python
@@ -13,10 +13,10 @@ await migrate(pool)
 durable = PostgresDurable(PostgresCheckpointer(pool=pool), PostgresScheduler(pool=pool))
 ```
 
-## The same two seams over one Postgres
+## The same two interfaces over one Postgres
 
 This package is `Checkpointer` and `Scheduler` again, over three tables in one
-database. It is the other half of the argument the Redis store makes: the seam
+database. It is the other half of the argument the Redis store makes: the interface
 states the guarantees, a store says how it reaches them, and putting two real
 stores side by side is what turns that from a design intention into something you
 can read.
@@ -75,12 +75,12 @@ then re-read the row it locked, so the token it compares against is the newest o
 Four things that were live questions on Redis do not arise here, and one of them
 closes a load-bearing gap rather than a detail.
 
-**A workflow id carries no contract.** `RedisCheckpointer`
+**A workflow id carries no constraints.** `RedisCheckpointer`
 [asks an id](../without-durability-redis/index.md#what-redis-holds-and-for-how-long)
 not to contain braces and to stay short, purely because it builds key names by
 interpolating one. Here the id is a query parameter, so there is nothing to ask:
 an id full of braces, quotes, and semicolons addresses exactly itself. That is
-the tell the Redis store predicted, that the contract was a property of building
+the tell the Redis store predicted, that the constraint was a property of building
 keys by concatenation rather than of workflow ids.
 
 **Nothing expires, so nothing is lost by expiring.** The Redis store re-arms a TTL

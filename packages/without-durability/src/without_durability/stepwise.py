@@ -16,10 +16,18 @@
 # still finds its record. What no longer holds is the graph's eager check, because the
 # set of keys a function will use is not knowable until it has used them.
 #
-# The other half is suspension. A step that cannot finish now raises `Suspended` instead
-# of blocking, which is what buys the things a graph cannot express at all: a three-day
+# The other half is suspension. A step that cannot finish now stops the pass instead of
+# blocking, which is what buys the things a graph cannot express at all: a three-day
 # settlement window, and a value another process has yet to write. Both are the same
 # idea as a recorded result, so both are entries in the same mapping.
+#
+# Suspension is an exception *inside* the pass and a value *at* its boundary, and the
+# split is deliberate. Unwinding a workflow written as straight-line code needs an
+# exception, since there is no other way to stop in the middle of somebody else's
+# function. But a caller deciding what to do next is asking a question with three
+# answers, and a sealed union of three answers is a better way to ask it than a `try`
+# whose `except` clause the type checker cannot check for completeness. So `resume`
+# catches its own signal and hands back an `Outcome`.
 
 from __future__ import annotations
 
@@ -32,9 +40,9 @@ from datetime import datetime
 from datetime import timedelta
 from typing import Never
 
-from without_durability.seams import Checkpointer
-from without_durability.seams import Interruption
-from without_durability.seams import Pass
+from without_durability.interfaces import Checkpointer
+from without_durability.interfaces import Interruption
+from without_durability.interfaces import Pass
 
 type StepKey = str
 # How a recorded value re-enters the workflow as the type the workflow declared.
@@ -56,13 +64,15 @@ class Suspended(Interruption):
     The pass cannot go further until `key` is recorded. Nothing has failed.
 
     A control-flow signal wearing an exception's clothes, so a workflow written as
-    straight-line code can stop in the middle of itself. Catch this to mean "the pass
-    stopped short"; catch one of the two subclasses below to mean a particular reason.
+    straight-line code can stop in the middle of itself. It is how a suspension travels
+    *through* a workflow body, not how it is reported: `resume` catches these and hands
+    back an `Outcome`, so a driver matches over three values rather than catching this.
 
     Error handling *around* a workflow must let this through: a suspended workflow is
     one that is going fine, and unwinding it would undo work it is still counting on.
     Being an `Interruption` is what makes that structural rather than a rule to
-    remember.
+    remember, and it is why these stay public despite `resume` absorbing them: a
+    workflow author needs to know what must not be caught.
     """
 
     def __init__(self, key: StepKey, waiting: str) -> None:
@@ -87,11 +97,11 @@ class ScheduledWakeup(Suspended):
     The pass is waiting out a deadline it chose itself (`Run.sleep`).
 
     `due` is that deadline, and it is not optional, which is the reason this is its own
-    type rather than a field on `Suspended`. A driver decides what to do with a
-    suspension by asking *which kind* it is, and the two answers are structurally
+    type rather than a field on `Suspended`. The two ways of waiting are structurally
     different: this one carries a moment to schedule, and `InputNeeded` carries nothing
     because there is nothing to schedule. One class with a nullable `due` would make
-    those two states the same shape and leave every consumer to re-derive them.
+    those two states the same shape and leave every consumer to re-derive them, which is
+    the same reason `Sleeping` and `Waiting` are separate on the way back out.
     """
 
     def __init__(self, key: StepKey, due: datetime) -> None:
@@ -178,7 +188,7 @@ class Run[Effect = Never]:
         datastore (a payment gateway, a carrier) cannot be in the commit, is not a
         transaction anyone can offer, and belongs in `step` with an idempotency key.
         That boundary is a fact about distributed transactions rather than a limitation
-        of this seam, which is why `Effect` is a type parameter and not a shared
+        of this interface, which is why `Effect` is a type parameter and not a shared
         interface.
 
         `parse` is required for the reason it is on `step`, and more plainly: what the
@@ -259,29 +269,80 @@ def parsing_deadline(key: StepKey) -> Parse[datetime]:
     return parse
 
 
+@dataclass(frozen=True, slots=True)
+class Completed[T]:
+    """The pass ran the workflow to the end, and `value` is what it returned."""
+
+    value: T
+
+
+@dataclass(frozen=True, slots=True)
+class Sleeping:
+    """
+    The pass stopped at a deadline the workflow chose, and nothing is owed but time.
+
+    `due` is that deadline, read back from the checkpoint rather than recomputed, so a
+    crash on day two of a three-day wait does not restart the clock. A driver schedules
+    a wakeup for it.
+    """
+
+    key: StepKey
+    due: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class Waiting:
+    """
+    The pass stopped on a value only something outside it can supply.
+
+    There is no deadline here and deliberately none to invent: no clock satisfies this
+    wait, so a driver schedules nothing and whoever writes the value under `key` is what
+    makes the workflow ready again.
+    """
+
+    key: StepKey
+
+
+# What one pass at a workflow came to. It is a sealed union rather than one type with
+# nullable fields because the three answers have genuinely different shapes, and a driver
+# that matches over them is told by the type checker when it has missed one.
+type Outcome[T] = Completed[T] | Sleeping | Waiting
+
+
 async def resume[T, Effect](
     holder: Pass,
     checkpointer: Checkpointer[Effect],
     body: Callable[[Run[Effect]], Awaitable[T]],
     *,
     now: Callable[[], datetime] = now_utc,
-) -> T:
+) -> Outcome[T]:
     """
     Make one pass at a claimed workflow, from whatever it has already recorded.
 
     Call it after a crash, after a wakeup, or after a value it was waiting on arrives:
-    each call runs `body` from the top and reaches further than the last, and calling
-    it on a finished workflow performs no effects at all. It raises a `Suspended` when
-    the pass stops short, and which one says what the pass is waiting on, leaving what
-    happens next to the caller (schedule the wakeup, do nothing until the approval
-    lands, hold the process open until `due`): that policy belongs to whoever is
-    driving rather than to this function.
+    each call runs `body` from the top and reaches further than the last, and calling it
+    on a finished workflow performs no effects at all.
 
-    It takes a claim rather than making one, for the same reason. Whether to wait for a
-    contended workflow, come back later, or fail is the driver's call: a worker holding
-    a queue delivery wants one answer and a test driving a workflow it owns wants
-    another. `claimed` is the second of those.
+    It returns what the pass came to rather than raising when the pass stops short, so
+    "the workflow finished", "it is waiting out a deadline", and "it is waiting to be
+    told" arrive as three values a caller matches over. What to *do* about each is still
+    the caller's (schedule the wakeup, do nothing until the approval lands, hold the
+    process open until `due`), which is the point: this reports, the driver decides.
+
+    Only the two suspensions are converted. Anything the workflow's own code raises
+    propagates untouched, including `Fenced` and `Contended`, because losing the
+    workflow is not an outcome of a pass but a statement that this pass was never
+    entitled to one.
+
+    It takes a claim rather than making one, for the same reason it returns rather than
+    raises. Whether to wait for a contended workflow, come back later, or fail is the
+    driver's call: a worker holding a queue delivery wants one answer and a test driving
+    a workflow it owns wants another. `claimed` is the second of those.
     """
-    return await body(
-        Run(holder=holder, checkpointer=checkpointer, recorded=await checkpointer.load(holder.workflow), now=now)
-    )
+    run = Run(holder=holder, checkpointer=checkpointer, recorded=await checkpointer.load(holder.workflow), now=now)
+    try:
+        return Completed(await body(run))
+    except ScheduledWakeup as wakeup:
+        return Sleeping(key=wakeup.key, due=wakeup.due)
+    except InputNeeded as needed:
+        return Waiting(key=needed.key)

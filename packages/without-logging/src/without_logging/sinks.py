@@ -15,8 +15,8 @@ from datetime import tzinfo
 from pathlib import Path
 from typing import TextIO
 
-from without.contracts import Sink
-from without.contracts import Stream
+from without.interfaces import Sink
+from without.interfaces import Stream
 
 
 @asynccontextmanager

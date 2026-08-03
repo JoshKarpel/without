@@ -30,9 +30,9 @@ from datetime import timedelta
 from typing import cast
 from typing import overload
 
-from without.contracts import Processor
-from without.contracts import Sink
-from without.contracts import Stream
+from without.interfaces import Processor
+from without.interfaces import Sink
+from without.interfaces import Stream
 from without.tasks import background_task
 
 

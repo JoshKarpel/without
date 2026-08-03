@@ -1,7 +1,7 @@
 # The same three tables again, in one file on one machine, with no server and no
 # third-party driver. It is the smallest thing that still meets every requirement in
-# `without_durability.seams`, and putting it beside the Redis and Postgres stores is the
-# clearest statement of what the seam is for: a durable workflow does not need a cluster,
+# `without_durability.interfaces`, and putting it beside the Redis and Postgres stores is the
+# clearest statement of what the interface is for: a durable workflow does not need a cluster,
 # a database server, or a dependency.
 #
 # What SQLite settles that the others have to arrange:
@@ -50,16 +50,16 @@ from typing import cast
 
 from without_durability.codec import JSON
 from without_durability.codec import CheckpointCodec
-from without_durability.seams import LEASE
-from without_durability.seams import Delivery
-from without_durability.seams import Fenced
-from without_durability.seams import Pass
-from without_durability.seams import Recorded
-from without_durability.seams import check_duration
+from without_durability.interfaces import LEASE
+from without_durability.interfaces import Delivery
+from without_durability.interfaces import Fenced
+from without_durability.interfaces import Pass
+from without_durability.interfaces import Recorded
+from without_durability.interfaces import check_duration
 from without_durability.stepwise import now_utc
 
 # How often a worker with nothing to do asks again, which is the price of having no
-# blocking read. The *lease* is not restated here: it is `seams.LEASE`, because unlike the
+# blocking read. The *lease* is not restated here: it is `interfaces.LEASE`, because unlike the
 # poll interval it has to agree with something outside this store (the checkpoint claim
 # the worker takes for exactly as long).
 POLL = timedelta(milliseconds=50)
@@ -297,7 +297,7 @@ class SqliteCheckpointer:
     is a broader reach than it sounds: it is the same guarantee DBOS gets from Postgres,
     for an application that never needed Postgres.
 
-    A workflow id carries no contract at all: it is bound as a query parameter, never
+    A workflow id carries no constraints at all: it is bound as a query parameter, never
     parsed as key structure. The only constraint that survives is the one `run_saga`
     states about any store, that an id ending in `:unwind` addresses another workflow's
     rollback.
