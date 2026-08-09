@@ -65,10 +65,10 @@ dev = [
     # stays a system install (`apt install podman`, `brew install podman`, `winget install podman`).
     "podman-compose>=1.6",
     "trustme>=1.1",
-    "hypothesis>=6.161.2",
-    "mutmut>=3",
+    "hypothesis>=6.165.0",
+    "mutmut>=3.7.0",
     "mypy>=2.3.0",
-    "ruff>=0.16.0",
+    "ruff>=0.16.1",
     "types-pyyaml>=6.0.12.20260724",
     "uvloop>=0.22.1 ; sys_platform != 'win32'",  # uvloop has no Windows support; the suite runs asyncio-only there
 ]
