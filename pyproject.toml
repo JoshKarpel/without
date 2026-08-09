@@ -51,7 +51,7 @@ dev = [
     "integration",
     "benchmarks",
     "cogapp>=3.4",
-    "pre-commit>=4.4",
+    "pre-commit>=4.6.1",
     "pytest<10",
     "pytest-cov>=3",
     "pytest-durations>=1.7.0",
@@ -65,11 +65,11 @@ dev = [
     # stays a system install (`apt install podman`, `brew install podman`, `winget install podman`).
     "podman-compose>=1.6",
     "trustme>=1.1",
-    "hypothesis>=6.156.6",
+    "hypothesis>=6.161.2",
     "mutmut>=3",
     "mypy>=2.3.0",
-    "ruff>=0.15.22",
-    "types-pyyaml>=6",
+    "ruff>=0.16.0",
+    "types-pyyaml>=6.0.12.20260724",
     "uvloop>=0.22.1 ; sys_platform != 'win32'",  # uvloop has no Windows support; the suite runs asyncio-only there
 ]
 docs = [
