@@ -1,5 +1,9 @@
 import asyncio
 from collections.abc import AsyncIterator
+from datetime import UTC
+from datetime import datetime
+from datetime import timedelta
+from time import monotonic
 
 import pytest
 from without import Transition
@@ -12,6 +16,7 @@ from without import spool
 from without import stream_from_iterable
 from without import stream_from_queue
 from without import tee
+from without import ticks
 from without.testing import yield_once
 
 
@@ -263,3 +268,62 @@ async def test_sample_rejects_an_empty_stream() -> None:
     with pytest.raises(ValueError, match="at least one value"):
         async with sample(stream_from_iterable([])):
             pass  # pragma: no cover - sample raises on enter, so the body never runs
+
+
+async def test_ticks_fires_at_once_and_then_on_the_interval() -> None:
+    # Firing immediately is what lets periodic work do its first sweep at boot rather
+    # than one interval later, which for a sweep that catches up on missed deadlines is
+    # the difference between starting and stalling.
+    moments = [datetime(2026, 3, 14, 9, 30, tzinfo=UTC) + timedelta(seconds=n) for n in range(3)]
+    handed = iter(moments)
+
+    # The smallest positive interval, so the waiting is not what this measures: the moments
+    # come from the clock it was handed, and only the *first* one proves it yields before
+    # it sleeps at all.
+    beating = ticks(timedelta(microseconds=1), now=lambda: next(handed))
+    taken = [await anext(beating) for _ in moments]
+    await beating.aclose()
+
+    assert taken == moments, "each tick carries its own moment, so a consumer needs no clock"
+
+
+@pytest.mark.parametrize("every", [timedelta(), timedelta(seconds=-1)])
+async def test_ticks_refuses_an_interval_that_is_not_positive(every: timedelta) -> None:
+    # There is no reading of a zero interval worth having: taken literally it is a loop
+    # that yields as fast as its sink can consume, which pins a core to do housekeeping.
+    # A duration read out of configuration whose setting was never set is how one arrives.
+    beating = ticks(every)
+
+    with pytest.raises(ValueError, match="every must be a positive duration"):
+        await anext(beating)
+
+
+async def test_ticks_waits_the_interval_between_events() -> None:
+    # Two intervals for three events, because the first one does not wait. The bound is
+    # deliberately loose: an event loop may fire a timer a fraction early, so asserting
+    # the exact nominal floor measures the platform's timer precision rather than this,
+    # and fails on a margin of microseconds. What is worth proving is that it waits at
+    # all rather than yielding as fast as it is asked.
+    started = monotonic()
+
+    beating = ticks(timedelta(milliseconds=20))
+    for _ in range(3):
+        await anext(beating)
+    await beating.aclose()
+
+    assert monotonic() - started >= 0.03
+
+
+async def test_a_sink_over_ticks_runs_once_per_event() -> None:
+    # The shape the whole thing exists for: periodic work says only *what* happens, and
+    # a stream says when, so the same sink runs off a clock here and off a fixed list of
+    # instants in a test.
+    swept: list[datetime] = []
+
+    async def sweep(moment: datetime) -> None:
+        swept.append(moment)
+
+    moments = [datetime(2026, 3, 14, 9, 30, tzinfo=UTC), datetime(2026, 3, 14, 9, 31, tzinfo=UTC)]
+    await from_sink(sweep)(stream_from_iterable(moments))
+
+    assert swept == moments

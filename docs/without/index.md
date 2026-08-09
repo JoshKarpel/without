@@ -1,11 +1,11 @@
 # without
 
-The narrow waist of the project: the contracts every plugin speaks, plus the
+The narrow waist of the project: the interfaces every plugin speaks, plus the
 stream connectors and a `with`-scoped background task helper. See the
 [Philosophy](../philosophy.md) for why the model is shaped this way, and the
 [`without` API reference](../without/reference.md) for the full surface.
 
-## The substrate (`without.contracts`)
+## The substrate (`without.interfaces`)
 
 Three types carry the whole model:
 

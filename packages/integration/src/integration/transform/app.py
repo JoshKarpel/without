@@ -158,7 +158,7 @@ def refuse_socket(settings: Settings, head: WebsocketScope) -> WebsocketHandler:
 # on its own (logging, headers). When a middleware instead needs a value that spans
 # the whole handling, that value is just a local in a plain processor (see
 # `access_timing`); `wrap`'s separate transformers have no shared scope to hold it.
-# A real service would emit structured records; printing just shows where the seam
+# A real service would emit structured records; printing just shows where the interface
 # is, and that the same shape serves both protocols.
 
 

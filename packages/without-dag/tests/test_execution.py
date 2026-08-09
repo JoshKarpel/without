@@ -284,6 +284,75 @@ async def test_drive_raises_on_a_dangling_dependency() -> None:
         [pair async for pair in drive(Plan.of([orphan]), inputs={}, limit=2)]
 
 
+async def test_drive_skips_a_node_whose_result_is_already_supplied() -> None:
+    # The resumption primitive at the interface: `inputs` names a *node*, not a source,
+    # so the node does not run, is never yielded, and its supplied value is what
+    # its dependents consume.
+    ran: list[str] = []
+
+    async def track(args: tuple[object, ...]) -> object:
+        ran.append("head")
+        return "recomputed"
+
+    async def echo(args: tuple[object, ...]) -> object:
+        return args[0]
+
+    nodes = [
+        Node("head", ("in",), track),
+        Node("tail", ("head",), echo),
+    ]
+
+    collected = {key: value async for key, value in drive(Plan.of(nodes), {"in": None, "head": "restored"}, limit=2)}
+
+    assert collected == {"tail": "restored"}
+    assert ran == []
+
+
+async def test_drive_keeps_filling_past_a_node_whose_result_is_supplied() -> None:
+    # A supplied node must not stall the pass that spawns ready work: its siblings
+    # still start at once, so resuming from a checkpoint never serializes what is
+    # left to do. `supplied` sits *between* the two workers so the scheduler reaches
+    # it mid-pass, with `first` already in flight and `second` not yet spawned.
+    started = asyncio.Semaphore(0)
+    release = asyncio.Event()
+
+    async def work(args: tuple[object, ...]) -> object:
+        started.release()
+        await release.wait()
+        return "worked"
+
+    nodes = [
+        Node("first", ("in",), work),
+        Node("supplied", ("in",), returning("unreached")),
+        Node("second", ("in",), work),
+    ]
+
+    async def collect() -> dict[str, object]:
+        return {key: value async for key, value in drive(Plan.of(nodes), {"in": None, "supplied": "restored"}, None)}
+
+    run = asyncio.create_task(collect())
+    await started.acquire()
+    await started.acquire()  # `second` only starts if the supplied node did not end the pass
+
+    release.set()
+
+    assert await run == {"first": "worked", "second": "worked"}
+
+
+async def test_drive_ends_when_every_node_is_already_supplied() -> None:
+    # The whole graph restored from a checkpoint: nothing runs, so no completion is
+    # ever queued and the run must end on the sorter alone rather than wait for one.
+    nodes = [
+        Node("head", ("in",), returning("head-value")),
+        Node("tail", ("head",), returning("tail-value")),
+    ]
+    supplied = {"in": None, "head": "restored-head", "tail": "restored-tail"}
+
+    collected = [pair async for pair in drive(Plan.of(nodes), supplied, limit=2)]
+
+    assert collected == []
+
+
 async def test_a_plan_is_reused_across_runs_with_different_inputs() -> None:
     async def double(args: tuple[object, ...]) -> object:
         value = args[0]

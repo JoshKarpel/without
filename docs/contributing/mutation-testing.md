@@ -66,6 +66,33 @@ trailing case whose body is a no-op (a bare `continue` at the bottom of a loop) 
 whether present or dropped. Prefer deleting such a case outright, so it falls through to a documented
 comment and mutmut has nothing to drop, rather than leaving it as a survivor to explain here.
 
+### Loop control the loop condition already decides
+
+`continue` and `break` are interchangeable where the loop's own condition is already
+false, which mutmut swaps freely. `without-dag`'s scheduler ends this way, in `drive`:
+
+```python
+while sorter.is_active():
+    while ready and (limit is None or len(running) < limit):
+        ...spawn each ready node...
+    if not running:
+        continue                    # mutant: continue -> break
+    done = await completed.get()
+```
+
+Reaching that guard means the fill loop drained `ready` (it exits on a full `limit`
+otherwise, and then `running` is non-empty), and every node the sorter had passed out
+has been marked done, so `is_active()` is false and `continue` leaves the loop
+immediately. `break` leaves it too. The guard exists for the run where a checkpoint
+supplies a graph's last nodes: without it, nothing is in flight and `completed.get()`
+waits forever.
+
+Note the sibling mutation one loop up, `continue -> break` on the branch that skips an
+already-supplied key, is *not* equivalent: it stops filling early, so a supplied node
+delays its ready siblings by a whole completion round. That one is killed by
+`test_drive_keeps_filling_past_a_node_whose_result_is_supplied`, which pins the
+property that resuming from a checkpoint does not serialize the work that is left.
+
 ### `suppress()` of a subclass alongside its base
 
 `without-http`'s HTTP/2 path guards several defensive operations with:

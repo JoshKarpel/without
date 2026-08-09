@@ -6,15 +6,16 @@ from collections import deque
 from collections.abc import AsyncGenerator
 from collections.abc import Awaitable
 from collections.abc import Callable
-from collections.abc import Hashable
 from collections.abc import Iterable
 from collections.abc import Mapping
 from dataclasses import dataclass
 from graphlib import TopologicalSorter
 
-from without import cancel_futures
-
-type NodeKey = Hashable
+# A *name*, not an identity. Any hashable would do to key a run in memory, but a
+# key that outlives the process is what lets a run's `(key, value)` completions be
+# sunk to a store and handed back as a checkpoint, so the interface is narrowed to the
+# one shape every store can hold. A frontend wanting richer keys encodes them.
+type NodeKey = str
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,10 +23,10 @@ class Node:
     """
     One async step in a graph, named by `key` and wired by `dependencies`.
 
-    The narrow seam a graph-defining frontend lowers onto: a `Node` is a value,
-    not a place. `run` receives its dependencies' results as a tuple in
+    The narrow interface a graph-defining frontend lowers onto: a `Node` is a
+    value, not a place. `run` receives its dependencies' results as a tuple in
     `dependencies` order and returns this node's single result. Results cross
-    this seam as `object` (the executor cannot know each step's type); a typed
+    this interface as `object` (the executor cannot know each step's type); a typed
     frontend restores precision above it, exactly as `without-web`'s `Extractor`
     values are collected with `object` values and re-typed by `into`.
     """
@@ -72,9 +73,18 @@ async def drive(
 
     The streaming core, and the *events* half of the model. Yields completions in
     whatever order nodes finish; the only ordering guarantee is the causal one, a
-    node after the dependencies it consumed. `inputs` pre-supplies the values of
-    source keys, marked done without running and never yielded. `limit` caps how
-    many nodes run concurrently (`None` is unbounded).
+    node after the dependencies it consumed. `limit` caps how many nodes run
+    concurrently (`None` is unbounded).
+
+    `inputs` pre-supplies values by key: a key found there is marked done without
+    running and is never yielded, and its value is fed to its dependents as if it
+    had just been computed. A source key the graph is opened over and a node whose
+    result was captured by an earlier run are the same thing to the scheduler,
+    which is what makes a run resumable from a checkpoint of the `(key, value)`
+    pairs a previous one yielded. Only a node's own key is consulted, so a node
+    absent from `inputs` runs even when a dependent of it is already supplied; a
+    checkpoint captured from a run is closed under ancestry anyway, since a node
+    completes only after its dependencies did.
 
     Scheduling drains completions off an `asyncio.Queue` that each spawned future
     feeds via a done-callback attached once at spawn, rather than
@@ -98,11 +108,31 @@ async def drive(
     running: dict[asyncio.Future[object], NodeKey] = {}
     completed: asyncio.Queue[asyncio.Future[object]] = asyncio.Queue()
     ready: deque[NodeKey] = deque(sorter.get_ready())
+
+    def release_dependencies(key: NodeKey) -> None:
+        """Drop the result of every dependency `key` was the last consumer of."""
+        # A supplied *input* names no node, so it has no dependencies to release; the
+        # lookup rather than an index is what lets both branches call this.
+        consumed = plan.by_key.get(key)
+        if consumed is None:
+            return
+        for dependency in consumed.dependencies:
+            consumers[dependency] -= 1
+            if consumers[dependency] == 0:
+                del results[dependency]
+
     try:
         while sorter.is_active():
             while ready and (limit is None or len(running) < limit):
                 key = ready.popleft()
                 if key in results:
+                    # A supplied node still *consumes* its dependencies, in the only
+                    # sense that matters here: it is the last thing that will ever want
+                    # them. Dropping their counts keeps a resumed run's memory bounded by
+                    # what is left to do, rather than pinning every ancestor of a
+                    # checkpointed node for the whole run because nothing claimed to have
+                    # read it.
+                    release_dependencies(key)
                     sorter.done(key)
                     ready.extend(sorter.get_ready())
                     continue
@@ -110,13 +140,21 @@ async def drive(
                     raise KeyError(f"{key!r} is neither a supplied input nor a defined node")
                 node = plan.by_key[key]
                 args = tuple(results[dependency] for dependency in node.dependencies)
-                for dependency in node.dependencies:
-                    consumers[dependency] -= 1
-                    if consumers[dependency] == 0:
-                        del results[dependency]
+                release_dependencies(key)
                 future = asyncio.ensure_future(node.run(args))
                 running[future] = key
                 future.add_done_callback(completed.put_nowait)
+            if not running:
+                # Everything the sorter had ready was already supplied, so nothing is in
+                # flight and no completion is coming: awaiting one would hang the run
+                # forever. Nothing is left to do either, which is what a checkpoint
+                # covering a graph's last nodes reaches: an empty pool means the loop
+                # above drained `ready` (a free slot always takes the next key), and
+                # every key it drained was either marked done or spawned, so the sorter
+                # has nothing outstanding and nothing further to release. Ending here
+                # rather than re-testing `is_active` says that in the control flow, and
+                # cannot spin if the invariant is ever broken.
+                break
             done = await completed.get()
             key = running.pop(done)
             value = done.result()
@@ -125,7 +163,29 @@ async def drive(
             ready.extend(sorter.get_ready())
             yield key, value
     finally:
-        await cancel_futures(running)
+        # Tearing the run down must not change what it is reporting, and this is the only
+        # place that can guarantee it. A node in `running` may have *already failed* (a
+        # sibling that raised while the consumer was away between two yields) or may fail
+        # *as it is cancelled* (a node whose own cleanup raises), and either one re-raises
+        # from this `finally` and replaces whatever brought the run down: a caller that
+        # closed this generator on a lost claim is handed a node's error instead, and the
+        # nodes behind it are never awaited at all, so their effects run on past the call
+        # that told the caller to stop.
+        #
+        # So this waits rather than awaits. `asyncio.wait` reports that the tasks are
+        # finished without raising what they finished with, which leaves the exception the
+        # caller came here with intact, and leaves *this* task's own cancellation the only
+        # thing that can interrupt the teardown.
+        for unfinished in running:
+            unfinished.cancel()
+        if running:
+            await asyncio.wait(running)
+        for finished in running:
+            if not finished.cancelled():
+                # Retrieved and dropped: there is nobody left to report a node's failure
+                # to, and an unretrieved one is logged by the loop at some later moment as
+                # an error nothing can act on.
+                finished.exception()
 
 
 async def evaluate(plan: Plan, target: NodeKey, inputs: Mapping[NodeKey, object], limit: int | None) -> object:

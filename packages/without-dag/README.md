@@ -19,9 +19,9 @@ async def parse(fetched: Fetched) -> Parsed: ...
 async def render(fetched: Fetched, parsed: Parsed) -> Report: ...
 
 graph, (request,) = Graph.of(Request)
-fetched = graph.node(fetch, request)
-parsed = graph.node(parse, fetched)
-report = graph.node(render, fetched, parsed)
+fetched = graph.node("fetched", fetch, request)
+parsed = graph.node("parsed", parse, fetched)
+report = graph.node("report", render, fetched, parsed)
 run = graph.build(output=report, limit=4)
 
 result: Report = await run(some_request)
@@ -32,8 +32,18 @@ time with no glitch), acyclicity is proven at the boundary via stdlib
 `graphlib`, and a single-input graph is an async `(In) -> Out` callable, exactly
 what `from_map` lifts into a `Processor`.
 
+A node's key is a name you choose, so it means the same thing after a crash:
+`run.stream(...)` yields each `(key, result)` as it lands, and handing that mapping
+back as `run(..., checkpoint=...)` skips every step it names. Sink the pairs to a
+Redis hash or a table row under a workflow's idempotency key and the graph is a
+resumable durable workflow, with no engine underneath it. Resumable is a claim
+about one runner over time: running the same workflow from two processes at once
+needs the store to say who may write, which is a guarantee the store owns rather
+than the graph.
+
 See the
 [`without-dag` guide](https://without.help/without-dag/)
 (with the [API reference](https://without.help/reference/without_dag/))
-for the full surface: the object-seam execution core (`Plan`, `drive`,
-`evaluate`), the typed frontend, and lifting into a processor.
+for the full surface: the object-interface execution core (`Plan`, `drive`,
+`evaluate`), the typed frontend, resuming from a checkpoint, and lifting into a
+processor.

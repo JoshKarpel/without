@@ -73,7 +73,7 @@ def ws_events_from_outbound(outbound: WebsocketOutbound, *, accepted: bool) -> l
 
     `accepted` distinguishes the two meanings of a `WebsocketClose`: before the
     handshake is accepted it is a *rejection* (an HTTP response, here a `403`);
-    after, it is a normal close frame. This mirrors the ASGI contract that a close
+    after, it is a normal close frame. This mirrors the ASGI interface that a close
     sent before `websocket.accept` becomes an HTTP denial.
     """
     match outbound:

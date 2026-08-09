@@ -39,7 +39,7 @@ class Level(IntEnum):
 # that is deliberately dropped: it is gated by module flags (`logThreads`,
 # `logProcesses`, `logAsyncioTasks`) and a swappable factory, so it may be `None` or
 # absent, and it exists for stdlib's formatter `%(...)s` placeholders rather than as
-# a stable per-event contract. A caller who wants some of it lifts it into `fields`
+# a stable per-event guarantee. A caller who wants some of it lifts it into `fields`
 # with a custom `parse=` on `capture`.
 RESERVED: frozenset[str] = frozenset(
     {

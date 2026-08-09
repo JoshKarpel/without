@@ -15,8 +15,44 @@ watch *CMD:
 
 alias w := watch
 
+# The services in compose.yaml back the tests that drive a real dependency instead of
+# a fake, and starting them is the harness's job rather than a fixture's: up once here,
+# and down again from an EXIT trap, so a failed run, a Ctrl-C, or a crashed pytest
+# cannot leave a container behind. That also keeps pytest's own machinery out of it:
+# no session fixture to coordinate across xdist workers, and the image pull happens
+# before the first test rather than inside its timeout.
+#
+# podman, because it is rootless and daemonless: nothing to install as a service and
+# nothing running between test runs. `podman compose` is only a wrapper around an
+# external implementation, so podman-compose is called directly, pinned in the dev
+# group like every other tool. A machine without podman still runs everything else:
+# the tests that need a service skip themselves when the address is unset, which is
+# also how the macOS and Windows CI legs run (GitHub's runners ship no container
+# runtime that can run a Linux image).
 [doc('Run type checking and tests')]
 test *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    compose=(uv run podman-compose --file compose.yaml --project-name without-tests)
+    if command -v podman > /dev/null; then
+      trap '"${compose[@]}" down --volumes > /dev/null 2>&1' EXIT
+      # --wait holds until each service is *healthy* (see the healthchecks in
+      # compose.yaml), so the first test cannot race a server that is still starting.
+      # The output (image pulls, container ids, the wait's own bookkeeping) is worth
+      # seeing only when it fails, so it is held back until it does.
+      if ! output="$("${compose[@]}" up --detach --wait 2>&1)"; then
+        echo "$output" >&2
+        exit 1
+      fi
+      export WITHOUT_TESTS_REDIS="$("${compose[@]}" port redis 6379 2> /dev/null)"
+      export WITHOUT_TESTS_POSTGRES="$("${compose[@]}" port postgres 5432 2> /dev/null)"
+      # The services are up, so the code only their tests reach is measurable. Coverage
+      # substitutes this into its omit globs, where any non-empty value makes them match
+      # nothing; the value says so out loud (see the note in pyproject.toml).
+      export WITHOUT_COMPOSE_AVAILABLE=prefix-that-will-not-match
+    else
+      echo "podman is not installed, so the tests that need the services in compose.yaml will skip"
+    fi
     uv run mypy
     uv run pytest --failed-first --cov {{ args }}
 

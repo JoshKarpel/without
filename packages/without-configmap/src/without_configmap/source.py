@@ -11,13 +11,13 @@ from collections.abc import Callable
 from pathlib import Path
 
 from watchfiles import awatch
-from without.contracts import Stream
+from without.interfaces import Stream
 
 type Changes = Callable[[Path], AsyncIterator[object]]
 
 
 async def _awatch_changes(mount: Path) -> AsyncIterator[object]:
-    async for batch in awatch(mount):  # pragma: no cover - default I/O adapter; tests drive the `changes` seam
+    async for batch in awatch(mount):  # pragma: no cover - default I/O adapter; tests drive `changes` directly
         yield batch
 
 

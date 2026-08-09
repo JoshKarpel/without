@@ -9,11 +9,12 @@ a processor's step) so the parts stay reusable.
 The bet: Python has many frameworks with similar-but-subtly-different shapes
 (ASGI apps, Kafka consumers, asyncio protocols, config reloaders) that do not
 interoperate because none of them names the shared lower layer. `without` names
-that layer as a narrow contract, so the pieces compose. It is meant to feel like
+that layer as a narrow interface, so the pieces compose. It is meant to feel like
 a library (your control flow stays visible) rather than a framework.
 
-See [`PHILOSOPHY.md`](PHILOSOPHY.md) for the design rationale: the narrow-waist
-bet, functional-core/imperative-shell, and values-over-places. The full
+See [`PHILOSOPHY.md`](PHILOSOPHY.md) for the design rationale: the stateful
+stream processor as a universal way to model computation, and an ecosystem of
+thin layers you can descend, remix, and replace. The full
 documentation, narrative guides, an API reference recovered from the source
 docstrings, and the derived package dependency graph, lives at
 <https://without.help/>.
@@ -23,8 +24,8 @@ docstrings, and the derived package dependency graph, lives at
 This is a `uv` workspace of flat, version-locked packages (no namespace
 packages). Each package is its own top-level import.
 
-- `packages/without` — the core: the contracts every plugin speaks
-  (`without.contracts`), the stream edge connectors (`without.wiring`), and a
+- `packages/without` — the core: the interfaces every plugin speaks
+  (`without.interfaces`), the stream edge connectors (`without.wiring`), and a
   `with`-scoped background task helper (`without.tasks`). Distributed on PyPI as
   `without-core` (the bare `without` name is unavailable there); imported as
   `without`.
@@ -48,6 +49,14 @@ packages). Each package is its own top-level import.
   workflows: a `Graph` builder threads value types through the wiring, and a
   single-input graph is an async callable that `from_map` lifts straight into a
   `Processor`. Imported as `without_dag`.
+- `packages/without-durability` — durable workflows over `without-dag`: a
+  checkpoint any process can read, plus the store interfaces (`Checkpointer`,
+  `Scheduler`, `Durable`) that make "one writer at a time" enforceable rather than
+  hoped for. Imported as `without_durability`.
+- `packages/without-durability-redis`, `packages/without-durability-postgres`,
+  `packages/without-durability-sqlite` — one store each, so the core pulls no
+  driver. Redis reaches every guarantee with small Lua scripts, the SQL stores with
+  ordinary transactions, and SQLite needs no server at all.
 - `packages/without-logging` — a logging pipeline: stdlib log records parsed into
   immutable `Record` values at a `capture` boundary, filtered and enriched as
   processors, drained to a sink the app owns. Imported as `without_logging`.
@@ -67,7 +76,7 @@ Planned plugins, in the order they should be attempted:
    proves the context-updated-by-a-stream loop. **(done)**
 3. a toy line-protocol server (Redis-ish); proves long-lived processor state.
    **(done: `integration.kv`)**
-4. HTTP (sans-IO deps); the real test of the contract. **(done: `without-asgi`
+4. HTTP (sans-IO deps); the real test of the interface. **(done: `without-asgi`
    adapters, the `without-web` router, and `without-http` (an `h11`/`h2`/`wsproto`
    ASGI server plus client, serving HTTP/1.1, HTTP/2, and WebSockets). HTTP/3 and
    WebSockets-over-HTTP/2 are documented fast-follows.)**
@@ -76,7 +85,11 @@ Planned plugins, in the order they should be attempted:
 
 ```bash
 uv sync
-just test        # mypy + pytest
+just test        # start the services in compose.yaml, then mypy + pytest
 just durations   # profile the suite (slowest fixtures, setup, calls, teardown)
 just docs        # serve the documentation site with live reload
 ```
+
+A few tests drive a real backing service rather than a fake. `just test` starts the
+services in [`compose.yaml`](compose.yaml) with [podman](https://podman.io) and stops
+them again when it exits; install podman to run them, or let them skip.

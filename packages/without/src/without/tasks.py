@@ -50,7 +50,11 @@ async def cancel_futures[T](futures: Iterable[asyncio.Future[T] | None]) -> None
     task (`task: asyncio.Task | None`) can pass it without a guard. The futures are
     materialized first, so a caller may pass a live set the awaits will mutate. Each
     future's own `CancelledError` is suppressed; any other exception it raises during
-    teardown propagates.
+    teardown propagates, which also ends the loop, so the futures behind it in the set
+    are cancelled but never awaited. That is the right order for a set of *pending*
+    futures, where nothing has an exception to raise; pass one that may already hold a
+    failure and the ones behind it lose their teardown to it. Filter to what is still
+    running when the set can contain both.
     """
     present = [future for future in futures if future is not None]
     for future in present:

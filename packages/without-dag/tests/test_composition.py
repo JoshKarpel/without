@@ -12,7 +12,7 @@ async def test_a_compiled_graph_lifts_into_a_processor_run_once_per_event() -> N
     async def square(value: int) -> int:
         return value * value
 
-    squared = graph.node(square, number)
+    squared = graph.node("squared", square, number)
     run = graph.build(output=squared, limit=2)
 
     processor = from_map(run)

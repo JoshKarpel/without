@@ -37,7 +37,7 @@ __all__ = [
 # and how dispatch falls back are opinionated app choices, so without-asgi leaves
 # the router to the app and ships only the unopinionated pieces: a `Middleware`
 # vocabulary that composes, and `buffered` for the common request/response shape.
-# The `make_asgi_app` seam still asks for nothing but an `HttpRouter[T]` function;
+# The `make_asgi_app` interface still asks for nothing but an `HttpRouter[T]` function;
 # these just make one easy to assemble.
 
 # `Middleware` wraps a connection handler given the lifespan state and the parsed

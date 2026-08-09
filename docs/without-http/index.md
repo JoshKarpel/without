@@ -75,7 +75,7 @@ What the server handles:
 - **WebSockets** over the HTTP/1.1 `Upgrade`: the handshake is handed to `wsproto`,
   and the connection runs full-duplex (a reader pump feeds inbound frames to the
   app's `receive` while `send` writes outbound frames). A `websocket.close` sent
-  before `websocket.accept` becomes an HTTP `403`, per the ASGI contract.
+  before `websocket.accept` becomes an HTTP `403`, per the ASGI interface.
 - **Isolation.** A crashing request handler is contained: it becomes a `500` (when
   no response has started yet) without taking the connection or server down.
 - **Connections.** Served via `asyncio.start_server`, which owns the accept loop
@@ -170,7 +170,7 @@ read still releases its connection rather than stranding it.
 A response can carry trailing headers after its body (gRPC's `grpc-status` is the
 common case). The default path drops them: `async for chunk in body` and
 `await body.read()` yield only `bytes`. When you know (out of band, by the
-endpoint's contract) that trailers matter, opt in:
+endpoint's interface) that trailers matter, opt in:
 
 ```python
 data, trailers = await body.read_with_trailers()   # trailers: tuple[ResponseTrailers, ...]
@@ -250,7 +250,7 @@ async with pool.request("POST", url, body=request_body()) as (head, body):
 ```
 
 The framework provides the *mechanism* (a concurrent duplex transport); you own the
-*policy* (the interleaving protocol, and the knowledge of the server's contract that
+*policy* (the interleaving protocol, and the knowledge of the server's interface that
 keeps it from deadlocking). It deliberately does not buffer or force the body to
 finish first, since that would defeat the pattern. A `write`/`read` timeout (below) is
 the opt-in safety net that turns a mis-designed interleaving from an eternal hang into

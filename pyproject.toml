@@ -1,7 +1,7 @@
 [project]
 name = "without-workspace"
 version = "0.0.0"
-description = "Workspace root for without: a sans-IO narrow-waist contract for composing stateful stream processors, so independently-written pieces snap together."
+description = "Workspace root for without: a sans-IO narrow-waist interface for composing stateful stream processors, so independently-written pieces snap together."
 readme = "README.md"
 license = "MIT"
 authors = [
@@ -16,6 +16,10 @@ dependencies = [
     "without-http",
     "without-web",
     "without-dag",
+    "without-durability",
+    "without-durability-redis",
+    "without-durability-postgres",
+    "without-durability-sqlite",
     "without-logging",
 ]
 
@@ -34,6 +38,10 @@ without-asgi = { workspace = true }
 without-http = { workspace = true }
 without-web = { workspace = true }
 without-dag = { workspace = true }
+without-durability = { workspace = true }
+without-durability-redis = { workspace = true }
+without-durability-postgres = { workspace = true }
+without-durability-sqlite = { workspace = true }
 without-logging = { workspace = true }
 integration = { workspace = true }
 benchmarks = { workspace = true }
@@ -52,6 +60,10 @@ dev = [
     "pytest-mock>=3",
     "pytest-randomly>=3",
     "pytest-timeout>=2.3",
+    # Runs the services in compose.yaml around the suite (see the `test` recipe). It is a Python
+    # package, so the toolchain that pins everything else pins it too; podman itself is not, so it
+    # stays a system install (`apt install podman`, `brew install podman`, `winget install podman`).
+    "podman-compose>=1.6",
     "trustme>=1.1",
     "hypothesis>=6.161.2",
     "mutmut>=3",
@@ -83,11 +95,23 @@ testpaths = ["packages/**/tests"]
 # A global per-test timeout so a deadlocked async test (e.g. a server that never
 # replies) fails loudly instead of hanging the suite. `thread` works without
 # signals, so it is xdist-safe.
-timeout = 30
+#
+# The bound is deliberately tight. A deadlock is the *expected* way to fail here, so
+# the budget is what waiting on one costs, and a mutation run stalls the scheduler on
+# purpose over and over: the without-dag run spent longer waiting out a 30-second
+# budget than running every other mutant. Five seconds is roughly five times the
+# slowest test in the suite (`just durations` reports it: one that waits a deliberate
+# one-second `wait_for` to prove a socket buffer fills) and sixteen times the next.
+# Raise it per-test with `@pytest.mark.timeout(...)` rather than globally.
+timeout = 5
 timeout_method = "thread"
 
 markers = [
     "slow",
+    # For a test that drives one of the services in compose.yaml. `just test` starts them and
+    # passes each address through the environment; a marked test skips when its service is
+    # unset, and `-m "not compose"` deselects them all up front.
+    "compose: drives a real service from compose.yaml, started by the `test` recipe",
     # Excluded from mutation runs (`just mutate` filters `-m "not no_mutation"`). For a test that
     # passes in the real suite but fails only under mutmut's function trampoline, whose wrapping of
     # async generators perturbs `aclose()`/`finally` finalization timing. Use sparingly.
@@ -127,6 +151,23 @@ omit = [
     "*/benchmarks/harness.py",
     "*/benchmarks/plot.py",
     "*/benchmarks/hotspots.py",
+    # The store-backed half of the durable-workflow toy and the tests that drive it,
+    # omitted only when the run *cannot* cover them. Coverage substitutes `${VAR-default}` from
+    # the environment as it reads this file, and the `test` recipe sets
+    # WITHOUT_COMPOSE_AVAILABLE once the services in compose.yaml are up: unset, each
+    # entry is the bare glob and matches; set, its value prefixes the glob into a
+    # pattern that matches nothing, so both files are measured like any other. A run
+    # where the compose-marked tests skip (no podman, as on the macOS and Windows CI
+    # legs) then leaves the gate reporting the suite rather than the environment.
+    "${WITHOUT_COMPOSE_AVAILABLE-}*/without_durability_redis/*.py",
+    "${WITHOUT_COMPOSE_AVAILABLE-}*/without_durability_postgres/*.py",
+    "${WITHOUT_COMPOSE_AVAILABLE-}*/tests/test_redis_store.py",
+    "${WITHOUT_COMPOSE_AVAILABLE-}*/tests/test_postgres_store.py",
+    # The cross-store suite and the doubles it shares, reached only when the servers are
+    # up: it is parametrized over every store at once, so one unavailable skips them all.
+    "${WITHOUT_COMPOSE_AVAILABLE-}*/tests/durable/test_workflows_over_stores.py",
+    "${WITHOUT_COMPOSE_AVAILABLE-}*/tests/durable/stores.py",
+    "${WITHOUT_COMPOSE_AVAILABLE-}*/tests/durable/gateways.py",
 ]
 
 [tool.coverage.report]

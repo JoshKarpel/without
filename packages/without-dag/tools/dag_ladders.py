@@ -58,11 +58,14 @@ def _of_ladder() -> str:
 
 
 def _node_ladder() -> str:
-    """`node`: a step function plus one `Handle` per dependency (arity 0-10)."""
+    """`node`: a step function plus one `Handle` per dependency, and the node's key (arity 0-10)."""
     blocks = []
     for arity in range(11):
         letters = list(LETTERS[:arity])
-        params = ["self,", f"fn: Callable[[{', '.join(letters)}], Awaitable[T]],"]
+        # The key leads, ahead of the function: a node is named first and defined
+        # second, and putting it there keeps it out of the run of dependency
+        # handles, where one more trailing argument would read as another handle.
+        params = ["self,", "key: NodeKey,", f"fn: Callable[[{', '.join(letters)}], Awaitable[T]],"]
         params.extend(f"{letter.lower()}: Handle[{letter}]," for letter in letters)
         params.append("/,")
         blocks.append(_overload("node", ["T", *letters], params, "Handle[T]"))

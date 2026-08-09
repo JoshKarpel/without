@@ -1,15 +1,15 @@
-from without.contracts import Context
-from without.contracts import Fold
-from without.contracts import Processor
-from without.contracts import Sink
-from without.contracts import Stream
-from without.contracts import Transition
-from without.contracts import from_filter
-from without.contracts import from_fold
-from without.contracts import from_map
-from without.contracts import from_scan
-from without.contracts import from_selector
-from without.contracts import from_sink
+from without.interfaces import Context
+from without.interfaces import Fold
+from without.interfaces import Processor
+from without.interfaces import Sink
+from without.interfaces import Stream
+from without.interfaces import Transition
+from without.interfaces import from_filter
+from without.interfaces import from_fold
+from without.interfaces import from_map
+from without.interfaces import from_scan
+from without.interfaces import from_selector
+from without.interfaces import from_sink
 from without.tasks import as_async_iterator
 from without.tasks import background_task
 from without.tasks import cancel_futures
@@ -26,6 +26,7 @@ from without.wiring import stack
 from without.wiring import stream_from_iterable
 from without.wiring import stream_from_queue
 from without.wiring import tee
+from without.wiring import ticks
 
 __all__ = [
     "Context",
@@ -55,5 +56,6 @@ __all__ = [
     "stream_from_iterable",
     "stream_from_queue",
     "tee",
+    "ticks",
     "timeout",
 ]

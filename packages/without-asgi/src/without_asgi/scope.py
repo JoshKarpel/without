@@ -336,7 +336,7 @@ def encode_http_scope(scope: HttpScope) -> RawScope:
 
     The server-direction dual of `parse_http_scope`: a transport that owns the
     wire (without-http) builds the typed scope from the request line and renders
-    it back to the dict the ASGI contract hands an app.
+    it back to the dict the ASGI interface hands an app.
     """
     return {
         "type": "http",
