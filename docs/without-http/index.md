@@ -114,7 +114,7 @@ type Client = Callable[[ClientRequest], Awaitable[ClientResponse]]
 
 That is the whole interface. A `ConnectionPool` is one (calling it answers the request
 over the network), middleware maps one to another, and the in-memory clients in
-[Testing](#testing) are more of them. `request` is the surface you drive any of them
+[Testing](testing.md) are more of them. `request` is the surface you drive any of them
 through: it builds the `ClientRequest`, runs it, and closes the response body on the way
 out.
 
@@ -473,95 +473,11 @@ requests share cookies exactly when they share a jar. See [Cookies](cookies.md) 
 jar's matching rules, the origin guards it enforces on untrusted `Set-Cookie` responses,
 and its expiry model.
 
-## Testing
+### In-memory clients
 
-`without_http.testing` holds three more clients. They are ordinary `Client`s, so the
-test above them is the same code as the one that runs against the network, and the
-choice is only how much of the stack it exercises:
-
-```text
-   async with request(client, "GET", "http://testserver/items") as (head, body): ...
-   ─────────────────────────────────────────────────────────────────────────────────
-        │                       every one of these IS a Client
-        ├──────────────┬────────────────────────┬────────────────────────┐
-        ▼              ▼                        ▼                        ▼
-    mock_client     asgi_client            loopback_client         ConnectionPool
-    (no app)        (no wire)              (no socket)             (production)
-```
-
-None of the first three binds a socket or opens a port. URLs stay absolute at every
-altitude, so swapping the client is the only edit between an in-memory test and one
-against a live server; `base_url("http://testserver")` composes on if you would rather
-write `"/items"`.
-
-### `mock_client`: answer without an app
-
-To test code that *sends* requests, hand it a client that answers from a function:
-
-```python
-from without_http.testing import mock_client, respond
-
-
-def answer(request: ClientRequest) -> ClientResponse:
-    if request.url == "https://api.test/items":
-        return respond(200, body=b"[]")
-    raise AssertionError(f"unexpected request to {request.url}")
-
-
-report = await summarize(mock_client(answer))
-```
-
-There is no mechanism here beyond the interface: a client is a function from a request
-to a response, so a mock *is* one. `respond` builds the canned `ClientResponse`; call it
-inside the handler, since a response body is a stream consumed exactly once.
-
-### `asgi_client`: drive an app with no wire
-
-```python
-from without_http.testing import asgi_client
-
-async with asgi_client(app) as client:
-    async with request(client, "GET", "http://testserver/items") as (head, body):
-        assert head.status == 200
-```
-
-Each request builds an `HttpScope` from the `ClientRequest` and calls
-`app(scope, receive, send)` on a task, with the response head returned the instant the
-app sends `http.response.start` and body chunks crossing a one-slot queue. Two
-consequences worth knowing: the response *streams* (so a handler that reads the request
-body while writing its response is testable, which a buffering transport cannot show),
-and the app's lifespan runs for the block through the same `run_lifespan` a real server
-uses, so startup state is in place before the first request.
-
-An exception from the app surfaces to the caller rather than becoming a `500`. There is
-no server here to convert it, and swallowing it would hide the failure.
-
-### `loopback_client`: the real wire, no socket
-
-```python
-from without_http.testing import loopback_client
-
-async with loopback_client(app) as client:  # or loopback_client(app, http2=True)
-    async with request(client, "GET", "http://testserver/items") as (head, body):
-        assert head.status == 500  # the server's own isolation, exercised
-```
-
-This is `serving` minus `asyncio.start_server`: a `ConnectionPool` encodes the request,
-the server decodes and drives the app, and the bytes cross a `pipe` (two cross-wired
-`StreamReader`s, with backpressure) instead of the kernel. So it covers what
-`asgi_client` skips: framing and chunking, keep-alive and connection reuse, HTTP/2 by
-prior knowledge, and the server turning a crashing handler into a `500`.
-
-What it cannot reproduce is what only a kernel provides: TLS (an `https` URL is a loud
-failure rather than a silent downgrade) and the difference between an orderly `FIN` and
-an abortive `RST`. Tests that turn on those belong on `serving` and a real socket.
-
-### Interoperating
-
-All of this speaks plain ASGI and plain request/response values, so it crosses the
-ecosystem boundary in both directions: `asgi_client` and `loopback_client` drive a
-FastAPI or Starlette app as readily as a `without` one, and a `without` app is driven
-unchanged by `httpx.ASGITransport` or starlette's `TestClient`. The one thing to carry
-over from those tools is what they leave out: `httpx.ASGITransport` never runs the
-lifespan protocol, so an app whose state is built at startup needs `run_lifespan` around
-it, which is what `asgi_client` does for you.
+`without_http.testing` holds three more clients: `mock_client` answers from a function,
+`asgi_client` drives an ASGI app with no wire under it, and `loopback_client` runs the
+real wire protocols over no socket at all. They are ordinary `Client`s, so a test above
+them is the same code that runs against the network, and swapping one in is the only
+edit. See [Testing](testing.md) for how much of the stack each one covers, what none of
+them can reproduce, and how they interoperate with `httpx` and starlette's `TestClient`.

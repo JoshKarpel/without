@@ -477,6 +477,7 @@ async def loopback_client(
             yield pool
         finally:
             # Close the pooled connections first, so each server task sees the EOF and
-            # ends on its own; whatever is still in flight after that is cancelled.
+            # ends on its own; whatever is still in flight after that is cancelled, which
+            # is what `serving` does at shutdown too.
             await pool.aclose()
             await cancel_futures(connections)

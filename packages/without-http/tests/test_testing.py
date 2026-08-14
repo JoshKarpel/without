@@ -62,6 +62,12 @@ async def test_mock_client_sees_the_body_the_caller_sent() -> None:
     assert seen == [b"payload"]
 
 
+async def test_respond_defaults_to_an_empty_body() -> None:
+    async with request(mock_client(lambda _outgoing: respond(204)), "GET", "https://api.test/x") as (head, body):
+        assert head.status == 204
+        assert await body.read() == b""
+
+
 async def test_respond_carries_trailers_to_a_reader_that_asks_for_them() -> None:
     client = mock_client(lambda _outgoing: respond(200, body=b"data", trailers=((b"grpc-status", b"0"),)))
 
@@ -99,7 +105,7 @@ async def test_base_url_resolves_a_relative_url_and_leaves_an_absolute_one() -> 
 
 async def test_asgi_client_drives_an_app_with_no_socket(monkeypatch: pytest.MonkeyPatch) -> None:
     async def refuse(*args: object, **kwargs: object) -> None:
-        raise AssertionError("the in-memory client must not open a connection")
+        raise AssertionError("the in-memory client must not open a connection")  # pragma: no cover
 
     monkeypatch.setattr(asyncio, "open_connection", refuse)
     async with asgi_client(echo_app) as client:
@@ -157,10 +163,6 @@ async def test_asgi_client_streams_the_response_while_the_request_body_is_still_
             assert [chunk async for chunk in chunks] == []
 
 
-async def stateful_app_factory() -> tuple[object, ...]:  # pragma: no cover - unused placeholder
-    raise NotImplementedError
-
-
 async def test_asgi_client_runs_the_lifespan_around_the_block() -> None:
     events: list[str] = []
 
@@ -183,6 +185,76 @@ async def test_asgi_client_runs_the_lifespan_around_the_block() -> None:
             assert await body.read() == b"startup"
 
     assert events == ["startup", "shutdown"]
+
+
+async def test_an_app_that_reads_past_its_request_body_sees_a_disconnect() -> None:
+    seen: list[str] = []
+
+    async def nosy(scope: RawScope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "lifespan":
+            raise RuntimeError("this app has no lifespan")
+        while True:
+            message = await receive()
+            seen.append(str(message["type"]))
+            if message["type"] == "http.disconnect":
+                break
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async with asgi_client(nosy) as client:
+        async with request(client, "POST", "http://testserver/", body=b"payload") as (head, _body):
+            assert head.status == 200
+
+    assert seen == ["http.request", "http.request", "http.disconnect"]
+
+
+async def test_an_app_can_send_trailers_and_an_early_hint() -> None:
+    async def hinting(scope: RawScope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "lifespan":
+            raise RuntimeError("this app has no lifespan")
+        # A client discards a 103 the way the h11 one does, so it must not disturb the
+        # response that follows it.
+        await send({"type": "http.response.early_hint", "links": [b"</style.css>; rel=preload"]})
+        await send({"type": "http.response.start", "status": 200, "headers": [], "trailers": True})
+        await send({"type": "http.response.body", "body": b"body", "more_body": True})
+        await send({"type": "http.response.trailers", "headers": [(b"grpc-status", b"0")], "more_trailers": False})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    async with asgi_client(hinting) as client:
+        async with request(client, "GET", "http://testserver/") as (head, body):
+            assert head.status == 200
+            data, trailers = await body.read_with_trailers()
+
+    assert data == b"body"
+    assert [block.headers for block in trailers] == [((b"grpc-status", b"0"),)]
+
+
+async def test_an_app_that_sends_an_extension_event_this_transport_never_offered_fails() -> None:
+    async def pushing(scope: RawScope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "lifespan":
+            raise RuntimeError("this app has no lifespan")
+        await send({"type": "http.response.push", "path": "/style.css", "headers": []})
+
+    async with asgi_client(pushing) as client:
+        with pytest.raises(NotImplementedError, match="ServerPush"):
+            async with request(client, "GET", "http://testserver/") as _response:
+                pass  # pragma: no cover
+
+
+async def test_an_app_that_stops_mid_body_without_failing_is_a_loud_failure() -> None:
+    async def truncating(scope: RawScope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "lifespan":
+            raise RuntimeError("this app has no lifespan")
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"half", "more_body": True})
+
+    async def read_it(client: Client) -> bytes:
+        async with request(client, "GET", "http://testserver/") as (_head, body):
+            return await body.read()
+
+    async with asgi_client(truncating) as client:
+        with pytest.raises(RuntimeError, match="ended before finishing its response body"):
+            await read_it(client)
 
 
 async def test_an_app_that_crashes_before_responding_surfaces_to_the_caller() -> None:
@@ -251,7 +323,7 @@ async def test_loopback_client_round_trips_over_the_real_wire_without_a_socket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def refuse(*args: object, **kwargs: object) -> None:
-        raise AssertionError("the loopback client must not open a connection")
+        raise AssertionError("the loopback client must not open a connection")  # pragma: no cover
 
     monkeypatch.setattr(asyncio, "open_connection", refuse)
     async with loopback_client(echo_app) as client:
@@ -269,7 +341,7 @@ async def test_the_no_socket_probe_can_fail() -> None:
     with pytest.MonkeyPatch.context() as patched:
         patched.setattr(asyncio, "open_connection", refuse)
         async with ConnectionPool() as pool:
-            with pytest.raises(AssertionError, match="must not open a connection"):
+            with pytest.raises(AssertionError, match="must not open a connection"):  # pragma: no branch
                 async with request(pool, "GET", "http://127.0.0.1:9/items") as _response:
                     pass  # pragma: no cover
 

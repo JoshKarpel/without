@@ -20,8 +20,10 @@ a directory under [`docs/`](docs) (`docs/<package>/`) holding all of its docs:
 the guide is that directory's `index.md`, its API reference is the generated
 `reference.md` beside it, and any deep-dive sub-pages live alongside. So: the
 core (`without/index.md`), the ASGI boundary (`without-asgi/index.md`), the HTTP
-server and client (`without-http/index.md`, with cookie handling split out into
-`without-http/cookies.md`), the opinionated router (`without-web/index.md`), the
+server and client (`without-http/index.md`, with cookie handling, connection-close
+security, and the in-memory test clients split into `without-http/cookies.md`,
+`without-http/security.md`, and `without-http/testing.md`), the opinionated router
+(`without-web/index.md`), the
 config sources (`without-env/index.md`, `without-configmap/index.md`), the DAG
 executor (`without-dag/index.md`), and durable workflows
 (`without-durability/index.md`, with the store interface in
