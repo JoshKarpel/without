@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 
 import pytest
 from without.testing import yield_once
+from without_asgi import RawMessage
 from without_asgi import RawScope
 from without_asgi import Receive
 from without_asgi import Send
@@ -63,9 +64,9 @@ async def test_mock_client_sees_the_body_the_caller_sent() -> None:
     assert seen == [b"payload"]
 
 
-async def test_respond_defaults_to_an_empty_body() -> None:
-    async with request(mock_client(lambda _outgoing: respond(204)), "GET", "https://api.test/x") as (head, body):
-        assert head.status == 204
+async def test_respond_defaults_to_200_and_an_empty_body() -> None:
+    async with request(mock_client(lambda _outgoing: respond()), "GET", "https://api.test/x") as (head, body):
+        assert head.status == 200
         assert await body.read() == b""
 
 
@@ -104,6 +105,22 @@ async def test_base_url_resolves_a_relative_url_and_leaves_an_absolute_one() -> 
     assert seen == ["http://testserver/items", "https://elsewhere.test/other"]
 
 
+async def test_base_url_strips_only_the_joining_slash() -> None:
+    seen: list[str] = []
+
+    def answer(outgoing: ClientRequest) -> ClientResponse:
+        seen.append(outgoing.url)
+        return respond()
+
+    # A base ending in some other character keeps it: only a trailing slash is trimmed, so
+    # the prefix and the relative URL cannot end up with two slashes or none between them.
+    client = base_url("http://testserver/vX")(mock_client(answer))
+    async with request(client, "GET", "/items") as _response:
+        pass
+
+    assert seen == ["http://testserver/vX/items"]
+
+
 async def test_asgi_client_drives_an_app_with_no_socket(monkeypatch: pytest.MonkeyPatch) -> None:
     async def refuse(*args: object, **kwargs: object) -> None:
         raise AssertionError("the in-memory client must not open a connection")  # pragma: no cover
@@ -112,7 +129,29 @@ async def test_asgi_client_drives_an_app_with_no_socket(monkeypatch: pytest.Monk
     async with asgi_client(echo_app) as client:
         async with request(client, "GET", "http://testserver/items") as (head, body):
             assert head.status == 200
+            assert head.headers == ((b"content-type", b"text/plain"),)
             assert await body.read() == b"GET /items test= body="
+
+
+async def test_asgi_client_drops_the_body_of_a_head_response() -> None:
+    # HEAD is the one method whose response carries no body however much the app sends,
+    # which is the transport's job here as much as it is the wire server's.
+    async with asgi_client(echo_app) as client:
+        async with request(client, "HEAD", "http://testserver/items") as (head, body):
+            assert head.status == 200
+            assert await body.read() == b""
+
+
+async def test_asgi_client_mounts_the_app_under_a_root_path() -> None:
+    async def mounted(scope: RawScope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "lifespan":
+            raise RuntimeError("this app has no lifespan")
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": parse_http_scope(scope).root_path.encode()})
+
+    async with asgi_client(mounted, root_path="/mounted") as client:
+        async with request(client, "GET", "http://testserver/items") as (_head, body):
+            assert await body.read() == b"/mounted"
 
 
 async def test_asgi_client_sends_a_request_body() -> None:
@@ -164,6 +203,30 @@ async def test_asgi_client_streams_the_response_while_the_request_body_is_still_
             assert [chunk async for chunk in chunks] == []
 
 
+async def test_asgi_client_parks_an_app_that_runs_ahead_of_its_reader() -> None:
+    sent: list[int] = []
+
+    async def flooding(scope: RawScope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "lifespan":
+            raise RuntimeError("this app has no lifespan")
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        index = 0
+        while True:  # the client abandons the body, which cancels this app mid-send
+            await send({"type": "http.response.body", "body": f"chunk{index}".encode(), "more_body": True})
+            sent.append(index)
+            index += 1
+
+    async with asgi_client(flooding) as client:
+        async with request(client, "GET", "http://testserver/") as (head, body):
+            # None of this races: the app runs uninterrupted from the `start` that releases
+            # the head until a `send` blocks, so by the time the head is in hand the queue
+            # holds one chunk and the second `send` is parked on it. A deeper queue would
+            # let the app run further ahead, which is the whole of what the depth decides.
+            assert head.status == 200
+            assert sent == [0]
+            assert await anext(aiter(body)) == b"chunk0"
+
+
 async def test_asgi_client_runs_the_lifespan_around_the_block() -> None:
     events: list[str] = []
 
@@ -189,14 +252,14 @@ async def test_asgi_client_runs_the_lifespan_around_the_block() -> None:
 
 
 async def test_an_app_that_reads_past_its_request_body_sees_a_disconnect() -> None:
-    seen: list[str] = []
+    seen: list[RawMessage] = []
 
     async def nosy(scope: RawScope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
             raise RuntimeError("this app has no lifespan")
         while True:
             message = await receive()
-            seen.append(str(message["type"]))
+            seen.append(message)
             if message["type"] == "http.disconnect":
                 break
         await send({"type": "http.response.start", "status": 200, "headers": []})
@@ -206,7 +269,14 @@ async def test_an_app_that_reads_past_its_request_body_sees_a_disconnect() -> No
         async with request(client, "POST", "http://testserver/", body=b"payload") as (head, _body):
             assert head.status == 200
 
-    assert seen == ["http.request", "http.request", "http.disconnect"]
+    # The whole message, not just its type: `more_body` is what tells an app whether to come
+    # back for another chunk, so the final one must carry it as `False` rather than merely
+    # something falsy, and the run must end with a disconnect rather than a further chunk.
+    assert seen == [
+        {"type": "http.request", "body": b"payload", "more_body": True},
+        {"type": "http.request", "body": b"", "more_body": False},
+        {"type": "http.disconnect"},
+    ]
 
 
 async def test_an_app_can_send_trailers_and_an_early_hint() -> None:
@@ -259,7 +329,7 @@ async def test_an_app_that_declares_trailers_and_never_sends_them_is_a_loud_fail
             return await body.read()
 
     async with asgi_client(forgetful) as client:
-        with pytest.raises(RuntimeError, match="ended before finishing its response"):
+        with pytest.raises(RuntimeError, match=r"^the application ended before finishing its response$"):
             await read_it(client)
 
 
@@ -287,7 +357,7 @@ async def test_an_app_that_stops_mid_body_without_failing_is_a_loud_failure() ->
             return await body.read()
 
     async with asgi_client(truncating) as client:
-        with pytest.raises(RuntimeError, match="ended before finishing its response"):
+        with pytest.raises(RuntimeError, match=r"^the application ended before finishing its response$"):
             await read_it(client)
 
 
@@ -327,11 +397,12 @@ async def test_an_app_that_returns_without_responding_is_a_loud_failure() -> Non
             raise RuntimeError("this app has no lifespan")
 
     async with asgi_client(silent) as client:
-        with pytest.raises(RuntimeError, match="without starting a response"):
+        with pytest.raises(RuntimeError, match=r"^the application returned without starting a response$"):
             async with request(client, "GET", "http://testserver/") as _response:
                 pass  # pragma: no cover
 
 
+@pytest.mark.no_mutation  # asserts aclose()-triggered `finally`, which mutmut's trampoline skips; see pyproject
 async def test_abandoning_the_response_body_cancels_the_app() -> None:
     cancelled = asyncio.Event()
 
@@ -364,6 +435,26 @@ async def test_loopback_client_round_trips_over_the_real_wire_without_a_socket(
         async with request(client, "GET", "http://testserver/items") as (head, body):
             assert head.status == 200
             assert await body.read() == b"GET /items test= body="
+
+
+async def test_loopback_client_gives_the_server_both_ends_of_the_connection() -> None:
+    seen: list[tuple[str, int | None] | None] = []
+
+    async def addressed(scope: RawScope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "lifespan":
+            raise RuntimeError("this app has no lifespan")
+        head = parse_http_scope(scope)
+        seen.extend([head.server, head.client])
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async with loopback_client(addressed) as client:
+        async with request(client, "GET", "http://testserver/") as (head, _body):
+            assert head.status == 200
+
+    # The server reads these off the transport, so they prove the pipe hands each end the
+    # right side of the connection rather than mirroring one address into both.
+    assert seen == [("testserver", 80), ("127.0.0.1", 51234)]
 
 
 async def test_the_no_socket_probe_can_fail() -> None:
@@ -452,19 +543,23 @@ async def test_pipe_carries_bytes_and_a_half_close_in_both_directions() -> None:
         assert client_writer.get_extra_info("socket") is None
         assert client_writer.get_extra_info("ssl_object") is None
 
+        assert client_writer.can_write_eof()  # the half-close the wire protocols rely on
         client_writer.write_eof()
         assert await server_reader.read() == b""
 
 
 async def test_pipe_applies_backpressure_when_the_reader_falls_behind() -> None:
     async with _pipe(limit=16) as ((_client_reader, client_writer), (server_reader, _server_writer)):
-        client_writer.write(b"x" * 64)  # well past the reader's buffer limit
-        drain = asyncio.create_task(client_writer.drain())
-        await yield_once()
-        assert not drain.done()  # the writer is parked until the reader catches up
+        # Twice, because backpressure that engages once and never again is the failure that
+        # matters: a resume has to leave both ends able to pause on the next round.
+        for _round in range(2):
+            client_writer.write(b"x" * 64)  # well past the reader's buffer limit
+            drain = asyncio.create_task(client_writer.drain())
+            await yield_once()
+            assert not drain.done()  # the writer is parked until the reader catches up
 
-        assert await server_reader.readexactly(64) == b"x" * 64
-        await drain
+            assert await server_reader.readexactly(64) == b"x" * 64
+            await drain
 
 
 async def test_pipe_close_ends_both_sides() -> None:
@@ -513,6 +608,34 @@ def test_scope_carries_the_url_and_a_synthesized_host_header() -> None:
     assert scope.query_string == b"q=1&r=2"
     assert scope.server == ("api.test", 8443)
     assert scope.headers == ((b"host", b"api.test:8443"),)
+
+
+@pytest.mark.parametrize(
+    ("url", "expected_server"),
+    [
+        ("http://api.test/x", ("api.test", 80)),
+        ("https://api.test/x", ("api.test", 443)),
+        ("http://api.test:8080/x", ("api.test", 8080)),
+        ("https://api.test:8443/x", ("api.test", 8443)),
+    ],
+)
+def test_scope_defaults_the_server_port_from_the_scheme(url: str, expected_server: tuple[str, int]) -> None:
+    assert scope_from_client_request(ClientRequest("GET", url)).server == expected_server
+
+
+def test_scope_presents_the_connection_facts_an_app_reads_off_the_wire() -> None:
+    scope = scope_from_client_request(ClientRequest("GET", "http://api.test/x"))
+
+    assert scope.http_version == "1.1"
+    assert scope.client == ("127.0.0.1", 51234)
+    assert scope.root_path == ""  # no mount point unless the caller names one
+
+
+def test_scope_from_a_url_with_no_path_targets_the_root() -> None:
+    scope = scope_from_client_request(ClientRequest("GET", "http://api.test"))
+
+    assert scope.raw_path == b"/"
+    assert scope.path == "/"
 
 
 def test_scope_advertises_trailers_and_nothing_else() -> None:

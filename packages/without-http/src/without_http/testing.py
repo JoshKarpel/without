@@ -233,7 +233,7 @@ async def _drive(app: ASGIApp, request: ClientRequest, *, root_path: str) -> Cli
     body = aiter(request.body)
     request_done = False  # pragma: no mutate - initial sentinel, read only as a bool
     response_done = False  # pragma: no mutate - initial sentinel, read only as a bool
-    sends_trailers = False
+    sends_trailers = False  # pragma: no mutate - `http.response.start` always assigns it before a body event
 
     async def receive() -> RawMessage:
         nonlocal request_done
@@ -309,7 +309,10 @@ async def _drive(app: ASGIApp, request: ClientRequest, *, root_path: str) -> Cli
         raise RuntimeError("the application ended before finishing its response")
 
     async def release(fully_read: bool) -> None:
-        chunks.shutdown(immediate=True)  # unblock a `send` parked on the full queue
+        # Shutting the queue down is what unblocks a `send` parked on it, immediate or not;
+        # `immediate` additionally drops what is still queued, which nothing will read now
+        # that the body generator is closed.
+        chunks.shutdown(immediate=True)  # pragma: no mutate - nothing reads the queue after this
         await cancel_futures([task])
 
     return ClientResponse(head[0], ResponseBody(await _releasing(events(), release)))
@@ -340,9 +343,10 @@ class _PipeTransport(asyncio.Transport):
 
     def __init__(self, extra: dict[str, object]) -> None:
         super().__init__(extra)
-        self._peer_reader: asyncio.StreamReader | None = None
-        self._peer: _PipeTransport | None = None
-        self._protocol: asyncio.StreamReaderProtocol | None = None
+        # Three placeholders until `link` runs, which it always does before any use.
+        self._peer_reader: asyncio.StreamReader | None = None  # pragma: no mutate
+        self._peer: _PipeTransport | None = None  # pragma: no mutate
+        self._protocol: asyncio.StreamReaderProtocol | None = None  # pragma: no mutate
         self._closing = False
         self._paused = False
         self._eof_sent = False

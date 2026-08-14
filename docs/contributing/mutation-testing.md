@@ -131,7 +131,18 @@ def _param_precedence(item) -> int:
 ```
 
 Others in this class: `authority = b"" -> None` when `authority` is only read as `if authority`;
-`request_done = True -> None` / `more_body=False -> None` where the flag feeds only an `if`.
+`request_done = True -> None` / `more_body=False -> None` where the flag feeds only an `if`;
+`_dumps`'s `json.dumps(payload, allow_nan=False) -> allow_nan=None` in `without-asgi`, since the
+stdlib encoder reads `allow_nan` for truthiness and `None` rejects `nan` exactly as `False` does
+(verified empirically); and `_with_release`'s `fully_read = False -> None` in `without-http`, whose
+value reaches only `if not fully_read` and a boolean conjunction.
+
+`without-http`'s in-memory `_PipeTransport` contributes three more of the same shape:
+`_closing`, `_paused`, and `_eof_sent` each start `False` and are read only as conditions
+(`if self._closing`, `if not self._paused`, `if self._eof_sent or ...`), so `None` behaves
+identically. They cannot take a `# pragma: no mutate`, because the *other* mutation of each line
+(`False -> True`) is a real behavior change that the pipe tests do kill, and a pragma would blind
+both.
 
 ### Codec-name case swaps
 
@@ -174,6 +185,43 @@ HTTP/2 server:
   `SEND_RESPONSE`, exactly when `and` also fires, so `or` never produces an observable 500 that `and`
   would not. (The `is` → `is not` and `not response_done` → `response_done` mutants on the same line
   are real behavior changes, killed by the crash tests.)
+
+### Guards asyncio's own flow control already decides
+
+`without-http`'s in-memory `_PipeTransport` translates a paused reader into a paused peer writer,
+and both halves are guarded the same way:
+
+```python
+def stall_writes(self) -> None:
+    if not self._paused and self._protocol is not None:  # mutant: and -> or
+        self._paused = True
+        self._protocol.pause_writing()
+```
+
+The guard is load-bearing (asyncio's `FlowControlMixin.pause_writing` asserts `not self._paused`,
+and `resume_writing` asserts `self._paused`), but the `or` mutant is still equivalent, because
+neither clause can be false when the other is. `_protocol` is set by `link` before any use, and
+`StreamReader` only calls `pause_reading` when it is not already paused and `resume_reading` only
+after a pause, so `stall_writes` never runs while paused and `resume_writes` never runs while
+unpaused. `resume_writes`'s `self._paused = False -> None` is likewise truthiness-only; its
+`False -> True` sibling *is* a real change (backpressure that engages once and never again) and is
+killed by driving the pipe through two pause/resume rounds.
+
+### Arguments a library resolves to the same value
+
+`pipe` builds each endpoint from the running loop, which every constructor it passes it to would
+have found on its own:
+
+```python
+reader = asyncio.StreamReader(limit=limit, loop=loop)  # mutants: loop=None, and the kwarg dropped
+protocol = asyncio.StreamReaderProtocol(reader, loop=loop)  # same pair
+writer = asyncio.StreamWriter(transport, protocol, reader, loop)  # mutant: reader -> None
+```
+
+`StreamReader` and `StreamReaderProtocol` fall back to `get_event_loop()`, which inside a running
+coroutine is the same object that was passed, so all four loop mutants are equivalent. The
+`reader -> None` mutant is equivalent for a different reason: `StreamWriter` reads `_reader` only to
+re-raise a reader exception from `drain()`, and nothing on a pipe ever sets one.
 
 ### Killing test excluded by the trampoline
 
