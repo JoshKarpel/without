@@ -137,7 +137,7 @@ sequenceDiagram
     C-->>T: stream ends
 ```
 
-Two consequences of that shape are worth knowing, because they are what a buffering
+Three consequences of that shape are worth knowing, because they are what a buffering
 transport cannot give you:
 
 - **The response streams.** The head returns the instant the app sends
@@ -148,6 +148,13 @@ transport cannot give you:
 - **The lifespan runs.** `asgi_client` is a context manager because it wraps the same
   `run_lifespan` a real server uses, so state built at startup is in place before the
   first request and torn down after the last.
+- **Trailers arrive.** The scope advertises `http.response.trailers`, and nothing else,
+  because a `ClientResponse` carries trailing blocks through to `read_with_trailers`.
+  An app that negotiates the extension takes its trailer path here, in the extension's
+  own order: the trailing blocks come *after* the final `http.response.body`, and the
+  last of them ends the response. The server-offload extensions (server push, zero-copy
+  and path send) have a kernel or a proxy to offload to and nothing in memory does, so
+  sending one of their events raises, as it does over HTTP/1.1.
 
 An exception from the app surfaces to the caller rather than becoming a `500`. There is
 no server here to convert it, and swallowing it would hide the failure; use
@@ -197,6 +204,11 @@ feeds the peer's `StreamReader`, `write_eof`/`close` feed it EOF (the half-close
 protocols read as "the peer is done sending"), and a reader whose buffer fills pauses the
 peer's writer, so `drain()` blocks exactly as it would on a socket. It is a connection,
 not a buffer.
+
+A write once either end has closed is dropped rather than delivered, which is what makes
+the keep-alive race behave: a pool that checks a pooled connection for EOF and then writes
+can have the close land in between, and a socket takes those bytes and reports the failure
+on the next read.
 
 So `loopback_client` covers everything `asgi_client` skips: framing and chunking,
 keep-alive and connection reuse, HTTP/2 by prior knowledge (`http2=True` makes the client

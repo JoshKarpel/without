@@ -9,6 +9,7 @@ from without.testing import yield_once
 from without_asgi import RawScope
 from without_asgi import Receive
 from without_asgi import Send
+from without_asgi import extension
 from without_asgi import parse_http_scope
 from without_http import Client
 from without_http import ClientRequest
@@ -216,9 +217,9 @@ async def test_an_app_can_send_trailers_and_an_early_hint() -> None:
         # response that follows it.
         await send({"type": "http.response.early_hint", "links": [b"</style.css>; rel=preload"]})
         await send({"type": "http.response.start", "status": 200, "headers": [], "trailers": True})
-        await send({"type": "http.response.body", "body": b"body", "more_body": True})
+        await send({"type": "http.response.body", "body": b"body", "more_body": False})
+        # The extension's own order: the trailing block comes after the final body.
         await send({"type": "http.response.trailers", "headers": [(b"grpc-status", b"0")], "more_trailers": False})
-        await send({"type": "http.response.body", "body": b"", "more_body": False})
 
     async with asgi_client(hinting) as client:
         async with request(client, "GET", "http://testserver/") as (head, body):
@@ -227,6 +228,39 @@ async def test_an_app_can_send_trailers_and_an_early_hint() -> None:
 
     assert data == b"body"
     assert [block.headers for block in trailers] == [((b"grpc-status", b"0"),)]
+
+
+async def test_an_app_can_send_several_trailing_blocks() -> None:
+    async def chatty(scope: RawScope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "lifespan":
+            raise RuntimeError("this app has no lifespan")
+        await send({"type": "http.response.start", "status": 200, "headers": [], "trailers": True})
+        await send({"type": "http.response.body", "body": b"body", "more_body": False})
+        await send({"type": "http.response.trailers", "headers": [(b"grpc-status", b"0")], "more_trailers": True})
+        await send({"type": "http.response.trailers", "headers": [(b"x-count", b"7")], "more_trailers": False})
+
+    async with asgi_client(chatty) as client:
+        async with request(client, "GET", "http://testserver/") as (_head, body):
+            data, trailers = await body.read_with_trailers()
+
+    assert data == b"body"
+    assert [block.headers for block in trailers] == [((b"grpc-status", b"0"),), ((b"x-count", b"7"),)]
+
+
+async def test_an_app_that_declares_trailers_and_never_sends_them_is_a_loud_failure() -> None:
+    async def forgetful(scope: RawScope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "lifespan":
+            raise RuntimeError("this app has no lifespan")
+        await send({"type": "http.response.start", "status": 200, "headers": [], "trailers": True})
+        await send({"type": "http.response.body", "body": b"body", "more_body": False})
+
+    async def read_it(client: Client) -> bytes:
+        async with request(client, "GET", "http://testserver/") as (_head, body):
+            return await body.read()
+
+    async with asgi_client(forgetful) as client:
+        with pytest.raises(RuntimeError, match="ended before finishing its response"):
+            await read_it(client)
 
 
 async def test_an_app_that_sends_an_extension_event_this_transport_never_offered_fails() -> None:
@@ -253,7 +287,7 @@ async def test_an_app_that_stops_mid_body_without_failing_is_a_loud_failure() ->
             return await body.read()
 
     async with asgi_client(truncating) as client:
-        with pytest.raises(RuntimeError, match="ended before finishing its response body"):
+        with pytest.raises(RuntimeError, match="ended before finishing its response"):
             await read_it(client)
 
 
@@ -442,6 +476,28 @@ async def test_pipe_close_ends_both_sides() -> None:
         assert await server_reader.read() == b""
 
 
+async def test_pipe_drops_a_write_after_this_side_half_closed() -> None:
+    async with _pipe() as ((_client_reader, client_writer), (server_reader, _server_writer)):
+        client_writer.write_eof()
+        client_writer.write(b"too late")
+
+        assert await server_reader.read() == b""
+
+
+async def test_pipe_drops_a_write_to_a_peer_that_already_closed() -> None:
+    # The keep-alive race a socket sees: the peer closes between a writer's last check and
+    # its next write. A socket takes the bytes and reports the failure on a later read, so
+    # this must not raise, and the reader that outlives the close sees the EOF.
+    async with _pipe() as ((client_reader, client_writer), (_server_reader, server_writer)):
+        server_writer.close()
+        await server_writer.wait_closed()
+
+        client_writer.write(b"too late")
+        await client_writer.drain()
+
+        assert await client_reader.read() == b""
+
+
 def test_scope_from_a_relative_url_fails_loudly() -> None:
     with pytest.raises(ValueError, match="must be absolute"):
         scope_from_client_request(ClientRequest("GET", "/items"))
@@ -457,6 +513,13 @@ def test_scope_carries_the_url_and_a_synthesized_host_header() -> None:
     assert scope.query_string == b"q=1&r=2"
     assert scope.server == ("api.test", 8443)
     assert scope.headers == ((b"host", b"api.test:8443"),)
+
+
+def test_scope_advertises_trailers_and_nothing_else() -> None:
+    scope = scope_from_client_request(ClientRequest("GET", "http://api.test/x"))
+
+    assert extension(scope.extensions, "http.response.trailers") is not None
+    assert extension(scope.extensions, "http.response.zerocopysend") is None
 
 
 def test_scope_keeps_a_host_header_the_caller_set() -> None:

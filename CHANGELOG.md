@@ -281,7 +281,9 @@
   directly, streaming: the head returns the moment the app sends `http.response.start` and body
   chunks cross a one-slot queue, so duplex handlers are testable, and the app's lifespan runs for
   the block through the same `run_lifespan` a server uses (which `httpx.ASGITransport` leaves to
-  the caller). `loopback_client(app)` is `serving` minus `asyncio.start_server`: the real
+  the caller). Its scope advertises `http.response.trailers`, the one extension in-memory delivery
+  can honestly offer, since a `ClientResponse` carries trailing blocks through to
+  `read_with_trailers`, so an app that negotiates trailers takes that path here. `loopback_client(app)` is `serving` minus `asyncio.start_server`: the real
   `ConnectionPool` and the real server, wired to each other over `pipe()`, two cross-wired
   `StreamReader`s with genuine backpressure, so framing, keep-alive, HTTP/2 by prior knowledge, and
   the server's crash-to-`500` isolation all run with no port and no file descriptor. All three

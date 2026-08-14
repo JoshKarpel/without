@@ -7,9 +7,11 @@ from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from collections.abc import Buffer
 from collections.abc import Callable
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import timedelta
+from types import MappingProxyType
 from typing import assert_never
 from urllib.parse import unquote
 from urllib.parse import urlsplit
@@ -52,10 +54,16 @@ from without_http.server import _serve_connection
 from without_http.socket_options import SocketOptions
 from without_http.timeouts import Timeout
 
-# What an in-memory client tells an app about itself. It presents as HTTP/1.1 and
-# advertises no extensions, exactly as the HTTP/1.1 transport does, so an app that runs
-# against it faces the same surface it would over a socket.
+# What an in-memory client tells an app about itself. It presents as HTTP/1.1, so an app
+# that runs against it faces the same surface it would over a socket.
 _ASGI = Asgi(version="3.0", spec_version="2.4")
+
+# The one extension this transport can honestly offer: a `ClientResponse` carries trailer
+# blocks through to `read_with_trailers`, so an app's trailers reach the caller here
+# rather than being dropped. The server-offload extensions (server push, zero-copy and
+# path send) have a kernel or a proxy to offload to and nothing in memory does, so they
+# stay unadvertised, as they are over HTTP/1.1.
+_EXTENSIONS: Mapping[str, Mapping[str, object]] = MappingProxyType({"http.response.trailers": {}})
 _ASCII = "ascii"
 _CLIENT_ADDRESS = ("127.0.0.1", 51234)
 _SERVER_ADDRESS = ("testserver", 80)
@@ -145,6 +153,10 @@ def scope_from_client_request(request: ClientRequest, *, root_path: str = "") ->
     wire would have (`scheme`, `server`, the raw path and query string), and a `host`
     header is synthesized when the caller did not set one, matching what the HTTP/1.1
     transport puts on the wire.
+
+    The scope advertises `http.response.trailers`, since trailers do reach the caller in
+    memory, and nothing else: an app that negotiates the extension takes its trailer path
+    here.
     """
     parts = urlsplit(request.url)
     if parts.hostname is None:
@@ -165,7 +177,7 @@ def scope_from_client_request(request: ClientRequest, *, root_path: str = "") ->
         headers=headers,
         client=_CLIENT_ADDRESS,
         server=(parts.hostname, parts.port or (443 if parts.scheme == "https" else 80)),
-        extensions=None,
+        extensions=_EXTENSIONS,
     )
 
 
@@ -221,6 +233,7 @@ async def _drive(app: ASGIApp, request: ClientRequest, *, root_path: str) -> Cli
     body = aiter(request.body)
     request_done = False  # pragma: no mutate - initial sentinel, read only as a bool
     response_done = False  # pragma: no mutate - initial sentinel, read only as a bool
+    sends_trailers = False
 
     async def receive() -> RawMessage:
         nonlocal request_done
@@ -233,25 +246,35 @@ async def _drive(app: ASGIApp, request: ClientRequest, *, root_path: str) -> Cli
             return encode_inbound(RequestBody(body=b"", more_body=False))
         return encode_inbound(RequestBody(body=chunk, more_body=True))
 
-    async def send(message: RawMessage) -> None:
+    def end_response() -> None:
         nonlocal response_done
+        response_done = True
+        chunks.shutdown()  # drains what is queued, then ends the body stream
+
+    async def send(message: RawMessage) -> None:
+        nonlocal sends_trailers
         match parse_outbound(message):
-            case ResponseStart(status, headers, _trailers):
+            case ResponseStart(status, headers, trailers):
+                sends_trailers = trailers
                 head.append(ResponseHead(status, headers))
                 started.set()
             case OutboundBody(chunk, more_body):
                 if chunk and request.method != "HEAD":
                     await chunks.put(chunk)
-                if not more_body:
-                    response_done = True
-                    chunks.shutdown()  # drains what is queued, then ends the body stream
-            case OutboundTrailers(headers, _more_trailers):
+                if not more_body and not sends_trailers:
+                    end_response()
+            case OutboundTrailers(headers, more_trailers):
+                # The extension puts the trailing blocks *after* the final body message,
+                # so for an app that declared them at `http.response.start` it is the
+                # last block, not the last body chunk, that ends the response.
                 await chunks.put(ResponseTrailers(headers))
+                if not more_trailers:
+                    end_response()
             case EarlyHint():
                 pass  # a client discards informational responses, as the h11 one does
             case ServerPush() | ZeroCopySend() | PathSend() | ResponseDebug() as unsupported:
-                # This transport advertises no extensions, so an app that sends one of
-                # their events is misusing the scope it was handed.
+                # Trailers are the only extension this transport advertises, so an app
+                # sending one of these events is misusing the scope it was handed.
                 raise NotImplementedError(f"{type(unsupported).__name__} is not supported in memory")
             case _ as unreachable:
                 assert_never(unreachable)
@@ -279,10 +302,11 @@ async def _drive(app: ASGIApp, request: ClientRequest, *, root_path: str) -> Cli
             yield item
         if response_done:
             return
-        # The app ended without finishing its body. Surface why, rather than handing back
-        # a truncated body as though it were the whole response.
+        # The app ended mid-response: short of the final body chunk, or short of the
+        # trailing block it declared. Surface why, rather than handing back a truncated
+        # response as though it were the whole thing.
         await task  # re-raises the app's failure, when it had one
-        raise RuntimeError("the application ended before finishing its response body")
+        raise RuntimeError("the application ended before finishing its response")
 
     async def release(fully_read: bool) -> None:
         chunks.shutdown(immediate=True)  # unblock a `send` parked on the full queue
@@ -302,7 +326,9 @@ class _PipeTransport(asyncio.Transport):
 
     - **EOF and close.** `write_eof` and `close` feed the peer EOF, which is the half-
       close the wire protocols read as "the peer is done sending"; `close` also completes
-      this side's `wait_closed` by delivering `connection_lost` to its own protocol.
+      this side's `wait_closed` by delivering `connection_lost` to its own protocol. Once
+      either end has closed, a `write` is dropped rather than delivered, since a socket
+      also accepts it and reports the failure on a later read.
     - **Backpressure.** When a reader's buffer fills, `asyncio` pauses *its* transport;
       here that is translated into pausing the peer's writing, so the peer's `drain()`
       blocks until the reader catches up. Without that wiring an in-memory writer would
@@ -319,6 +345,7 @@ class _PipeTransport(asyncio.Transport):
         self._protocol: asyncio.StreamReaderProtocol | None = None
         self._closing = False
         self._paused = False
+        self._eof_sent = False
 
     def link(
         self, peer_reader: asyncio.StreamReader, peer: _PipeTransport, protocol: asyncio.StreamReaderProtocol
@@ -328,14 +355,20 @@ class _PipeTransport(asyncio.Transport):
         self._protocol = protocol
 
     def write(self, data: Buffer) -> None:
-        if self._closing or self._peer_reader is None:  # pragma: no cover - a write after close
+        # A write lands in the peer's `StreamReader`, which refuses data once it has been
+        # fed EOF: by this side's own `write_eof`, or by the peer's `connection_lost` when
+        # the peer closed. A socket takes such a write and surfaces the failure on a later
+        # read, so the bytes are dropped here rather than raising out of the reader.
+        if self._eof_sent or (self._peer is not None and self._peer.is_closing()):
             return
-        self._peer_reader.feed_data(bytes(data))
+        if self._peer_reader is not None:  # pragma: no branch - always linked before use
+            self._peer_reader.feed_data(bytes(data))
 
     def can_write_eof(self) -> bool:
         return True
 
     def write_eof(self) -> None:
+        self._eof_sent = True
         if self._peer_reader is not None:  # pragma: no branch - always linked before use
             self._peer_reader.feed_eof()
 
