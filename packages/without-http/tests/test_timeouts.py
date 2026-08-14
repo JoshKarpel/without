@@ -14,6 +14,7 @@ import h2.connection
 import h2.settings
 import pytest
 from without import cancel_futures
+from without_http import Client
 from without_http import ConnectionPool
 from without_http import ConnectTimeout
 from without_http import HTTPTimeout
@@ -21,6 +22,8 @@ from without_http import PoolTimeout
 from without_http import ReadTimeout
 from without_http import Timeout
 from without_http import WriteTimeout
+from without_http import deadline
+from without_http import request
 from without_http import serving
 
 from .conftest import HOST
@@ -80,18 +83,21 @@ async def test_connect_timeout_when_the_tls_handshake_never_completes(
         async with ConnectionPool(
             allow_http2=False,
             ssl_context_factory=trusting_client_context_factory,
-            timeout=Timeout(connect=timedelta(seconds=0.2)),
         ) as pool:
             with pytest.raises(ConnectTimeout):  # pragma: no branch
-                async with pool.request("GET", f"https://{host}:{port}/") as _response:  # pragma: no branch
+                async with request(
+                    pool, "GET", f"https://{host}:{port}/", timeout=Timeout(connect=timedelta(seconds=0.2))
+                ) as _response:  # pragma: no branch
                     pass  # pragma: no cover
 
 
 async def test_read_timeout_waiting_for_the_response_head() -> None:
     async with _tcp_server(_hang_after_reading_request) as (host, port):
-        async with ConnectionPool(timeout=Timeout(read=timedelta(seconds=0.2))) as pool:
+        async with ConnectionPool() as pool:
             with pytest.raises(ReadTimeout):  # pragma: no branch
-                async with pool.request("GET", f"http://{host}:{port}/") as _response:  # pragma: no branch
+                async with request(
+                    pool, "GET", f"http://{host}:{port}/", timeout=Timeout(read=timedelta(seconds=0.2))
+                ) as _response:  # pragma: no branch
                     pass  # pragma: no cover
 
 
@@ -102,22 +108,28 @@ async def test_read_timeout_stalled_mid_response_body() -> None:
         await writer.drain()
         await asyncio.Event().wait()  # never send the next chunk
 
-    async def exchange(pool: ConnectionPool, url: str) -> None:
-        async with pool.request("GET", url) as (head, body):
+    async def exchange(client: Client, url: str) -> None:
+        async with request(client, "GET", url, timeout=Timeout(read=timedelta(seconds=0.2))) as (head, body):
             assert head.status == 200
             await body.read()
 
     async with _tcp_server(head_then_stall) as (host, port):
-        async with ConnectionPool(timeout=Timeout(read=timedelta(seconds=0.2))) as pool:
+        async with ConnectionPool() as pool:
             with pytest.raises(ReadTimeout):  # pragma: no branch
                 await exchange(pool, f"http://{host}:{port}/")
 
 
 async def test_write_timeout_when_the_peer_never_reads_the_request_body() -> None:
     async with _tcp_server(_never_read) as (host, port):
-        async with ConnectionPool(timeout=Timeout(write=timedelta(seconds=0.2))) as pool:
+        async with ConnectionPool() as pool:
             with pytest.raises(WriteTimeout):  # pragma: no branch
-                async with pool.request("POST", f"http://{host}:{port}/upload", body=_large_upload()) as (
+                async with request(
+                    pool,
+                    "POST",
+                    f"http://{host}:{port}/upload",
+                    body=_large_upload(),
+                    timeout=Timeout(write=timedelta(seconds=0.2)),
+                ) as (
                     _head,
                     body,
                 ):  # pragma: no branch
@@ -137,11 +149,17 @@ async def test_h2_write_timeout_when_the_flow_control_window_never_opens() -> No
             await writer.drain()
 
     async with _tcp_server(zero_window) as (host, port):
-        async with ConnectionPool(force_http2_cleartext=True, timeout=Timeout(write=timedelta(seconds=0.2))) as pool:
+        async with ConnectionPool(force_http2_cleartext=True) as pool:
             with pytest.raises(WriteTimeout):  # pragma: no branch
                 # Larger than the default 65535 connection window, so it blocks regardless
                 # of the timing of the zero-window SETTINGS.
-                async with pool.request("POST", f"http://{host}:{port}/upload", body=b"x" * 100_000) as (
+                async with request(
+                    pool,
+                    "POST",
+                    f"http://{host}:{port}/upload",
+                    body=b"x" * 100_000,
+                    timeout=Timeout(write=timedelta(seconds=0.2)),
+                ) as (
                     _head,
                     body,
                 ):  # pragma: no branch
@@ -155,50 +173,51 @@ async def test_write_timeout_after_the_head_surfaces_at_the_body_read() -> None:
         await writer.drain()
         await asyncio.Event().wait()  # never read the request body nor send the response body
 
-    async def exchange(pool: ConnectionPool, url: str) -> None:
-        async with pool.request("POST", url, body=_large_upload()) as (head, body):
+    async def exchange(client: Client, url: str) -> None:
+        bound = Timeout(write=timedelta(seconds=0.2))
+        async with request(client, "POST", url, body=_large_upload(), timeout=bound) as (head, body):
             assert head.status == 200  # the head arrives before the upload stalls out
             await body.read()
 
     async with _tcp_server(head_then_never_read) as (host, port):
-        async with ConnectionPool(timeout=Timeout(write=timedelta(seconds=0.2))) as pool:
+        async with ConnectionPool() as pool:
             with pytest.raises(WriteTimeout):  # pragma: no branch
                 await exchange(pool, f"http://{host}:{port}/up")
 
 
 async def test_pool_timeout_when_the_per_host_bound_is_saturated() -> None:
-    async with (
-        serving(sized_echo_app) as server,
-        ConnectionPool(max_connections_per_host=1, timeout=Timeout(pool=timedelta(seconds=0.2))) as pool,
-    ):
+    async with serving(sized_echo_app) as server, ConnectionPool(max_connections_per_host=1) as pool:
         url = f"http://{server.host}:{server.port}/items"
-        async with pool.request("GET", url) as (_head, first):  # holds the only permit (body unread)
+        bound = Timeout(pool=timedelta(seconds=0.2))
+        async with request(pool, "GET", url, timeout=bound) as (_head, first):  # holds the only permit
             with pytest.raises(PoolTimeout):  # pragma: no branch
-                async with pool.request("GET", url) as _second:  # pragma: no branch
+                async with request(pool, "GET", url, timeout=bound) as _second:  # pragma: no branch
                     pass  # pragma: no cover
             assert await first.read() == b"GET /items body="
 
 
-async def test_a_request_inherits_the_pool_timeout_when_none_is_given() -> None:
+async def test_deadline_middleware_bounds_a_request_that_states_no_budget() -> None:
     async with _tcp_server(_hang_after_reading_request) as (host, port):
-        async with ConnectionPool(timeout=Timeout(read=timedelta(seconds=0.2))) as pool:
-            with pytest.raises(ReadTimeout):  # pragma: no branch - inherits the pool's read bound
-                async with pool.request("GET", f"http://{host}:{port}/") as _response:  # pragma: no branch
+        async with ConnectionPool() as pool:
+            client = deadline(Timeout(read=timedelta(seconds=0.2)))(pool)
+            with pytest.raises(ReadTimeout):  # pragma: no branch - takes the middleware's read bound
+                async with request(client, "GET", f"http://{host}:{port}/") as _response:  # pragma: no branch
                     pass  # pragma: no cover
 
 
-async def test_a_per_request_timeout_replaces_an_inherited_bound() -> None:
+async def test_a_requests_own_budget_survives_the_deadline_middleware() -> None:
     async def slow_then_answer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         await reader.read(65536)
-        await asyncio.sleep(0.3)  # slower than the pool's read bound
+        await asyncio.sleep(0.3)  # slower than the default bound, faster than this request's own
         writer.write(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhi")
         await writer.drain()
 
     async with _tcp_server(slow_then_answer) as (host, port):
-        async with ConnectionPool(timeout=Timeout(read=timedelta(seconds=0.05))) as pool:
-            # The pool default would time out at 0.05s, but this request replaces the whole
-            # Timeout with a disabled one, so the slow-but-completing response arrives.
-            async with pool.request("GET", f"http://{host}:{port}/", timeout=Timeout()) as (
+        async with ConnectionPool() as pool:
+            client = deadline(Timeout(read=timedelta(seconds=0.05)))(pool)
+            # The default would time out at 0.05s, but this request states a budget of its
+            # own, which the middleware leaves alone, so the slow response arrives.
+            async with request(client, "GET", f"http://{host}:{port}/", timeout=Timeout(read=timedelta(seconds=2))) as (
                 head,
                 body,
             ):  # pragma: no branch

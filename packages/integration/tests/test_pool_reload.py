@@ -18,6 +18,7 @@ from without_asgi import ResponseBody
 from without_asgi import ResponseStart
 from without_asgi import make_asgi_app
 from without_http import ConnectionPool
+from without_http import request
 from without_http import serving
 
 # The proof for issue #27: a connection pool whose per-host concurrency bound is
@@ -80,7 +81,7 @@ def probe_app(phase: Phase) -> ASGIApp:
 async def fire(pool: Sample[ConnectionPool], url: str, count: int) -> list[int]:
     async def one() -> int:
         connection_pool = pool.current()
-        async with connection_pool.request("GET", url) as (head, body):
+        async with request(connection_pool, "GET", url) as (head, body):
             await body.read()
             return head.status
 

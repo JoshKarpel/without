@@ -17,13 +17,12 @@ session regardless of how connections are pooled. Two requests share cookies
 exactly when they share a jar.
 
 ```python
-from without_http import ConnectionPool, CookieJar, cookies, follow_redirects, stack
+from without_http import ConnectionPool, CookieJar, cookies, follow_redirects, request, stack
 
 jar = CookieJar()
 async with ConnectionPool() as pool:
-    async with pool.request(
-        "GET", url, middleware=stack(follow_redirects(), cookies(jar))
-    ) as (head, body):
+    client = stack(follow_redirects(), cookies(jar))(pool)
+    async with request(client, "GET", url) as (head, body):
         ...
 ```
 

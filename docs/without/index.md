@@ -62,7 +62,7 @@ the rest of the system consumes, and `spool` drives a source ahead of its
 consumer (read-ahead) by pumping it into a bounded queue on a background task.
 `stack`
 composes middleware (any `(handler, *context) -> handler`) into one, serving both
-server handlers and client exchanges.
+server handlers and HTTP clients.
 
 ## Tasks (`without.tasks`)
 

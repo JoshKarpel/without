@@ -8,6 +8,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC
+from datetime import timedelta
 from urllib.parse import urlsplit
 
 import h11
@@ -23,9 +24,11 @@ from without_http import CookieJar
 from without_http import ResponseBody
 from without_http import ResponseHead
 from without_http import ResponseTrailers
+from without_http import Timeout
 from without_http import add_headers
 from without_http import cookies
 from without_http import follow_redirects
+from without_http import request
 from without_http import serving
 from without_http import wrap
 from without_http.client import _REDIRECT_STATUSES
@@ -96,7 +99,7 @@ async def redirect_app(scope: RawScope, receive: Receive, send: Send) -> None:
 
 async def test_pool_gets_a_response() -> None:
     async with serving(echo_app) as server, ConnectionPool() as pool:
-        async with pool.request("GET", f"http://{server.host}:{server.port}/items") as (head, body):
+        async with request(pool, "GET", f"http://{server.host}:{server.port}/items") as (head, body):
             assert head.status == 200
             assert await body.read() == b"GET /items test= body="
 
@@ -104,14 +107,14 @@ async def test_pool_gets_a_response() -> None:
 async def test_pool_posts_a_body() -> None:
     async with serving(echo_app) as server, ConnectionPool() as pool:
         url = f"http://{server.host}:{server.port}/submit"
-        async with pool.request("POST", url, body=b"payload") as (_head, body):
+        async with request(pool, "POST", url, body=b"payload") as (_head, body):
             assert await body.read() == b"POST /submit test= body=payload"
 
 
 async def test_wrap_request_side_rewrites_the_outgoing_request() -> None:
     inject = wrap(request=lambda request: replace(request, headers=(*request.headers, (b"x-test", b"viawrap"))))
-    async with serving(echo_app) as server, ConnectionPool(middleware=inject) as pool:
-        async with pool.request("GET", f"http://{server.host}:{server.port}/items") as (_head, body):
+    async with serving(echo_app) as server, ConnectionPool() as pool:
+        async with request(inject(pool), "GET", f"http://{server.host}:{server.port}/items") as (_head, body):
             assert await body.read() == b"GET /items test=viawrap body="
 
 
@@ -125,24 +128,24 @@ async def test_wrap_response_side_transforms_the_returned_body() -> None:
 
         return ClientResponse(response.head, ResponseBody(upper(response.body.events())))
 
-    async with serving(echo_app) as server, ConnectionPool(middleware=wrap(response=shout)) as pool:
-        async with pool.request("GET", f"http://{server.host}:{server.port}/items") as (_head, body):
+    async with serving(echo_app) as server, ConnectionPool() as pool:
+        client = wrap(response=shout)(pool)
+        async with request(client, "GET", f"http://{server.host}:{server.port}/items") as (_head, body):
             assert await body.read() == b"GET /ITEMS TEST= BODY="
 
 
 async def test_add_headers_middleware_injects_a_header_seen_server_side() -> None:
-    async with (
-        serving(echo_app) as server,
-        ConnectionPool(middleware=add_headers((b"x-test", b"injected"))) as pool,
-    ):
-        async with pool.request("GET", f"http://{server.host}:{server.port}/items") as (_head, body):
+    async with serving(echo_app) as server, ConnectionPool() as pool:
+        client = add_headers((b"x-test", b"injected"))(pool)
+        async with request(client, "GET", f"http://{server.host}:{server.port}/items") as (_head, body):
             assert await body.read() == b"GET /items test=injected body="
 
 
 @pytest.mark.parametrize("status", sorted(_REDIRECT_STATUSES))
 async def test_follow_redirects_middleware_follows_each_redirect_status(status: int) -> None:
-    async with serving(redirect_app) as server, ConnectionPool(middleware=follow_redirects()) as pool:
-        async with pool.request("GET", f"http://{server.host}:{server.port}/start?status={status}") as (head, body):
+    async with serving(redirect_app) as server, ConnectionPool() as pool:
+        client = follow_redirects()(pool)
+        async with request(client, "GET", f"http://{server.host}:{server.port}/start?status={status}") as (head, body):
             assert head.status == 200
             assert await body.read() == b"arrived"
 
@@ -166,15 +169,17 @@ async def chain_app(scope: RawScope, receive: Receive, send: Send) -> None:
 
 
 async def test_follow_redirects_middleware_follows_a_chain_of_hops() -> None:
-    async with serving(chain_app) as server, ConnectionPool(middleware=follow_redirects(max_hops=5)) as pool:
-        async with pool.request("GET", f"http://{server.host}:{server.port}/hop/3") as (head, body):
+    async with serving(chain_app) as server, ConnectionPool() as pool:
+        client = follow_redirects(max_hops=5)(pool)
+        async with request(client, "GET", f"http://{server.host}:{server.port}/hop/3") as (head, body):
             assert head.status == 200
             assert await body.read() == b"done"
 
 
 async def test_follow_redirects_middleware_stops_at_max_hops() -> None:
-    async with serving(chain_app) as server, ConnectionPool(middleware=follow_redirects(max_hops=2)) as pool:
-        async with pool.request("GET", f"http://{server.host}:{server.port}/hop/5") as (head, body):
+    async with serving(chain_app) as server, ConnectionPool() as pool:
+        client = follow_redirects(max_hops=2)(pool)
+        async with request(client, "GET", f"http://{server.host}:{server.port}/hop/5") as (head, body):
             # The chain is longer than max_hops, so it stops still on a redirect.
             assert head.status == 302
             assert await body.read() == b""
@@ -204,11 +209,11 @@ def _only_idle(pool: ConnectionPool) -> list[_Http11Connection]:
 async def test_keep_alive_reuses_one_connection_for_sequential_requests() -> None:
     async with serving(sized_echo_app) as server, ConnectionPool() as pool:
         url = f"http://{server.host}:{server.port}/items"
-        async with pool.request("GET", url) as (_head, body):
+        async with request(pool, "GET", url) as (_head, body):
             assert await body.read() == b"GET /items body="
         kept = _only_idle(pool)
         assert len(kept) == 1
-        async with pool.request("GET", url) as (_head, body):
+        async with request(pool, "GET", url) as (_head, body):
             assert await body.read() == b"GET /items body="
         assert _only_idle(pool) == kept
 
@@ -241,7 +246,7 @@ async def _large_upload() -> AsyncIterator[bytes]:
 
 async def test_early_response_to_a_large_upload_does_not_deadlock() -> None:
     async def post_status(pool: ConnectionPool, url: str) -> int:
-        async with pool.request("POST", url, body=_large_upload()) as (head, body):
+        async with request(pool, "POST", url, body=_large_upload()) as (head, body):
             await body.read()
             return head.status
 
@@ -268,9 +273,9 @@ async def test_send_body_stops_at_a_chunk_boundary_when_the_peer_half_closes(
         assert await client_reader.read() == b""  # ...and the client observes the FIN
         yield b"second-chunk"  # pulled, but the send stops before writing it
 
-    request = _build_request("POST", url, (), body())
-    await connection.send_head(request, urlsplit(url))
-    await connection.send_body(request)
+    outgoing = _build_request("POST", url, (), body(), Timeout())
+    await connection.send_head(outgoing, urlsplit(url))
+    await connection.send_body(outgoing)
     client_writer.write_eof()
     sent = await peer_reader.read()
 
@@ -291,9 +296,9 @@ async def test_send_body_skips_the_end_of_message_when_the_peer_half_closes(
         peer_writer.write_eof()  # the peer half-closes just as the body ends
         assert await client_reader.read() == b""
 
-    request = _build_request("POST", url, (), body())
-    await connection.send_head(request, urlsplit(url))
-    await connection.send_body(request)
+    outgoing = _build_request("POST", url, (), body(), Timeout())
+    await connection.send_head(outgoing, urlsplit(url))
+    await connection.send_body(outgoing)
     client_writer.write_eof()
     sent = await peer_reader.read()
 
@@ -315,18 +320,18 @@ async def test_a_request_body_generator_error_surfaces_to_the_caller() -> None:
         with pytest.raises(ValueError, match="body generator blew up"):
             # The echo server waits for the whole body, so the head never arrives: the error
             # surfaces as the request is made, before the response body is ever read.
-            async with pool.request("POST", url, body=_raising_body()) as (_head, body):  # pragma: no branch
+            async with request(pool, "POST", url, body=_raising_body()) as (_head, body):  # pragma: no branch
                 await body.read()  # pragma: no cover
         assert _idle_count(pool) == 0  # the broken exchange leaves nothing pooled
         # The permit was freed despite the error, so the origin is not starved.
-        async with pool.request("GET", url) as (head, _body):
+        async with request(pool, "GET", url) as (head, _body):
             assert head.status == 200
 
 
 async def test_max_connections_per_host_serializes_concurrent_requests() -> None:
     async with serving(sized_echo_app) as server, ConnectionPool(max_connections_per_host=1) as pool:
         url = f"http://{server.host}:{server.port}/items"
-        async with pool.request("GET", url) as (head, first):
+        async with request(pool, "GET", url) as (head, first):
             assert head.status == 200
             # `first` holds the origin's only permit until its body is read, so a second
             # request to the same origin must wait rather than open a second connection.
@@ -338,7 +343,7 @@ async def test_max_connections_per_host_serializes_concurrent_requests() -> None
 
 
 async def _read_one(pool: ConnectionPool, url: str) -> bytes:
-    async with pool.request("GET", url) as (_head, body):
+    async with request(pool, "GET", url) as (_head, body):
         return await body.read()
 
 
@@ -348,8 +353,8 @@ async def test_max_keepalive_per_host_caps_retained_idle_connections() -> None:
         # Two overlapping requests force two live connections (no peak bound is set), so the
         # pool ramps up under load past the idle cap.
         async with (
-            pool.request("GET", url) as (_first_head, first),
-            pool.request("GET", url) as (_second_head, second),
+            request(pool, "GET", url) as (_first_head, first),
+            request(pool, "GET", url) as (_second_head, second),
         ):
             assert await first.read() == b"GET /items body="
             assert await second.read() == b"GET /items body="
@@ -376,11 +381,11 @@ def test_non_positive_per_host_bounds_are_rejected(
 async def test_a_stale_pooled_connection_is_replaced_with_a_fresh_one() -> None:
     async with serving(sized_echo_app) as server, ConnectionPool() as pool:
         url = f"http://{server.host}:{server.port}/items"
-        async with pool.request("GET", url) as (_head, body):
+        async with request(pool, "GET", url) as (_head, body):
             assert await body.read() == b"GET /items body="
         (stale,) = _only_idle(pool)
         await stale.aclose()  # the server-closed-an-idle-keep-alive case, simulated
-        async with pool.request("GET", url) as (_head, body):
+        async with request(pool, "GET", url) as (_head, body):
             assert await body.read() == b"GET /items body="
         (fresh,) = _only_idle(pool)
         assert fresh is not stale
@@ -388,7 +393,7 @@ async def test_a_stale_pooled_connection_is_replaced_with_a_fresh_one() -> None:
 
 async def test_cleartext_h2c_uses_http_2_by_prior_knowledge() -> None:
     async with serving(echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
-        async with pool.request("GET", f"http://{server.host}:{server.port}/items") as (head, body):
+        async with request(pool, "GET", f"http://{server.host}:{server.port}/items") as (head, body):
             assert head.status == 200
             assert await body.read() == b"GET /items test= body="
         assert len(pool._h2) == 1
@@ -414,13 +419,13 @@ async def chunked_response_app(scope: RawScope, receive: Receive, send: Send) ->
 async def test_streams_a_request_body_from_an_async_iterator() -> None:
     async with serving(echo_app) as server, ConnectionPool() as pool:
         upload = _chunks(b"ab", b"cd", b"ef")
-        async with pool.request("POST", f"http://{server.host}:{server.port}/up", body=upload) as (_head, body):
+        async with request(pool, "POST", f"http://{server.host}:{server.port}/up", body=upload) as (_head, body):
             assert await body.read() == b"POST /up test= body=abcdef"
 
 
 async def test_streams_a_response_body_chunk_by_chunk() -> None:
     async with serving(chunked_response_app) as server, ConnectionPool() as pool:
-        async with pool.request("GET", f"http://{server.host}:{server.port}/down") as (_head, body):
+        async with request(pool, "GET", f"http://{server.host}:{server.port}/down") as (_head, body):
             received = [chunk async for chunk in body]
     assert b"".join(received) == b"onetwothree"
 
@@ -451,21 +456,23 @@ async def test_cookie_jar_carries_a_set_cookie_to_the_next_request() -> None:
     jar = CookieJar()
     async with serving(cookie_app) as server, ConnectionPool() as pool:
         base = f"http://{server.host}:{server.port}"
-        async with pool.request("GET", f"{base}/set", middleware=cookies(jar)) as (head, _body):
+        client = cookies(jar)(pool)
+        async with request(client, "GET", f"{base}/set") as (head, _body):
             assert head.status == 200
-        async with pool.request("GET", f"{base}/echo", middleware=cookies(jar)) as (_head, body):
+        async with request(client, "GET", f"{base}/echo") as (_head, body):
             assert await body.read() == b"cookie=sid=xyz789"
 
 
 async def test_cookie_jar_drops_a_cookie_deleted_with_max_age_zero() -> None:
     jar = CookieJar()
-    async with serving(cookie_app) as server, ConnectionPool(middleware=cookies(jar)) as pool:
+    async with serving(cookie_app) as server, ConnectionPool() as pool:
         base = f"http://{server.host}:{server.port}"
-        async with pool.request("GET", f"{base}/set") as (head, _body):
+        client = cookies(jar)(pool)
+        async with request(client, "GET", f"{base}/set") as (head, _body):
             assert head.status == 200
-        async with pool.request("GET", f"{base}/clear") as (head, _body):
+        async with request(client, "GET", f"{base}/clear") as (head, _body):
             assert head.status == 200
-        async with pool.request("GET", f"{base}/echo") as (_head, body):
+        async with request(client, "GET", f"{base}/echo") as (_head, body):
             assert await body.read() == b"cookie="
 
 
@@ -475,17 +482,17 @@ def test_origin_rejects_a_url_without_a_host() -> None:
 
 
 def test_build_request_keeps_an_explicit_content_length_for_a_buffered_body() -> None:
-    request = _build_request("POST", "http://h/x", ((b"content-length", b"7"),), b"payload")
+    outgoing = _build_request("POST", "http://h/x", ((b"content-length", b"7"),), b"payload", Timeout())
 
-    assert request.headers == ((b"content-length", b"7"),)
+    assert outgoing.headers == ((b"content-length", b"7"),)
 
 
 async def test_build_request_keeps_explicit_framing_for_a_streaming_body() -> None:
     stream = _chunks(b"ab", b"cd")
-    request = _build_request("POST", "http://h/x", ((b"transfer-encoding", b"chunked"),), stream)
+    outgoing = _build_request("POST", "http://h/x", ((b"transfer-encoding", b"chunked"),), stream, Timeout())
 
-    assert request.headers == ((b"transfer-encoding", b"chunked"),)
-    assert [chunk async for chunk in request.body] == [b"ab", b"cd"]
+    assert outgoing.headers == ((b"transfer-encoding", b"chunked"),)
+    assert [chunk async for chunk in outgoing.body] == [b"ab", b"cd"]
 
 
 async def _chunks_with_gaps(*parts: bytes) -> AsyncIterator[bytes]:
@@ -497,7 +504,7 @@ async def test_streams_an_h11_body_with_an_explicit_host_and_empty_chunks() -> N
     async with serving(echo_app) as server, ConnectionPool() as pool:
         upload = _chunks_with_gaps(b"", b"ab", b"", b"cd")
         url = f"http://{server.host}:{server.port}/up"
-        async with pool.request("POST", url, headers=((b"host", b"override.test"),), body=upload) as (_head, body):
+        async with request(pool, "POST", url, headers=((b"host", b"override.test"),), body=upload) as (_head, body):
             assert await body.read() == b"POST /up test= body=abcd"
 
 
@@ -505,7 +512,7 @@ async def test_reads_a_large_h11_response_body_across_multiple_socket_reads() ->
     payload = b"x" * 200_000
     async with serving(echo_app) as server, ConnectionPool() as pool:
         url = f"http://{server.host}:{server.port}/big"
-        async with pool.request("POST", url, body=payload) as (_head, body):
+        async with request(pool, "POST", url, body=payload) as (_head, body):
             assert await body.read() == b"POST /big test= body=" + payload
 
 
@@ -519,8 +526,9 @@ async def no_location_redirect_app(scope: RawScope, receive: Receive, send: Send
 
 
 async def test_follow_redirects_stops_when_a_redirect_lacks_a_location() -> None:
-    async with serving(no_location_redirect_app) as server, ConnectionPool(middleware=follow_redirects()) as pool:
-        async with pool.request("GET", f"http://{server.host}:{server.port}/start") as (head, _body):
+    async with serving(no_location_redirect_app) as server, ConnectionPool() as pool:
+        client = follow_redirects()(pool)
+        async with request(client, "GET", f"http://{server.host}:{server.port}/start") as (head, _body):
             assert head.status == 302
 
 
@@ -679,23 +687,30 @@ def test_target_defaults_an_empty_path_to_slash() -> None:
 
 
 def test_build_request_adds_content_length_for_a_buffered_body() -> None:
-    request = _build_request("POST", "http://api.example.test/x", (), b"payload")
+    outgoing = _build_request("POST", "http://api.example.test/x", (), b"payload", Timeout())
 
-    assert request.headers == ((b"content-length", b"7"),)
+    assert outgoing.headers == ((b"content-length", b"7"),)
 
 
 async def test_build_request_keeps_content_length_for_a_streaming_body() -> None:
     stream = _chunks(b"ab", b"cd")
-    request = _build_request("POST", "http://api.example.test/x", ((b"content-length", b"4"),), stream)
+    outgoing = _build_request("POST", "http://api.example.test/x", ((b"content-length", b"4"),), stream, Timeout())
 
-    assert request.headers == ((b"content-length", b"4"),)  # no chunked framing added over an explicit length
+    assert outgoing.headers == ((b"content-length", b"4"),)  # no chunked framing added over an explicit length
 
 
 async def test_build_request_adds_chunked_transfer_encoding_for_an_unframed_streaming_body() -> None:
     stream = _chunks(b"payload")
-    request = _build_request("POST", "http://api.example.test/x", (), stream)
+    outgoing = _build_request("POST", "http://api.example.test/x", (), stream, Timeout())
 
-    assert request.headers == ((b"transfer-encoding", b"chunked"),)
+    assert outgoing.headers == ((b"transfer-encoding", b"chunked"),)
+
+
+def test_build_request_carries_the_timeout_onto_the_request() -> None:
+    budget = Timeout(read=timedelta(seconds=3))
+    outgoing = _build_request("GET", "http://api.example.test/x", (), b"", budget)
+
+    assert outgoing.timeout == budget
 
 
 async def test_open_reports_http_1_1_for_a_cleartext_connection() -> None:
@@ -710,8 +725,9 @@ async def test_open_reports_http_1_1_for_a_cleartext_connection() -> None:
 
 
 async def test_follow_redirects_defaults_to_five_hops() -> None:
-    async with serving(chain_app) as server, ConnectionPool(middleware=follow_redirects()) as pool:
-        async with pool.request("GET", f"http://{server.host}:{server.port}/hop/6") as (head, _body):
+    async with serving(chain_app) as server, ConnectionPool() as pool:
+        client = follow_redirects()(pool)
+        async with request(client, "GET", f"http://{server.host}:{server.port}/hop/6") as (head, _body):
             # A six-hop chain needs six follows; the default of five stops one short, still on a redirect.
             assert head.status == 302
 
@@ -843,7 +859,7 @@ def test_with_cookie_merges_a_value_into_an_existing_cookie_header() -> None:
 async def test_checking_in_to_a_closed_host_pool_closes_the_connection() -> None:
     async with serving(sized_echo_app) as server, ConnectionPool() as pool:
         url = f"http://{server.host}:{server.port}/items"
-        async with pool.request("GET", url) as (_head, body):
+        async with request(pool, "GET", url) as (_head, body):
             assert await body.read() == b"GET /items body="
         host_pool = next(iter(pool._h11.values()))
         (connection,) = host_pool.idle

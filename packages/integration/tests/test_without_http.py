@@ -22,8 +22,10 @@ from without_asgi import Inbound
 from without_asgi import Outbound
 from without_asgi import file_response
 from without_asgi import make_asgi_app
+from without_http import Client
 from without_http import ConnectionPool
 from without_http import add_headers
+from without_http import request
 from without_http import serving
 from wsproto import ConnectionType
 from wsproto import WSConnection
@@ -124,7 +126,7 @@ async def test_without_http_client_gets_one_todo() -> None:
     async with (
         serving(todos_app(_todos())) as server,
         ConnectionPool() as pool,
-        pool.request("GET", f"http://{server.host}:{server.port}/todos/1") as (head, body),
+        request(pool, "GET", f"http://{server.host}:{server.port}/todos/1") as (head, body),
     ):
         assert head.status == 200
         assert json.loads(await body.read()) == {"id": 1, "title": "write", "done": False}
@@ -134,13 +136,13 @@ async def test_a_missing_todo_maps_to_404() -> None:
     async with (
         serving(todos_app(_todos())) as server,
         ConnectionPool() as pool,
-        pool.request("GET", f"http://{server.host}:{server.port}/todos/999") as (head, _body),
+        request(pool, "GET", f"http://{server.host}:{server.port}/todos/999") as (head, _body),
     ):
         assert head.status == 404
 
 
-async def _admin_status(pool: ConnectionPool, url: str) -> int:
-    async with pool.request("GET", url) as (head, _body):
+async def _admin_status(client: Client, url: str) -> int:
+    async with request(client, "GET", url) as (head, _body):
         return head.status
 
 
@@ -149,7 +151,7 @@ async def test_client_middleware_supplies_the_admin_authorization_header() -> No
         url = f"http://{server.host}:{server.port}/admin/stats"
         async with ConnectionPool() as pool:
             unauthorized = await _admin_status(pool, url)
-        async with ConnectionPool(middleware=add_headers((b"authorization", b"Bearer let-me-in"))) as authorized:
+            authorized = add_headers((b"authorization", b"Bearer let-me-in"))(pool)
             authorized_status = await _admin_status(authorized, url)
 
     assert unauthorized == 401

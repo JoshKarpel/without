@@ -134,6 +134,11 @@ filterwarnings = [
     # to key its fixture measurements. Its timing report is a dev tool, not production
     # behaviour, so ignore its deprecation rather than let it fail the suite.
     "ignore:FixtureDef.has_location is deprecated:pytest.PytestRemovedIn10Warning",
+    # starlette's TestClient now prefers `httpx2` and warns when it finds only `httpx`.
+    # The interop test that drives a `without` app through TestClient is about TestClient,
+    # not about which httpx major backs it, so it runs on the httpx already in the tree
+    # rather than pulling in a second HTTP client for one test.
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
 ]
 
 asyncio_mode = "auto"
@@ -280,4 +285,7 @@ force-single-line = true
     # `timeout` is a `Timeout` config value threaded to the API boundary (the httpx-parity public name),
     # not a raw seconds deadline; it is applied via `asyncio.timeout` inside `phase`, so ASYNC109's advice is met.
     "ASYNC109",
+]
+"packages/without-http/src/without_http/testing.py" = [
+    "ASYNC109",  # a `Connect` implementation, so it carries `client.py`'s `Timeout` parameter verbatim
 ]

@@ -285,7 +285,7 @@ mistaking symmetry for simplicity. The recurring instance is who holds the
 continuation: where the library calls inward, the user writes a node and the
 shape is the substrate's; where the user holds the continuation and the code
 after the call is theirs, they are at the rim writing a script, and the honest
-shape there is imperative. A client exchange is at the rim. Contorting a rim API
+shape there is imperative. A client request is at the rim. Contorting a rim API
 into a node to make the library look uniform buys nothing and costs the caller.
 
 **Strictness follows authorship** settles how to react to an unexpected value,

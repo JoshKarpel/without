@@ -17,15 +17,15 @@ translate between typed events and the ASGI dicts an app expects.
 ```python
 from without import sleep_forever
 from without_asgi import make_asgi_app
-from without_http import ConnectionPool, serving
+from without_http import ConnectionPool, request, serving
 
 app = make_asgi_app(lifespan, http=router.dispatch, websocket=sockets.dispatch)
 
 async with serving(app, host="127.0.0.1", port=8000):
-    await sleep_forever()   # run until cancelled
+    await sleep_forever()  # run until cancelled
 
 async with ConnectionPool() as pool:
-    async with pool.request("GET", "http://127.0.0.1:8000/items") as (head, body):
+    async with request(pool, "GET", "http://127.0.0.1:8000/items") as (head, body):
         assert head.status == 200
         data = await body.read()
 ```
@@ -33,11 +33,15 @@ async with ConnectionPool() as pool:
 Because `without-http` speaks plain ASGI to the app, *any* ASGI app runs over it,
 interchangeably with uvicorn. The server handles TLS, HTTP/2 (by ALPN or prior
 knowledge), keep-alive, WebSockets over the HTTP/1.1 upgrade, per-handler
-isolation, and flow control. The client is a `ConnectionPool` with a `(head,
-body)` response split, buffered and streaming bodies in both directions,
-opt-in trailers, HTTP/2 multiplexing, per-host connection bounds, per-phase
-request timeouts, consumer-driven duplex (with bidirectional streaming over
-HTTP/2), and `stack`-composed middleware.
+isolation, and flow control. A client is a function from a request to a response, and
+a `ConnectionPool` is the one that answers over the network: a `(head, body)` response
+split, buffered and streaming bodies in both directions, opt-in trailers, HTTP/2
+multiplexing, per-host connection bounds, per-phase request timeouts, consumer-driven
+duplex (with bidirectional streaming over HTTP/2), and `stack`-composed middleware.
+
+`without_http.testing` carries the same interface into a test: a mock client that answers
+from a function, an ASGI client that drives an app in memory, and a loopback client that
+runs the real wire protocols over no socket at all.
 
 See the
 [`without-http` guide](https://without.help/without-http/)

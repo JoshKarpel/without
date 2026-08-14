@@ -36,9 +36,12 @@ send, path send, early hints, response trailers (with the `trailers` flag on
 reads the `tls` extension out of a scope's generic `extensions` mapping).
 
 Sourced from the spec on 2026-06-23 (HTTP & WebSocket spec version 2.5, lifespan
-spec version 2.0, TLS extension version 0.2). One easy-to-miss detail when
+spec version 2.0, TLS extension version 0.2). Two easy-to-miss details when
 revising: the `asgi.spec_version` default differs by scope (HTTP/WebSocket
-default `"2.0"`, lifespan `"1.0"`).
+default `"2.0"`, lifespan `"1.0"`), and the whole `asgi` mapping is tolerated
+missing, defaulting `version` to `"2.0"` as the spec's Applications section
+instructs, because real producers omit it (starlette's `TestClient` sends a
+lifespan scope with no `asgi` key).
 
 ## Where built-in middleware lives
 
@@ -59,7 +62,7 @@ needs, and in the package that owns the exchange shape it wraps.**
 - **`without-web`** holds route-aware middleware: anything keyed on the matched
   route or that maps exceptions to responses, plus route-scoped middleware and
   OpenAPI-aware pieces. Only that layer can see route metadata.
-- **`without-http`** holds the **client** middleware, since the client exchange
+- **`without-http`** holds the **client** middleware, since a `Client`
   (`ClientRequest -> ClientResponse`) is a `Processor` too and lives there
   (`add_headers`, `follow_redirects`, `cookies` over a caller-owned `CookieJar`,
   and future retry / auth / response decompression). Its server side keeps only the concerns that **cannot** be

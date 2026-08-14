@@ -31,6 +31,9 @@ dependencies = [
     "pydantic>=2",
     "pydantic-settings>=2.7",
     "httpx>=0.28",
+    # The interop proof runs a FastAPI (Starlette) app through without-http's in-memory
+    # clients, and a without app through starlette's TestClient and httpx's ASGITransport.
+    "fastapi>=0.140.0",
 ]
 
 [tool.uv.sources]

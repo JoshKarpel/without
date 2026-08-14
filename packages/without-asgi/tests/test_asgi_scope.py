@@ -205,6 +205,26 @@ def test_parse_scope_defaults_lifespan_spec_version() -> None:
     assert parsed == LifespanScope(asgi=Asgi(version="3.0", spec_version="1.0"))
 
 
+def test_parse_scope_defaults_the_asgi_version_a_producer_left_out() -> None:
+    # The spec tells applications to assume 2.0 when the version is missing, and real
+    # producers do omit it: starlette's TestClient sends no `asgi` key at all.
+    assert parse_scope({"type": "lifespan", "state": {}}) == LifespanScope(asgi=Asgi("2.0", "1.0"))
+    assert parse_scope({"type": "lifespan", "asgi": {}}) == LifespanScope(asgi=Asgi("2.0", "1.0"))
+
+
+def test_parse_http_scope_defaults_the_asgi_version_a_producer_left_out() -> None:
+    scope: RawMessage = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "GET",
+        "path": "/items",
+        "query_string": b"",
+        "headers": [],
+    }
+
+    assert parse_scope(scope).asgi == Asgi(version="2.0", spec_version="2.0")
+
+
 def test_parse_tls_reads_the_connection_info() -> None:
     extensions: dict[str, dict[str, object]] = {
         "tls": {

@@ -260,9 +260,40 @@
   `ValueError` (from a custom extractor or an `into` factory) as a backstop. Making the boundary a
   single matchable type is what lets a plain `ValueError` raised deeper in a handler surface as a 500
   rather than masquerading as a client 400.
+- **`without-http`**: `without_http.testing`, three more `Client`s that reach an app (or nothing)
+  without binding a socket. `mock_client(handler)` answers from a function, which is the whole of
+  mocking once a client is one, with `respond(...)` building the canned response.
+  `asgi_client(app)` builds an `HttpScope` from each request and drives `app(scope, receive, send)`
+  directly, streaming: the head returns the moment the app sends `http.response.start` and body
+  chunks cross a one-slot queue, so duplex handlers are testable, and the app's lifespan runs for
+  the block through the same `run_lifespan` a server uses (which `httpx.ASGITransport` leaves to
+  the caller). `loopback_client(app)` is `serving` minus `asyncio.start_server`: the real
+  `ConnectionPool` and the real server, wired to each other over `pipe()`, two cross-wired
+  `StreamReader`s with genuine backpressure, so framing, keep-alive, HTTP/2 by prior knowledge, and
+  the server's crash-to-`500` isolation all run with no port and no file descriptor. All three
+  speak plain ASGI and plain request values, so they drive a FastAPI or Starlette app as readily as
+  a `without` one, and `base_url(...)` composes on when a test would rather write `"/items"`.
 
 ### Changed
 
+- **`without-http`**: a client *is* a function from a request to a response. The type formerly
+  called `ClientExchange` is now `Client`, `ConnectionPool` satisfies it by being callable
+  (`await pool(request)`), and the caller-facing surface is a free `request(client, method, url,
+  ...)` context manager rather than a method on the pool. Everything the pool held that was not
+  about connections has left it: `middleware` is gone, because a decorated client is just
+  `stack(add_headers(...), cookies(jar))(pool)`, and `timeout` is gone, because a deadline belongs
+  to the caller rather than to the connection and now rides on `ClientRequest.timeout` (set it per
+  call with `request(..., timeout=...)`, or across a client with the new `deadline(...)`
+  middleware, which fills in only a request that states no budget of its own). What is left on the
+  pool is connections: TLS, HTTP/2, the per-host bounds, socket options, and the new injectable
+  `connect`, which is the one step that touches the network. Migration is mechanical:
+  `pool.request(m, u, ...)` becomes `request(pool, m, u, ...)`, `ConnectionPool(middleware=mw)`
+  becomes composing `mw(pool)` where the client is built, and `ConnectionPool(timeout=t)` becomes
+  `deadline(t)(pool)`.
+- **`without-asgi`**: a scope whose `asgi` key (or `asgi["version"]`) is missing parses as version
+  `"2.0"` rather than raising `KeyError`, which is what the spec tells applications to assume.
+  Real producers omit it: starlette's `TestClient` sends a lifespan scope with no `asgi` key at
+  all, and a `without` app driven through it previously crashed on the first request.
 - **`without`**: the module holding the substrate is `without.interfaces` rather than
   `without.contracts`. Every name is re-exported from the package's top-level `__init__`, so
   `from without import Processor` is unaffected and only a direct submodule import has to change.

@@ -194,11 +194,22 @@ def _as_subprotocols(value: object) -> tuple[str, ...]:
     return tuple(narrow(item, str) for item in value)
 
 
+# What the spec tells an *application* to assume when a server leaves the version out:
+# "If missing, the version should default to `2.0`"
+# (https://asgi.readthedocs.io/en/latest/specs/main.html). Real producers do leave it
+# out (starlette's `TestClient` sends a lifespan scope with no `asgi` key at all), and
+# nothing here branches on the version, so tolerating it is the spec's own instruction
+# rather than a swallowed fault.
+_DEFAULT_VERSION = "2.0"
+
+
 def _as_asgi(value: object, *, default_spec_version: str) -> Asgi:
+    if value is None:
+        return Asgi(version=_DEFAULT_VERSION, spec_version=default_spec_version)
     if not isinstance(value, Mapping):
         raise TypeError(f"expected an asgi mapping, got {type(value).__name__}")
     return Asgi(
-        version=narrow(value["version"], str),
+        version=narrow(value.get("version", _DEFAULT_VERSION), str),
         spec_version=narrow(value.get("spec_version", default_spec_version), str),
     )
 
@@ -256,7 +267,7 @@ def _as_extensions(value: object) -> Mapping[str, Mapping[str, object]] | None:
 def parse_http_scope(scope: RawScope) -> HttpScope:
     """Read an `http` scope into the typed connection facts, validating at the boundary."""
     return HttpScope(
-        asgi=_as_asgi(scope["asgi"], default_spec_version="2.0"),
+        asgi=_as_asgi(scope.get("asgi"), default_spec_version="2.0"),
         http_version=narrow(scope["http_version"], str),
         method=narrow(scope["method"], str),
         scheme=narrow(scope.get("scheme", "http"), str),
@@ -274,7 +285,7 @@ def parse_http_scope(scope: RawScope) -> HttpScope:
 def parse_websocket_scope(scope: RawScope) -> WebsocketScope:
     """Read a `websocket` scope into the typed handshake facts, validating at the boundary."""
     return WebsocketScope(
-        asgi=_as_asgi(scope["asgi"], default_spec_version="2.0"),
+        asgi=_as_asgi(scope.get("asgi"), default_spec_version="2.0"),
         http_version=narrow(scope.get("http_version", "1.1"), str),
         scheme=narrow(scope.get("scheme", "ws"), str),
         path=narrow(scope["path"], str),
@@ -297,7 +308,7 @@ def parse_scope(scope: RawScope) -> Scope:
         case "websocket":
             return parse_websocket_scope(scope)
         case "lifespan":
-            return LifespanScope(asgi=_as_asgi(scope["asgi"], default_spec_version="1.0"))
+            return LifespanScope(asgi=_as_asgi(scope.get("asgi"), default_spec_version="1.0"))
         case other:
             raise ValueError(f"unexpected scope type: {other!r}")
 

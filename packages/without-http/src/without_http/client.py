@@ -16,6 +16,7 @@ from datetime import UTC
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from typing import NamedTuple
+from typing import Protocol
 from typing import Self
 from urllib.parse import SplitResult
 from urllib.parse import urljoin
@@ -86,18 +87,26 @@ class Origin:
 @dataclass(frozen=True, slots=True)
 class ClientRequest:
     """
-    A client request as a value: the head plus a streaming body.
+    A client request as a value: the head, a streaming body, and its deadline.
 
     The body is a `Stream[bytes]` (an async iterable of chunks), so a request can be
     buffered (one chunk) or streamed (many), the upload half of the buffered/streaming
-    matrix. Because the whole request is the value a `ClientExchange` transforms,
-    middleware can rewrite it: add headers, change the URL, wrap the body.
+    matrix. Because the whole request is the value a `Client` transforms, middleware can
+    rewrite it: add headers, change the URL, wrap the body, extend the deadline.
+
+    `timeout` bounds each phase of *this* request (see `Timeout`), and defaults to no
+    bounds at all. It rides on the request rather than on the transport because a
+    deadline is the caller's policy, not the connection's: it is the caller's time
+    budget that decides when slow progress is worse than failure. Carrying it here is
+    what lets a `Client` be a plain one-argument function, and what lets middleware
+    (`deadline`, or a retry that shortens each attempt) set it like any other field.
     """
 
     method: str
     url: str
     headers: RawHeaders = ()
     body: Stream[bytes] = field(default_factory=_empty_body)
+    timeout: Timeout = _NO_TIMEOUT
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,16 +194,16 @@ class ClientResponse(NamedTuple):
     A client response as a value: the head paired with the body.
 
     `head` is the parsed `ResponseHead` (status + headers), available the instant
-    `await exchange(request)` returns. `body` is a `ResponseBody`, a once-consumable
+    `await client(request)` returns. `body` is a `ResponseBody`, a once-consumable
     stream that releases its connection when it ends or is closed.
 
     A `NamedTuple` so a caller can take it whole (`response.head`, `response.body`) or
     unpack it (`head, body = response`) with each field keeping its precise type, which a
     `__iter__` on a dataclass could not give. The two halves are independent, the
     consumer split that mirrors how a server consumes a request (a `scope` value plus a
-    body stream): branch on `head` without touching `body`. `ConnectionPool.request`
-    yields this value and closes `body` on exit; it is also what a `ClientExchange`
-    rewrites (by constructing a new one, since a `NamedTuple` has no `dataclasses.replace`).
+    body stream): branch on `head` without touching `body`. `request` yields this value
+    and closes `body` on exit; it is also what a `ClientMiddleware` rewrites (by
+    constructing a new one, since a `NamedTuple` has no `dataclasses.replace`).
     """
 
     head: ResponseHead
@@ -242,17 +251,21 @@ async def _releasing(
     return armed
 
 
-# A client exchange is the dual of a server handler: where a handler maps a request to
-# a response over streams, an exchange maps a whole `ClientRequest` to a
-# `ClientResponse`. A `ClientMiddleware` wraps an exchange into an exchange (`Endo`):
-# it can rewrite the request before, or the response after, the inner exchange runs.
-# This is the zero-context case of the shared `stack` vocabulary: a server middleware
-# is `(handler, state, scope)`, a client one needs no context (the request is the value
-# it transforms, not a fixed scope), so it is simply `(exchange) -> exchange`, and the
-# same `stack` composes them. State a middleware must keep lives in a closure (see
-# `cookies`), as it does server-side.
-type ClientExchange = Callable[[ClientRequest], Awaitable[ClientResponse]]
-type ClientMiddleware = Endo[ClientExchange]
+# A client *is* a function from a request to a response, the dual of a server handler:
+# where a handler maps a request to a response over streams, a client maps a whole
+# `ClientRequest` to a `ClientResponse`. Everything that answers a request is one, and
+# they are interchangeable by construction: a `ConnectionPool` over the network, a
+# canned response table in a test, an ASGI app driven in memory.
+#
+# A `ClientMiddleware` wraps a client into a client (`Endo`): it can rewrite the request
+# before, or the response after, the inner client runs. This is the zero-context case of
+# the shared `stack` vocabulary: a server middleware is `(handler, state, scope)`, a
+# client one needs no context (the request is the value it transforms, not a fixed
+# scope), so it is simply `(client) -> client`, and the same `stack` composes them.
+# State a middleware must keep lives in a closure (see `cookies`), as it does
+# server-side.
+type Client = Callable[[ClientRequest], Awaitable[ClientResponse]]
+type ClientMiddleware = Endo[Client]
 
 _PASSTHROUGH: ClientMiddleware = stack()
 
@@ -275,7 +288,9 @@ def _target(parts: SplitResult) -> str:
     return target
 
 
-def _build_request(method: str, url: str, headers: RawHeaders, content: bytes | Stream[bytes]) -> ClientRequest:
+def _build_request(
+    method: str, url: str, headers: RawHeaders, content: bytes | Stream[bytes], timeout: Timeout
+) -> ClientRequest:
     """
     Assemble a `ClientRequest`, picking the body framing from `content`.
 
@@ -285,13 +300,15 @@ def _build_request(method: str, url: str, headers: RawHeaders, content: bytes | 
     """
     if isinstance(content, bytes):
         if not content:
-            return ClientRequest(method, url, headers, _empty_body())  # pragma: no mutate - equals _empty_body()
+            return ClientRequest(
+                method, url, headers, _empty_body(), timeout
+            )  # pragma: no mutate - equals _empty_body()
         if not _has(headers, b"content-length"):
             headers = (*headers, (b"content-length", str(len(content)).encode(_ASCII)))
-        return ClientRequest(method, url, headers, _single(content))
+        return ClientRequest(method, url, headers, _single(content), timeout)
     if not _has(headers, b"content-length") and not _has(headers, b"transfer-encoding"):
         headers = (*headers, (b"transfer-encoding", b"chunked"))
-    return ClientRequest(method, url, headers, content)
+    return ClientRequest(method, url, headers, content, timeout)
 
 
 _ALPN_H2 = ("h2", "http/1.1")
@@ -327,6 +344,28 @@ async def _open(
     ssl_object = writer.get_extra_info("ssl_object")
     negotiated = ssl_object.selected_alpn_protocol() if ssl_object is not None else None
     return reader, writer, "h2" if negotiated == "h2" else "http/1.1"
+
+
+class Connect(Protocol):
+    """
+    How a pool reaches an origin: the one step that touches the network.
+
+    Injected into `ConnectionPool` so the rest of it (reuse, bounds, protocol selection)
+    stays independent of how a connection is made. `_open` is the default and speaks
+    TCP; a test dials an in-memory pipe, and a unix-socket or proxy connector would slot
+    in the same way. The negotiated wire protocol comes back alongside the streams
+    because only the connector can know it: ALPN is read off the finished handshake.
+    """
+
+    async def __call__(
+        self,
+        host: str,
+        port: int,
+        *,
+        ssl_context: ssl.SSLContext | None,
+        timeout: Timeout = ...,
+        socket_options: SocketOptions = (),
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, str]: ...
 
 
 @dataclass(slots=True, eq=False)
@@ -933,12 +972,16 @@ class _HostPool:
 @dataclass(slots=True)
 class ConnectionPool:
     """
-    Connections keyed by origin, and the entrypoint for making requests.
+    Connections keyed by origin: the `Client` that answers a request over the network.
+
+    Calling it *is* the request (`await pool(request)`), so a pool is interchangeable
+    with any other `Client` and composes with `ClientMiddleware` through `stack`. Most
+    callers go through the `request` context manager rather than calling it directly,
+    since that builds the `ClientRequest` and closes the response body for them.
 
     Open it as an async context manager (`async with ConnectionPool(...) as pool`) so
     its connections are closed on exit; a directly-constructed pool works for
     short-lived use but does not manage the long-lived connections keep-alive retains.
-    Make requests through `async with pool.request(...) as response`.
 
     HTTP/2 connections are kept and reused: many concurrent requests to one origin
     multiplex over a single connection, which is the point of h2. HTTP/1.1
@@ -957,13 +1000,14 @@ class ConnectionPool:
     live context, precisely because ALPN can only be set context-wide: a shared context
     would be mutated out from under other pools or libraries using it.
 
-    `middleware` decorates every request through the pool; per-request `middleware` on
-    `request` composes inside it. Keep pool-level middleware to *pure* decoration
-    (default headers, redirect following, retry): things that are values, not state.
-    Anything carrying mutable, request-spanning identity (a `CookieJar`, an auth
-    session) belongs in a value you own and pass per request, so that connection reuse
-    (a transport concern) and application identity stay independent rather than both
-    hiding in the pool.
+    `connect` is how the pool reaches an origin, defaulting to a TCP connect (see
+    `Connect`). It is the only part of the pool that touches the network, so replacing
+    it points the same pooling, protocol selection, and keep-alive at somewhere else.
+
+    Decoration (default headers, redirect following, cookies, a deadline) is *not* a
+    pool concern: compose it around the pool with `stack`, which yields another `Client`.
+    That keeps connection reuse (a transport concern) and application identity
+    independent, rather than both hiding in the pool.
 
     `max_connections_per_host` bounds the number of concurrent HTTP/1.1 connections to
     one origin: at the bound, a checkout *waits* for one to be returned (the wait a
@@ -980,9 +1024,9 @@ class ConnectionPool:
     connections cannot outnumber concurrent checkouts. Both knobs, when set, MUST be `>=
     1`.
 
-    `timeout` bounds each phase of a request (see `Timeout`); it defaults to no timeouts,
-    since a deadline is the caller's policy, not the transport's. A per-request `timeout`
-    on `request` replaces it wholesale for that call.
+    Deadlines ride on the request (`ClientRequest.timeout`), not on the pool: the same
+    pool serves callers with different time budgets, and a bound stored here would be a
+    property of the connection rather than of the caller that wanted it.
 
     `socket_options` is applied to every socket the pool opens, as `(level, option, value)`
     triples. Build it by concatenating the pure producers in `without_http.socket_options`
@@ -996,10 +1040,9 @@ class ConnectionPool:
     allow_http2: bool = True
     force_http2_cleartext: bool = False
     ssl_context_factory: Callable[[], ssl.SSLContext] = ssl.create_default_context
-    middleware: ClientMiddleware = _PASSTHROUGH
+    connect: Connect = _open
     max_connections_per_host: int | None = None
     max_keepalive_per_host: int | None = None
-    timeout: Timeout = _NO_TIMEOUT
     socket_options: SocketOptions = _DEFAULT_SOCKET_OPTIONS
     _h2: dict[Origin, _Http2Connection] = field(default_factory=dict)
     _h11: dict[Origin, _HostPool] = field(default_factory=dict)
@@ -1021,61 +1064,16 @@ class ConnectionPool:
     async def __aexit__(self, *exc: object) -> None:
         await self.aclose()
 
-    @asynccontextmanager
-    async def request(
-        self,
-        method: str,
-        url: str,
-        *,
-        headers: RawHeaders = (),
-        body: bytes | Stream[bytes] = b"",
-        middleware: ClientMiddleware = _PASSTHROUGH,
-        timeout: Timeout | None = None,
-    ) -> AsyncIterator[ClientResponse]:
+    async def __call__(self, request: ClientRequest) -> ClientResponse:
         """
-        Send a request and yield its `ClientResponse` for the block, then release the connection.
+        Answer one request over the network, which is what makes a pool a `Client`.
 
-        `body` is the request body: `bytes` to buffer it, or a `Stream[bytes]` to stream
-        it. The yielded `ClientResponse` can be taken whole (`response.head`,
-        `response.body`) or unpacked (`head, body = ...`); read the response body with
-        `async for chunk in body` / `await body.read()`, or `body.read_with_trailers()`
-        when the endpoint carries trailers. On exit any unread body is drained or aborted
-        so the connection is never stranded.
-
-        `middleware` is composed inside the pool's own `middleware`, so a single request
-        can add decoration (a `CookieJar` via `cookies`, an extra header) on top of the
-        pool-wide stack for this call alone.
-
-        `timeout` replaces the pool's own `timeout` for this call (`None` inherits it).
-        It is captured as a value in the transport exchange, so it does not compose through
-        `middleware` the way decoration does; a deadline overrides, it does not layer.
+        Picks the origin's wire protocol, checks out (or opens) a connection, and returns
+        the response as soon as its head arrives, with the body still streaming. The
+        request's own `timeout` is threaded through as a value, never stored on the
+        shared connection objects, so concurrent requests keep their own deadlines.
         """
-        outgoing = _build_request(method, url, headers, body)
-        effective = self.timeout if timeout is None else timeout
-
-        async def bound(outgoing: ClientRequest) -> ClientResponse:
-            return await self._exchange(outgoing, effective)
-
-        exchange = stack(self.middleware, middleware)(bound)
-        response = await exchange(outgoing)
-        try:
-            yield response
-        except BaseException:
-            # An error is already in flight; still close the body to release the connection,
-            # but suppress any close error (e.g. a surfaced request-body send failure) so it
-            # cannot mask the original exception the caller is trying to debug.
-            with suppress(Exception):
-                await response.body.aclose()
-            raise
-        else:
-            await response.body.aclose()
-
-    async def _exchange(self, request: ClientRequest, timeout: Timeout) -> ClientResponse:
-        # The bare transport exchange: the inner `ClientExchange` that `request` wraps
-        # with `stack(self.middleware, ...)`. Private so callers go through `request`
-        # and never accidentally bypass the pool's configured middleware. The effective
-        # `timeout` is threaded in as a value (captured by `bound` above), never stored on
-        # the shared connection objects, so concurrent requests keep their own deadlines.
+        timeout = request.timeout
         parts = urlsplit(request.url)
         origin = _origin(parts)
         if origin.secure and self.allow_http2:
@@ -1110,7 +1108,7 @@ class ConnectionPool:
             async with self._lock_for(origin):
                 connection = self._reusable_h2(origin)
                 if connection is None and origin not in self._h11_only:
-                    reader, writer, protocol = await _open(
+                    reader, writer, protocol = await self.connect(
                         origin.host,
                         origin.port,
                         ssl_context=self._context_for_connection(http2=True),
@@ -1140,7 +1138,7 @@ class ConnectionPool:
             async with self._lock_for(origin):
                 connection = self._reusable_h2(origin)
                 if connection is None:
-                    reader, writer, _ = await _open(
+                    reader, writer, _ = await self.connect(
                         origin.host,
                         origin.port,
                         ssl_context=None,
@@ -1233,7 +1231,7 @@ class ConnectionPool:
 
     async def _open_h11(self, origin: Origin, timeout: Timeout) -> _Http11Connection:
         ssl_context = self._context_for_connection(http2=False) if origin.secure else None
-        reader, writer, _ = await _open(
+        reader, writer, _ = await self.connect(
             origin.host, origin.port, ssl_context=ssl_context, timeout=timeout, socket_options=self.socket_options
         )
         return _Http11Connection.new(reader, writer)
@@ -1263,6 +1261,49 @@ class ConnectionPool:
             await host_pool.aclose()
 
 
+@asynccontextmanager
+async def request(
+    client: Client,
+    method: str,
+    url: str,
+    *,
+    headers: RawHeaders = (),
+    body: bytes | Stream[bytes] = b"",
+    timeout: Timeout = _NO_TIMEOUT,
+) -> AsyncIterator[ClientResponse]:
+    """
+    Send a request through `client` and yield its `ClientResponse` for the block.
+
+    The one request surface, over *any* `Client`: a `ConnectionPool`, a pool wrapped in
+    middleware (`stack(add_headers(...), cookies(jar))(pool)`), or an in-memory one from
+    `without_http.testing`. It owns the two things a caller would otherwise repeat: the
+    body framing (`bytes` gets a `content-length`, a `Stream[bytes]` gets
+    `transfer-encoding: chunked`) and closing the response body on the way out, so a
+    connection is never stranded by a body nobody read.
+
+    The yielded `ClientResponse` can be taken whole (`response.head`, `response.body`) or
+    unpacked (`head, body = ...`); read the response body with `async for chunk in body`
+    / `await body.read()`, or `body.read_with_trailers()` when the endpoint carries
+    trailers. On exit any unread body is drained or aborted.
+
+    `timeout` bounds this request's phases (see `Timeout`), defaulting to no bounds. It
+    lands on the `ClientRequest`, so middleware sees and can rewrite it like any other
+    field; `deadline` sets the same field for every request through a client.
+    """
+    response = await client(_build_request(method, url, headers, body, timeout))
+    try:
+        yield response
+    except BaseException:
+        # An error is already in flight; still close the body to release the connection,
+        # but suppress any close error (e.g. a surfaced request-body send failure) so it
+        # cannot mask the original exception the caller is trying to debug.
+        with suppress(Exception):
+            await response.body.aclose()
+        raise
+    else:
+        await response.body.aclose()
+
+
 def wrap(
     *,
     request: Endo[ClientRequest] | None = None,
@@ -1280,10 +1321,10 @@ def wrap(
     This is the easy path for the *independent* before/after case (the dual of why
     `add_headers`, below, is a one-liner over it). A middleware whose two sides share
     state, like `cookies` needing the request URL when it stores the response, or that
-    loops, like `follow_redirects`, is written directly as a `ClientExchange` wrapper.
+    loops, like `follow_redirects`, is written directly as a `Client` wrapper.
     """
 
-    def middleware(inner: ClientExchange) -> ClientExchange:
+    def middleware(inner: Client) -> Client:
         async def exchange(outgoing: ClientRequest) -> ClientResponse:
             if request is not None:
                 outgoing = request(outgoing)
@@ -1302,12 +1343,33 @@ def add_headers(*headers: tuple[bytes, bytes]) -> ClientMiddleware:
     Client middleware that adds headers to every request.
 
     The mirror of a server's request-decorating middleware: it sits in the same
-    `stack` and rewrites the request before the inner exchange runs. This is how a
-    pool sends default headers (auth tokens, a user agent) on every request, or a
+    `stack` and rewrites the request before the inner client runs. This is how a
+    caller sends default headers (auth tokens, a user agent) on every request, or a
     single request adds its own.
     """
     extra: RawHeaders = tuple(headers)
     return wrap(request=lambda request: replace(request, headers=extra + request.headers))
+
+
+def deadline(timeout: Timeout) -> ClientMiddleware:
+    """
+    Client middleware that applies `timeout` to every request that bounds nothing itself.
+
+    A default time budget for everything sent through the composed client, in the same
+    `stack` as any other decoration. A request that bounds any phase of its own keeps its
+    own `timeout` whole, so a caller with a tighter budget for one call is not overridden
+    by the default; that is the difference between a default and a policy imposed from
+    above. A request bounding *nothing* (the default `Timeout()`) reads as "no budget
+    stated" rather than "no budget wanted", so it takes the default: a caller who wants
+    one request exempt composes it against a client without this middleware.
+    """
+
+    def apply(request: ClientRequest) -> ClientRequest:
+        if request.timeout != _NO_TIMEOUT:
+            return request
+        return replace(request, timeout=timeout)
+
+    return wrap(request=apply)
 
 
 _SENSITIVE_REDIRECT_HEADERS = frozenset({b"authorization", b"cookie", b"proxy-authorization"})
@@ -1334,7 +1396,7 @@ def follow_redirects(max_hops: int = 5) -> ClientMiddleware:
     unfollowed) so nothing is replayed over cleartext.
     """
 
-    def middleware(inner: ClientExchange) -> ClientExchange:
+    def middleware(inner: Client) -> Client:
         async def exchange(request: ClientRequest) -> ClientResponse:
             response = await inner(request)
             for _ in range(max_hops):
@@ -1622,7 +1684,7 @@ def cookies(jar: CookieJar) -> ClientMiddleware:
     the hop sets.
     """
 
-    def middleware(inner: ClientExchange) -> ClientExchange:
+    def middleware(inner: Client) -> Client:
         async def exchange(request: ClientRequest) -> ClientResponse:
             header = jar.header_for(request.url)
             if header is not None:

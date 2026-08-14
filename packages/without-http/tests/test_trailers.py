@@ -11,6 +11,7 @@ import h2.events
 from without_http import ConnectionPool
 from without_http import ResponseBody
 from without_http import ResponseTrailers
+from without_http import request
 
 
 async def _events(*items: bytes | ResponseTrailers) -> AsyncGenerator[bytes | ResponseTrailers]:
@@ -102,7 +103,7 @@ async def test_h11_client_surfaces_chunked_trailers() -> None:
         b"\r\n"
     )
     async with _raw_http11_server(response) as (host, port), ConnectionPool() as pool:
-        async with pool.request("GET", f"http://{host}:{port}/") as (head, body):
+        async with request(pool, "GET", f"http://{host}:{port}/") as (head, body):
             assert head.status == 200
             data, trailers = await body.read_with_trailers()
     assert data == b"hello"
@@ -112,7 +113,7 @@ async def test_h11_client_surfaces_chunked_trailers() -> None:
 async def test_h11_dropping_trailers_still_keeps_the_connection_alive() -> None:
     response = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nx-trace: t1\r\n\r\n"
     async with _raw_http11_server(response) as (host, port), ConnectionPool() as pool:
-        async with pool.request("GET", f"http://{host}:{port}/") as (_head, body):
+        async with request(pool, "GET", f"http://{host}:{port}/") as (_head, body):
             assert await body.read() == b"hello"  # drops the trailer block
         idle = sum(len(host_pool.idle) for host_pool in pool._h11.values())
     assert idle == 1
@@ -153,7 +154,7 @@ async def test_h2_client_surfaces_trailers() -> None:
     async with (
         _raw_h2_server(200, b"hello", [(b"grpc-status", b"0")]) as (host, port),
         ConnectionPool(force_http2_cleartext=True) as pool,
-        pool.request("GET", f"http://{host}:{port}/") as (head, body),
+        request(pool, "GET", f"http://{host}:{port}/") as (head, body),
     ):
         assert head.status == 200
         data, trailers = await body.read_with_trailers()

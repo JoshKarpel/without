@@ -12,6 +12,7 @@ import h2.events
 import h2.settings
 import pytest
 from without_http import ConnectionPool
+from without_http import request
 from without_http.client import _empty_body
 from without_http.client import _Http2Connection
 from without_http.client import _Stream
@@ -147,7 +148,7 @@ async def test_request_raises_when_the_server_resets_the_stream() -> None:
 
     async with _raw_h2_server(handle) as (host, port), ConnectionPool(force_http2_cleartext=True) as pool:
         with pytest.raises(ConnectionError, match="reset the HTTP/2 stream"):
-            async with pool.request("GET", f"http://{host}:{port}/") as _response:  # pragma: no branch
+            async with request(pool, "GET", f"http://{host}:{port}/") as _response:  # pragma: no branch
                 pass  # pragma: no cover
 
 
@@ -170,7 +171,7 @@ async def test_request_raises_when_the_server_sends_goaway_without_responding() 
 
     async with _raw_h2_server(handle) as (host, port), ConnectionPool(force_http2_cleartext=True) as pool:
         with pytest.raises(ConnectionError):
-            async with pool.request("GET", f"http://{host}:{port}/") as _response:  # pragma: no branch
+            async with request(pool, "GET", f"http://{host}:{port}/") as _response:  # pragma: no branch
                 pass  # pragma: no cover
 
 
@@ -195,7 +196,7 @@ async def test_request_raises_when_the_server_violates_the_protocol() -> None:
 
     async with _raw_h2_server(handle) as (host, port), ConnectionPool(force_http2_cleartext=True) as pool:
         with pytest.raises(ConnectionError):
-            async with pool.request("GET", f"http://{host}:{port}/") as _response:  # pragma: no branch
+            async with request(pool, "GET", f"http://{host}:{port}/") as _response:  # pragma: no branch
                 pass  # pragma: no cover
 
 
@@ -224,8 +225,8 @@ async def test_uploading_a_streaming_body_to_a_resetting_server_raises() -> None
 
     async with _raw_h2_server(handle) as (host, port), ConnectionPool(force_http2_cleartext=True) as pool:
         with pytest.raises(ConnectionError):
-            async with pool.request(
-                "POST", f"http://{host}:{port}/", body=_slow_body()
+            async with request(
+                pool, "POST", f"http://{host}:{port}/", body=_slow_body()
             ) as _response:  # pragma: no branch
                 pass  # pragma: no cover
 
@@ -249,8 +250,8 @@ async def test_uploading_to_a_server_that_closes_mid_upload_raises() -> None:
 
     async with _raw_h2_server(handle) as (host, port), ConnectionPool(force_http2_cleartext=True) as pool:
         with pytest.raises(ConnectionError):
-            async with pool.request(
-                "POST", f"http://{host}:{port}/", body=b"z" * 300_000
+            async with request(
+                pool, "POST", f"http://{host}:{port}/", body=b"z" * 300_000
             ) as _response:  # pragma: no branch
                 pass  # pragma: no cover
 
@@ -291,7 +292,7 @@ async def test_a_response_reset_after_its_head_raises_when_the_body_is_read() ->
         ConnectionPool(force_http2_cleartext=True) as pool,
     ):
         with pytest.raises(ConnectionError, match="reset the HTTP/2 stream"):
-            async with pool.request("GET", f"http://{host}:{port}/") as (_head, body):  # pragma: no branch
+            async with request(pool, "GET", f"http://{host}:{port}/") as (_head, body):  # pragma: no branch
                 await body.read()
 
 
@@ -300,7 +301,7 @@ async def test_a_response_body_is_truncated_when_a_goaway_closes_the_connection(
         _raw_h2_server(_head_then_body_then(finish="goaway")) as (host, port),
         ConnectionPool(force_http2_cleartext=True) as pool,
     ):
-        async with pool.request("GET", f"http://{host}:{port}/") as (head, body):
+        async with request(pool, "GET", f"http://{host}:{port}/") as (head, body):
             assert head.status == 200
             await asyncio.sleep(0.15)  # let the GOAWAY mark the connection closed
             assert await body.read() == b"partial-body"
@@ -319,7 +320,7 @@ async def test_a_connection_aborted_mid_request_raises() -> None:
 
     async with _raw_h2_server(handle) as (host, port), ConnectionPool(force_http2_cleartext=True) as pool:
         with pytest.raises(ConnectionError):
-            async with pool.request("GET", f"http://{host}:{port}/") as _response:  # pragma: no branch
+            async with request(pool, "GET", f"http://{host}:{port}/") as _response:  # pragma: no branch
                 pass  # pragma: no cover
 
 
@@ -348,7 +349,7 @@ async def test_run_loop_swallows_an_oserror_from_the_socket_and_fails_pending_st
 
 async def test_concurrent_first_requests_share_one_pooled_h2c_connection() -> None:
     async def fetch(pool: ConnectionPool, host: str, port: int, index: int) -> bytes:
-        async with pool.request("POST", f"http://{host}:{port}/", body=f"body{index}".encode()) as (_head, body):
+        async with request(pool, "POST", f"http://{host}:{port}/", body=f"body{index}".encode()) as (_head, body):
             return await body.read()
 
     async with (
@@ -377,7 +378,7 @@ async def test_abandoning_an_open_h2_body_resets_the_stream() -> None:
         writer.close()
 
     async with _raw_h2_server(handle) as (host, port), ConnectionPool(force_http2_cleartext=True) as pool:
-        async with pool.request("GET", f"http://{host}:{port}/") as (head, _body):
+        async with request(pool, "GET", f"http://{host}:{port}/") as (head, _body):
             assert head.status == 200
             # leave the block without reading the body: release aborts the stream
 
@@ -420,7 +421,7 @@ async def test_h2_streams_a_request_body_skipping_empty_chunks() -> None:
         ConnectionPool(force_http2_cleartext=True) as pool,
     ):
         upload = _empty_then(b"", b"ab", b"", b"cd")
-        async with pool.request("POST", f"http://{host}:{port}/", body=upload) as (head, body):
+        async with request(pool, "POST", f"http://{host}:{port}/", body=upload) as (head, body):
             assert head.status == 200
             assert await body.read() == b"abcd"
 
@@ -431,9 +432,9 @@ async def test_h2c_reuses_a_pooled_connection_for_a_second_request() -> None:
         ConnectionPool(force_http2_cleartext=True) as pool,
     ):
         url = f"http://{host}:{port}/"
-        async with pool.request("POST", url, body=b"first") as (_head, body):
+        async with request(pool, "POST", url, body=b"first") as (_head, body):
             assert await body.read() == b"first"
-        async with pool.request("POST", url, body=b"second") as (_head, body):
+        async with request(pool, "POST", url, body=b"second") as (_head, body):
             assert await body.read() == b"second"
         assert len(pool._h2) == 1
 
@@ -451,8 +452,8 @@ async def test_h2_a_request_body_error_before_the_head_surfaces_to_the_caller() 
         ConnectionPool(force_http2_cleartext=True) as pool,
     ):
         with pytest.raises(ValueError, match="boom before head"):
-            async with pool.request(
-                "POST", f"http://{host}:{port}/", body=_raising_body(b"partial")
+            async with request(
+                pool, "POST", f"http://{host}:{port}/", body=_raising_body(b"partial")
             ) as _r:  # pragma: no branch
                 pass  # pragma: no cover
 
@@ -479,12 +480,12 @@ async def test_h2_a_reset_during_a_large_upload_surfaces_and_does_not_strand() -
 
     async with _raw_h2_server(reset_on_request) as (host, port), ConnectionPool(force_http2_cleartext=True) as pool:
         with pytest.raises(ConnectionError, match="reset the HTTP/2 stream"):
-            async with pool.request("POST", f"http://{host}:{port}/", body=_big_body()) as _r:  # pragma: no branch
+            async with request(pool, "POST", f"http://{host}:{port}/", body=_big_body()) as _r:  # pragma: no branch
                 pass  # pragma: no cover
 
 
 async def _head_status(pool: ConnectionPool, url: str) -> int:
-    async with pool.request("GET", url) as (head, _body):
+    async with request(pool, "GET", url) as (head, _body):
         return head.status
 
 
@@ -507,7 +508,7 @@ async def test_h2_gates_new_streams_at_the_server_max_concurrent_streams() -> No
 
     async with _raw_h2_server(handle) as (host, port), ConnectionPool(force_http2_cleartext=True) as pool:
         url = f"http://{host}:{port}/"
-        async with pool.request("GET", url) as (head, _body):
+        async with request(pool, "GET", url) as (head, _body):
             assert head.status == 200
             # The server advertised one stream, held open by this request, so a second
             # cannot be issued until this one's slot frees.
