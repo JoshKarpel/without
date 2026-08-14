@@ -20,12 +20,14 @@ import json
 from without_asgi import Response, make_asgi_app
 from without_web import INT, Router, get, path_param
 
-uid = path_param("id", INT)              # one token: a pattern segment AND a typed read
+uid = path_param("id", INT)  # one token: a pattern segment AND a typed read
 
-@get(t"/users/{uid}", uid)               # t-string pattern; `@get` returns a Route value
-async def show_user(state, user_id: int):    # user_id is an int, no `assert isinstance`
+
+@get(t"/users/{uid}", uid)  # t-string pattern; `@get` returns a Route value
+async def show_user(state, user_id: int):  # user_id is an int, no `assert isinstance`
     body = json.dumps({"id": user_id}).encode()
     return Response(status=200, headers=((b"content-type", b"application/json"),), body=body)
+
 
 router = Router(routes=(show_user,), fallback=not_found)
 app = make_asgi_app(lifespan, http=router.dispatch)
@@ -317,11 +319,12 @@ string that drifts when the path changes. It is a **plain function** of the rout
 value, no router involved:
 
 ```python
-show_user = get(t"/users/{uid}", uid)   # a Route value you hold
+show_user = get(t"/users/{uid}", uid)  # a Route value you hold
+
 
 @post("/users", new_user_body)
 async def create_user(state, new):
-    location = url_for(show_user, {"id": created.id})   # -> "/users/<id>"
+    location = url_for(show_user, {"id": created.id})  # -> "/users/<id>"
     return Response(status=201, headers=((b"location", location.encode()),), body=...)
 ```
 

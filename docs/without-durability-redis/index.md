@@ -9,7 +9,7 @@ from redis.asyncio import Redis
 from without_durability import SplitDurable
 from without_durability_redis import RedisCheckpointer, RedisStreamScheduler
 
-redis = Redis(host=..., decode_responses=True)   # this client owns both ends of every key
+redis = Redis(host=..., decode_responses=True)  # this client owns both ends of every key
 durable = SplitDurable(RedisCheckpointer(redis=redis), RedisStreamScheduler(redis=redis))
 ```
 

@@ -9,22 +9,28 @@ recorded instead of running.
 ```python
 from without_durability import Completed, MemoryCheckpointer, Run, Sleeping, Waiting, claimed, resume
 
+
 def as_text(recorded: object) -> str:
     if not isinstance(recorded, str):
         raise TypeError(f"{recorded!r} is not the reference this step recorded")
     return recorded
 
+
 async def fulfil(run: Run) -> str:
     charge = await run.step("charged", lambda: gateway.charge(order), as_text)
-    await run.sleep("settling", timedelta(days=3))          # survives a crash on day two
-    approver = await run.awaiting("approved-by", as_text)    # another process writes this
+    await run.sleep("settling", timedelta(days=3))  # survives a crash on day two
+    approver = await run.awaiting("approved-by", as_text)  # another process writes this
     return await run.step("paid", lambda: gateway.pay(charge, approver), as_text)
+
 
 checkpointer = MemoryCheckpointer()
 match await resume(await claimed(checkpointer, "order-42"), checkpointer, fulfil):
-    case Completed(value=reference): ...   # the workflow finished
-    case Sleeping(due=due): ...            # schedule a wakeup for `due`
-    case Waiting(key=key): ...             # nothing to schedule; someone must write `key`
+    case Completed(value=reference):
+        ...  # the workflow finished
+    case Sleeping(due=due):
+        ...  # schedule a wakeup for `due`
+    case Waiting(key=key):
+        ...  # nothing to schedule; someone must write `key`
 ```
 
 A pass comes back as one of those three rather than raising two of them, so what to do

@@ -126,8 +126,8 @@ A sort key is equivalent under any change that preserves the *ordering*, not the
 ```python
 # without-web/trie.py — used only as `sorted(..., key=_param_precedence)`
 def _param_precedence(item) -> int:
-    return 1 if converter.name == "str" else 0   # mutant: 1 -> 2. Values are {0, str}; 0 < 2 orders
-                                                 # identically to 0 < 1, so the sort result is unchanged
+    return 1 if converter.name == "str" else 0  # mutant: 1 -> 2. Values are {0, str}; 0 < 2 orders
+    # identically to 0 < 1, so the sort result is unchanged
 ```
 
 Others in this class: `authority = b"" -> None` when `authority` is only read as `if authority`;

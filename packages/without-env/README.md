@@ -21,8 +21,8 @@ class Settings(BaseSettings):
     max_bytes: int = 1_048_576
 
 
-config = EnvContext.load(Settings)   # reads os.environ once, validates
-config.current().default_mode        # the parsed value, same every call
+config = EnvContext.load(Settings)  # reads os.environ once, validates
+config.current().default_mode  # the parsed value, same every call
 ```
 
 See the

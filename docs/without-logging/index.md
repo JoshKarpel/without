@@ -195,13 +195,14 @@ read. `bind` writes the context and `capture` reads it by default:
 ```python
 from without_logging import bind, capture
 
+
 async def handle(scope):
-    with bind(request_id=scope["request_id"]):   # scoped to this block, on this task
-        log.info("handling")                     # emit runs here; the bind is read here
-        ...                                       # every log call inside carries request_id
+    with bind(request_id=scope["request_id"]):  # scoped to this block, on this task
+        log.info("handling")  # emit runs here; the bind is read here
+        ...  # every log call inside carries request_id
 
 
-async with capture(pipeline):   # default parser merges the bind, so it just works
+async with capture(pipeline):  # default parser merges the bind, so it just works
     ...
 ```
 
@@ -341,15 +342,15 @@ from without_logging import Level, at_least, capture, offload, to_rotating_file
 
 async def render(record):
     line = f"{record.timestamp:%H:%M:%S} {record.level_name} {record.message}"
-    if record.exception is not None:                  # format the captured traceback here
+    if record.exception is not None:  # format the captured traceback here
         line += "\n" + "".join(record.exception.format()).rstrip("\n")
     return line
 
 
 writer = to_rotating_file(
-    lambda i, when: directory / f"app.{i}.log",   # (index, open time) -> path; 0 is the current file
-    max_bytes=64 * 1024 * 1024,                   # rotate at 64 MiB, and/or ...
-    max_age=timedelta(hours=1),                   # ... rotate hourly, whichever comes first
+    lambda i, when: directory / f"app.{i}.log",  # (index, open time) -> path; 0 is the current file
+    max_bytes=64 * 1024 * 1024,  # rotate at 64 MiB, and/or ...
+    max_age=timedelta(hours=1),  # ... rotate hourly, whichever comes first
 )
 async with (
     offload(writer) as sink,
@@ -411,8 +412,8 @@ from without_logging import at_times, to_rotating_file
 
 writer = to_rotating_file(
     lambda i, when: directory / f"app.{when:%Y%m%d}.{i}.log",
-    max_bytes=64 * 1024 * 1024,               # rotate at 64 MiB, or ...
-    schedule=at_times(time(0, 0)),            # ... at midnight UTC, whichever comes first
+    max_bytes=64 * 1024 * 1024,  # rotate at 64 MiB, or ...
+    schedule=at_times(time(0, 0)),  # ... at midnight UTC, whichever comes first
 )
 ```
 
@@ -433,7 +434,7 @@ from without_logging import capture, offload, render_console, render_json, to_st
 
 async with (
     offload(to_stream(sys.stdout)) as out,
-    capture(compose(render_json(), out)),   # one JSON object per line
+    capture(compose(render_json(), out)),  # one JSON object per line
 ):
     ...
 ```
@@ -512,8 +513,15 @@ import sys
 
 from without import compose, from_selector, tee
 from without_logging import (
-    Level, add_fields, at_least, capture, offload,
-    render_console, render_json, to_rotating_file, to_stream,
+    Level,
+    add_fields,
+    at_least,
+    capture,
+    offload,
+    render_console,
+    render_json,
+    to_rotating_file,
+    to_stream,
 )
 
 async with (
@@ -521,10 +529,10 @@ async with (
     offload(to_rotating_file(name, max_bytes=64 * 1024 * 1024)) as file,
     capture(
         compose(
-            add_fields(service="api"),                        # shared: parsed + enriched once
+            add_fields(service="api"),  # shared: parsed + enriched once
             tee(
-                compose(render_console(), console),              # console: everything, human-readable
-                compose(                                          # file: WARNING+, as JSON
+                compose(render_console(), console),  # console: everything, human-readable
+                compose(  # file: WARNING+, as JSON
                     from_selector(at_least(Level.WARNING)),
                     compose(render_json(), file),
                 ),

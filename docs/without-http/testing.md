@@ -230,7 +230,7 @@ a test that asserts something the handler does *after* its last response event, 
 a metric, a write, must wait for the handler to say so rather than for the response:
 
 ```python
-drained = asyncio.Event()   # set by the handler after its stream ends
+drained = asyncio.Event()  # set by the handler after its stream ends
 
 async with loopback_client(app(drained)) as client:
     async with request(client, "GET", "http://testserver/download") as (head, body):

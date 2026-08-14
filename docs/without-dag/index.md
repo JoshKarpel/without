@@ -26,11 +26,13 @@ class Plan:
     @classmethod
     def of(cls, nodes: Iterable[Node]) -> Plan: ...
 
-async def drive(plan: Plan, inputs: Mapping[NodeKey, object], limit: int | None
+
+async def drive(
+    plan: Plan, inputs: Mapping[NodeKey, object], limit: int | None
 ) -> AsyncGenerator[tuple[NodeKey, object]]: ...
 
-async def evaluate(plan: Plan, target: NodeKey, inputs: Mapping[NodeKey, object], limit: int | None
-) -> object: ...
+
+async def evaluate(plan: Plan, target: NodeKey, inputs: Mapping[NodeKey, object], limit: int | None) -> object: ...
 ```
 
 A `Node` is the interface: a value carrying its `key`, its ordered `dependencies`, and
@@ -98,14 +100,16 @@ checked for argument count and types:
 ```python
 from without_dag import Graph
 
+
 async def fetch(request: Request) -> Fetched: ...
 async def parse(fetched: Fetched) -> Parsed: ...
 async def render(fetched: Fetched, parsed: Parsed) -> Report: ...
 
+
 graph, (request,) = Graph.of(Request)
 fetched = graph.node("fetched", fetch, request)
-parsed = graph.node("parsed", parse, fetched)             # parse must take a Fetched
-report = graph.node("report", render, fetched, parsed)    # render must take (Fetched, Parsed)
+parsed = graph.node("parsed", parse, fetched)  # parse must take a Fetched
+report = graph.node("report", render, fetched, parsed)  # render must take (Fetched, Parsed)
 run = graph.build(output=report, limit=4)
 
 result: Report = await run(some_request)
@@ -209,7 +213,7 @@ because there is nothing to add.
 ```python
 from without import collect, from_map, stream_from_iterable
 
-processor = from_map(run)                      # Processor[Request, Report]
+processor = from_map(run)  # Processor[Request, Report]
 reports = await collect(processor(stream_from_iterable([request_a, request_b])))
 ```
 
