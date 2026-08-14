@@ -8,7 +8,9 @@ import pytest
 from benchmarks.todos.apps import fastapi_todos
 from benchmarks.todos.apps import without_todos
 from without_asgi import ASGIApp
+from without_asgi import Content
 from without_asgi import RawHeaders
+from without_asgi import json_content
 from without_http import request
 from without_http.testing import asgi_client
 
@@ -29,7 +31,7 @@ async def _request(
     method: str,
     path: str,
     *,
-    body: bytes = b"",
+    body: bytes | Content = b"",
     headers: RawHeaders = (),
 ) -> tuple[int, object]:
     async with asgi_client(app) as client:
@@ -68,14 +70,12 @@ async def test_show_missing_todo_is_not_found(stack: Stack) -> None:
 
 @pytest.mark.parametrize("stack", STACKS)
 async def test_create_echoes_the_new_todo_with_the_next_id(stack: Stack) -> None:
-    body = json.dumps({"title": "review the draft", "done": True}).encode()
-
     status, payload = await _request(
         stack(),
         "POST",
         "/todos",
-        body=body,
-        headers=((b"content-type", b"application/json"), (b"idempotency-key", b"bench-abc-123")),
+        body=json_content({"title": "review the draft", "done": True}),
+        headers=((b"idempotency-key", b"bench-abc-123"),),
     )
 
     assert status == 201

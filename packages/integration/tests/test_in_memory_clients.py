@@ -13,6 +13,7 @@ from integration.todos.core import Todo
 from integration.todos.core import TodoList
 from starlette.testclient import TestClient
 from without_asgi import ASGIApp
+from without_asgi import json_content
 from without_http import Client
 from without_http import request
 from without_http import run_lifespan
@@ -78,13 +79,10 @@ async def test_an_in_memory_client_drives_a_fastapi_app(wire: bool) -> None:
             assert head.status == 200
             assert json.loads(await body.read()) == {"item_id": 7, "started": ["up"]}
 
-        async with request(
-            client,
-            "POST",
-            "http://testserver/echo",
-            headers=((b"content-type", b"application/json"),),
-            body=b'{"shape": "round"}',
-        ) as (head, body):
+        async with request(client, "POST", "http://testserver/echo", body=json_content({"shape": "round"})) as (
+            head,
+            body,
+        ):
             assert head.status == 200
             assert json.loads(await body.read()) == {"shape": "round"}
 

@@ -10,6 +10,7 @@ from integration.durable import Order
 from integration.durable import Payouts
 from integration.durable import Services
 from without_asgi import RawHeaders
+from without_asgi import json_content
 from without_http import Client
 from without_http import request
 
@@ -75,11 +76,8 @@ def paying(calls: list[str]) -> Payouts:
 
 async def post_json(client: Client, path: str, payload: object, *, key: str | None = None) -> tuple[int, JsonObject]:
     """`POST` a JSON body (with an optional idempotency key) and read the whole answer."""
-    headers: RawHeaders = ((b"content-type", b"application/json"),)
-    if key is not None:
-        headers = (*headers, (b"idempotency-key", key.encode()))
-    body = json.dumps(payload).encode()
-    async with request(client, "POST", f"{BASE}{path}", headers=headers, body=body) as (head, answer):
+    headers: RawHeaders = () if key is None else ((b"idempotency-key", key.encode()),)
+    async with request(client, "POST", f"{BASE}{path}", headers=headers, body=json_content(payload)) as (head, answer):
         return head.status, as_object(json.loads(await answer.read()))
 
 

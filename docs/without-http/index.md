@@ -162,6 +162,21 @@ on `request`: pass `bytes` to buffer it, or a `Stream[bytes]` (any async
 iterable of chunks) to stream it. The response `body` is a live stream: iterate it
 chunk by chunk, or `await body.read()` to buffer the whole thing.
 
+When you hold a *value* rather than bytes, pass a
+[`Content`](../without-asgi/index.md#content-a-body-and-what-it-is) and the encoding
+travels with the `content-type` describing it, which is the same value a handler answers
+with:
+
+```python
+from without_asgi import json_content
+
+async with request(client, "POST", url, body=json_content(order)) as (head, body):
+    ...
+```
+
+An explicit `headers=` wins over what the content described, so overriding the
+`content-type` does not mean rebuilding the body.
+
 ```python
 async def upload() -> AsyncIterator[bytes]:
     for path in paths:

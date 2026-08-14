@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import timedelta
@@ -13,6 +12,7 @@ from gateways import post_json as post
 from integration.durable.api import MAX_WORKFLOW_ID
 from integration.durable.api import Payments
 from integration.durable.api import payments_app
+from without_asgi import json_content
 from without_durability import MemoryCheckpointer
 from without_durability import MemoryScheduler
 from without_durability import Pass
@@ -289,8 +289,8 @@ async def test_a_failure_that_is_not_the_requests_fault_is_a_500_not_a_422() -> 
     # Read past the helpers here: the body is the server's own plain-text error, not this
     # app's JSON, which is the point. The app never answered at all.
     async with loopback_client(payments_app(payments)) as client:
-        headers = ((b"content-type", b"application/json"), (b"idempotency-key", WORKFLOW.encode()))
-        async with request(client, "POST", f"{BASE}/orders", headers=headers, body=json.dumps(ORDER).encode()) as (
+        headers = ((b"idempotency-key", WORKFLOW.encode()),)
+        async with request(client, "POST", f"{BASE}/orders", headers=headers, body=json_content(ORDER)) as (
             head,
             _body,
         ):

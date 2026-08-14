@@ -31,11 +31,13 @@ router = Router(routes=(show_user,), fallback=not_found)
 app = make_asgi_app(lifespan, http=router.dispatch)
 ```
 
-Encoding (the serializer, its options, the content type) is the application's
-choice, so `without-web` ships no `json_response`-style helper: a handler returns
-a `Response` (status, headers, bytes) however it likes. The same stance the
-router takes toward schemas (`schema_for` is injected) it takes toward response
-bodies.
+The serializer stays the application's choice, so `without-web` decides nothing about
+encoding: a handler returns a `Response` (status, headers, bytes) however it likes, the
+same stance the router takes toward schemas (`schema_for` is injected). What a handler
+does *not* have to re-derive is the pairing of encoded bytes with the `content-type`
+naming them, which lives one layer down as
+[`json_content` and `Response.from_content`](../without-asgi/index.md#content-a-body-and-what-it-is)
+with the encoder still an argument.
 
 ## A router dispatches on the scope, never the body
 

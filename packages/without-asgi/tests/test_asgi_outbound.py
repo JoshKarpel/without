@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
+
 import pytest
+from without_asgi import Content
 from without_asgi import EarlyHint
 from without_asgi import LifespanReply
 from without_asgi import Outbound
 from without_asgi import PathSend
+from without_asgi import RawHeaders
 from without_asgi import RawMessage
 from without_asgi import Response
 from without_asgi import ResponseBody
@@ -29,6 +33,7 @@ from without_asgi import encode_lifespan_reply
 from without_asgi import encode_outbound
 from without_asgi import encode_response
 from without_asgi import encode_websocket_outbound
+from without_asgi import json_content
 from without_asgi import parse_lifespan_reply
 from without_asgi import parse_outbound
 from without_asgi import parse_websocket_outbound
@@ -75,6 +80,40 @@ def test_encode_response_splits_into_start_then_final_body() -> None:
         ResponseStart(status=200, headers=((b"content-type", b"text/plain"),), trailers=False),
         ResponseBody(body=b"ok", more_body=False),
     )
+
+
+def test_json_content_pairs_the_encoding_with_the_content_type() -> None:
+    content = json_content({"title": "write", "done": False})
+
+    assert content == Content(b'{"title": "write", "done": false}', ((b"content-type", b"application/json"),))
+
+
+def test_json_content_takes_the_encoder_as_the_whole_policy() -> None:
+    content = json_content({"b": 2, "a": 1}, dumps=lambda payload: json.dumps(payload, sort_keys=True))
+
+    assert content.body == b'{"a": 1, "b": 2}'
+
+
+def test_json_content_refuses_a_payload_that_is_not_json() -> None:
+    # `NaN` encodes to a token no strict parser accepts, so it fails at the sender rather
+    # than at whoever reads the response.
+    with pytest.raises(ValueError, match="Out of range float"):
+        json_content({"ratio": float("nan")})
+
+
+def test_response_from_content_carries_the_body_and_its_headers() -> None:
+    response = Response.from_content(201, json_content({"id": 1}))
+
+    assert response == Response(status=201, headers=((b"content-type", b"application/json"),), body=b'{"id": 1}')
+
+
+def test_response_from_content_lets_the_caller_override_what_the_content_described() -> None:
+    extra: RawHeaders = ((b"content-type", b"application/problem+json"), (b"x-request-id", b"r-7"))
+
+    response = Response.from_content(422, json_content({"error": "nope"}), headers=extra)
+
+    assert response.headers == extra
+    assert response.body == b'{"error": "nope"}'
 
 
 def test_encode_outbound_renders_a_server_push() -> None:

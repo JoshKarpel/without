@@ -111,6 +111,39 @@ socket: build a `scope`, a scripted `receive`, and a capturing `send`, then call
 text-transform service that reads the request body and dynamic config from a
 `without-configmap` `Context`.
 
+## `Content`: a body and what it is
+
+Encoding a value produces two things that have to travel together, the bytes and the
+`content-type` naming them, and separating them is the same mistake at every call site.
+`Content` pairs them, and carries no policy of its own:
+
+```python
+from without_asgi import Response, json_content
+
+Response.from_content(201, json_content(todo))
+```
+
+`json_content(payload, *, dumps=...)` is one producer of a `Content`; a form, text, or
+msgpack encoder is another, with equal standing. The *encoder* stays an argument, so an
+app that needs sorted keys, a faster library, or one that knows its domain types passes
+its own and changes nothing else:
+
+```python
+json_content(todo, dumps=lambda value: json.dumps(value, sort_keys=True))
+```
+
+The stdlib is the default because a default should add no dependency, and it is strict
+where JSON is (`allow_nan=False`, so a `NaN` fails at the sender rather than at whoever
+parses the response). Key order is left alone: sorting is a policy some callers want and
+a cost every response would pay.
+
+`Response.from_content(status, content, *, headers=())` layers the caller's headers over
+the ones the content described, so a handler answering `application/problem+json` over a
+JSON body says so there rather than rebuilding the body. The same value is what
+`without-http`'s client takes as a request body (`request(client, "POST", url,
+body=json_content(order))`), which is the point of it living here rather than in either
+package above.
+
 ## Streaming a file
 
 `file_response(path)` builds the outbound stream that serves a file: a

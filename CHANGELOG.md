@@ -260,6 +260,20 @@
   `ValueError` (from a custom extractor or an `into` factory) as a backstop. Making the boundary a
   single matchable type is what lets a plain `ValueError` raised deeper in a handler surface as a 500
   rather than masquerading as a client 400.
+- **`without-asgi`**: `Content`, a body paired with the headers that describe it, plus `json_content`
+  and `Response.from_content`. Encoding a value produces two things that must travel together, the
+  bytes and the `content-type` naming them, and every caller that separated them re-derived the same
+  three lines: the app layer, the router's own tests, and every test that sent a JSON body each
+  carried a private `json_response`. `Content` carries no policy, so `json_content` is one producer
+  of it and a form or msgpack encoder is another, and the serializer stays an argument
+  (`json_content(order, dumps=...)`) with the stdlib as the default, because a default should add no
+  dependency. It is strict where JSON is (`allow_nan=False`, so a `NaN` fails at the sender) and
+  leaves key order alone, since sorting is a policy some callers want and a cost every response
+  would pay. `Response.from_content(status, content, headers=...)` layers the caller's headers over
+  the content's, and `without-http`'s `request` takes the same value as a request body, which is why
+  it lives in the package both sides already depend on. This walks back `without-web`'s "ships no
+  `json_response`-style helper" stance on the narrow point of the *shape*: what a handler must not
+  have imposed on it is the serializer, and that is still injected.
 - **`without-http`**: `without_http.testing`, three more `Client`s that reach an app (or nothing)
   without binding a socket. `mock_client(handler)` answers from a function, which is the whole of
   mocking once a client is one, with `respond(...)` building the canned response.

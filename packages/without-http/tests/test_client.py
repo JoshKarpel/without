@@ -13,9 +13,11 @@ from urllib.parse import urlsplit
 
 import h11
 import pytest
+from without_asgi import RawHeaders
 from without_asgi import RawScope
 from without_asgi import Receive
 from without_asgi import Send
+from without_asgi import json_content
 from without_asgi import parse_http_scope
 from without_http import ClientRequest
 from without_http import ClientResponse
@@ -704,6 +706,27 @@ async def test_build_request_adds_chunked_transfer_encoding_for_an_unframed_stre
     outgoing = _build_request("POST", "http://api.example.test/x", (), stream, Timeout())
 
     assert outgoing.headers == ((b"transfer-encoding", b"chunked"),)
+
+
+def test_build_request_takes_a_contents_headers_and_bytes() -> None:
+    outgoing = _build_request("POST", "http://h/x", (), json_content({"id": 1}), Timeout())
+
+    assert outgoing.headers == ((b"content-type", b"application/json"), (b"content-length", b"9"))
+
+
+def test_build_request_lets_the_caller_override_what_the_content_described() -> None:
+    explicit: RawHeaders = ((b"content-type", b"application/problem+json"),)
+
+    outgoing = _build_request("POST", "http://h/x", explicit, json_content({"id": 1}), Timeout())
+
+    assert outgoing.headers == (*explicit, (b"content-length", b"9"))
+
+
+async def test_a_content_body_reaches_the_server_as_bytes_and_a_content_type() -> None:
+    async with serving(echo_app) as server, ConnectionPool() as pool:
+        url = f"http://{server.host}:{server.port}/submit"
+        async with request(pool, "POST", url, body=json_content({"n": 1})) as (_head, body):
+            assert await body.read() == b'POST /submit test= body={"n": 1}'
 
 
 def test_build_request_carries_the_timeout_onto_the_request() -> None:
