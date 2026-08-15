@@ -222,7 +222,13 @@ async def test_a_workflow_suspended_on_an_approval_resumes_when_another_process_
 SETTLING = timedelta(milliseconds=200)
 
 
-@pytest.mark.timeout(60)
+# Above the global bound because this one waits on a real worker: it polls until a pass
+# lands, so its cost is a scheduler wakeup against a containerized store rather than the
+# in-process work every other test here does. Kept close to that cost all the same, since
+# a store that never wakes the workflow shows up as a hang and nothing else, and the
+# waiting is the whole failure. Measured at ~0.3s per store under `-n 8`, with the slowest
+# execution seen near 3s, which leaves the 5s global too tight for a loaded runner.
+@pytest.mark.timeout(10)
 async def test_an_order_submitted_to_the_api_is_carried_to_payout_by_the_worker(
     durable: Durable,  # noqa: F811
     workflow: str,

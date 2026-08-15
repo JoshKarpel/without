@@ -66,8 +66,13 @@ _ASGI = Asgi(version="3.0", spec_version="2.4")
 _EXTENSIONS: Mapping[str, Mapping[str, object]] = MappingProxyType({"http.response.trailers": {}})
 _ASCII = "ascii"
 _CLIENT_ADDRESS = ("127.0.0.1", 51234)
-_SERVER_ADDRESS = ("testserver", 80)
 _BUFFER = 65536
+
+# The address an in-memory server presents as, which nothing resolves: a `pipe` has no
+# port to report, so the server reads this back from `sockname` and a client names it in
+# the URL (or, over HTTP/2, in `:authority`). Public because a test that writes frames by
+# hand has to spell the authority itself.
+SERVER_ADDRESS = ("testserver", 80)
 
 
 def mock_client(handler: Callable[[ClientRequest], ClientResponse | Awaitable[ClientResponse]]) -> Client:
@@ -418,7 +423,7 @@ type Endpoint = tuple[asyncio.StreamReader, asyncio.StreamWriter]
 
 def pipe(
     *,
-    server: tuple[str, int] = _SERVER_ADDRESS,
+    server: tuple[str, int] = SERVER_ADDRESS,
     client: tuple[str, int] = _CLIENT_ADDRESS,
     limit: int = _BUFFER,
 ) -> tuple[Endpoint, Endpoint]:
@@ -450,6 +455,61 @@ def pipe(
     near_transport.link(far[0], far_transport, near_protocol)
     far_transport.link(near[0], near_transport, far_protocol)
     return near, far
+
+
+@asynccontextmanager
+async def served_pipe(
+    app: ASGIApp,
+    *,
+    max_concurrent_streams: int = 100,
+    max_stream_resets: int = 200,
+    idle_timeout: timedelta | None = None,
+    max_websocket_message_bytes: int | None = None,
+) -> AsyncIterator[Endpoint]:
+    """
+    The client end of a `pipe` with `app` served on the other, for a test that writes bytes.
+
+    `serving` minus `asyncio.start_server`, and minus a client: where `loopback_client`
+    puts a `ConnectionPool` on this end, this hands the raw `(reader, writer)` over, so a
+    test can drive the exact frames and (half-)close timing a protocol conformance test
+    needs. The server reads `SERVER_ADDRESS` back as its `sockname`, which is the
+    authority such a test names.
+
+    ```python
+    async with served_pipe(app, max_stream_resets=2) as (reader, writer):
+        writer.write(connection.data_to_send())
+        await writer.drain()
+    ```
+
+    The app's lifespan runs for the block and the connection is cancelled on exit, both
+    as `serving` does, so a test can assert what leaving the block does to work still in
+    flight. Both ends are closed on the way out, and a test may close its own end early
+    (to send the half-close a protocol reads as "done sending"), since closing twice is
+    a no-op. The keyword arguments are `serving`'s per-connection bounds, with the same
+    defaults.
+    """
+    limits = _Limits(
+        max_concurrent_streams=max_concurrent_streams,
+        max_stream_resets=max_stream_resets,
+        idle_timeout=idle_timeout,
+        max_websocket_message_bytes=max_websocket_message_bytes,
+    )
+    async with run_lifespan(app):
+        near, far = pipe()
+        connection = asyncio.create_task(_serve_connection(app, *far, limits))
+        try:
+            yield near
+        finally:
+            # Cancelling first is what makes the shutdown, rather than the client's EOF,
+            # the thing that ends work still in flight. The server's end is closed here
+            # rather than left to `_serve_connection`, since a block that exits without
+            # ever awaiting never lets the connection task run at all. `close()` alone,
+            # not `wait_closed()`: a pipe has nothing to flush, and the close waiter is
+            # shared with whoever closed the endpoint first, so it may already have been
+            # cancelled with them.
+            await cancel_futures([connection])
+            for _reader, writer in (near, far):
+                writer.close()
 
 
 @asynccontextmanager

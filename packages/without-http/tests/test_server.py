@@ -35,6 +35,8 @@ from without_http.server import _LiveConnections
 from without_http.server import _send_simple
 from without_http.server import _serve_connection
 from without_http.server import _serve_h11_connection
+from without_http.testing import SERVER_ADDRESS
+from without_http.testing import served_pipe
 from wsproto import ConnectionType
 from wsproto import WSConnection
 from wsproto.events import Request as WsRequest
@@ -49,6 +51,14 @@ _DEFAULT_LIMITS = _Limits(
     idle_timeout=None,
     max_websocket_message_bytes=None,
 )
+
+# Tests that write bytes by hand run the server over an in-memory pipe (`served_pipe`)
+# rather than a bound socket: the h11/h2/wsproto codecs and the server's own connection
+# loop are what they assert, and those run unchanged either way. The ones that stay on
+# `serving` are the ones a pipe cannot answer: anything driven by `httpx` (a real client
+# needs a real socket), anything with a TLS context, and anything reading `Server`'s own
+# accept-loop metrics.
+_SERVER_HOST, _SERVER_PORT = SERVER_ADDRESS
 
 
 async def echo_app(scope: RawMessage, receive: Receive, send: Send) -> None:
@@ -125,9 +135,8 @@ async def test_serves_a_get_response() -> None:
 
 @pytest.mark.security("an idle connection is closed after the idle timeout (slowloris defense)")
 async def test_an_idle_connection_is_closed_after_the_idle_timeout() -> None:
-    async with serving(echo_app, idle_timeout=timedelta(seconds=0.1)) as server:
-        reader, writer = await asyncio.open_connection(server.host, server.port)
-        # Send nothing: the server's read outlives the idle timeout and it closes the socket.
+    async with served_pipe(echo_app, idle_timeout=timedelta(seconds=0.1)) as (reader, writer):
+        # Send nothing: the server's read outlives the idle timeout and it closes the connection.
         assert await reader.read(65536) == b""
         writer.close()
         with suppress(OSError):
@@ -173,8 +182,7 @@ async def test_keep_alive_survives_an_app_that_never_reads_the_request() -> None
     # ignores `receive` (FastAPI, on any request with no body parameter) leaves the
     # request's EndOfMessage unread and the connection looks unfinished. Driven over
     # a raw socket because httpx would transparently reconnect and hide the drop.
-    async with serving(unread_app) as server:
-        reader, writer = await asyncio.open_connection(server.host, server.port)
+    async with served_pipe(unread_app) as (reader, writer):
         statuses = []
         for path in (b"/one", b"/two"):
             writer.write(b"GET " + path + b" HTTP/1.1\r\nhost: test\r\n\r\n")
@@ -193,8 +201,7 @@ async def test_an_unread_partial_body_is_not_kept_alive() -> None:
     # The other side of consuming what the app never read: only h11's buffered bytes
     # count. A peer that promised 100 bytes and sent 10 still owes us a body, so the
     # connection must close rather than be reused for whatever it sends next.
-    async with serving(unread_app) as server:
-        reader, writer = await asyncio.open_connection(server.host, server.port)
+    async with served_pipe(unread_app) as (reader, writer):
         writer.write(b"POST /x HTTP/1.1\r\nhost: test\r\ncontent-length: 100\r\n\r\n" + b"a" * 10)
         await writer.drain()
         head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
@@ -210,8 +217,7 @@ async def test_an_unread_malformed_body_closes_the_connection_without_crashing()
     # Draining what the app never read can meet a malformed chunk header, which puts
     # h11 in ERROR. The response we already sent must still stand and the connection
     # must close quietly, rather than the parse error escaping the connection task.
-    async with serving(unread_app) as server:
-        reader, writer = await asyncio.open_connection(server.host, server.port)
+    async with served_pipe(unread_app) as (reader, writer):
         writer.write(b"POST /x HTTP/1.1\r\nhost: test\r\ntransfer-encoding: chunked\r\n\r\nZZZZ\r\n")
         await writer.drain()
         head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
@@ -295,8 +301,7 @@ async def test_receiving_after_the_request_body_is_done_yields_a_disconnect() ->
 
 
 async def test_a_malformed_request_gets_a_400() -> None:
-    async with serving(echo_app) as server:
-        reader, writer = await asyncio.open_connection(server.host, server.port)
+    async with served_pipe(echo_app) as (reader, writer):
         writer.write(b"!!! not a valid request line !!!\r\n\r\n")
         await writer.drain()
         status_line = await reader.readline()
@@ -477,8 +482,7 @@ async def test_http11_scope_carries_scheme_server_and_client() -> None:
     # Threads the resolved scheme and the distinct server/client addresses all the way to
     # the app: a dropped or Noned address (or a wrong scheme) shows up as a crash-to-500 or
     # a mismatched body, so every hop that carries them is pinned by this one round-trip.
-    async with serving(scope_echo_app) as server:
-        reader, writer = await asyncio.open_connection(server.host, server.port)
+    async with served_pipe(scope_echo_app) as (reader, writer):
         client_host, client_port = writer.get_extra_info("sockname")
         writer.write(b"GET /s HTTP/1.1\r\nhost: test\r\n\r\n")
         await writer.drain()
@@ -488,15 +492,14 @@ async def test_http11_scope_carries_scheme_server_and_client() -> None:
             await writer.wait_closed()
 
     assert status_line == b"HTTP/1.1 200 "
-    assert body == f"http {server.host}:{server.port} {client_host}:{client_port}".encode()
+    assert body == f"http {_SERVER_HOST}:{_SERVER_PORT} {client_host}:{client_port}".encode()
 
 
 async def test_head_keeps_the_connection_alive_after_suppressing_the_body() -> None:
     # A HEAD response must skip its body Data (h11 rejects a body on a HEAD response), then
     # finish cleanly so the keep-alive connection is reusable. If the method check or the
     # skip is broken, sending the body raises and the connection dies before the next request.
-    async with serving(sized_echo_app) as server:
-        reader, writer = await asyncio.open_connection(server.host, server.port)
+    async with served_pipe(sized_echo_app) as (reader, writer):
         writer.write(b"HEAD /one HTTP/1.1\r\nhost: test\r\n\r\n")
         await writer.drain()
         head_status, head_body = await _read_one_http_response(reader, read_body=False)
@@ -516,8 +519,7 @@ async def test_head_keeps_the_connection_alive_after_suppressing_the_body() -> N
 async def test_a_crash_sends_the_500_body_and_does_not_keep_the_connection_alive() -> None:
     # A crashing handler yields exactly one 500 whose body is the internal-error text, then
     # the connection closes: a second pipelined request must be dropped, never served.
-    async with serving(crash_app()) as server:
-        reader, writer = await asyncio.open_connection(server.host, server.port)
+    async with served_pipe(crash_app()) as (reader, writer):
         writer.write(b"GET /a HTTP/1.1\r\nhost: test\r\n\r\nGET /b HTTP/1.1\r\nhost: test\r\n\r\n")
         await writer.drain()
         status_line, body = await _read_one_http_response(reader)
@@ -533,8 +535,7 @@ async def test_a_crash_sends_the_500_body_and_does_not_keep_the_connection_alive
 
 @pytest.mark.security("partial request headers followed by a stall hit the idle timeout")
 async def test_partial_request_headers_hit_the_idle_timeout() -> None:
-    async with serving(echo_app, idle_timeout=timedelta(seconds=0.1)) as server:
-        reader, writer = await asyncio.open_connection(server.host, server.port)
+    async with served_pipe(echo_app, idle_timeout=timedelta(seconds=0.1)) as (reader, writer):
         writer.write(b"GET /x HTTP/1.1\r\nhost: test\r\n")  # headers never terminated; then stall
         await writer.drain()
         assert await asyncio.wait_for(reader.read(), timeout=5) == b""
@@ -545,8 +546,7 @@ async def test_partial_request_headers_hit_the_idle_timeout() -> None:
 
 @pytest.mark.security("a stalled partial request body hits the idle timeout (slowloris on the body)")
 async def test_a_stalled_partial_body_hits_the_idle_timeout() -> None:
-    async with serving(echo_app, idle_timeout=timedelta(seconds=0.1)) as server:
-        reader, writer = await asyncio.open_connection(server.host, server.port)
+    async with served_pipe(echo_app, idle_timeout=timedelta(seconds=0.1)) as (reader, writer):
         writer.write(b"POST /x HTTP/1.1\r\nhost: test\r\ncontent-length: 100\r\n\r\n" + b"a" * 10)
         await writer.drain()
         response = await asyncio.wait_for(reader.read(), timeout=5)
@@ -560,8 +560,7 @@ async def test_a_stalled_partial_body_hits_the_idle_timeout() -> None:
 @pytest.mark.security("closing a connection idle beyond the timeout is logged at INFO")
 async def test_idle_timeout_logs_the_close_reason(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.INFO, logger="without_http.server"):
-        async with serving(echo_app, idle_timeout=timedelta(seconds=0.1)) as server:
-            reader, writer = await asyncio.open_connection(server.host, server.port)
+        async with served_pipe(echo_app, idle_timeout=timedelta(seconds=0.1)) as (reader, writer):
             assert await asyncio.wait_for(reader.read(), timeout=5) == b""
             writer.close()
             with suppress(OSError):  # pragma: no branch - wait_closed's suppressed-exception arc is unobservable here
@@ -780,25 +779,25 @@ async def test_an_unread_body_lingers_instead_of_being_kept_alive(
     linger.assert_awaited_once_with(server_reader, server_writer)
 
 
-async def _ws_first_text(host: str, port: int, path: str) -> tuple[str | None, tuple[str, int]]:
+async def _ws_first_text(app: ASGIApp, path: str) -> tuple[str | None, tuple[str, int]]:
     """Open a WebSocket, return the first text frame the server sends and the client address."""
-    reader, writer = await asyncio.open_connection(host, port)
-    conn = WSConnection(ConnectionType.CLIENT)
-    writer.write(conn.send(WsRequest(host=host, target=path)))
-    await writer.drain()
-    client_host, client_port = writer.get_extra_info("sockname")
-    text: str | None = None
-    while text is None:
-        data = await asyncio.wait_for(reader.read(65536), timeout=5)
-        if not data:  # pragma: no cover - the awaited response arrives before the socket reaches EOF
-            break
-        conn.receive_data(data)
-        for event in conn.events():
-            if isinstance(event, TextMessage):
-                text = event.data
-    writer.close()
-    with suppress(OSError):
-        await writer.wait_closed()
+    async with served_pipe(app) as (reader, writer):
+        conn = WSConnection(ConnectionType.CLIENT)
+        writer.write(conn.send(WsRequest(host=_SERVER_HOST, target=path)))
+        await writer.drain()
+        client_host, client_port = writer.get_extra_info("sockname")
+        text: str | None = None
+        while text is None:
+            data = await asyncio.wait_for(reader.read(65536), timeout=5)
+            if not data:  # pragma: no cover - the awaited response arrives before the connection reaches EOF
+                break
+            conn.receive_data(data)
+            for event in conn.events():
+                if isinstance(event, TextMessage):
+                    text = event.data
+        writer.close()
+        with suppress(OSError):
+            await writer.wait_closed()
     return text, (client_host, client_port)
 
 
@@ -819,60 +818,58 @@ async def ws_scope_echo_app(scope: RawMessage, receive: Receive, send: Send) -> 
 
 
 async def test_websocket_scope_carries_scheme_server_and_client() -> None:
-    async with serving(ws_scope_echo_app) as server:
-        text, (client_host, client_port) = await _ws_first_text(server.host, server.port, "/ws")
+    text, (client_host, client_port) = await _ws_first_text(ws_scope_echo_app, "/ws")
 
-    assert text == f"ws {server.host}:{server.port} {client_host}:{client_port}"
+    assert text == f"ws {_SERVER_HOST}:{_SERVER_PORT} {client_host}:{client_port}"
 
 
-async def _h2c_scope_roundtrip(host: str, port: int, path: str) -> tuple[int, bytes, tuple[str, int]]:
+async def _h2c_scope_roundtrip(app: ASGIApp, path: str) -> tuple[int, bytes, tuple[str, int]]:
     """Drive one HTTP/2-over-cleartext request, returning status, body, and the client address."""
-    reader, writer = await asyncio.open_connection(host, port)
-    conn = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=True, header_encoding=None))
-    conn.initiate_connection()
-    stream_id = conn.get_next_available_stream_id()
-    conn.send_headers(
-        stream_id,
-        [
-            (b":method", b"GET"),
-            (b":path", path.encode()),
-            (b":scheme", b"http"),
-            (b":authority", f"{host}:{port}".encode()),
-        ],
-        end_stream=True,
-    )
-    writer.write(conn.data_to_send())
-    await writer.drain()
-    client_host, client_port = writer.get_extra_info("sockname")
-    status = 0
-    chunks: list[bytes] = []
-    done = False
-    while not done:
-        data = await asyncio.wait_for(reader.read(65536), timeout=5)
-        if not data:  # pragma: no cover - the awaited response arrives before the socket reaches EOF
-            break
-        for event in conn.receive_data(data):
-            if isinstance(event, h2.events.ResponseReceived) and event.stream_id == stream_id:
-                status = int(dict(event.headers)[b":status"])
-            elif isinstance(event, h2.events.DataReceived) and event.stream_id == stream_id:
-                chunks.append(event.data)
-                conn.acknowledge_received_data(event.flow_controlled_length, stream_id)
-            elif isinstance(event, h2.events.StreamEnded) and event.stream_id == stream_id:
-                done = True
+    async with served_pipe(app) as (reader, writer):
+        conn = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=True, header_encoding=None))
+        conn.initiate_connection()
+        stream_id = conn.get_next_available_stream_id()
+        conn.send_headers(
+            stream_id,
+            [
+                (b":method", b"GET"),
+                (b":path", path.encode()),
+                (b":scheme", b"http"),
+                (b":authority", f"{_SERVER_HOST}:{_SERVER_PORT}".encode()),
+            ],
+            end_stream=True,
+        )
         writer.write(conn.data_to_send())
         await writer.drain()
-    writer.close()
-    with suppress(OSError):
-        await writer.wait_closed()
+        client_host, client_port = writer.get_extra_info("sockname")
+        status = 0
+        chunks: list[bytes] = []
+        done = False
+        while not done:
+            data = await asyncio.wait_for(reader.read(65536), timeout=5)
+            if not data:  # pragma: no cover - the awaited response arrives before the connection reaches EOF
+                break
+            for event in conn.receive_data(data):
+                if isinstance(event, h2.events.ResponseReceived) and event.stream_id == stream_id:
+                    status = int(dict(event.headers)[b":status"])
+                elif isinstance(event, h2.events.DataReceived) and event.stream_id == stream_id:
+                    chunks.append(event.data)
+                    conn.acknowledge_received_data(event.flow_controlled_length, stream_id)
+                elif isinstance(event, h2.events.StreamEnded) and event.stream_id == stream_id:
+                    done = True
+            writer.write(conn.data_to_send())
+            await writer.drain()
+        writer.close()
+        with suppress(OSError):
+            await writer.wait_closed()
     return status, b"".join(chunks), (client_host, client_port)
 
 
 async def test_h2_cleartext_scope_carries_server_and_client() -> None:
-    async with serving(scope_echo_app) as server:
-        status, body, (client_host, client_port) = await _h2c_scope_roundtrip(server.host, server.port, "/s")
+    status, body, (client_host, client_port) = await _h2c_scope_roundtrip(scope_echo_app, "/s")
 
     assert status == 200
-    assert body == f"http {server.host}:{server.port} {client_host}:{client_port}".encode()
+    assert body == f"http {_SERVER_HOST}:{_SERVER_PORT} {client_host}:{client_port}".encode()
 
 
 async def test_h2_over_tls_carries_server_and_client(

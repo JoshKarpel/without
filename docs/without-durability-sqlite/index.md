@@ -10,11 +10,19 @@ from without_durability_sqlite import SqliteCheckpointer, SqliteDurable, SqliteS
 database = connect("workflows.db")
 await migrate(database)
 durable = SqliteDurable(SqliteCheckpointer(database), SqliteScheduler(database))
+...
+await database.aclose()
 ```
 
 It is the smallest thing that still meets every requirement the interface states,
 which is the clearest way to say what the interface is for: a durable workflow does not need a
 cluster, a database server, or a dependency.
+
+Close it with `aclose` and never with `connection.close()`. `sqlite3.close()` frees
+the connection under any thread still executing a statement on it, which segfaults the
+process rather than raising, and a cancelled caller leaves exactly such a thread behind
+(see [An effect is synchronous here](#an-effect-is-synchronous-here)). `aclose` waits
+that out.
 
 ## What settles itself here
 

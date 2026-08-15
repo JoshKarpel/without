@@ -9,6 +9,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from without.testing import yield_once
 from without_durability import Contended
 from without_durability import Fenced
 from without_durability import Recorded
@@ -50,7 +51,7 @@ async def database(tmp_path: Path) -> AsyncIterator[Database]:
         await opened.run(lambda connection: connection.execute(LEDGER))
         yield opened
     finally:
-        opened.connection.close()
+        await opened.aclose()
 
 
 @pytest.fixture
@@ -95,7 +96,7 @@ async def test_a_file_left_by_one_process_is_where_another_picks_the_workflow_up
     try:
         assert await SqliteCheckpointer(database=reopened).load(WORKFLOW) == {"charged": "ch-1"}
     finally:
-        reopened.connection.close()
+        await reopened.aclose()
 
 
 async def test_only_one_of_many_passes_racing_for_a_workflow_gets_to_run_one(
@@ -251,7 +252,7 @@ async def test_two_stores_on_different_databases_are_refused_at_construction(
         with pytest.raises(ValueError, match="must share one database"):
             SqliteDurable(SqliteCheckpointer(database=database), SqliteScheduler(database=elsewhere))
     finally:
-        elsewhere.connection.close()
+        await elsewhere.aclose()
 
 
 async def test_a_workflow_taken_off_the_schedule_is_invisible_for_its_lease(database: Database) -> None:
@@ -356,6 +357,40 @@ async def test_a_cancelled_caller_does_not_hand_the_connection_to_the_next_one(
 
     assert await checkpointer.load(WORKFLOW) == {"charged": "ch-1"}, "the second write survived the first's rollback"
     assert await reserved(database, "widget") is None, "and the rolled-back effect left nothing behind"
+
+
+async def test_closing_waits_out_the_statement_a_cancelled_caller_left_running(
+    database: Database,
+    checkpointer: SqliteCheckpointer,
+) -> None:
+    # The other end of the same fact, and the reason `aclose` exists rather than callers
+    # reaching for `connection.close()`. Closing frees the connection and finalizes its
+    # statements under any thread still executing one, which segfaults the process rather
+    # than raising, and a cancelled caller is exactly what leaves such a thread behind.
+    # So the close has to wait for the *thread*, not for the caller that walked away.
+    holder = await claimed(checkpointer, WORKFLOW)
+    inside = threading.Event()
+    finish = threading.Event()
+
+    def parked(cursor: sqlite3.Cursor) -> object:
+        inside.set()
+        # Bounded, so a broken `aclose` fails this test rather than hanging the suite.
+        finish.wait(timeout=5)
+        return cursor.execute("SELECT 1").fetchone()[0]
+
+    abandoned = asyncio.ensure_future(checkpointer.transact(holder, "reserved", parked))
+    await asyncio.to_thread(inside.wait)
+    abandoned.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await abandoned
+
+    closing = asyncio.ensure_future(database.aclose())
+    await yield_once()  # far enough to park on the guard, which the running thread holds
+
+    assert not closing.done(), "the close must wait out the statement, not race it"
+
+    finish.set()
+    await closing
 
 
 async def test_a_wakeup_that_arrived_during_a_pass_is_not_overwritten_by_its_deadline(database: Database) -> None:

@@ -18,6 +18,7 @@ from without_http import ClientResponse
 from without_http import ConnectionPool
 from without_http import request
 from without_http import stack
+from without_http.testing import SERVER_ADDRESS
 from without_http.testing import Endpoint
 from without_http.testing import asgi_client
 from without_http.testing import base_url
@@ -26,6 +27,7 @@ from without_http.testing import mock_client
 from without_http.testing import pipe
 from without_http.testing import respond
 from without_http.testing import scope_from_client_request
+from without_http.testing import served_pipe
 
 from .test_client import echo_app
 
@@ -591,6 +593,87 @@ async def test_pipe_drops_a_write_to_a_peer_that_already_closed() -> None:
         await client_writer.drain()
 
         assert await client_reader.read() == b""
+
+
+async def test_served_pipe_answers_a_request_written_as_bytes() -> None:
+    async with served_pipe(echo_app) as (reader, writer):
+        writer.write(b"GET /items HTTP/1.1\r\nhost: testserver\r\n\r\n")
+        await writer.drain()
+        head = await reader.readuntil(b"\r\n\r\n")
+
+    assert head.startswith(b"HTTP/1.1 200 ")
+
+
+async def test_served_pipe_runs_the_apps_lifespan_around_the_block() -> None:
+    events: list[str] = []
+
+    async def app(scope: RawScope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "lifespan":
+            while True:
+                message = await receive()
+                if message["type"] == "lifespan.startup":
+                    events.append("startup")
+                    await send({"type": "lifespan.startup.complete"})
+                else:
+                    events.append("shutdown")
+                    await send({"type": "lifespan.shutdown.complete"})
+                    return
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": ",".join(events).encode()})
+
+    async with served_pipe(app) as (reader, writer):
+        writer.write(b"GET / HTTP/1.1\r\nhost: testserver\r\n\r\n")
+        await writer.drain()
+        await reader.readuntil(b"\r\n\r\n")
+        # The startup state the app reports is in place before the first byte reaches it,
+        # as it is under `serving`. The body arrives chunked, the app having declared no
+        # length, so it is read to the terminating chunk.
+        assert b"startup" in await reader.readuntil(b"0\r\n\r\n")
+
+    assert events == ["startup", "shutdown"]
+
+
+async def test_served_pipe_cancels_a_request_still_in_flight_on_exit() -> None:
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def endless(scope: RawScope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "lifespan":
+            raise RuntimeError("this app has no lifespan")
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    async with served_pipe(endless) as (_reader, writer):
+        writer.write(b"GET /slow HTTP/1.1\r\nhost: testserver\r\n\r\n")
+        await writer.drain()
+        await entered.wait()
+
+    # Leaving the block does what `serving` does at shutdown, so a test can assert on
+    # work the app was still doing rather than waiting for a connection to time out.
+    assert cancelled.is_set()
+
+
+async def test_served_pipe_gives_the_app_the_addresses_a_socket_would() -> None:
+    seen: list[tuple[str, int | None] | None] = []
+
+    async def addressed(scope: RawScope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "lifespan":
+            raise RuntimeError("this app has no lifespan")
+        head = parse_http_scope(scope)
+        seen.extend([head.server, head.client])
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async with served_pipe(addressed) as (reader, writer):
+        writer.write(b"GET / HTTP/1.1\r\nhost: testserver\r\n\r\n")
+        await writer.drain()
+        await reader.readuntil(b"\r\n\r\n")
+
+    assert seen == [SERVER_ADDRESS, ("127.0.0.1", 51234)]
 
 
 def test_scope_from_a_relative_url_fails_loudly() -> None:

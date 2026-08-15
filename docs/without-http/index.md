@@ -494,5 +494,7 @@ and its expiry model.
 `asgi_client` drives an ASGI app with no wire under it, and `loopback_client` runs the
 real wire protocols over no socket at all. They are ordinary `Client`s, so a test above
 them is the same code that runs against the network, and swapping one in is the only
-edit. See [Testing](testing.md) for how much of the stack each one covers, what none of
-them can reproduce, and how they interoperate with `httpx` and starlette's `TestClient`.
+edit. Underneath them, `pipe()` and `served_pipe(app)` hand over the raw endpoints for a
+test that writes frames rather than requests. See [Testing](testing.md) for how much of
+the stack each one covers, what none of them can reproduce, and how they interoperate
+with `httpx` and starlette's `TestClient`.

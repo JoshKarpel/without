@@ -41,7 +41,8 @@ duplex (with bidirectional streaming over HTTP/2), and `stack`-composed middlewa
 
 `without_http.testing` carries the same interface into a test: a mock client that answers
 from a function, an ASGI client that drives an app in memory, and a loopback client that
-runs the real wire protocols over no socket at all.
+runs the real wire protocols over no socket at all, plus the raw in-memory endpoints
+those are built from, for a test that writes frames rather than requests.
 
 See the
 [`without-http` guide](https://without.help/without-http/)

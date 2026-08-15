@@ -289,6 +289,12 @@
   the server's crash-to-`500` isolation all run with no port and no file descriptor. All three
   speak plain ASGI and plain request values, so they drive a FastAPI or Starlette app as readily as
   a `without` one, and `base_url(...)` composes on when a test would rather write `"/items"`.
+  Below the clients, `served_pipe(app, ...)` hands over the client end of a `pipe()` with the
+  server on the other, for a conformance test that writes frames rather than requests (a malformed
+  request line, an h2 preface followed by an illegal frame, a reset flood); it runs the lifespan and
+  cancels the connection on exit as `serving` does, and the server presents as `SERVER_ADDRESS`.
+  `without-http`'s own HTTP/1.1 and HTTP/2 server suites run on it, leaving a bound socket to the
+  tests that need what only a kernel provides: TLS, socket options, and a third-party client.
 
 ### Changed
 
@@ -373,6 +379,17 @@
   [Security](https://without.help/without-http/security/) page.
 
 ### Fixed
+
+- **`without-durability-sqlite`**: `Database.aclose()`, and closing the connection any other way is
+  now a documented mistake. `sqlite3.close()` frees the connection and finalizes its statements
+  under any thread still executing one, which segfaults the process rather than raising, and
+  `Database.run` makes that reachable by design: a cancelled caller unwinds immediately while its
+  thread runs on, precisely so the connection is not handed to the next caller mid-transaction. A
+  shutdown that follows a cancellation therefore closed on top of a statement in flight. It
+  surfaced as an intermittently dying test worker, roughly one run in twenty-five, whenever a
+  workflow's worker task was cancelled just before its store was torn down. `aclose` takes the same
+  guard `run` releases from the thread, so the close waits the statement out; the guard is released
+  afterwards, so a `run` arriving later fails loudly on a closed connection.
 
 - **`without-http`**: an HTTP/1.1 connection is no longer dropped after every request whose app never
   read the body. `h11` advances the client's state only as events are *pulled*, and an ASGI app may

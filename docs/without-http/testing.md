@@ -2,8 +2,9 @@
 
 How to test code that answers HTTP requests, and code that sends them, without binding
 a socket. This page covers the three clients in `without_http.testing`, how much of the
-stack each one runs, and how they interoperate with the ecosystem's own test tools. For
-the client interface itself, see the [guide](index.md#client).
+stack each one runs, the raw endpoints underneath them for a test that writes bytes, and
+how all of it interoperates with the ecosystem's own test tools. For the client interface
+itself, see the [guide](index.md#client).
 
 ## One interface, four altitudes
 
@@ -210,6 +211,26 @@ the keep-alive race behave: a pool that checks a pooled connection for EOF and t
 can have the close land in between, and a socket takes those bytes and reports the failure
 on the next read.
 
+### `served_pipe`: the server, with the bytes left to you
+
+A conformance test writes frames rather than requests: a malformed request line, an h2
+preface followed by an illegal frame, a `RST_STREAM` flood. `served_pipe` is the same
+wiring as `loopback_client` with the client half left off, handing the raw endpoint over
+instead:
+
+```python
+async with served_pipe(app, max_stream_resets=2) as (reader, writer):
+    writer.write(b"!!! not a valid request line !!!\r\n\r\n")
+    await writer.drain()
+    assert (await reader.readline()).startswith(b"HTTP/1.1 400")
+```
+
+It runs the lifespan and cancels the connection on exit, both as `serving` does, so a
+test can still assert what shutdown does to a request left in flight. The server reads
+`SERVER_ADDRESS` back as its own address, which is the authority such a test writes into
+`:authority` or a `Host` header. This is what `without-http`'s own HTTP/1.1 and HTTP/2
+server suites run on.
+
 So `loopback_client` covers everything `asgi_client` skips: framing and chunking,
 keep-alive and connection reuse, HTTP/2 by prior knowledge (`http2=True` makes the client
 write the h2 preface, which the server recognizes), the `413`/redirect early-response
@@ -225,8 +246,9 @@ What it cannot reproduce is what only a kernel provides:
   and a reset is invisible.
 - **The accept path.** No listen backlog, no bind, no address in use.
 
-Tests that turn on any of those belong on `serving()` and a real socket, which is why
-`without-http`'s own server suite still binds one.
+Tests that turn on any of those belong on `serving()` and a real socket, which is what
+`without-http`'s TLS suite, its socket-option tests, and the tests driven by a
+third-party client still bind.
 
 ## A client finishing is not the app finishing
 
@@ -291,11 +313,13 @@ async with run_lifespan(app), httpx.AsyncClient(transport=httpx.ASGITransport(ap
 ```
 
 It also buffers the whole response before returning it, so streaming and duplex
-behaviour are not observable through it. Starlette's `TestClient` closes both gaps, and
-adds a background event loop in a portal thread so *synchronous* tests can drive an
-async app. `without`'s suite is async throughout, so `asgi_client` needs no thread: what
-it keeps from `TestClient` is the lifespan bracket, and what it adds is the streaming
-response.
+behaviour are not observable through it. Starlette's `TestClient` closes the lifespan
+gap, and adds a background event loop in a portal thread so *synchronous* tests can
+drive an async app, but it buffers the same way: it runs the app to completion and then
+builds the response from what was collected, so the head cannot arrive before the last
+chunk and a duplex handler has nothing to read. `without`'s suite is async throughout,
+so `asgi_client` needs no thread: what it keeps from `TestClient` is the lifespan
+bracket, and what it adds is the streaming response.
 
 ## Reference
 
