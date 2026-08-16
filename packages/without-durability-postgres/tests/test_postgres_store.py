@@ -28,7 +28,7 @@ from without_durability_postgres.store import migrate
 
 # `just test` starts the services in compose.yaml and publishes each address; these tests
 # drive the real server it started rather than a fake, and skip when it did not (no
-# podman on this machine, or pytest run directly).
+# container engine on this machine, or pytest run directly).
 pytestmark = pytest.mark.compose
 
 ORDER = Order(order_id="o-42", sku="gizmo", cents=1999)
@@ -57,9 +57,9 @@ async def pool() -> AsyncIterator[AsyncConnectionPool]:
 
     # podman-compose reports the published port alone, docker compose the bind address it
     # is published on (`0.0.0.0:32768`), which is a wildcard a client cannot dial. Either
-    # way the loopback address is where the port is reachable.
-    host, _, port = published.strip().rpartition(":")
-    dsn = f"postgresql://postgres:without@{host or '127.0.0.1'}:{int(port)}/without"
+    # way the loopback address is where the port is reachable, so only the port is taken.
+    port = published.strip().rpartition(":")[2]
+    dsn = f"postgresql://postgres:without@127.0.0.1:{int(port)}/without"
     connections = AsyncConnectionPool(dsn, min_size=1, max_size=8, open=False)
     await connections.open(wait=True)
     try:

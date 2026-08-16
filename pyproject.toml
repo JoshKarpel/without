@@ -60,9 +60,10 @@ dev = [
     "pytest-mock>=3",
     "pytest-randomly>=3",
     "pytest-timeout>=2.3",
-    # Runs the services in compose.yaml around the suite (see the `test` recipe). It is a Python
-    # package, so the toolchain that pins everything else pins it too; podman itself is not, so it
-    # stays a system install (`apt install podman`, `brew install podman`, `winget install podman`).
+    # Runs the services in compose.yaml around the suite when docker is not the engine (see the
+    # `test` recipe). It is a Python package, so the toolchain that pins everything else pins it
+    # too; the engines themselves are not, so each stays a system install (`apt install podman`,
+    # `brew install podman`, `winget install podman`, or docker by its own instructions).
     "podman-compose>=1.6",
     "trustme>=1.1",
     "hypothesis>=6.161.2",
@@ -162,8 +163,8 @@ omit = [
     # WITHOUT_COMPOSE_AVAILABLE once the services in compose.yaml are up: unset, each
     # entry is the bare glob and matches; set, its value prefixes the glob into a
     # pattern that matches nothing, so both files are measured like any other. A run
-    # where the compose-marked tests skip (no podman, as on the macOS and Windows CI
-    # legs) then leaves the gate reporting the suite rather than the environment.
+    # where the compose-marked tests skip (no container engine, as on the macOS and
+    # Windows CI legs) then leaves the gate reporting the suite rather than the environment.
     "${WITHOUT_COMPOSE_AVAILABLE-}*/without_durability_redis/*.py",
     "${WITHOUT_COMPOSE_AVAILABLE-}*/without_durability_postgres/*.py",
     "${WITHOUT_COMPOSE_AVAILABLE-}*/tests/test_redis_store.py",

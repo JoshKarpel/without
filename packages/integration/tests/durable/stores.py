@@ -50,9 +50,8 @@ def published(variable: str) -> tuple[str, int]:
         pytest.skip(f"{variable} is unset: run `just test`, which starts the services in compose.yaml")
     # podman-compose reports the published port alone, docker compose the bind address it
     # is published on (`0.0.0.0:32768`), which is a wildcard a client cannot dial. Either
-    # way the loopback address is where the port is reachable.
-    host, _, port = address.strip().rpartition(":")
-    return host or "127.0.0.1", int(port)
+    # way the loopback address is where the port is reachable, so only the port is taken.
+    return "127.0.0.1", int(address.strip().rpartition(":")[2])
 
 
 @pytest.fixture(params=STORES)

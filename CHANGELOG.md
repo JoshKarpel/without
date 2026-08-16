@@ -184,8 +184,8 @@
   suite runs the same saga, the same suspension, and the same API-plus-worker flow against all four,
   so "a workflow cannot tell which store it got" is a claim the suite makes rather than a page
   asserts. Those tests drive real servers: the `test` recipe starts the new `compose.yaml` with
-  podman, hands pytest each published address, and takes the stack down from an exit trap. They
-  carry a `compose` mark and skip where podman is not installed.
+  docker or podman, whichever it finds, hands pytest each published address, and takes the stack
+  down from an exit trap. They carry a `compose` mark and skip where neither is installed.
 - **`without`**: `ticks(every)`, a `Stream` of moments, one now and one every interval after. It is
   the clock as a source, so periodic work stops being a `while True` with a `sleep` buried in it
   and becomes a `Sink` that says only what happens per event, composed with a stream that says when.

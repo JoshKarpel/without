@@ -31,10 +31,10 @@ proving it for one store. What each store *is* (its scripts, its statements, its
 own failure modes) is tested in that store's own package.
 
 Those tests drive real servers rather than fakes: `just test` starts the services
-in `compose.yaml` with podman, hands each published address to pytest through the
-environment, and takes the stack down again from an exit trap. They carry a
-`compose` mark and skip when that address is unset (no podman on the machine, or
-pytest run directly), so `-m "not compose"` opts out up front.
+in `compose.yaml` with docker or podman, hands each published address to pytest
+through the environment, and takes the stack down again from an exit trap. They
+carry a `compose` mark and skip when that address is unset (no engine on the
+machine, or pytest run directly), so `-m "not compose"` opts out up front.
 
 `transform` is a text-transform service built on the `without-asgi` adapters.
 `POST /transform` reads the request body, uppercases/lowercases/title-cases it

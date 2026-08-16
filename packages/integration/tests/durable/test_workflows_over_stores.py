@@ -45,8 +45,9 @@ from without_http.testing import loopback_client
 # tests that a workflow cannot tell which it got.
 #
 # It is `compose`-marked because two of the four parameters need a server. The memory and
-# SQLite parameters would run anywhere, and losing them on a machine without podman is
-# the price of keeping the parametrization in one place rather than splitting the suite.
+# SQLite parameters would run anywhere, and losing them on a machine with no container
+# engine is the price of keeping the parametrization in one place rather than splitting
+# the suite.
 
 pytestmark = pytest.mark.compose
 
