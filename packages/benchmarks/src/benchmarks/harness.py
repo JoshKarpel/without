@@ -11,6 +11,7 @@ from pathlib import Path
 
 import psutil
 from without_http import ConnectionPool
+from without_http import request
 
 from benchmarks.todos.servers import DEFAULT_SERVER
 from benchmarks.todos.servers import FRAMEWORKS
@@ -74,7 +75,7 @@ async def _await_ready(url: str, timeout_seconds: float = 10.0) -> None:
     async with ConnectionPool() as pool:
         while time.monotonic() < deadline:
             try:
-                async with asyncio.timeout(1.0), pool.request("GET", url, headers=close) as response:
+                async with asyncio.timeout(1.0), request(pool, "GET", url, headers=close) as response:
                     if response.head.status == 200:
                         return
             except OSError, TimeoutError:

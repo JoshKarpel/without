@@ -59,8 +59,11 @@ repos:
         pass_filenames: false
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: 'v0.15.17'
+    rev: 'v0.16.0'
     hooks:
       - id: ruff-check
         args: [ --fix, --exit-non-zero-on-fix ]
       - id: ruff-format
+        # the upstream hook only passes python/pyi/jupyter; `ruff format` also formats
+        # the python code blocks inside markdown, so hand it the docs too
+        types_or: [ python, pyi, jupyter, markdown ]

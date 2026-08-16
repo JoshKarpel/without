@@ -236,6 +236,7 @@ class Database:
     Build it with `connect`, which applies the pragmas that make this durable rather than
     merely persistent. Share one between the checkpoint store and the queue: that is what
     makes `SqliteDurable.arrive` a single commit, and it is checked rather than assumed.
+    Close it with `aclose`, never `connection.close()`, for the reason given there.
     """
 
     connection: sqlite3.Connection
@@ -271,6 +272,34 @@ class Database:
         running = asyncio.ensure_future(asyncio.to_thread(work, self.connection))
         running.add_done_callback(lambda _finished: self.guard.release())
         return await asyncio.shield(running)
+
+    async def aclose(self) -> None:
+        """
+        Close the connection once nobody is inside it.
+
+        The other half of `run`'s handshake, and the reason a caller must never reach
+        for `connection.close()` itself. `sqlite3.close()` frees the connection and
+        finalizes its statements; a thread still executing one is then reading freed
+        memory, which segfaults the process rather than raising. `run` makes that
+        reachable by design, since a cancelled caller unwinds while its thread runs on,
+        so a shutdown that follows a cancellation is exactly when the two meet: the
+        worker's task is cancelled, the statement it left behind is still in flight, and
+        the close lands on top of it.
+
+        Taking the guard is what waits that out, because `run` releases it from the
+        thread rather than from its caller. That wait is unbounded: an effect hung
+        inside a `run` thread holds the guard until it returns, and cancelling this
+        coroutine while it is parked on the guard abandons the close, leaving the
+        connection open. The guard is then let go again, so a `run` arriving after
+        this fails on a closed connection, which is the loud version of a bug that
+        would otherwise be silent.
+
+        The close itself goes to a thread like every other driver call: under WAL it
+        runs the final checkpoint (and, with `synchronous=FULL`, an fsync), which is
+        real disk I/O that does not belong on the event loop.
+        """
+        async with self.guard:
+            await asyncio.to_thread(self.connection.close)
 
 
 def connect(path: Path | str, *, timeout: timedelta = timedelta(seconds=5)) -> Database:

@@ -10,6 +10,8 @@ from without_durability_sqlite import SqliteCheckpointer, SqliteDurable, SqliteS
 database = connect("workflows.db")
 await migrate(database)
 durable = SqliteDurable(SqliteCheckpointer(database), SqliteScheduler(database))
+...
+await database.aclose()
 ```
 
 It is the smallest thing that still meets every requirement the interface states,
@@ -36,4 +38,5 @@ See the
 (with the [API reference](https://without.help/without-durability-sqlite/reference/))
 for the statements, why `connect` pays the fsync that the usual WAL advice trades
 away, why an effect here is a synchronous callback where the Postgres store's is
-`async`, and how the blocking driver is kept off the event loop.
+`async`, how the blocking driver is kept off the event loop, and why closing goes
+through `aclose` rather than the connection.

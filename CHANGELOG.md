@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.3
 
 ### Added
 
@@ -184,8 +184,8 @@
   suite runs the same saga, the same suspension, and the same API-plus-worker flow against all four,
   so "a workflow cannot tell which store it got" is a claim the suite makes rather than a page
   asserts. Those tests drive real servers: the `test` recipe starts the new `compose.yaml` with
-  podman, hands pytest each published address, and takes the stack down from an exit trap. They
-  carry a `compose` mark and skip where podman is not installed.
+  docker or podman, whichever it finds, hands pytest each published address, and takes the stack
+  down from an exit trap. They carry a `compose` mark and skip where neither is installed.
 - **`without`**: `ticks(every)`, a `Stream` of moments, one now and one every interval after. It is
   the clock as a source, so periodic work stops being a `while True` with a `sleep` buried in it
   and becomes a `Sink` that says only what happens per event, composed with a stream that says when.
@@ -260,9 +260,63 @@
   `ValueError` (from a custom extractor or an `into` factory) as a backstop. Making the boundary a
   single matchable type is what lets a plain `ValueError` raised deeper in a handler surface as a 500
   rather than masquerading as a client 400.
+- **`without-asgi`**: `Content`, a body paired with the headers that describe it, plus `json_content`
+  and `Response.from_content`. Encoding a value produces two things that must travel together, the
+  bytes and the `content-type` naming them, and every caller that separated them re-derived the same
+  three lines: the app layer, the router's own tests, and every test that sent a JSON body each
+  carried a private `json_response`. `Content` carries no policy, so `json_content` is one producer
+  of it and a form or msgpack encoder is another, and the serializer stays an argument
+  (`json_content(order, dumps=...)`) with the stdlib as the default, because a default should add no
+  dependency. It is strict where JSON is (`allow_nan=False`, so a `NaN` fails at the sender) and
+  leaves key order alone, since sorting is a policy some callers want and a cost every response
+  would pay. `Response.from_content(status, content, headers=...)` layers the caller's headers over
+  the content's, and `without-http`'s `request` takes the same value as a request body, which is why
+  it lives in the package both sides already depend on. This walks back `without-web`'s "ships no
+  `json_response`-style helper" stance on the narrow point of the *shape*: what a handler must not
+  have imposed on it is the serializer, and that is still injected.
+- **`without-http`**: `without_http.testing`, three more `Client`s that reach an app (or nothing)
+  without binding a socket. `mock_client(handler)` answers from a function, which is the whole of
+  mocking once a client is one, with `respond(...)` building the canned response.
+  `asgi_client(app)` builds an `HttpScope` from each request and drives `app(scope, receive, send)`
+  directly, streaming: the head returns the moment the app sends `http.response.start` and body
+  chunks cross a one-slot queue, so duplex handlers are testable, and the app's lifespan runs for
+  the block through the same `run_lifespan` a server uses (which `httpx.ASGITransport` leaves to
+  the caller). Its scope advertises `http.response.trailers`, the one extension in-memory delivery
+  can honestly offer, since a `ClientResponse` carries trailing blocks through to
+  `read_with_trailers`, so an app that negotiates trailers takes that path here. `loopback_client(app)` is `serving` minus `asyncio.start_server`: the real
+  `ConnectionPool` and the real server, wired to each other over `pipe()`, two cross-wired
+  `StreamReader`s with genuine backpressure, so framing, keep-alive, HTTP/2 by prior knowledge, and
+  the server's crash-to-`500` isolation all run with no port and no file descriptor. All three
+  speak plain ASGI and plain request values, so they drive a FastAPI or Starlette app as readily as
+  a `without` one, and `base_url(...)` composes on when a test would rather write `"/items"`.
+  Below the clients, `served_pipe(app, ...)` hands over the client end of a `pipe()` with the
+  server on the other, for a conformance test that writes frames rather than requests (a malformed
+  request line, an h2 preface followed by an illegal frame, a reset flood); it runs the lifespan and
+  cancels the connection on exit as `serving` does, and the server presents as `SERVER_ADDRESS`
+  (with `AUTHORITY` spelling the `host:port` bytes such a test writes into `:authority` or `Host`).
+  `without-http`'s own HTTP/1.1 and HTTP/2 server suites run on it, leaving a bound socket to the
+  tests that need what only a kernel provides: TLS, socket options, and a third-party client.
 
 ### Changed
 
+- **`without-http`**: a client *is* a function from a request to a response. The type formerly
+  called `ClientExchange` is now `Client`, `ConnectionPool` satisfies it by being callable
+  (`await pool(request)`), and the caller-facing surface is a free `request(client, method, url,
+  ...)` context manager rather than a method on the pool. Everything the pool held that was not
+  about connections has left it: `middleware` is gone, because a decorated client is just
+  `stack(add_headers(...), cookies(jar))(pool)`, and `timeout` is gone, because a deadline belongs
+  to the caller rather than to the connection and now rides on `ClientRequest.timeout` (set it per
+  call with `request(..., timeout=...)`, or across a client with the new `deadline(...)`
+  middleware, which fills in only a request that states no budget of its own). What is left on the
+  pool is connections: TLS, HTTP/2, the per-host bounds, socket options, and the new injectable
+  `connect`, which is the one step that touches the network. Migration is mechanical:
+  `pool.request(m, u, ...)` becomes `request(pool, m, u, ...)`, `ConnectionPool(middleware=mw)`
+  becomes composing `mw(pool)` where the client is built, and `ConnectionPool(timeout=t)` becomes
+  `deadline(t)(pool)`.
+- **`without-asgi`**: a scope whose `asgi` key (or `asgi["version"]`) is missing parses as version
+  `"2.0"` rather than raising `KeyError`, which is what the spec tells applications to assume.
+  Real producers omit it: starlette's `TestClient` sends a lifespan scope with no `asgi` key at
+  all, and a `without` app driven through it previously crashed on the first request.
 - **`without`**: the module holding the substrate is `without.interfaces` rather than
   `without.contracts`. Every name is re-exported from the package's top-level `__init__`, so
   `from without import Processor` is unaffected and only a direct submodule import has to change.
@@ -326,6 +380,19 @@
   [Security](https://without.help/without-http/security/) page.
 
 ### Fixed
+
+- **`without-durability-sqlite`**: `Database.aclose()`, and closing the connection any other way is
+  now a documented mistake. `sqlite3.close()` frees the connection and finalizes its statements
+  under any thread still executing one, which segfaults the process rather than raising, and
+  `Database.run` makes that reachable by design: a cancelled caller unwinds immediately while its
+  thread runs on, precisely so the connection is not handed to the next caller mid-transaction. A
+  shutdown that follows a cancellation therefore closed on top of a statement in flight. It
+  surfaced as an intermittently dying test worker, roughly one run in twenty-five, whenever a
+  workflow's worker task was cancelled just before its store was torn down. `aclose` takes the same
+  guard `run` releases from the thread, so the close waits the statement out; the guard is released
+  afterwards, so a `run` arriving later fails loudly on a closed connection. The close itself runs
+  on a thread like every other driver call, since under WAL it performs the final checkpoint (and,
+  with `synchronous=FULL`, an fsync), which is blocking disk I/O the event loop should not carry.
 
 - **`without-http`**: an HTTP/1.1 connection is no longer dropped after every request whose app never
   read the body. `h11` advances the client's state only as events are *pulled*, and an ASGI app may

@@ -2,6 +2,11 @@
 
 set ignore-comments
 
+# How long the compose stack gets to pull its images and report both services healthy.
+# Generous against a cold cache, since overshooting only costs a hung run the time it
+# was going to lose anyway, while undershooting fails a slow but working pull.
+compose-timeout := "5m"
+
 [default]
 [doc('List available recipes')]
 list:
@@ -22,26 +27,58 @@ alias w := watch
 # no session fixture to coordinate across xdist workers, and the image pull happens
 # before the first test rather than inside its timeout.
 #
-# podman, because it is rootless and daemonless: nothing to install as a service and
-# nothing running between test runs. `podman compose` is only a wrapper around an
-# external implementation, so podman-compose is called directly, pinned in the dev
-# group like every other tool. A machine without podman still runs everything else:
-# the tests that need a service skip themselves when the address is unset, which is
-# also how the macOS and Windows CI legs run (GitHub's runners ship no container
+# Either engine serves, and the recipe takes the first it finds: docker compose, then
+# podman-compose. That order is not a judgement between them. podman does not run a
+# healthcheck itself, it asks systemd to, one transient timer per container, and
+# GitHub's Ubuntu runner installs podman as a static bundle built without systemd; the
+# checks in compose.yaml therefore never run there, health never leaves `starting`, and
+# the `--wait` below never returns. Docker's daemon runs them in-process, so it is the
+# engine that works in both places. podman is otherwise the nicer neighbour, rootless
+# and daemonless with nothing running between test runs, and `podman compose` only
+# wraps an external implementation, so podman-compose is called directly and pinned in
+# the dev group like every other tool. A machine with neither still runs everything
+# else: the tests that need a service skip themselves when the address is unset, which
+# is also how the macOS and Windows CI legs run (GitHub's runners ship no container
 # runtime that can run a Linux image).
 [doc('Run type checking and tests')]
 test *args:
     #!/usr/bin/env bash
     set -euo pipefail
-    compose=(uv run podman-compose --file compose.yaml --project-name without-tests)
-    if command -v podman > /dev/null; then
+    engine=""
+    # `OSType`, not merely a reachable daemon: the Windows runner has docker too, in
+    # Windows-container mode, where every image in compose.yaml is unrunnable. That leg
+    # is meant to reach the `else` and skip, the way it did when it had no engine at all.
+    if [[ "$(docker info --format '{{ '{{' }}.OSType{{ '}}' }}' 2> /dev/null)" == "linux" ]]; then
+      engine="docker compose"
+      compose=(docker compose --file compose.yaml --project-name without-tests)
+    elif command -v podman > /dev/null; then
+      engine="podman-compose"
+      compose=(uv run podman-compose --file compose.yaml --project-name without-tests)
+    fi
+    if [[ -n "$engine" ]]; then
       trap '"${compose[@]}" down --volumes > /dev/null 2>&1' EXIT
       # --wait holds until each service is *healthy* (see the healthchecks in
       # compose.yaml), so the first test cannot race a server that is still starting.
       # The output (image pulls, container ids, the wait's own bookkeeping) is worth
       # seeing only when it fails, so it is held back until it does.
-      if ! output="$("${compose[@]}" up --detach --wait 2>&1)"; then
+      #
+      # Bounded, because a wait that never returns is the one failure this held-back
+      # output cannot report: it prints nothing while it hangs, and whatever it had
+      # buffered dies with the shell that gets killed. That is worth a few lines here
+      # rather than a CI job spending its whole timeout in silence. `timeout` is GNU
+      # coreutils, which a Linux box has and a mac does not, so a mac running an engine
+      # of its own waits unbounded rather than not at all.
+      status=0
+      if command -v timeout > /dev/null; then
+        output="$(timeout {{ compose-timeout }} "${compose[@]}" up --detach --wait 2>&1)" || status=$?
+      else
+        output="$("${compose[@]}" up --detach --wait 2>&1)" || status=$?
+      fi
+      if [[ "$status" -ne 0 ]]; then
         echo "$output" >&2
+        if [[ "$status" -eq 124 ]]; then
+          echo "the services in compose.yaml were not healthy within {{ compose-timeout }}" >&2
+        fi
         exit 1
       fi
       export WITHOUT_TESTS_REDIS="$("${compose[@]}" port redis 6379 2> /dev/null)"
@@ -51,7 +88,7 @@ test *args:
       # nothing; the value says so out loud (see the note in pyproject.toml).
       export WITHOUT_COMPOSE_AVAILABLE=prefix-that-will-not-match
     else
-      echo "podman is not installed, so the tests that need the services in compose.yaml will skip"
+      echo "no container engine found, so the tests that need the services in compose.yaml will skip"
     fi
     uv run mypy
     uv run pytest --failed-first --cov {{ args }}

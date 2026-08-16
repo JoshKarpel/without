@@ -392,7 +392,11 @@ async def test_the_worker_claims_a_workflow_for_the_lease_its_queue_hands_out() 
         releasing.set()
         worker.cancel()
 
-    assert lease - BRIEF <= held_for <= lease, f"the claim runs to the queue's lease, not to {LEASE}"
+    # Whatever the runner spends between the worker writing the claim and this read comes
+    # off `held_for`, and a loaded one spends far more than a tick there. The slack only has
+    # to stay well short of the gap between the windows being told apart, so it is generous.
+    slack = lease / 2
+    assert lease - slack <= held_for <= lease, f"the claim runs to the queue's lease, not to {LEASE}"
 
 
 @pytest.mark.parametrize("lease", [timedelta(), timedelta(seconds=-1)])

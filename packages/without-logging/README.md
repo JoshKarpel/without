@@ -24,7 +24,7 @@ async def write(record):
 
 pipeline = compose(from_selector(at_least(Level.WARNING)), from_sink(write))
 
-async with capture(pipeline):          # attaches to the root logger for the block
+async with capture(pipeline):  # attaches to the root logger for the block
     logging.getLogger("app").warning("disk almost full", extra={"free_pct": 3})
 ```
 
@@ -50,7 +50,7 @@ from without_logging import Level, at_least, offload, to_rotating_file
 
 writer = to_rotating_file(lambda i, when: directory / f"app.{i}.log", max_bytes=64 << 20, max_age=timedelta(hours=1))
 async with offload(writer) as sink:
-    lines = compose(from_map(render), sink)   # Record -> str -> file
+    lines = compose(from_map(render), sink)  # Record -> str -> file
     async with capture(compose(from_selector(at_least(Level.WARNING)), lines)):
         ...  # WARNING+ records written off the event loop, rotated by size and time
 ```

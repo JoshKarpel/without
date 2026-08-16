@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from contextlib import suppress
 
 from without_http import ConnectionPool
+from without_http import request
 
 
 @asynccontextmanager
@@ -32,7 +33,7 @@ async def _raw_server(response: bytes) -> AsyncIterator[tuple[str, int]]:
 async def test_read_head_skips_an_informational_response() -> None:
     response = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello"
     async with _raw_server(response) as (host, port), ConnectionPool() as pool:
-        async with pool.request("GET", f"http://{host}:{port}/") as (head, body):
+        async with request(pool, "GET", f"http://{host}:{port}/") as (head, body):
             assert head.status == 200
             assert await body.read() == b"hello"
 
@@ -40,7 +41,7 @@ async def test_read_head_skips_an_informational_response() -> None:
 async def test_a_connection_close_response_is_not_returned_to_the_pool() -> None:
     response = b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\nhi"
     async with _raw_server(response) as (host, port), ConnectionPool() as pool:
-        async with pool.request("GET", f"http://{host}:{port}/") as (head, body):
+        async with request(pool, "GET", f"http://{host}:{port}/") as (head, body):
             assert head.status == 200
             assert await body.read() == b"hi"
         idle = sum(len(host_pool.idle) for host_pool in pool._h11.values())

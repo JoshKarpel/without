@@ -20,22 +20,26 @@ import json
 from without_asgi import Response, make_asgi_app
 from without_web import INT, Router, get, path_param
 
-uid = path_param("id", INT)              # one token: a pattern segment AND a typed read
+uid = path_param("id", INT)  # one token: a pattern segment AND a typed read
 
-@get(t"/users/{uid}", uid)               # t-string pattern; `@get` returns a Route value
-async def show_user(state, user_id: int):    # user_id is an int, no `assert isinstance`
+
+@get(t"/users/{uid}", uid)  # t-string pattern; `@get` returns a Route value
+async def show_user(state, user_id: int):  # user_id is an int, no `assert isinstance`
     body = json.dumps({"id": user_id}).encode()
     return Response(status=200, headers=((b"content-type", b"application/json"),), body=body)
+
 
 router = Router(routes=(show_user,), fallback=not_found)
 app = make_asgi_app(lifespan, http=router.dispatch)
 ```
 
-Encoding (the serializer, its options, the content type) is the application's
-choice, so `without-web` ships no `json_response`-style helper: a handler returns
-a `Response` (status, headers, bytes) however it likes. The same stance the
-router takes toward schemas (`schema_for` is injected) it takes toward response
-bodies.
+The serializer stays the application's choice, so `without-web` decides nothing about
+encoding: a handler returns a `Response` (status, headers, bytes) however it likes, the
+same stance the router takes toward schemas (`schema_for` is injected). What a handler
+does *not* have to re-derive is the pairing of encoded bytes with the `content-type`
+naming them, which lives one layer down as
+[`json_content` and `Response.from_content`](../without-asgi/index.md#content-a-body-and-what-it-is)
+with the encoder still an argument.
 
 ## A router dispatches on the scope, never the body
 
@@ -315,11 +319,12 @@ string that drifts when the path changes. It is a **plain function** of the rout
 value, no router involved:
 
 ```python
-show_user = get(t"/users/{uid}", uid)   # a Route value you hold
+show_user = get(t"/users/{uid}", uid)  # a Route value you hold
+
 
 @post("/users", new_user_body)
 async def create_user(state, new):
-    location = url_for(show_user, {"id": created.id})   # -> "/users/<id>"
+    location = url_for(show_user, {"id": created.id})  # -> "/users/<id>"
     return Response(status=201, headers=((b"location", location.encode()),), body=...)
 ```
 

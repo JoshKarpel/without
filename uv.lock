@@ -666,6 +666,7 @@ name = "integration"
 version = "0.0.0"
 source = { editable = "packages/integration" }
 dependencies = [
+    { name = "fastapi" },
     { name = "httpx" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -684,6 +685,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "fastapi", specifier = ">=0.140.0" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "pydantic", specifier = ">=2" },
     { name = "pydantic-settings", specifier = ">=2.7" },

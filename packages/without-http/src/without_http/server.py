@@ -86,13 +86,18 @@ class _Limits:
     Bundled into one value so `serving` threads a single argument down through the
     protocol handlers, and a new bound snaps in as a field rather than another
     parameter on every signature. `serving` exposes each field as an explicit keyword
-    argument, keeping the public surface flat while the plumbing stays terse.
+    argument, keeping the public surface flat while the plumbing stays terse. The
+    defaults live here, and the exposing signatures (`serving`, `loopback_client`,
+    `served_pipe`) read them off `_DEFAULT_LIMITS`, so the three cannot disagree.
     """
 
-    max_concurrent_streams: int
-    max_stream_resets: int
-    idle_timeout: timedelta | None
-    max_websocket_message_bytes: int | None
+    max_concurrent_streams: int = 100
+    max_stream_resets: int = 200
+    idle_timeout: timedelta | None = None
+    max_websocket_message_bytes: int | None = None
+
+
+_DEFAULT_LIMITS = _Limits()
 
 
 def _address(info: object) -> tuple[str, int] | None:
@@ -845,10 +850,10 @@ async def serving(
     host: str = "127.0.0.1",
     port: int = 0,
     max_pending_connections: int = 100,
-    max_concurrent_streams: int = 100,
-    max_stream_resets: int = 200,
-    idle_timeout: timedelta | None = None,
-    max_websocket_message_bytes: int | None = None,
+    max_concurrent_streams: int = _DEFAULT_LIMITS.max_concurrent_streams,
+    max_stream_resets: int = _DEFAULT_LIMITS.max_stream_resets,
+    idle_timeout: timedelta | None = _DEFAULT_LIMITS.idle_timeout,
+    max_websocket_message_bytes: int | None = _DEFAULT_LIMITS.max_websocket_message_bytes,
     ssl_context: ssl.SSLContext | None = None,
     ssl_handshake_timeout: float | None = None,
     ssl_shutdown_timeout: float | None = None,

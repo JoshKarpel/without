@@ -33,8 +33,8 @@ class MyConfig(BaseModel):
 
 source = watch_config(Path("/etc/config"), read_yaml_file(MyConfig, "config.yaml"))
 async with sample(source) as config:
-    config.current()       # always the latest reloaded value, never blocks
-    await config.updated() # block until the next reload lands, then return it
+    config.current()  # always the latest reloaded value, never blocks
+    await config.updated()  # block until the next reload lands, then return it
 ```
 
 `sample` reads the first value eagerly, so the context is never "not ready"; a

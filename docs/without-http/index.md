@@ -25,7 +25,7 @@ from without_http import serving
 app = make_asgi_app(lifespan, http=router.dispatch, websocket=sockets.dispatch)
 
 async with serving(app, host="127.0.0.1", port=8000):
-    await sleep_forever()   # run until cancelled
+    await sleep_forever()  # run until cancelled
 ```
 
 Because `without-http` speaks plain ASGI to the app, *any* ASGI app runs over it,
@@ -106,27 +106,40 @@ touches I/O.
 
 ## Client
 
-The client is a `ConnectionPool` you open once and make requests through, not free
-`get`/`post` functions:
+A client is a function from a request to a response:
 
 ```python
-from without_http import ConnectionPool
+type Client = Callable[[ClientRequest], Awaitable[ClientResponse]]
+```
+
+That is the whole interface. A `ConnectionPool` is one (calling it answers the request
+over the network), middleware maps one to another, and the in-memory clients in
+[Testing](testing.md) are more of them. `request` is the surface you drive any of them
+through: it builds the `ClientRequest`, runs it, and closes the response body on the way
+out.
+
+```python
+from without_http import ConnectionPool, request
 
 async with ConnectionPool() as pool:
-    async with pool.request("GET", "http://127.0.0.1:8000/items") as (head, body):
+    async with request(pool, "GET", "http://127.0.0.1:8000/items") as (head, body):
         assert head.status == 200
         data = await body.read()
 ```
 
+Nothing about the pool is special to `request`, and nothing about `request` is special
+to the pool. That split is what makes a test able to swap the network out from under
+code it does not otherwise change.
+
 ### The response: a `(head, body)` split
 
-`pool.request` yields a `ClientResponse`, which is a `NamedTuple`, so take it whole or
+`request` yields a `ClientResponse`, which is a `NamedTuple`, so take it whole or
 unpack it as you like:
 
 ```python
-async with pool.request("GET", url) as response:   # response.head, response.body
+async with request(client, "GET", url) as response:  # response.head, response.body
     ...
-async with pool.request("GET", url) as (head, body):   # unpacked, types preserved
+async with request(client, "GET", url) as (head, body):  # unpacked, types preserved
     ...
 ```
 
@@ -145,24 +158,40 @@ builds carries them for ergonomics. Same split as without-asgi's `RequestBody`
 
 Request and response bodies each cover the full buffered/streaming matrix, the
 client mirror of `without-web`'s server handlers. The request body is `body=`
-on `pool.request`: pass `bytes` to buffer it, or a `Stream[bytes]` (any async
+on `request`: pass `bytes` to buffer it, or a `Stream[bytes]` (any async
 iterable of chunks) to stream it. The response `body` is a live stream: iterate it
 chunk by chunk, or `await body.read()` to buffer the whole thing.
+
+When you hold a *value* rather than bytes, pass a
+[`Content`](../without-asgi/index.md#content-a-body-and-what-it-is) and the encoding
+travels with the `content-type` describing it, which is the same value a handler answers
+with:
+
+```python
+from without_asgi import json_content
+
+async with request(client, "POST", url, body=json_content(order)) as (head, body):
+    ...
+```
+
+An explicit `headers=` wins over what the content described, so overriding the
+`content-type` does not mean rebuilding the body.
 
 ```python
 async def upload() -> AsyncIterator[bytes]:
     for path in paths:
         yield path.read_bytes()
 
-async with pool.request("POST", url, body=upload()) as (head, body):
-    async for chunk in body:          # stream the response as it arrives
+
+async with request(pool, "POST", url, body=upload()) as (head, body):
+    async for chunk in body:  # stream the response as it arrives
         sink.write(chunk)
 ```
 
 The connection is released when the body is finished: an HTTP/1.1 connection is
 returned to the pool only if its body was read to the end (a partial read closes
 it, since unread bytes remain on the wire), and an HTTP/2 stream is reset if
-abandoned early. `pool.request` closes the body on block exit, so a body you never
+abandoned early. `request` closes the body on block exit, so a body you never
 read still releases its connection rather than stranding it.
 
 ### Trailers
@@ -173,7 +202,7 @@ common case). The default path drops them: `async for chunk in body` and
 endpoint's interface) that trailers matter, opt in:
 
 ```python
-data, trailers = await body.read_with_trailers()   # trailers: tuple[ResponseTrailers, ...]
+data, trailers = await body.read_with_trailers()  # trailers: tuple[ResponseTrailers, ...]
 # or, while streaming: async for item in body.events():  # bytes | ResponseTrailers
 ```
 
@@ -233,20 +262,22 @@ and stops reading: the early response is read even though the request-body write
 still backed up on the wire.
 
 Because the request body is a lazy `Stream[bytes]`, this extends to genuine
-bidirectional streaming: hand `pool.request` a queue-backed generator and feed it
+bidirectional streaming: hand `request` a queue-backed generator and feed it
 *in reaction to* the response you are reading (the gRPC ping-pong shape).
 
 ```python
 outbound: asyncio.Queue[bytes | None] = asyncio.Queue()
 
+
 async def request_body() -> AsyncIterator[bytes]:
     while (chunk := await outbound.get()) is not None:
         yield chunk
 
-await outbound.put(first_message)          # client speaks first
-async with pool.request("POST", url, body=request_body()) as (head, body):
+
+await outbound.put(first_message)  # client speaks first
+async with request(pool, "POST", url, body=request_body()) as (head, body):
     async for message in body:
-        await outbound.put(reply_to(message))   # or None to end the request
+        await outbound.put(reply_to(message))  # or None to end the request
 ```
 
 The framework provides the *mechanism* (a concurrent duplex transport); you own the
@@ -275,26 +306,33 @@ lingering `FIN` rather than an `RST` that could discard its own response). See
 By default a request has **no timeouts**: a hung connect or a stalled server blocks
 until you cancel it. A timeout is a *policy* keyed to your time budget ("fail rather
 than make slow progress, so my caller can react"), which the transport cannot know,
-so you opt in per phase with a `Timeout` value, on the pool or per request:
+so you opt in per phase with a `Timeout` value on the request:
 
 ```python
 from datetime import timedelta
 
-from without_http import Timeout
+from without_http import Timeout, deadline, request
 
-async with ConnectionPool(timeout=Timeout(connect=timedelta(seconds=10), read=timedelta(seconds=30))) as pool:
-    async with pool.request("GET", url, timeout=Timeout(read=timedelta(seconds=5))) as (head, body):
-        ...
+async with request(pool, "GET", url, timeout=Timeout(read=timedelta(seconds=5))) as (head, body):
+    ...
+
+# or as a default for everything sent through one client
+budgeted = deadline(Timeout(connect=timedelta(seconds=10), read=timedelta(seconds=30)))(pool)
 ```
+
+The budget rides on the `ClientRequest`, not on the pool, because it belongs to the
+caller rather than to the connection: one pool serves callers with different budgets,
+and middleware (a retry shortening each attempt) can rewrite it like any other field.
+`deadline` fills it in for a request that states none, and leaves a request that states
+its own alone.
 
 Each axis is a `timedelta`, so the unit is explicit rather than an ambiguous bare
 number, and an *inactivity* bound (it re-arms on progress), not a total deadline:
 `read`/`write` bound the gap between chunks, so a slow-but-progressing transfer is
 not killed. Every field defaults to `None` (that axis disabled), and there is no
 shared-default scalar, since one duration across four unrelated phases carries no
-meaning. A per-request `Timeout` *replaces* the pool's wholesale (it does not layer
-through middleware; `None` inherits the pool default). For an overall wall-clock cap,
-compose one on the substrate: `async with asyncio.timeout(t): pool.request(...)`.
+meaning. For an overall wall-clock cap, compose one on the substrate:
+`async with asyncio.timeout(t): request(...)`.
 
 **What each axis bounds** (what is actually happening on the wire; the thing most
 clients leave you to guess at):
@@ -404,34 +442,38 @@ every TCP transport it creates, in both directions, so there is nothing to confi
 
 ### Client middleware
 
-A client *exchange* (`ClientRequest -> ClientResponse`) is the dual of a server
-handler, and a `ClientMiddleware` wraps one into another: `ClientExchange ->
-ClientExchange`. That is the zero-context case of the **same** `stack` that composes
-server middleware (a server middleware is `(handler, state, scope) -> handler`; a
-client one needs no context because the request *is* the value it transforms), so the
-one `stack` serves both. The pool carries a default `middleware` applied to every
-request, and `pool.request(..., middleware=...)` composes more *inside* it for a
-single call:
+A `Client` is the dual of a server handler, and a `ClientMiddleware` wraps one into
+another: `Client -> Client`. That is the zero-context case of the **same** `stack` that
+composes server middleware (a server middleware is `(handler, state, scope) -> handler`;
+a client one needs no context because the request *is* the value it transforms), so the
+one `stack` serves both. A decorated client is just another client, so you build the one
+you want and pass it to `request`:
 
 ```python
-from without_http import ConnectionPool, add_headers, follow_redirects, cookies, CookieJar, stack
+from without_http import ConnectionPool, CookieJar, add_headers, cookies, follow_redirects, request, stack
 
 jar = CookieJar()
-async with ConnectionPool(middleware=add_headers((b"authorization", b"Bearer ..."))) as pool:
-    async with pool.request("GET", url, middleware=stack(follow_redirects(), cookies(jar))) as (head, body):
+async with ConnectionPool() as pool:
+    client = stack(add_headers((b"authorization", b"Bearer ...")), follow_redirects(), cookies(jar))(pool)
+    async with request(client, "GET", url) as (head, body):
         ...
 ```
 
-Because the whole request is the value the exchange transforms (not a fixed scope),
+The pool holds no middleware of its own, which is what keeps decoration and connection
+reuse independent: the order is visible where you compose it, and the same pool can back
+several differently-decorated clients (one authorized, one not) without any of them
+reaching into it.
+
+Because the whole request is the value a client transforms (not a fixed scope),
 middleware can rewrite it on the way out (inject headers, change the URL on redirect,
-attach cookies) and wrap the response on the way back.
+attach cookies, set a deadline) and wrap the response on the way back.
 
 For the simple independent case, `wrap(request=, response=)` builds a middleware from a
 request transform and/or a response transform, the client counterpart to
 without-asgi's `wrap` (which wraps a handler's inbound/outbound streams). `add_headers`
 is a one-liner over it: `wrap(request=lambda r: replace(r, headers=...))`. Reach for it
 when the two sides are independent; a middleware whose sides share state (`cookies`) or
-that loops (`follow_redirects`) is written directly as a `ClientExchange` wrapper.
+that loops (`follow_redirects`) is written directly as a `Client` wrapper.
 
 ```python
 from without_http import ClientResponse, wrap
@@ -439,11 +481,20 @@ from without_http import ClientResponse, wrap
 byte_counter = wrap(response=lambda r: ClientResponse(r.head, counting(r.body)))
 ```
 
-Keep the pool's own middleware to *pure* decoration (default headers, redirect
-following, retry): things that are values, not state. Anything carrying mutable,
-request-spanning identity belongs in a value you own and pass per request. A
-`CookieJar` is the canonical case: you construct the jar and hand it to `cookies(jar)`,
-so cookie scope (application identity) stays independent of connection reuse
-(transport) rather than both hiding in the pool. Two requests share cookies exactly
-when they share a jar. See [Cookies](cookies.md) for the jar's matching rules, the
-origin guards it enforces on untrusted `Set-Cookie` responses, and its expiry model.
+State a middleware carries lives in a value you own, not in the transport. A `CookieJar`
+is the canonical case: you construct the jar and hand it to `cookies(jar)`, so cookie
+scope (application identity) stays independent of connection reuse (transport). Two
+requests share cookies exactly when they share a jar. See [Cookies](cookies.md) for the
+jar's matching rules, the origin guards it enforces on untrusted `Set-Cookie` responses,
+and its expiry model.
+
+### In-memory clients
+
+`without_http.testing` holds three more clients: `mock_client` answers from a function,
+`asgi_client` drives an ASGI app with no wire under it, and `loopback_client` runs the
+real wire protocols over no socket at all. They are ordinary `Client`s, so a test above
+them is the same code that runs against the network, and swapping one in is the only
+edit. Underneath them, `pipe()` and `served_pipe(app)` hand over the raw endpoints for a
+test that writes frames rather than requests. See [Testing](testing.md) for how much of
+the stack each one covers, what none of them can reproduce, and how they interoperate
+with `httpx` and starlette's `TestClient`.

@@ -81,6 +81,7 @@ async def reserve(cursor: AsyncCursor[TupleRow]) -> object:
     )
     return (await cursor.fetchone())[0]
 
+
 await run.transact("reserved", reserve, as_count)
 ```
 
@@ -245,7 +246,7 @@ across them; `Checkpointer` and `Scheduler` are unchanged underneath and are wha
 implementations actually are:
 
 ```python
-await payments.durable.arrive(workflow, "order", order.items)   # one call, no order to get right
+await payments.durable.arrive(workflow, "order", order.items)  # one call, no order to get right
 ```
 
 What varies between implementations is not whether `arrive` exists but what it

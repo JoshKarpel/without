@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Mapping
@@ -10,10 +9,12 @@ from datetime import datetime
 from datetime import timedelta
 from uuid import uuid4
 
-import httpx
 import pytest
 from gateways import Gateway
+from gateways import as_object
+from gateways import get_json
 from gateways import paying
+from gateways import post_json
 from gateways import until
 from integration.durable import Order
 from integration.durable import Payments
@@ -36,7 +37,7 @@ from without_durability import now_utc
 from without_durability import resume
 from without_durability import run_durably
 from without_durability import work
-from without_http import serving
+from without_http.testing import loopback_client
 
 # The same workflows over every store, which is the claim the `Checkpointer` and `Scheduler`
 # interfaces exist to support and the thing no single-store suite can show. The stores' own
@@ -44,8 +45,9 @@ from without_http import serving
 # tests that a workflow cannot tell which it got.
 #
 # It is `compose`-marked because two of the four parameters need a server. The memory and
-# SQLite parameters would run anywhere, and losing them on a machine without podman is
-# the price of keeping the parametrization in one place rather than splitting the suite.
+# SQLite parameters would run anywhere, and losing them on a machine with no container
+# engine is the price of keeping the parametrization in one place rather than splitting
+# the suite.
 
 pytestmark = pytest.mark.compose
 
@@ -221,7 +223,14 @@ async def test_a_workflow_suspended_on_an_approval_resumes_when_another_process_
 SETTLING = timedelta(milliseconds=200)
 
 
-@pytest.mark.timeout(60)
+# Above the global bound because this one waits on a real worker: it polls until a pass
+# lands, so its cost is a scheduler wakeup against a containerized store rather than the
+# in-process work every other test here does. Measured at ~0.3s per store under `-n 8`,
+# with the slowest execution seen near 3s, which leaves the 5s global too tight for a
+# loaded runner. Sized well past the suite's ~5x-the-slowest convention because the
+# stakes are asymmetric: the timeout is purely a hang detector, and expiry under the
+# thread method kills the whole xdist worker, not just this test.
+@pytest.mark.timeout(30)
 async def test_an_order_submitted_to_the_api_is_carried_to_payout_by_the_worker(
     durable: Durable,  # noqa: F811
     workflow: str,
@@ -229,20 +238,15 @@ async def test_an_order_submitted_to_the_api_is_carried_to_payout_by_the_worker(
     worker = asyncio.create_task(work(durable, submitting(settling=SETTLING)))
 
     try:
-        async with (
-            serving(payments_app(Payments(durable=durable))) as server,
-            httpx.AsyncClient(base_url=f"http://{server.host}:{server.port}") as client,
-        ):
-            accepted = await client.post(
-                "/orders",
-                json={"items": {"piano": 90_000, "stool": 4_000}},
-                headers={"idempotency-key": workflow},
+        async with loopback_client(payments_app(Payments(durable=durable))) as client:
+            accepted, _answer = await post_json(
+                client, "/orders", {"items": {"piano": 90_000, "stool": 4_000}}, key=workflow
             )
-            assert accepted.status_code == 202
+            assert accepted == 202
 
             # The captures happen at once; the payout then waits out its settlement
             # window, and the worker is the only thing that knows the window exists.
-            recorded = await until(client, workflow, lambda state: "settling" in state["recorded"])
+            recorded = await until(client, workflow, lambda state: "settling" in as_object(state["recorded"]))
             assert set(recorded) == {"order", "items", "captured:piano", "captured:stool", "settling"}
 
             # Past the deadline the workflow becomes ready again, the pass runs, and it
@@ -253,11 +257,13 @@ async def test_an_order_submitted_to_the_api_is_carried_to_payout_by_the_worker(
             # whether or not the wakeup has landed yet.
             deadline = datetime.fromisoformat(str(recorded["settling"]))
             await asyncio.sleep(max((deadline - now_utc()).total_seconds(), 0.0))
-            held = await client.get(f"/orders/{workflow}")
-            assert json.loads(held.text)["done"] is False
+            _held, state = await get_json(client, f"/orders/{workflow}")
+            assert state["done"] is False
 
-            confirmed = await client.post(f"/orders/{workflow}/confirmation", json={"approved_by": "auditor-7"})
-            assert confirmed.status_code == 202
+            confirmed, _receipt = await post_json(
+                client, f"/orders/{workflow}/confirmation", {"approved_by": "auditor-7"}
+            )
+            assert confirmed == 202
 
             paid = await until(client, workflow, lambda state: state["done"])
 

@@ -14,11 +14,12 @@ of that callable read as plain `without` wiring:
 ```python
 from without_asgi import http_inbound, http_outbound, parse_http_scope
 
+
 async def app(scope, receive, send):
     head = parse_http_scope(scope)
-    handler = select(head)                          # your routing, your processor
-    outbound = handler(http_inbound(receive))       # Stream[Inbound] -> Stream[Outbound]
-    await http_outbound(send)(outbound)             # drive ASGI send
+    handler = select(head)  # your routing, your processor
+    outbound = handler(http_inbound(receive))  # Stream[Inbound] -> Stream[Outbound]
+    await http_outbound(send)(outbound)  # drive ASGI send
 ```
 
 `make_asgi_app(lifespan, http=..., websocket=...)` builds the ASGI app, driving

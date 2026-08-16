@@ -34,7 +34,8 @@ A full run on a big package (`without-http`, `without-web`) is ~15 min. Small pa
    `docs/contributing/mutation-testing.md` categories). Be rigorous: only call it equivalent if you can state exactly why no
    observable behavior changes. Probe empirically when unsure (does h2 lowercase that header? does
    `aclose()` run the finally?).
-5. **Write tests** for the killable ones (patterns below), then **re-run** `just mutate <pkg>` to
+5. **Write tests** for the killable ones (patterns below), then delete
+   `packages/<pkg>/mutants/mutmut-stats.json` (see the traps) and **re-run** `just mutate <pkg>` to
    confirm. The central re-run is the source of truth, not the test passing.
 
 For a large residue, fanning out one subagent per source module (each owning a distinct test file,
@@ -59,6 +60,12 @@ rather than a `sleep`/`yield`-and-hope.
   no longer correspond. Never cross-reference survivor ids across runs; re-extract.
 - **Don't clear the `./mutants` cache before you've extracted the diffs you need.** `mutmut show`
   reads it. Cleaning between packages (to keep pytest collection clean) wipes it.
+- **Delete `mutants/mutmut-stats.json` after adding tests.** mutmut runs only the tests its stats
+  map to each mutant's function, and it *loads* that map from disk instead of recollecting. A test
+  written against a function nothing previously reached is therefore never run, so the mutant
+  reports `survived` however good the test is. Extract the diffs you need first (the point above),
+  then delete the stats file and re-run. Symptom: a mutant survives the central run even though
+  breaking that line by hand makes your new test fail.
 - **Don't run two mutmut jobs at once**, and don't run one alongside subagents that run pytest: the
   30s-per-test timeout can trip a server-startup test under CPU contention.
 - **The `-n0` baseline is stricter than `just test`.** A test that passes under `-n auto` can fail

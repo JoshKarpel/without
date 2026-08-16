@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from contextlib import suppress
 
 import h2.config
 import h2.connection
@@ -12,23 +11,28 @@ from without_asgi import ASGIApp
 from without_asgi import RawMessage
 from without_asgi import Receive
 from without_asgi import Send
-from without_http import serving
+from without_http.testing import AUTHORITY
+from without_http.testing import served_pipe
 
 from .test_server import configured_app
 from .test_server import crash_app
 from .test_server import echo_app
 
+# Cleartext HTTP/2 by prior knowledge, driven over an in-memory pipe: the codec and the
+# server's flow-control sender are the subject, and both run identically without a
+# socket. The h2 path reached through ALPN needs a handshake, so it stays on a real one.
 
-def _h2_client() -> h2.connection.H2Connection:
+
+def h2_client() -> h2.connection.H2Connection:
     return h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=True, header_encoding=None))
 
 
-def _request_headers(host: str, port: int, method: str, path: str) -> list[tuple[bytes, bytes]]:
+def request_headers(method: str, path: str) -> list[tuple[bytes, bytes]]:
     return [
         (b":method", method.encode()),
         (b":path", path.encode()),
         (b":scheme", b"http"),
-        (b":authority", f"{host}:{port}".encode()),
+        (b":authority", AUTHORITY),
     ]
 
 
@@ -65,60 +69,46 @@ class H2Result:
         self.body = body
 
 
-async def h2c_roundtrip(host: str, port: int, method: str, path: str, body: bytes = b"") -> H2Result:
+async def _roundtrip(app: ASGIApp, method: str, path: str, body: bytes = b"") -> H2Result:
     """
     Drive one HTTP/2-over-cleartext request to completion via prior knowledge.
 
     A fresh connection per request keeps the helper small; multiplexing many streams
     over one connection is exercised through the TLS path instead.
     """
-    reader, writer = await asyncio.open_connection(host, port)
-    conn = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=True, header_encoding=None))
-    conn.initiate_connection()
-    stream_id = conn.get_next_available_stream_id()
-    request_headers = [
-        (b":method", method.encode()),
-        (b":path", path.encode()),
-        (b":scheme", b"http"),
-        (b":authority", f"{host}:{port}".encode()),
-    ]
-    conn.send_headers(stream_id, request_headers, end_stream=not body)
-    if body:
-        conn.send_data(stream_id, body, end_stream=True)
-    writer.write(conn.data_to_send())
-    await writer.drain()
-
-    status = 0
-    chunks: list[bytes] = []
-    done = False
-    while not done:
-        data = await reader.read(65536)
-        if not data:  # pragma: no cover - the server always ends the stream before EOF here
-            break
-        for event in conn.receive_data(data):
-            match event:  # pragma: no branch - the helper drives a single known stream
-                case h2.events.ResponseReceived(stream_id=sid, headers=headers) if sid == stream_id:
-                    status = int(next(value for name, value in headers if name == b":status").decode())
-                case h2.events.DataReceived(stream_id=sid, data=chunk, flow_controlled_length=length) if (
-                    sid == stream_id
-                ):
-                    chunks.append(chunk)
-                    conn.acknowledge_received_data(length, stream_id)
-                case h2.events.StreamEnded(stream_id=sid) if sid == stream_id:
-                    done = True
-                case _:
-                    pass
+    async with served_pipe(app) as (reader, writer):
+        conn = h2_client()
+        conn.initiate_connection()
+        stream_id = conn.get_next_available_stream_id()
+        conn.send_headers(stream_id, request_headers(method, path), end_stream=not body)
+        if body:
+            conn.send_data(stream_id, body, end_stream=True)
         writer.write(conn.data_to_send())
         await writer.drain()
-    writer.close()
-    with suppress(OSError):
-        await writer.wait_closed()
+
+        status = 0
+        chunks: list[bytes] = []
+        done = False
+        while not done:
+            data = await reader.read(65536)
+            if not data:  # pragma: no cover - the server always ends the stream before EOF here
+                break
+            for event in conn.receive_data(data):
+                match event:  # pragma: no branch - the helper drives a single known stream
+                    case h2.events.ResponseReceived(stream_id=sid, headers=headers) if sid == stream_id:
+                        status = int(next(value for name, value in headers if name == b":status").decode())
+                    case h2.events.DataReceived(stream_id=sid, data=chunk, flow_controlled_length=length) if (
+                        sid == stream_id
+                    ):
+                        chunks.append(chunk)
+                        conn.acknowledge_received_data(length, stream_id)
+                    case h2.events.StreamEnded(stream_id=sid) if sid == stream_id:
+                        done = True
+                    case _:
+                        pass
+            writer.write(conn.data_to_send())
+            await writer.drain()
     return H2Result(status, b"".join(chunks))
-
-
-async def _roundtrip(app: ASGIApp, method: str, path: str, body: bytes = b"") -> H2Result:
-    async with serving(app) as server:
-        return await h2c_roundtrip(server.host, server.port, method, path, body)
 
 
 async def test_serves_a_get_response_over_cleartext_prior_knowledge() -> None:
@@ -192,8 +182,7 @@ async def test_the_scope_carries_the_server_and_client_addresses() -> None:
 
 
 async def _drive_blocked_then_bump(
-    host: str,
-    port: int,
+    app: ASGIApp,
     *,
     initial_window: int,
     body_size: int,
@@ -208,35 +197,32 @@ async def _drive_blocked_then_bump(
     A sender that is never woken by the grant leaves the body short of `body_size`,
     so the surrounding read never completes and its `asyncio.timeout` fires.
     """
-    reader, writer = await asyncio.open_connection(host, port)
-    conn = _h2_client()
-    conn.initiate_connection()
-    conn.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: initial_window})
-    stream_id = conn.get_next_available_stream_id()
-    conn.send_headers(stream_id, _request_headers(host, port, "GET", "/w"), end_stream=True)
-    writer.write(conn.data_to_send())
-    await writer.drain()
+    async with served_pipe(app) as (reader, writer):
+        conn = h2_client()
+        conn.initiate_connection()
+        conn.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: initial_window})
+        stream_id = conn.get_next_available_stream_id()
+        conn.send_headers(stream_id, request_headers("GET", "/w"), end_stream=True)
+        writer.write(conn.data_to_send())
+        await writer.drain()
 
-    received = bytearray()
-    bumped = False
-    async with asyncio.timeout(10):
-        while len(received) < body_size:
-            data = await reader.read(65536)
-            if not data:  # pragma: no cover - the woken sender completes the body before EOF
-                break
-            for event in conn.receive_data(data):
-                if isinstance(event, h2.events.DataReceived):
-                    received.extend(event.data)
-            writer.write(conn.data_to_send())
-            await writer.drain()
-            if not bumped and len(received) >= bump_after:
-                bump(conn, stream_id)
+        received = bytearray()
+        bumped = False
+        async with asyncio.timeout(10):
+            while len(received) < body_size:
+                data = await reader.read(65536)
+                if not data:  # pragma: no cover - the woken sender completes the body before EOF
+                    break
+                for event in conn.receive_data(data):
+                    if isinstance(event, h2.events.DataReceived):
+                        received.extend(event.data)
                 writer.write(conn.data_to_send())
                 await writer.drain()
-                bumped = True
-    writer.close()
-    with suppress(OSError):
-        await writer.wait_closed()
+                if not bumped and len(received) >= bump_after:
+                    bump(conn, stream_id)
+                    writer.write(conn.data_to_send())
+                    await writer.drain()
+                    bumped = True
     return bytes(received)
 
 
@@ -244,10 +230,9 @@ async def test_a_settings_increase_wakes_a_window_blocked_sender() -> None:
     def bump(conn: h2.connection.H2Connection, _stream_id: int) -> None:
         conn.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 500})
 
-    async with serving(fixed_body_app(100)) as server:
-        body = await _drive_blocked_then_bump(
-            server.host, server.port, initial_window=10, body_size=100, bump_after=10, bump=bump
-        )
+    body = await _drive_blocked_then_bump(
+        fixed_body_app(100), initial_window=10, body_size=100, bump_after=10, bump=bump
+    )
 
     assert body == b"x" * 100
 
@@ -256,10 +241,9 @@ async def test_a_stream_window_update_wakes_the_blocked_stream() -> None:
     def bump(conn: h2.connection.H2Connection, stream_id: int) -> None:
         conn.increment_flow_control_window(500, stream_id=stream_id)
 
-    async with serving(fixed_body_app(100)) as server:
-        body = await _drive_blocked_then_bump(
-            server.host, server.port, initial_window=10, body_size=100, bump_after=10, bump=bump
-        )
+    body = await _drive_blocked_then_bump(
+        fixed_body_app(100), initial_window=10, body_size=100, bump_after=10, bump=bump
+    )
 
     assert body == b"x" * 100
 
@@ -268,10 +252,9 @@ async def test_a_connection_window_update_wakes_the_blocked_sender() -> None:
     def bump(conn: h2.connection.H2Connection, _stream_id: int) -> None:
         conn.increment_flow_control_window(200_000, stream_id=None)
 
-    async with serving(fixed_body_app(100_000)) as server:
-        body = await _drive_blocked_then_bump(
-            server.host, server.port, initial_window=1_000_000, body_size=100_000, bump_after=65_535, bump=bump
-        )
+    body = await _drive_blocked_then_bump(
+        fixed_body_app(100_000), initial_window=1_000_000, body_size=100_000, bump_after=65_535, bump=bump
+    )
 
     assert body == b"x" * 100_000
 
@@ -279,13 +262,12 @@ async def test_a_connection_window_update_wakes_the_blocked_sender() -> None:
 async def test_a_single_byte_window_still_sends_the_first_byte() -> None:
     # With a per-stream window of exactly one byte, a sender computing `sendable > 0`
     # sends that one byte, while a `sendable > 1` off-by-one would block without it.
-    async with serving(fixed_body_app(2)) as server:
-        reader, writer = await asyncio.open_connection(server.host, server.port)
-        conn = _h2_client()
+    async with served_pipe(fixed_body_app(2)) as (reader, writer):
+        conn = h2_client()
         conn.initiate_connection()
         conn.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 1})
         stream_id = conn.get_next_available_stream_id()
-        conn.send_headers(stream_id, _request_headers(server.host, server.port, "GET", "/one"), end_stream=True)
+        conn.send_headers(stream_id, request_headers("GET", "/one"), end_stream=True)
         writer.write(conn.data_to_send())
         await writer.drain()
 
@@ -301,6 +283,3 @@ async def test_a_single_byte_window_still_sends_the_first_byte() -> None:
                 writer.write(conn.data_to_send())
                 await writer.drain()
         assert first == b"x"
-        writer.close()
-        with suppress(OSError):
-            await writer.wait_closed()

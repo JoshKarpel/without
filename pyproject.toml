@@ -60,9 +60,10 @@ dev = [
     "pytest-mock>=3",
     "pytest-randomly>=3",
     "pytest-timeout>=2.3",
-    # Runs the services in compose.yaml around the suite (see the `test` recipe). It is a Python
-    # package, so the toolchain that pins everything else pins it too; podman itself is not, so it
-    # stays a system install (`apt install podman`, `brew install podman`, `winget install podman`).
+    # Runs the services in compose.yaml around the suite when docker is not the engine (see the
+    # `test` recipe). It is a Python package, so the toolchain that pins everything else pins it
+    # too; the engines themselves are not, so each stays a system install (`apt install podman`,
+    # `brew install podman`, `winget install podman`, or docker by its own instructions).
     "podman-compose>=1.6",
     "trustme>=1.1",
     "hypothesis>=6.161.2",
@@ -134,6 +135,11 @@ filterwarnings = [
     # to key its fixture measurements. Its timing report is a dev tool, not production
     # behaviour, so ignore its deprecation rather than let it fail the suite.
     "ignore:FixtureDef.has_location is deprecated:pytest.PytestRemovedIn10Warning",
+    # starlette's TestClient now prefers `httpx2` and warns when it finds only `httpx`.
+    # The interop test that drives a `without` app through TestClient is about TestClient,
+    # not about which httpx major backs it, so it runs on the httpx already in the tree
+    # rather than pulling in a second HTTP client for one test.
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
 ]
 
 asyncio_mode = "auto"
@@ -157,8 +163,8 @@ omit = [
     # WITHOUT_COMPOSE_AVAILABLE once the services in compose.yaml are up: unset, each
     # entry is the bare glob and matches; set, its value prefixes the glob into a
     # pattern that matches nothing, so both files are measured like any other. A run
-    # where the compose-marked tests skip (no podman, as on the macOS and Windows CI
-    # legs) then leaves the gate reporting the suite rather than the environment.
+    # where the compose-marked tests skip (no container engine, as on the macOS and
+    # Windows CI legs) then leaves the gate reporting the suite rather than the environment.
     "${WITHOUT_COMPOSE_AVAILABLE-}*/without_durability_redis/*.py",
     "${WITHOUT_COMPOSE_AVAILABLE-}*/without_durability_postgres/*.py",
     "${WITHOUT_COMPOSE_AVAILABLE-}*/tests/test_redis_store.py",
@@ -280,4 +286,7 @@ force-single-line = true
     # `timeout` is a `Timeout` config value threaded to the API boundary (the httpx-parity public name),
     # not a raw seconds deadline; it is applied via `asyncio.timeout` inside `phase`, so ASYNC109's advice is met.
     "ASYNC109",
+]
+"packages/without-http/src/without_http/testing.py" = [
+    "ASYNC109",  # a `Connect` implementation, so it carries `client.py`'s `Timeout` parameter verbatim
 ]

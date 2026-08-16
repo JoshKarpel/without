@@ -12,7 +12,7 @@ from without import timeout
 @dataclass(frozen=True, slots=True)
 class Timeout:
     """
-    Per-phase inactivity bounds for a client request, each disabled (`None`) by default.
+    Per-phase inactivity bounds for one client request, each disabled (`None`) by default.
 
     Four axes, following httpx, each bounding one phase of a request that fails for its
     own reason (see the `without-http` guide's request-lifecycle table):
@@ -31,8 +31,10 @@ class Timeout:
     budget ("fail rather than make slow progress so my upstream can react"), which the
     transport cannot know, so a caller opts in per axis (`Timeout(connect=timedelta(
     seconds=10), read=timedelta(seconds=30))`). There is deliberately no shared-default
-    scalar: one duration across four unrelated phases carries no meaning. For an overall
-    wall-clock cap, compose `async with asyncio.timeout(t): pool.request(...)`.
+    scalar: one duration across four unrelated phases carries no meaning. It rides on the
+    `ClientRequest` it bounds (`deadline` fills it in for a whole client), so it is the
+    caller's value rather than the connection's. For an overall wall-clock cap, compose
+    `async with asyncio.timeout(t): request(...)`.
 
     Each axis is applied through its own bound: `connecting()`, `reading()`, `writing()`,
     and `pooling()` each return a context manager that bounds the wrapped await(s) by that

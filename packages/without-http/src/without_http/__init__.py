@@ -1,7 +1,8 @@
-from without_http.client import ClientExchange
+from without_http.client import Client
 from without_http.client import ClientMiddleware
 from without_http.client import ClientRequest
 from without_http.client import ClientResponse
+from without_http.client import Connect
 from without_http.client import ConnectionPool
 from without_http.client import CookieJar
 from without_http.client import ResponseBody
@@ -9,7 +10,9 @@ from without_http.client import ResponseHead
 from without_http.client import ResponseTrailers
 from without_http.client import add_headers
 from without_http.client import cookies
+from without_http.client import deadline
 from without_http.client import follow_redirects
+from without_http.client import request
 from without_http.client import stack
 from without_http.client import wrap
 from without_http.h2_wire import early_hint_headers
@@ -42,10 +45,11 @@ from without_http.ws_wire import ws_events_from_outbound
 
 __all__ = [
     "ALPN_PROTOCOLS",
-    "ClientExchange",
+    "Client",
     "ClientMiddleware",
     "ClientRequest",
     "ClientResponse",
+    "Connect",
     "ConnectTimeout",
     "ConnectionPool",
     "CookieJar",
@@ -62,12 +66,14 @@ __all__ = [
     "WriteTimeout",
     "add_headers",
     "cookies",
+    "deadline",
     "early_hint_headers",
     "follow_redirects",
     "h11_events_from_outbound",
     "inbound_from_event",
     "is_websocket_upgrade",
     "receive_buffer_size",
+    "request",
     "request_headers",
     "response_headers",
     "response_status_and_headers",

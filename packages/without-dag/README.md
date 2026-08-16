@@ -14,9 +14,11 @@ It compiles once into a `CompiledGraph`, an async callable reused per event:
 ```python
 from without_dag import Graph
 
+
 async def fetch(request: Request) -> Fetched: ...
 async def parse(fetched: Fetched) -> Parsed: ...
 async def render(fetched: Fetched, parsed: Parsed) -> Report: ...
+
 
 graph, (request,) = Graph.of(Request)
 fetched = graph.node("fetched", fetch, request)

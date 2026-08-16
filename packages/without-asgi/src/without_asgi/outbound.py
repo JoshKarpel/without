@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Callable
 from collections.abc import Iterable
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -7,6 +9,7 @@ from typing import Protocol
 from typing import assert_never
 from typing import runtime_checkable
 
+from without_asgi.headers import merge
 from without_asgi.narrow import narrow
 from without_asgi.types import RawHeaders
 from without_asgi.types import RawMessage
@@ -95,12 +98,75 @@ type Outbound = (
 
 
 @dataclass(frozen=True, slots=True)
+class Content:
+    """
+    A body and the headers that describe it: what a caller holds when it has a *value*
+    rather than bytes.
+
+    Encoding a value produces two things that must travel together, the bytes and the
+    `content-type` naming what they are, and every caller that separates them gets to
+    make the same mistake. This pairs them without deciding either: `Content` carries no
+    policy, so `json_content` is one producer of it and a form, text, or msgpack encoder
+    is another, all with equal standing.
+
+    The body is `bytes` because a `Content` is a value the caller already holds whole.
+    Streaming a body is a different situation (nothing to describe yet, and no length),
+    and `without-http`'s `request` takes a `Stream[bytes]` directly for it.
+    """
+
+    body: bytes
+    headers: RawHeaders = ()
+
+
+@dataclass(frozen=True, slots=True)
 class Response:
     """A whole response as one value, the common case behind the event pair."""
 
     status: int
     headers: RawHeaders = ()
     body: bytes = b""
+
+    @classmethod
+    def from_content(cls, status: int, content: Content, *, headers: RawHeaders = ()) -> Response:
+        """
+        A response carrying `content`, with `headers` layered over the ones it describes itself with.
+
+        The caller wins on any name the content also sets, so a handler that wants
+        `content-type: application/problem+json` over a JSON body says so here rather
+        than rebuilding the body.
+        """
+        return cls(status=status, headers=merge(content.headers, headers), body=content.body)
+
+
+JSON_MEDIA_TYPE = b"application/json"
+
+
+def _dumps(payload: object) -> str:
+    # `allow_nan` off because `NaN`/`Infinity` are not JSON: left on, a body encodes to
+    # tokens a strict parser at the other end rejects, which is a failure the receiver
+    # reports rather than the sender. Key order is left alone, since sorting is a policy
+    # (a caller who wants byte-identical bodies passes its own `dumps`) and one paid on
+    # every response.
+    return json.dumps(payload, allow_nan=False)
+
+
+def json_content(payload: object, *, dumps: Callable[[object], str] = _dumps) -> Content:
+    """
+    Encode `payload` as a JSON `Content`: the bytes plus `content-type: application/json`.
+
+    `dumps` is the whole encoding policy, injected rather than fixed, so an app that
+    needs sorted keys, a faster encoder, or one that knows its domain types passes its
+    own (`json_content(order, dumps=orjson_dumps)`). The default is the stdlib's, because
+    a default should add no dependency; what it costs is that a payload must be
+    JSON-native, and a value the stdlib encoder has never heard of raises here rather
+    than reaching the wire half-written.
+
+    JSON ships as a function here, where the library otherwise leaves encoding to the
+    app, because it is the one encoding *both* sides of this stack kept re-deriving:
+    the same three lines (serializer, encode, content type) appeared in every app,
+    helper, and test that answered or sent a JSON body.
+    """
+    return Content(dumps(payload).encode(), ((b"content-type", JSON_MEDIA_TYPE),))
 
 
 @dataclass(frozen=True, slots=True)

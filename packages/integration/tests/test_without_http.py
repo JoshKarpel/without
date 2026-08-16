@@ -21,10 +21,13 @@ from without_asgi import HttpScope
 from without_asgi import Inbound
 from without_asgi import Outbound
 from without_asgi import file_response
+from without_asgi import headers
 from without_asgi import make_asgi_app
-from without_http import ConnectionPool
+from without_http import Client
 from without_http import add_headers
+from without_http import request
 from without_http import serving
+from without_http.testing import loopback_client
 from wsproto import ConnectionType
 from wsproto import WSConnection
 from wsproto.events import AcceptConnection
@@ -34,8 +37,14 @@ from wsproto.events import TextMessage
 
 # This is the composition proof: a `without-web` router becomes an ASGI app via
 # `without-asgi`'s `make_asgi_app`, that app is served by `without-http`, and it is
-# driven by both `httpx` (any HTTP client) and `without-http`'s own client. The
-# same app would run unchanged under uvicorn.
+# driven by `without-http`'s own client. The same app would run unchanged under uvicorn.
+#
+# What each test needs decides how much transport it gets. Most run over
+# `loopback_client`, which is the whole server and the whole wire with no socket, because
+# the composition is what they assert and a bound port adds nothing to it. Two keep a real
+# one: the test whose claim *is* that an ordinary third-party client can talk to this
+# server over a network, and the websocket tests, since the in-memory clients speak HTTP
+# only.
 
 
 def _todos() -> TodoList:
@@ -77,7 +86,7 @@ async def _websocket(host: str, port: int, path: str) -> AsyncIterator[_WebSocke
             await writer.wait_closed()
 
 
-def _file_app(path: Path) -> ASGIApp:
+def _file_app(path: Path, drained: asyncio.Event) -> ASGIApp:
     """A minimal ASGI app that streams `path` for any request via `file_response`."""
 
     @asynccontextmanager
@@ -87,6 +96,7 @@ def _file_app(path: Path) -> ASGIApp:
     async def serve(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
         async for event in await file_response(path, chunk_size=1024):
             yield event
+        drained.set()
 
     def router(state: None, scope: HttpScope) -> HttpHandler:
         return serve
@@ -98,15 +108,21 @@ async def test_file_response_streams_a_file_over_without_http(tmp_path: Path) ->
     payload = b"%PDF-1.7\n" + bytes(range(256)) * 40  # ~10 KB, spans several 1 KB chunks
     path = tmp_path / "report.pdf"
     path.write_bytes(payload)
+    drained = asyncio.Event()
 
-    async with serving(_file_app(path)) as server:
-        async with httpx.AsyncClient(base_url=f"http://{server.host}:{server.port}") as client:
-            response = await client.get("/download")
+    async with loopback_client(_file_app(path, drained)) as client:
+        async with request(client, "GET", "http://testserver/download") as (head, body):
+            assert head.status == 200
+            assert headers.first(head.headers, b"content-type") == b"application/pdf"
+            assert headers.first(head.headers, b"content-length") == str(len(payload)).encode()
+            assert await body.read() == payload
 
-    assert response.status_code == 200
-    assert response.headers["content-type"] == "application/pdf"
-    assert response.headers["content-length"] == str(len(payload))
-    assert response.content == payload
+        # The response is complete before the *handler* is: `file_response` reads each
+        # chunk on a worker thread, so ending its stream costs one more thread hop after
+        # the last chunk is on the wire. Waiting for the handler's own signal is what
+        # makes that deterministic; a client fast enough to reach teardown first would
+        # otherwise cancel the connection mid-read.
+        await drained.wait()
 
 
 async def test_todos_router_served_over_without_http_is_reachable_by_httpx() -> None:
@@ -122,9 +138,8 @@ async def test_todos_router_served_over_without_http_is_reachable_by_httpx() -> 
 
 async def test_without_http_client_gets_one_todo() -> None:
     async with (
-        serving(todos_app(_todos())) as server,
-        ConnectionPool() as pool,
-        pool.request("GET", f"http://{server.host}:{server.port}/todos/1") as (head, body),
+        loopback_client(todos_app(_todos())) as client,
+        request(client, "GET", "http://testserver/todos/1") as (head, body),
     ):
         assert head.status == 200
         assert json.loads(await body.read()) == {"id": 1, "title": "write", "done": False}
@@ -132,25 +147,24 @@ async def test_without_http_client_gets_one_todo() -> None:
 
 async def test_a_missing_todo_maps_to_404() -> None:
     async with (
-        serving(todos_app(_todos())) as server,
-        ConnectionPool() as pool,
-        pool.request("GET", f"http://{server.host}:{server.port}/todos/999") as (head, _body),
+        loopback_client(todos_app(_todos())) as client,
+        request(client, "GET", "http://testserver/todos/999") as (head, _body),
     ):
         assert head.status == 404
 
 
-async def _admin_status(pool: ConnectionPool, url: str) -> int:
-    async with pool.request("GET", url) as (head, _body):
+async def _admin_status(client: Client, url: str) -> int:
+    async with request(client, "GET", url) as (head, _body):
         return head.status
 
 
 async def test_client_middleware_supplies_the_admin_authorization_header() -> None:
-    async with serving(todos_app(_todos())) as server:
-        url = f"http://{server.host}:{server.port}/admin/stats"
-        async with ConnectionPool() as pool:
-            unauthorized = await _admin_status(pool, url)
-        async with ConnectionPool(middleware=add_headers((b"authorization", b"Bearer let-me-in"))) as authorized:
-            authorized_status = await _admin_status(authorized, url)
+    url = "http://testserver/admin/stats"
+
+    async with loopback_client(todos_app(_todos())) as client:
+        unauthorized = await _admin_status(client, url)
+        authorized = add_headers((b"authorization", b"Bearer let-me-in"))(client)
+        authorized_status = await _admin_status(authorized, url)
 
     assert unauthorized == 401
     assert authorized_status == 200

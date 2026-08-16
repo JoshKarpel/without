@@ -15,6 +15,7 @@ from without_asgi import Receive
 from without_asgi import Send
 from without_http import ConnectionPool
 from without_http import add_headers
+from without_http import request
 from without_http import serving
 from without_http.client import _open
 from without_http.client import _origin
@@ -53,7 +54,7 @@ async def test_an_https_request_with_http2_disabled_uses_http_1_1(
 ) -> None:
     async with serving(echo_app, ssl_context=server_context) as server:
         async with ConnectionPool(allow_http2=False, ssl_context_factory=trusting_client_context_factory) as pool:
-            async with pool.request("GET", f"https://{HOST}:{server.port}/items") as (head, body):
+            async with request(pool, "GET", f"https://{HOST}:{server.port}/items") as (head, body):
                 assert head.status == 200
                 assert await body.read() == b"GET /items test= body="
             assert pool._h2 == {}
@@ -65,12 +66,12 @@ async def test_alpn_fallback_to_http_1_1_pools_and_reuses_an_h11_connection(
     async with serving(echo_app, ssl_context=server_context_h11_only) as server:
         async with ConnectionPool(ssl_context_factory=trusting_client_context_factory) as pool:
             url = f"https://{HOST}:{server.port}/items"
-            async with pool.request("GET", url) as (_head, body):
+            async with request(pool, "GET", url) as (_head, body):
                 assert await body.read() == b"GET /items test= body="
             origin = _origin(urlsplit(url))
             assert origin in pool._h11_only
             assert pool._h2 == {}
-            async with pool.request("GET", url) as (_head, body):  # pragma: no branch
+            async with request(pool, "GET", url) as (_head, body):  # pragma: no branch
                 assert await body.read() == b"GET /items test= body="
 
 
@@ -80,12 +81,12 @@ async def test_an_unusable_pooled_h2_connection_is_replaced(
     async with serving(echo_app, ssl_context=server_context) as server:
         async with ConnectionPool(ssl_context_factory=trusting_client_context_factory) as pool:
             url = f"https://{HOST}:{server.port}/items"
-            async with pool.request("GET", url) as (_head, body):
+            async with request(pool, "GET", url) as (_head, body):
                 await body.read()
             origin = _origin(urlsplit(url))
             stale = pool._h2[origin]
             await stale.aclose()  # the connection died while pooled
-            async with pool.request("GET", url) as (_head, body):
+            async with request(pool, "GET", url) as (_head, body):
                 assert await body.read() == b"GET /items test= body="
             assert pool._h2[origin] is not stale
 
@@ -95,7 +96,7 @@ async def test_client_round_trips_a_get_over_h2(
 ) -> None:
     async with serving(echo_app, ssl_context=server_context) as server:
         async with ConnectionPool(ssl_context_factory=trusting_client_context_factory) as pool:
-            async with pool.request("GET", f"https://{HOST}:{server.port}/items") as (head, body):
+            async with request(pool, "GET", f"https://{HOST}:{server.port}/items") as (head, body):
                 assert head.status == 200
                 assert await body.read() == b"GET /items test= body="
             assert len(pool._h2) == 1
@@ -107,7 +108,7 @@ async def test_client_posts_a_body_over_h2(
     async with serving(echo_app, ssl_context=server_context) as server:
         async with ConnectionPool(ssl_context_factory=trusting_client_context_factory) as pool:
             url = f"https://{HOST}:{server.port}/submit"
-            async with pool.request("POST", url, body=b"payload") as (_head, body):  # pragma: no branch
+            async with request(pool, "POST", url, body=b"payload") as (_head, body):  # pragma: no branch
                 assert await body.read() == b"POST /submit test= body=payload"
 
 
@@ -115,7 +116,7 @@ async def test_client_multiplexes_concurrent_requests_over_one_h2_connection(
     server_context: ssl.SSLContext, trusting_client_context_factory: Callable[[], ssl.SSLContext]
 ) -> None:
     async def fetch(pool: ConnectionPool, port: int, index: int) -> bytes:
-        async with pool.request("GET", f"https://{HOST}:{port}/n{index}") as (_head, body):
+        async with request(pool, "GET", f"https://{HOST}:{port}/n{index}") as (_head, body):
             return await body.read()
 
     async with serving(echo_app, ssl_context=server_context) as server:
@@ -137,7 +138,7 @@ async def test_client_streams_a_request_body_over_h2(
     async with serving(echo_app, ssl_context=server_context) as server:
         async with ConnectionPool(ssl_context_factory=trusting_client_context_factory) as pool:
             upload = _chunks(b"ab", b"cd", b"ef")
-            async with pool.request("POST", f"https://{HOST}:{server.port}/up", body=upload) as (
+            async with request(pool, "POST", f"https://{HOST}:{server.port}/up", body=upload) as (
                 _head,
                 body,
             ):  # pragma: no branch
@@ -150,7 +151,7 @@ async def test_client_round_trips_a_body_larger_than_the_flow_control_window(
     payload = b"z" * 200_000
     async with serving(echo_app, ssl_context=server_context) as server:
         async with ConnectionPool(ssl_context_factory=trusting_client_context_factory) as pool:
-            async with pool.request("POST", f"https://{HOST}:{server.port}/big", body=payload) as (
+            async with request(pool, "POST", f"https://{HOST}:{server.port}/big", body=payload) as (
                 _head,
                 body,
             ):  # pragma: no branch
@@ -162,17 +163,18 @@ async def test_client_add_headers_middleware_reaches_the_server_over_h2(
 ) -> None:
     async with (
         serving(echo_app, ssl_context=server_context) as server,
-        ConnectionPool(
-            ssl_context_factory=trusting_client_context_factory, middleware=add_headers((b"x-test", b"injected"))
-        ) as pool,
-        pool.request("GET", f"https://{HOST}:{server.port}/items") as (_head, body),
+        ConnectionPool(ssl_context_factory=trusting_client_context_factory) as pool,
+        request(add_headers((b"x-test", b"injected"))(pool), "GET", f"https://{HOST}:{server.port}/items") as (
+            _head,
+            body,
+        ),
     ):
         assert await body.read() == b"GET /items test=injected body="
 
 
 async def test_cleartext_stays_http_1_1_even_with_http2_enabled() -> None:
     async with serving(echo_app) as server, ConnectionPool(allow_http2=True) as pool:
-        async with pool.request("GET", f"http://{HOST}:{server.port}/items") as (_head, body):
+        async with request(pool, "GET", f"http://{HOST}:{server.port}/items") as (_head, body):
             assert await body.read() == b"GET /items test= body="
         assert pool._h2 == {}
 
@@ -208,7 +210,7 @@ async def test_h2_bidirectional_ping_pong_streams_both_ways() -> None:
         await outbound.put(b"one")  # client speaks first, then feeds more per response chunk
         url = f"http://{HOST}:{server.port}/bidi"
         received: list[bytes] = []
-        async with pool.request("POST", url, body=request_body()) as (head, body):
+        async with request(pool, "POST", url, body=request_body()) as (head, body):
             assert head.status == 200
             async for chunk in body:
                 if not chunk:  # skip the transport's trailing empty end-of-stream frame
@@ -227,7 +229,7 @@ async def test_h2_server_speaks_first_before_the_request_body_is_ready() -> None
             yield b"late"
 
         url = f"http://{HOST}:{server.port}/bidi"
-        async with pool.request("POST", url, body=request_body()) as (head, body):
+        async with request(pool, "POST", url, body=request_body()) as (head, body):
             assert head.status == 200  # the head arrives though no body chunk has been produced yet
             head_seen.set()
             received = [chunk async for chunk in body if chunk]  # skip the trailing empty end-of-stream frame
@@ -247,7 +249,7 @@ async def test_h2_abandoning_a_bidi_body_cancels_the_parked_sender() -> None:
 
         await outbound.put(b"hello")
         url = f"http://{HOST}:{server.port}/bidi"
-        async with pool.request("POST", url, body=request_body()) as (head, body):
+        async with request(pool, "POST", url, body=request_body()) as (head, body):
             assert head.status == 200
             first = await anext(aiter(body))
             assert first == b"HELLO"
@@ -273,7 +275,7 @@ async def test_h2_a_request_body_error_after_the_head_resets_the_stream() -> Non
         raise ValueError("h2 body blew up")
 
     async def exchange(pool: ConnectionPool, url: str) -> None:
-        async with pool.request("POST", url, body=request_body()) as (head, body):
+        async with request(pool, "POST", url, body=request_body()) as (head, body):
             assert head.status == 200  # the head has arrived before the body fails
             release.set()
             await body.read()

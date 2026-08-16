@@ -32,7 +32,7 @@ from without_durability_redis.units import seconds
 
 # `just test` starts the services in compose.yaml and publishes each address; these
 # tests drive the real server it started rather than a fake, and skip when it did not
-# (no podman on this machine, or pytest run directly).
+# (no container engine on this machine, or pytest run directly).
 pytestmark = pytest.mark.compose
 
 ORDER = Order(order_id="o-42", sku="gizmo", cents=1999)
@@ -55,12 +55,13 @@ async def redis() -> AsyncIterator[Redis]:
 
     # podman-compose reports the published port alone, docker compose the bind address
     # it is published on (`0.0.0.0:32768`), which is a wildcard a client cannot dial.
-    # Either way the loopback address is where the port is reachable.
-    host, _, port = published.strip().rpartition(":")
+    # Either way the loopback address is where the port is reachable, so only the port
+    # is taken.
+    port = published.strip().rpartition(":")[2]
     # `decode_responses=True` is the app's call to make, and this app makes it: it owns
     # both ends of every key it touches, so nothing downstream has to ask whether a
     # value came back as bytes.
-    client = Redis(host=host or "127.0.0.1", port=int(port), decode_responses=True)
+    client = Redis(host="127.0.0.1", port=int(port), decode_responses=True)
     try:
         yield client
     finally:
