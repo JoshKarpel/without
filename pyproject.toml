@@ -54,7 +54,7 @@ dev = [
     "pre-commit>=4.6.1",
     "pytest<10",
     "pytest-cov>=3",
-    "pytest-durations>=1.7.0",
+    "pytest-durations>=1.8.0",
     "pytest-xdist>=3",
     "pytest-asyncio>=1",
     "pytest-mock>=3",
@@ -66,10 +66,10 @@ dev = [
     # `brew install podman`, `winget install podman`, or docker by its own instructions).
     "podman-compose>=1.6",
     "trustme>=1.1",
-    "hypothesis>=6.161.2",
-    "mutmut>=3",
+    "hypothesis>=6.165.2",
+    "mutmut>=3.7.0",
     "mypy>=2.3.0",
-    "ruff>=0.16.0",
+    "ruff>=0.16.2",
     "types-pyyaml>=6.0.12.20260724",
     "uvloop>=0.22.1 ; sys_platform != 'win32'",  # uvloop has no Windows support; the suite runs asyncio-only there
 ]
