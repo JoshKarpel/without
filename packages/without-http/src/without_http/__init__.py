@@ -1,20 +1,30 @@
+from without_http.client import DEFAULT_DECOMPRESSORS
 from without_http.client import Client
 from without_http.client import ClientMiddleware
 from without_http.client import ClientRequest
 from without_http.client import ClientResponse
+from without_http.client import Compressor
 from without_http.client import Connect
 from without_http.client import ConnectionPool
 from without_http.client import CookieJar
+from without_http.client import Decompressor
+from without_http.client import Resolve
 from without_http.client import ResponseBody
 from without_http.client import ResponseHead
 from without_http.client import ResponseTrailers
 from without_http.client import add_headers
+from without_http.client import brotli_compress
+from without_http.client import compressing
 from without_http.client import cookies
 from without_http.client import deadline
+from without_http.client import decompress
 from without_http.client import follow_redirects
+from without_http.client import gzip_compress
 from without_http.client import request
 from without_http.client import stack
+from without_http.client import tcp_connect
 from without_http.client import wrap
+from without_http.client import zstd_compress
 from without_http.h2_wire import early_hint_headers
 from without_http.h2_wire import request_headers
 from without_http.h2_wire import response_headers
@@ -45,18 +55,22 @@ from without_http.ws_wire import ws_events_from_outbound
 
 __all__ = [
     "ALPN_PROTOCOLS",
+    "DEFAULT_DECOMPRESSORS",
     "Client",
     "ClientMiddleware",
     "ClientRequest",
     "ClientResponse",
+    "Compressor",
     "Connect",
     "ConnectTimeout",
     "ConnectionPool",
     "CookieJar",
+    "Decompressor",
     "HTTPTimeout",
     "LifespanError",
     "PoolTimeout",
     "ReadTimeout",
+    "Resolve",
     "ResponseBody",
     "ResponseHead",
     "ResponseTrailers",
@@ -65,10 +79,14 @@ __all__ = [
     "Timeout",
     "WriteTimeout",
     "add_headers",
+    "brotli_compress",
+    "compressing",
     "cookies",
     "deadline",
+    "decompress",
     "early_hint_headers",
     "follow_redirects",
+    "gzip_compress",
     "h11_events_from_outbound",
     "inbound_from_event",
     "is_websocket_upgrade",
@@ -84,8 +102,10 @@ __all__ = [
     "server_ssl_context",
     "serving",
     "stack",
+    "tcp_connect",
     "tcp_keepalive",
     "websocket_scope_from_request",
     "wrap",
     "ws_events_from_outbound",
+    "zstd_compress",
 ]

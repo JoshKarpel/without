@@ -52,8 +52,8 @@ mechanisms this package does not have.
 | Pooling with keep-alive | yes, [keyed by origin](index.md#connection-pooling) | yes | yes | yes |
 | Default pool bounds | [unbounded per host](index.md#connection-pooling), by stated position | [100 total, 20 keep-alive](https://www.python-httpx.org/advanced/resource-limits/) | [100 total, no per-host limit](https://docs.aiohttp.org/en/stable/client_reference.html#tcpconnector) | [10 hosts, 10 per host](https://niquests.readthedocs.io/en/latest/api.html) (requests defaults) |
 | TCP keepalive probing | [on by default](index.md#tcp-keepalive) | off; `socket_options` on the transport | — | [protocol pings for h2/h3](https://niquests.readthedocs.io/en/latest/api.html) |
-| Happy Eyeballs (dual-stack connect) | unwritten; [a connect knob](#how-a-gap-closes-here) | no | [yes](https://docs.aiohttp.org/en/stable/client_reference.html#tcpconnector) | [yes](https://github.com/jawah/niquests) |
-| DNS caching or custom resolution | unwritten; [a `Connect` wrapper](#how-a-gap-closes-here) | — | [cache with TTL](https://docs.aiohttp.org/en/stable/client_reference.html#tcpconnector) | [DoH, DoT, DoQ, DNSSEC, custom resolvers](https://github.com/jawah/niquests) |
+| Happy Eyeballs (dual-stack connect) | [on by default](index.md#connection-pooling) (250 ms, via aiohappyeyeballs; `tcp_connect()` tunes it) | no | [yes](https://docs.aiohttp.org/en/stable/client_reference.html#tcpconnector) | [yes](https://github.com/jawah/niquests) |
+| DNS caching or custom resolution | resolution injectable ([`tcp_connect(resolve=)`](index.md#connection-pooling)); a cache is unwritten, [a `Resolve` wrapper](#how-a-gap-closes-here) | — | [cache with TTL](https://docs.aiohttp.org/en/stable/client_reference.html#tcpconnector) | [DoH, DoT, DoQ, DNSSEC, custom resolvers](https://github.com/jawah/niquests) |
 | Unix domain sockets | unwritten; [a `Connect`](#how-a-gap-closes-here) | yes ([`uds=`](https://www.python-httpx.org/advanced/transports/)) | yes ([`UnixConnector`](https://docs.aiohttp.org/en/stable/client_reference.html#unixconnector)) | — |
 | Proxies | unwritten; [a `Connect`](#how-a-gap-closes-here) | [HTTP(S); SOCKS via extra](https://www.python-httpx.org/advanced/proxies/) | [HTTP](https://docs.aiohttp.org/en/stable/client_advanced.html#proxy-support); SOCKS [third party](https://github.com/romis2012/aiohttp-socks) | [HTTP(S) and SOCKS](https://github.com/jawah/niquests) |
 
@@ -64,8 +64,8 @@ mechanisms this package does not have.
 | Streaming bodies, both directions | [yes](index.md#buffered-and-streaming-both-directions) | [yes](https://www.python-httpx.org/quickstart/) | [yes](https://docs.aiohttp.org/en/stable/client_quickstart.html) | yes |
 | Concurrent duplex (early responses, bidi) | yes, [full bidi](index.md#duplex-and-bidirectional-streaming) | [no](https://github.com/encode/httpx/issues/877), request sent fully first | no; WebSockets are the duplex path | [early responses](https://github.com/jawah/niquests) |
 | Response trailers | [yes](index.md#trailers) | no | [no public API](https://github.com/aio-libs/aiohttp/issues/8452) | [yes](https://github.com/jawah/niquests) |
-| Response decompression | unwritten; [middleware-shaped](#how-a-gap-closes-here) | [yes](https://www.python-httpx.org/) (gzip; brotli/zstd extras) | yes ([`auto_decompress`](https://docs.aiohttp.org/en/stable/client_reference.html)) | yes |
-| Request compression | unwritten; [a `Content` wrapper or middleware](#how-a-gap-closes-here) | — | yes ([`compress=`](https://docs.aiohttp.org/en/stable/client_reference.html), deflate, off by default) | — |
+| Response decompression | yes, opt-in ([`decompress()` middleware](index.md#client-middleware): gzip, zstd, brotli; injectable coding table) | [yes](https://www.python-httpx.org/) (gzip; brotli/zstd extras) | yes ([`auto_decompress`](https://docs.aiohttp.org/en/stable/client_reference.html)) | yes |
+| Request compression | yes, opt-in ([`gzip_compress()`/`zstd_compress()`/`brotli_compress()` middleware](index.md#client-middleware), per client or per call) | — | yes ([`compress=`](https://docs.aiohttp.org/en/stable/client_reference.html), deflate, off by default) | — |
 | Multipart and form encoding | unwritten; [a `Content` producer](#how-a-gap-closes-here) | [yes](https://www.python-httpx.org/quickstart/) | [yes](https://docs.aiohttp.org/en/stable/client_quickstart.html) | yes |
 | Headers sent unbidden | [none](#what-stays-absent) (only `host` and body framing) | user-agent, accept, accept-encoding | user-agent and friends | requests-compatible set |
 
@@ -102,14 +102,11 @@ worth being specific:
 
 | Gap | The shape it takes |
 |---|---|
-| Response decompression | A `ClientMiddleware`: inject `accept-encoding` outbound, wrap the response body stream in a decoding transform inbound. Opt-in, so the transport never silently rewrites bytes. |
-| Request compression | Two shapes, split by scope. A `Content` wrapper (`gzip_content(inner)`) opts in one call; a `ClientMiddleware` opts in a whole client, composed onto the clients whose upstreams are known to accept it, while the same pool backs uncompressed clients beside them. Both stream: each wraps the same lazy body `Stream[bytes]` in an incremental compressor (zlib/gzip, bz2, lzma, and zstd all compress chunk by chunk in the stdlib), so nothing buffers. Requests have no `accept-encoding` negotiation, which is why both shapes stay opt-in where the server is known rather than a default. One caveat either shape must honor: a request already carrying a `content-encoding` is left alone (the body is already encoded; aiohttp documents the same exclusion for `compress=`). Framing needs no care: wrapping the body stream means it goes out chunked, so no stale `content-length` survives the rewrite. |
 | Multipart and form upload | A `Content` producer beside `json_content`; the encoding travels with its `content-type`. Parsing on the receiving side is a `without-web` extractor, not this package's concern. |
 | Auth | Basic and bearer are `add_headers` one-liners today; Digest is a looping middleware with the same shape as `follow_redirects`. |
 | Retries | A middleware that re-invokes its inner `Client`, rewriting the request's `Timeout` per attempt. The budget already rides on the request value so an attempt can shorten it. |
-| Proxies, Unix sockets, local address | `Connect` implementations. The pool takes `Connect` at construction; none of these are written, but none needs a new interface. |
-| Happy Eyeballs | Expose asyncio's own `happy_eyeballs_delay` through the connect path: a knob, not a mechanism. |
-| DNS caching | A `Connect` wrapper owning the cache, so resolution policy stays with the caller instead of inside the pool. |
+| Proxies, Unix sockets, local address | `Connect` implementations. The pool takes `Connect` at construction; none of these are written, but none needs a new interface (`tcp_connect` is the shape, already shipped). |
+| DNS caching | A `Resolve` wrapper owning the cache, injected as `tcp_connect(resolve=...)`, so resolution policy stays with the caller instead of inside the pool. The interface ships; the cache does not, because `getaddrinfo` hides record TTLs, making any staleness bound the caller's policy to choose. |
 | Server-sent events | A parser from a byte stream to typed events that composes over any response body. It needs nothing from the client, so it may not even live in this package. |
 | WebSocket client | A real addition: a new rim API over `wsproto`. The server-side wire mapping (`ws_wire`) exists; the client half and its API shape do not. |
 | HTTP/3 | A new wire module over a QUIC implementation, following the sans-IO pattern `h11_wire`/`h2_wire` set. The largest item on this page. |
@@ -135,7 +132,9 @@ Positions, not gaps, each with its cost named:
   friendlier one on day one.
 - **No headers sent unbidden.** No user-agent, no `accept-encoding`. Requests
   say exactly what the caller said; the cost is that peers which vary on
-  user-agent see an empty one until you add it.
+  user-agent see an empty one until you add it. Composing the `decompress`
+  middleware is how a client opts into an `accept-encoding` offer, which is the
+  position holding, not an exception to it.
 - **Unbounded per-host connections by default.** Mirrors the server's choice to
   let OS backpressure govern ([Connection pooling](index.md#connection-pooling));
   the cost is that a runaway caller opens sockets until the OS objects, where

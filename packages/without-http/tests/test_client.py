@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 from collections.abc import AsyncGenerator
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
@@ -32,6 +33,7 @@ from without_http import cookies
 from without_http import follow_redirects
 from without_http import request
 from without_http import serving
+from without_http import tcp_connect
 from without_http import wrap
 from without_http.client import _REDIRECT_STATUSES
 from without_http.client import Origin
@@ -745,6 +747,38 @@ async def test_open_reports_http_1_1_for_a_cleartext_connection() -> None:
             writer.close()
             with suppress(OSError):
                 await writer.wait_closed()
+
+
+async def test_tcp_connect_tunes_the_happy_eyeballs_delay() -> None:
+    connect = tcp_connect(happy_eyeballs_delay=timedelta(milliseconds=50))
+    async with serving(echo_app) as server, ConnectionPool(connect=connect) as pool:
+        async with request(pool, "GET", f"http://{server.host}:{server.port}/raced") as (head, body):
+            assert head.status == 200
+            assert await body.read() == b"GET /raced test= body="
+
+
+async def test_tcp_connect_connects_sequentially_without_a_delay() -> None:
+    connect = tcp_connect(happy_eyeballs_delay=None)
+    async with serving(echo_app) as server, ConnectionPool(connect=connect) as pool:
+        async with request(pool, "GET", f"http://{server.host}:{server.port}/serial") as (head, body):
+            assert head.status == 200
+            assert await body.read() == b"GET /serial test= body="
+
+
+async def test_tcp_connect_takes_an_injected_resolver() -> None:
+    # The URL names a host no DNS knows; the injected resolver maps it to the live
+    # server, proving resolution policy swaps without monkeypatching.
+    async with serving(echo_app) as server:
+
+        async def canned(host: str, port: int) -> list[tuple[int, int, int, str, tuple[str, int]]]:
+            assert (host, port) == ("fake.internal", 80)
+            return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", server.port))]
+
+        async with ConnectionPool(connect=tcp_connect(resolve=canned)) as pool:
+            async with request(pool, "GET", "http://fake.internal/resolved") as (head, body):
+                assert head.status == 200
+                body_bytes = await body.read()
+            assert body_bytes == b"GET /resolved test= body="
 
 
 async def test_follow_redirects_defaults_to_five_hops() -> None:

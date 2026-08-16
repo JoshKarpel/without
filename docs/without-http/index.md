@@ -257,6 +257,21 @@ unbounded by default (every reusable connection is kept); a value above
 `max_connections_per_host` is never reached, since idle connections cannot outnumber
 concurrent checkouts. Both knobs, when set, must be `>= 1`.
 
+How the pool reaches an origin is itself injected: `connect` is a `Connect`, the one
+step that touches the network. The default resolves with `getaddrinfo` and then
+connects with [aiohappyeyeballs](https://github.com/aio-libs/aiohappyeyeballs) (the
+CPython-extracted implementation aiohttp uses), racing address families per
+[RFC 8305](https://datatracker.ietf.org/doc/html/rfc8305) with 250 ms between
+attempts, so a dual-stack host with a black-holed IPv6 route costs one delay rather
+than a full connect timeout; the race drives plain `loop.sock_connect`, so it behaves
+the same on any event loop. Both steps are knobs on `tcp_connect`, the producer
+behind the default: `happy_eyeballs_delay` tunes or disables the race, and `resolve`
+injects the resolution step itself, a `(host, port) -> addr_infos` function, so a
+DNS cache, DNS over HTTPS, or a test's canned addresses swap in without touching how
+the winning address is connected. A cache's staleness bound stays the caller's
+policy: `getaddrinfo` hides record TTLs, so no honest default exists. The same
+`connect` slot is where a proxy or unix-socket connector would plug in.
+
 ### Duplex and bidirectional streaming
 
 The request body and the response are handled **concurrently**: the body is sent by
@@ -485,6 +500,33 @@ from without_http import ClientResponse, wrap
 
 byte_counter = wrap(response=lambda r: ClientResponse(r.head, counting(r.body)))
 ```
+
+Content codings are middleware too, one per direction. `decompress()` offers
+`accept-encoding: br, gzip, zstd` (a request carrying its own offer keeps it) and
+decodes an encoded response body through an incremental decoder as it streams,
+dropping the `content-encoding` and `content-length` that described the encoded bytes
+so the response stays self-consistent; an encoding it cannot decode passes through
+whole. It is composition rather than pool behavior, so the transport never silently
+rewrites bytes. `gzip_compress()`, `zstd_compress()`, and `brotli_compress()` encode
+request bodies the same streaming way; requests have no `accept-encoding`
+negotiation, so all are opt-in for the clients whose upstreams are known to decode
+them. The opt-in scope is wherever the composition happens: decorate once at assembly
+for a whole client, or inline at one call site
+(`request(gzip_compress()(client), ...)`) for a single request, since decorating a
+client is a stateless function wrap.
+
+gzip and zstd decode via the stdlib; brotli via
+[Google's own bindings](https://github.com/google/brotli), a bundled dependency
+because the stdlib has no brotli and there is exactly one library, so `decompress()`
+just works against the codings the web actually serves. The codings are table
+entries, not a property of the library: `decompress` takes a mapping from coding to
+`Decompressor` factory, defaulting to `DEFAULT_DECOMPRESSORS` and deriving its offer
+from the keys so what is advertised and what is decoded cannot disagree; and
+`compressing(coding, make_compressor)` is the public mechanism behind the shipped
+compressors. A codec this package does not ship plugs into either direction with a
+factory whose product satisfies the small `Compressor` / `Decompressor` protocols,
+inheriting the framing rewrite, streaming, and truncation check instead of
+reimplementing them.
 
 State a middleware carries lives in a value you own, not in the transport. A `CookieJar`
 is the canonical case: you construct the jar and hand it to `cookies(jar)`, so cookie

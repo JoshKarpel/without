@@ -138,6 +138,12 @@ where JSON is (`allow_nan=False`, so a `NaN` fails at the sender rather than at 
 parses the response). Key order is left alone: sorting is a policy some callers want and
 a cost every response would pay.
 
+A `Content` describes what its bytes *are*; *transforming* an exchange (compressing a
+request body, decoding a response) is middleware's job, in `without-http`'s client
+vocabulary, where it streams instead of buffering and applies at whatever scope the
+composition happens. A caller who wants one compressed request decorates the client
+inline for that call (`gzip_compress()(client)`) rather than wrapping the value.
+
 `Response.from_content(status, content, *, headers=())` layers the caller's headers over
 the ones the content described, so a handler answering `application/problem+json` over a
 JSON body says so there rather than rebuilding the body. The same value is what
