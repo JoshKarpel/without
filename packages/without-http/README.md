@@ -47,4 +47,7 @@ those are built from, for a test that writes frames rather than requests.
 See the
 [`without-http` guide](https://without.help/without-http/)
 (with the [API reference](https://without.help/reference/without_http/))
-for the full surface, including the deferred work (WebSockets over HTTP/2, HTTP/3).
+for the full surface, and
+[Alternatives](https://without.help/without-http/alternatives/) for where the
+client and server stand against httpx, aiohttp, niquests, and the ASGI servers,
+including which absences are gaps and which are positions.

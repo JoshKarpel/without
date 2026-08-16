@@ -15,6 +15,11 @@ The wire-protocol state machines are themselves sans-IO libraries:
 those state machines, and uses `without-asgi`'s server-direction codecs to
 translate between typed events and the ASGI dicts an app expects.
 
+For a feature-by-feature register of where the client stands against httpx,
+aiohttp, and niquests (and the server against uvicorn, hypercorn, and granian),
+including which absences are gaps and which are positions, see
+[Alternatives](alternatives.md).
+
 ## Server
 
 ```python
