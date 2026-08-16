@@ -27,14 +27,15 @@ from without_asgi import Send
 from without_asgi import make_asgi_app
 from without_asgi.routing import buffered
 from without_http import serving
+from without_http.server import _DEFAULT_LIMITS
 from without_http.server import _address
 from without_http.server import _consume_buffered_request
-from without_http.server import _Limits
 from without_http.server import _lingering_close
 from without_http.server import _LiveConnections
 from without_http.server import _send_simple
 from without_http.server import _serve_connection
 from without_http.server import _serve_h11_connection
+from without_http.testing import AUTHORITY
 from without_http.testing import SERVER_ADDRESS
 from without_http.testing import served_pipe
 from wsproto import ConnectionType
@@ -44,13 +45,6 @@ from wsproto.events import TextMessage
 
 type _Endpoint = tuple[asyncio.StreamReader, asyncio.StreamWriter]
 type _StreamPairFactory = Callable[[], Awaitable[tuple[_Endpoint, _Endpoint]]]
-
-_DEFAULT_LIMITS = _Limits(
-    max_concurrent_streams=100,
-    max_stream_resets=200,
-    idle_timeout=None,
-    max_websocket_message_bytes=None,
-)
 
 # Tests that write bytes by hand run the server over an in-memory pipe (`served_pipe`)
 # rather than a bound socket: the h11/h2/wsproto codecs and the server's own connection
@@ -135,12 +129,9 @@ async def test_serves_a_get_response() -> None:
 
 @pytest.mark.security("an idle connection is closed after the idle timeout (slowloris defense)")
 async def test_an_idle_connection_is_closed_after_the_idle_timeout() -> None:
-    async with served_pipe(echo_app, idle_timeout=timedelta(seconds=0.1)) as (reader, writer):
+    async with served_pipe(echo_app, idle_timeout=timedelta(seconds=0.1)) as (reader, _writer):
         # Send nothing: the server's read outlives the idle timeout and it closes the connection.
         assert await reader.read(65536) == b""
-        writer.close()
-        with suppress(OSError):
-            await writer.wait_closed()
 
 
 @pytest.mark.security("the idle timeout is scoped: a request completing within it is served")
@@ -190,9 +181,6 @@ async def test_keep_alive_survives_an_app_that_never_reads_the_request() -> None
             head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
             statuses.append(head.split(b"\r\n")[0])
             await asyncio.wait_for(reader.readexactly(len(_UNREAD_BODY)), timeout=5)
-        writer.close()
-        with suppress(OSError):
-            await writer.wait_closed()
 
     assert statuses == [b"HTTP/1.1 200 ", b"HTTP/1.1 200 "]
 
@@ -208,9 +196,6 @@ async def test_an_unread_partial_body_is_not_kept_alive() -> None:
         await asyncio.wait_for(reader.readexactly(len(_UNREAD_BODY)), timeout=5)
         assert head.split(b"\r\n")[0] == b"HTTP/1.1 200 "
         assert await asyncio.wait_for(reader.read(), timeout=5) == b""
-        writer.close()
-        with suppress(OSError):
-            await writer.wait_closed()
 
 
 async def test_an_unread_malformed_body_closes_the_connection_without_crashing() -> None:
@@ -225,9 +210,6 @@ async def test_an_unread_malformed_body_closes_the_connection_without_crashing()
         assert head.split(b"\r\n")[0] == b"HTTP/1.1 200 "
         assert body == _UNREAD_BODY
         assert await asyncio.wait_for(reader.read(), timeout=5) == b""
-        writer.close()
-        with suppress(OSError):
-            await writer.wait_closed()
 
 
 async def test_threads_lifespan_state_into_the_handler() -> None:
@@ -305,9 +287,6 @@ async def test_a_malformed_request_gets_a_400() -> None:
         writer.write(b"!!! not a valid request line !!!\r\n\r\n")
         await writer.drain()
         status_line = await reader.readline()
-        writer.close()
-        with suppress(OSError):
-            await writer.wait_closed()
 
     assert status_line.startswith(b"HTTP/1.1 400")
 
@@ -487,9 +466,6 @@ async def test_http11_scope_carries_scheme_server_and_client() -> None:
         writer.write(b"GET /s HTTP/1.1\r\nhost: test\r\n\r\n")
         await writer.drain()
         status_line, body = await _read_one_http_response(reader)
-        writer.close()
-        with suppress(OSError):
-            await writer.wait_closed()
 
     assert status_line == b"HTTP/1.1 200 "
     assert body == f"http {_SERVER_HOST}:{_SERVER_PORT} {client_host}:{client_port}".encode()
@@ -506,9 +482,6 @@ async def test_head_keeps_the_connection_alive_after_suppressing_the_body() -> N
         writer.write(b"GET /two HTTP/1.1\r\nhost: test\r\n\r\n")
         await writer.drain()
         get_status, get_body = await _read_one_http_response(reader)
-        writer.close()
-        with suppress(OSError):
-            await writer.wait_closed()
 
     assert head_status == b"HTTP/1.1 200 "
     assert head_body == b""
@@ -524,9 +497,6 @@ async def test_a_crash_sends_the_500_body_and_does_not_keep_the_connection_alive
         await writer.drain()
         status_line, body = await _read_one_http_response(reader)
         leftover = await asyncio.wait_for(reader.read(65536), timeout=5)
-        writer.close()
-        with suppress(OSError):
-            await writer.wait_closed()
 
     assert status_line == b"HTTP/1.1 500 "
     assert body == b"internal server error\n"
@@ -539,9 +509,6 @@ async def test_partial_request_headers_hit_the_idle_timeout() -> None:
         writer.write(b"GET /x HTTP/1.1\r\nhost: test\r\n")  # headers never terminated; then stall
         await writer.drain()
         assert await asyncio.wait_for(reader.read(), timeout=5) == b""
-        writer.close()
-        with suppress(OSError):
-            await writer.wait_closed()
 
 
 @pytest.mark.security("a stalled partial request body hits the idle timeout (slowloris on the body)")
@@ -550,9 +517,6 @@ async def test_a_stalled_partial_body_hits_the_idle_timeout() -> None:
         writer.write(b"POST /x HTTP/1.1\r\nhost: test\r\ncontent-length: 100\r\n\r\n" + b"a" * 10)
         await writer.drain()
         response = await asyncio.wait_for(reader.read(), timeout=5)
-        writer.close()
-        with suppress(OSError):
-            await writer.wait_closed()
 
     assert response.startswith(b"HTTP/1.1 500")
 
@@ -560,11 +524,8 @@ async def test_a_stalled_partial_body_hits_the_idle_timeout() -> None:
 @pytest.mark.security("closing a connection idle beyond the timeout is logged at INFO")
 async def test_idle_timeout_logs_the_close_reason(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.INFO, logger="without_http.server"):
-        async with served_pipe(echo_app, idle_timeout=timedelta(seconds=0.1)) as (reader, writer):
+        async with served_pipe(echo_app, idle_timeout=timedelta(seconds=0.1)) as (reader, _writer):
             assert await asyncio.wait_for(reader.read(), timeout=5) == b""
-            writer.close()
-            with suppress(OSError):  # pragma: no branch - wait_closed's suppressed-exception arc is unobservable here
-                await writer.wait_closed()
 
     assert "Closing a connection idle beyond the idle timeout" in caplog.messages
 
@@ -795,9 +756,6 @@ async def _ws_first_text(app: ASGIApp, path: str) -> tuple[str | None, tuple[str
             for event in conn.events():
                 if isinstance(event, TextMessage):
                     text = event.data
-        writer.close()
-        with suppress(OSError):
-            await writer.wait_closed()
     return text, (client_host, client_port)
 
 
@@ -835,7 +793,7 @@ async def _h2c_scope_roundtrip(app: ASGIApp, path: str) -> tuple[int, bytes, tup
                 (b":method", b"GET"),
                 (b":path", path.encode()),
                 (b":scheme", b"http"),
-                (b":authority", f"{_SERVER_HOST}:{_SERVER_PORT}".encode()),
+                (b":authority", AUTHORITY),
             ],
             end_stream=True,
         )
@@ -859,9 +817,6 @@ async def _h2c_scope_roundtrip(app: ASGIApp, path: str) -> tuple[int, bytes, tup
                     done = True
             writer.write(conn.data_to_send())
             await writer.drain()
-        writer.close()
-        with suppress(OSError):
-            await writer.wait_closed()
     return status, b"".join(chunks), (client_host, client_port)
 
 

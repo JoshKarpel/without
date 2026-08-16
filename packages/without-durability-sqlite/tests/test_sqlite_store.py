@@ -374,7 +374,9 @@ async def test_closing_waits_out_the_statement_a_cancelled_caller_left_running(
 
     def parked(cursor: sqlite3.Cursor) -> object:
         inside.set()
-        # Bounded, so a broken `aclose` fails this test rather than hanging the suite.
+        # Bounded only as a backstop for the thread itself: every outcome of the test
+        # sets `finish` in the `finally` below, and a genuinely hung `aclose` is ended
+        # by the global thread-method timeout, not by this wait.
         finish.wait(timeout=5)
         return cursor.execute("SELECT 1").fetchone()[0]
 
@@ -385,12 +387,15 @@ async def test_closing_waits_out_the_statement_a_cancelled_caller_left_running(
         await abandoned
 
     closing = asyncio.ensure_future(database.aclose())
-    await yield_once()  # far enough to park on the guard, which the running thread holds
-
-    assert not closing.done(), "the close must wait out the statement, not race it"
-
-    finish.set()
-    await closing
+    try:
+        await yield_once()  # far enough to park on the guard, which the running thread holds
+        assert not closing.done(), "the close must wait out the statement, not race it"
+    finally:
+        # However the assertion lands, release the parked thread: left holding the guard,
+        # it would turn a plain failure into the fixture teardown hanging on `aclose`
+        # until the global thread-method timeout kills the whole worker.
+        finish.set()
+        await closing
 
 
 async def test_a_wakeup_that_arrived_during_a_pass_is_not_overwritten_by_its_deadline(database: Database) -> None:

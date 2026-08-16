@@ -201,10 +201,12 @@ flowchart TB
 ```
 
 `pipe()` returns two connected `(reader, writer)` endpoints: each transport's `write`
-feeds the peer's `StreamReader`, `write_eof`/`close` feed it EOF (the half-close the wire
-protocols read as "the peer is done sending"), and a reader whose buffer fills pauses the
-peer's writer, so `drain()` blocks exactly as it would on a socket. It is a connection,
-not a buffer.
+feeds the peer's `StreamReader`, `write_eof` feeds it EOF (the half-close the wire
+protocols read as "the peer is done sending" while the response still flows back), and a
+reader whose buffer fills pauses the peer's writer, so `drain()` blocks exactly as it
+would on a socket. It is a connection, not a buffer. `close` is full teardown rather than
+a half-close: it feeds the peer EOF too, but it also ends its own side's reader and drops
+the peer's subsequent writes.
 
 A write once either end has closed is dropped rather than delivered, which is what makes
 the keep-alive race behave: a pool that checks a pooled connection for EOF and then writes
@@ -227,9 +229,9 @@ async with served_pipe(app, max_stream_resets=2) as (reader, writer):
 
 It runs the lifespan and cancels the connection on exit, both as `serving` does, so a
 test can still assert what shutdown does to a request left in flight. The server reads
-`SERVER_ADDRESS` back as its own address, which is the authority such a test writes into
-`:authority` or a `Host` header. This is what `without-http`'s own HTTP/1.1 and HTTP/2
-server suites run on.
+`SERVER_ADDRESS` back as its own address, and `AUTHORITY` spells the `host:port` bytes
+such a test writes into `:authority` or a `Host` header. This is what `without-http`'s
+own HTTP/1.1 and HTTP/2 server suites run on.
 
 So `loopback_client` covers everything `asgi_client` skips: framing and chunking,
 keep-alive and connection reuse, HTTP/2 by prior knowledge (`http2=True` makes the client

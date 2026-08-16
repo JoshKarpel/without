@@ -292,7 +292,8 @@
   Below the clients, `served_pipe(app, ...)` hands over the client end of a `pipe()` with the
   server on the other, for a conformance test that writes frames rather than requests (a malformed
   request line, an h2 preface followed by an illegal frame, a reset flood); it runs the lifespan and
-  cancels the connection on exit as `serving` does, and the server presents as `SERVER_ADDRESS`.
+  cancels the connection on exit as `serving` does, and the server presents as `SERVER_ADDRESS`
+  (with `AUTHORITY` spelling the `host:port` bytes such a test writes into `:authority` or `Host`).
   `without-http`'s own HTTP/1.1 and HTTP/2 server suites run on it, leaving a bound socket to the
   tests that need what only a kernel provides: TLS, socket options, and a third-party client.
 
@@ -389,7 +390,9 @@
   surfaced as an intermittently dying test worker, roughly one run in twenty-five, whenever a
   workflow's worker task was cancelled just before its store was torn down. `aclose` takes the same
   guard `run` releases from the thread, so the close waits the statement out; the guard is released
-  afterwards, so a `run` arriving later fails loudly on a closed connection.
+  afterwards, so a `run` arriving later fails loudly on a closed connection. The close itself runs
+  on a thread like every other driver call, since under WAL it performs the final checkpoint (and,
+  with `synchronous=FULL`, an fsync), which is blocking disk I/O the event loop should not carry.
 
 - **`without-http`**: an HTTP/1.1 connection is no longer dropped after every request whose app never
   read the body. `h11` advances the client's state only as events are *pulled*, and an ASGI app may

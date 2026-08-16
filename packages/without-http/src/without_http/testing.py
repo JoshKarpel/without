@@ -49,6 +49,7 @@ from without_http.client import _releasing
 from without_http.client import wrap
 from without_http.lifespan import _wait_for
 from without_http.lifespan import run_lifespan
+from without_http.server import _DEFAULT_LIMITS
 from without_http.server import _Limits
 from without_http.server import _serve_connection
 from without_http.socket_options import SocketOptions
@@ -71,8 +72,9 @@ _BUFFER = 65536
 # The address an in-memory server presents as, which nothing resolves: a `pipe` has no
 # port to report, so the server reads this back from `sockname` and a client names it in
 # the URL (or, over HTTP/2, in `:authority`). Public because a test that writes frames by
-# hand has to spell the authority itself.
+# hand has to spell the authority itself, which is what `AUTHORITY` spells for it.
 SERVER_ADDRESS = ("testserver", 80)
+AUTHORITY = f"{SERVER_ADDRESS[0]}:{SERVER_ADDRESS[1]}".encode()
 
 
 def mock_client(handler: Callable[[ClientRequest], ClientResponse | Awaitable[ClientResponse]]) -> Client:
@@ -461,10 +463,10 @@ def pipe(
 async def served_pipe(
     app: ASGIApp,
     *,
-    max_concurrent_streams: int = 100,
-    max_stream_resets: int = 200,
-    idle_timeout: timedelta | None = None,
-    max_websocket_message_bytes: int | None = None,
+    max_concurrent_streams: int = _DEFAULT_LIMITS.max_concurrent_streams,
+    max_stream_resets: int = _DEFAULT_LIMITS.max_stream_resets,
+    idle_timeout: timedelta | None = _DEFAULT_LIMITS.idle_timeout,
+    max_websocket_message_bytes: int | None = _DEFAULT_LIMITS.max_websocket_message_bytes,
 ) -> AsyncIterator[Endpoint]:
     """
     The client end of a `pipe` with `app` served on the other, for a test that writes bytes.
@@ -483,10 +485,12 @@ async def served_pipe(
 
     The app's lifespan runs for the block and the connection is cancelled on exit, both
     as `serving` does, so a test can assert what leaving the block does to work still in
-    flight. Both ends are closed on the way out, and a test may close its own end early
-    (to send the half-close a protocol reads as "done sending"), since closing twice is
-    a no-op. The keyword arguments are `serving`'s per-connection bounds, with the same
-    defaults.
+    flight. Both ends are closed on the way out, and a test may `write_eof()` its own
+    end early to send the half-close a protocol reads as "done sending" while still
+    reading the response. `close()` is full teardown, not a half-close: it also ends
+    this end's own reader and drops the server's subsequent writes, though closing
+    early is safe since closing twice is a no-op. The keyword arguments are `serving`'s
+    per-connection bounds, with the same defaults.
     """
     limits = _Limits(
         max_concurrent_streams=max_concurrent_streams,
@@ -506,10 +510,13 @@ async def served_pipe(
             # ever awaiting never lets the connection task run at all. `close()` alone,
             # not `wait_closed()`: a pipe has nothing to flush, and the close waiter is
             # shared with whoever closed the endpoint first, so it may already have been
-            # cancelled with them.
-            await cancel_futures([connection])
-            for _reader, writer in (near, far):
-                writer.close()
+            # cancelled with them. The closes run even when the connection task crashed
+            # (`cancel_futures` re-raises such a failure), so the endpoints never leak.
+            try:
+                await cancel_futures([connection])
+            finally:
+                for _reader, writer in (near, far):
+                    writer.close()
 
 
 @asynccontextmanager
@@ -517,10 +524,10 @@ async def loopback_client(
     app: ASGIApp,
     *,
     http2: bool = False,
-    max_concurrent_streams: int = 100,
-    max_stream_resets: int = 200,
-    idle_timeout: timedelta | None = None,
-    max_websocket_message_bytes: int | None = None,
+    max_concurrent_streams: int = _DEFAULT_LIMITS.max_concurrent_streams,
+    max_stream_resets: int = _DEFAULT_LIMITS.max_stream_resets,
+    idle_timeout: timedelta | None = _DEFAULT_LIMITS.idle_timeout,
+    max_websocket_message_bytes: int | None = _DEFAULT_LIMITS.max_websocket_message_bytes,
 ) -> AsyncIterator[Client]:
     """
     A `Client` that reaches `app` through the real wire protocols, over no socket at all.

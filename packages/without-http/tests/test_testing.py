@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import pytest
+from pytest_mock import MockerFixture
 from without.testing import yield_once
 from without_asgi import RawMessage
 from without_asgi import RawScope
@@ -655,6 +656,22 @@ async def test_served_pipe_cancels_a_request_still_in_flight_on_exit() -> None:
     # Leaving the block does what `serving` does at shutdown, so a test can assert on
     # work the app was still doing rather than waiting for a connection to time out.
     assert cancelled.is_set()
+
+
+async def test_served_pipe_closes_the_endpoints_when_the_connection_task_crashed(mocker: MockerFixture) -> None:
+    # A server bug (not an app crash, which the server turns into a 500) surfaces at
+    # block exit, where `cancel_futures` re-raises it; the endpoints must be closed on
+    # that path too, not leaked behind the propagating exception.
+    async def crash(app: object, reader: object, writer: object, limits: object) -> None:
+        raise RuntimeError("a server bug")
+
+    mocker.patch("without_http.testing._serve_connection", crash)
+
+    with pytest.raises(RuntimeError, match="a server bug"):
+        async with served_pipe(echo_app) as (_reader, writer):
+            await yield_once()  # lets the connection task run far enough to crash
+
+    assert writer.is_closing()
 
 
 async def test_served_pipe_gives_the_app_the_addresses_a_socket_would() -> None:

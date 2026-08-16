@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from contextlib import suppress
 
 import h2.config
 import h2.connection
@@ -12,7 +11,7 @@ from without_asgi import ASGIApp
 from without_asgi import RawMessage
 from without_asgi import Receive
 from without_asgi import Send
-from without_http.testing import SERVER_ADDRESS
+from without_http.testing import AUTHORITY
 from without_http.testing import served_pipe
 
 from .test_server import configured_app
@@ -23,19 +22,17 @@ from .test_server import echo_app
 # server's flow-control sender are the subject, and both run identically without a
 # socket. The h2 path reached through ALPN needs a handshake, so it stays on a real one.
 
-_AUTHORITY = f"{SERVER_ADDRESS[0]}:{SERVER_ADDRESS[1]}".encode()
 
-
-def _h2_client() -> h2.connection.H2Connection:
+def h2_client() -> h2.connection.H2Connection:
     return h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=True, header_encoding=None))
 
 
-def _request_headers(method: str, path: str) -> list[tuple[bytes, bytes]]:
+def request_headers(method: str, path: str) -> list[tuple[bytes, bytes]]:
     return [
         (b":method", method.encode()),
         (b":path", path.encode()),
         (b":scheme", b"http"),
-        (b":authority", _AUTHORITY),
+        (b":authority", AUTHORITY),
     ]
 
 
@@ -80,10 +77,10 @@ async def _roundtrip(app: ASGIApp, method: str, path: str, body: bytes = b"") ->
     over one connection is exercised through the TLS path instead.
     """
     async with served_pipe(app) as (reader, writer):
-        conn = _h2_client()
+        conn = h2_client()
         conn.initiate_connection()
         stream_id = conn.get_next_available_stream_id()
-        conn.send_headers(stream_id, _request_headers(method, path), end_stream=not body)
+        conn.send_headers(stream_id, request_headers(method, path), end_stream=not body)
         if body:
             conn.send_data(stream_id, body, end_stream=True)
         writer.write(conn.data_to_send())
@@ -111,9 +108,6 @@ async def _roundtrip(app: ASGIApp, method: str, path: str, body: bytes = b"") ->
                         pass
             writer.write(conn.data_to_send())
             await writer.drain()
-        writer.close()
-        with suppress(OSError):
-            await writer.wait_closed()
     return H2Result(status, b"".join(chunks))
 
 
@@ -204,11 +198,11 @@ async def _drive_blocked_then_bump(
     so the surrounding read never completes and its `asyncio.timeout` fires.
     """
     async with served_pipe(app) as (reader, writer):
-        conn = _h2_client()
+        conn = h2_client()
         conn.initiate_connection()
         conn.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: initial_window})
         stream_id = conn.get_next_available_stream_id()
-        conn.send_headers(stream_id, _request_headers("GET", "/w"), end_stream=True)
+        conn.send_headers(stream_id, request_headers("GET", "/w"), end_stream=True)
         writer.write(conn.data_to_send())
         await writer.drain()
 
@@ -229,9 +223,6 @@ async def _drive_blocked_then_bump(
                     writer.write(conn.data_to_send())
                     await writer.drain()
                     bumped = True
-        writer.close()
-        with suppress(OSError):
-            await writer.wait_closed()
     return bytes(received)
 
 
@@ -272,11 +263,11 @@ async def test_a_single_byte_window_still_sends_the_first_byte() -> None:
     # With a per-stream window of exactly one byte, a sender computing `sendable > 0`
     # sends that one byte, while a `sendable > 1` off-by-one would block without it.
     async with served_pipe(fixed_body_app(2)) as (reader, writer):
-        conn = _h2_client()
+        conn = h2_client()
         conn.initiate_connection()
         conn.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 1})
         stream_id = conn.get_next_available_stream_id()
-        conn.send_headers(stream_id, _request_headers("GET", "/one"), end_stream=True)
+        conn.send_headers(stream_id, request_headers("GET", "/one"), end_stream=True)
         writer.write(conn.data_to_send())
         await writer.drain()
 
@@ -292,6 +283,3 @@ async def test_a_single_byte_window_still_sends_the_first_byte() -> None:
                 writer.write(conn.data_to_send())
                 await writer.drain()
         assert first == b"x"
-        writer.close()
-        with suppress(OSError):
-            await writer.wait_closed()

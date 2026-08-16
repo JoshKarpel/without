@@ -287,12 +287,19 @@ class Database:
         the close lands on top of it.
 
         Taking the guard is what waits that out, because `run` releases it from the
-        thread rather than from its caller. The guard is then let go again, so a `run`
-        arriving after this fails on a closed connection, which is the loud version of
-        a bug that would otherwise be silent.
+        thread rather than from its caller. That wait is unbounded: an effect hung
+        inside a `run` thread holds the guard until it returns, and cancelling this
+        coroutine while it is parked on the guard abandons the close, leaving the
+        connection open. The guard is then let go again, so a `run` arriving after
+        this fails on a closed connection, which is the loud version of a bug that
+        would otherwise be silent.
+
+        The close itself goes to a thread like every other driver call: under WAL it
+        runs the final checkpoint (and, with `synchronous=FULL`, an fsync), which is
+        real disk I/O that does not belong on the event loop.
         """
         async with self.guard:
-            self.connection.close()
+            await asyncio.to_thread(self.connection.close)
 
 
 def connect(path: Path | str, *, timeout: timedelta = timedelta(seconds=5)) -> Database:
