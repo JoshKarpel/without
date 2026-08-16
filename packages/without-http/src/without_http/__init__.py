@@ -13,6 +13,8 @@ from without_http.client import ResponseBody
 from without_http.client import ResponseHead
 from without_http.client import ResponseTrailers
 from without_http.client import add_headers
+from without_http.client import basic_auth
+from without_http.client import bearer_auth
 from without_http.client import brotli_compress
 from without_http.client import compressing
 from without_http.client import cookies
@@ -79,6 +81,8 @@ __all__ = [
     "Timeout",
     "WriteTimeout",
     "add_headers",
+    "basic_auth",
+    "bearer_auth",
     "brotli_compress",
     "compressing",
     "cookies",

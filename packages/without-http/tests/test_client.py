@@ -20,6 +20,7 @@ from without_asgi import Receive
 from without_asgi import Send
 from without_asgi import json_content
 from without_asgi import parse_http_scope
+from without_http import Client
 from without_http import ClientRequest
 from without_http import ClientResponse
 from without_http import ConnectionPool
@@ -29,6 +30,8 @@ from without_http import ResponseHead
 from without_http import ResponseTrailers
 from without_http import Timeout
 from without_http import add_headers
+from without_http import basic_auth
+from without_http import bearer_auth
 from without_http import cookies
 from without_http import follow_redirects
 from without_http import request
@@ -143,6 +146,74 @@ async def test_add_headers_middleware_injects_a_header_seen_server_side() -> Non
         client = add_headers((b"x-test", b"injected"))(pool)
         async with request(client, "GET", f"http://{server.host}:{server.port}/items") as (_head, body):
             assert await body.read() == b"GET /items test=injected body="
+
+
+def _capturing(captured: list[ClientRequest]) -> Client:
+    """A `Client` that records each request and answers `200 ok`."""
+
+    async def capture(outgoing: ClientRequest) -> ClientResponse:
+        captured.append(outgoing)
+
+        async def events() -> AsyncGenerator[bytes | ResponseTrailers]:
+            yield b"ok"
+
+        return ClientResponse(ResponseHead(200, ()), ResponseBody(events()))
+
+    return capture
+
+
+async def test_basic_auth_sends_the_base64_credential_pair() -> None:
+    captured: list[ClientRequest] = []
+
+    client = basic_auth("Aladdin", "open sesame")(_capturing(captured))
+    async with request(client, "GET", "http://example.test/items") as (head, body):
+        assert head.status == 200
+        assert await body.read() == b"ok"
+
+    assert (b"authorization", b"Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==") in captured[0].headers
+
+
+async def test_basic_auth_encodes_non_ascii_credentials_as_utf8() -> None:
+    captured: list[ClientRequest] = []
+
+    client = basic_auth("test", "123£")(_capturing(captured))
+    async with request(client, "GET", "http://example.test/items"):
+        pass
+
+    assert (b"authorization", b"Basic dGVzdDoxMjPCow==") in captured[0].headers
+
+
+def test_basic_auth_rejects_a_colon_in_the_username() -> None:
+    with pytest.raises(ValueError, match="colon"):
+        basic_auth("user:name", "hunter2")
+
+
+async def test_bearer_auth_defaults_to_the_bearer_scheme() -> None:
+    captured: list[ClientRequest] = []
+
+    client = bearer_auth("sesame-token")(_capturing(captured))
+    async with request(client, "GET", "http://example.test/items"):
+        pass
+
+    assert (b"authorization", b"Bearer sesame-token") in captured[0].headers
+
+
+@pytest.mark.parametrize(
+    ("scheme", "expected"),
+    [
+        ("Token", b"Token abc123"),
+        ("token", b"token abc123"),
+        ("", b"abc123"),
+    ],
+)
+async def test_bearer_auth_sends_the_injected_scheme(scheme: str, expected: bytes) -> None:
+    captured: list[ClientRequest] = []
+
+    client = bearer_auth("abc123", scheme=scheme)(_capturing(captured))
+    async with request(client, "GET", "http://example.test/items"):
+        pass
+
+    assert (b"authorization", expected) in captured[0].headers
 
 
 @pytest.mark.parametrize("status", sorted(_REDIRECT_STATUSES))

@@ -10,6 +10,7 @@ from without_asgi import RequestBody
 from without_asgi import ResponseBody
 from without_asgi import ResponseStart
 from without_asgi import ServerPush
+from without_asgi import extension
 from without_http import h11_events_from_outbound
 from without_http import inbound_from_event
 from without_http import scope_from_request
@@ -44,6 +45,15 @@ def test_scope_from_request_percent_decodes_the_path() -> None:
 
     assert scope.path == "/café"
     assert scope.raw_path == b"/caf%C3%A9"
+
+
+def test_scope_from_request_advertises_early_hints_and_no_offload_extensions() -> None:
+    request = h11.Request(method="GET", target="/items", headers=[("host", "t")], http_version="1.1")
+
+    scope = scope_from_request(request, scheme="http", server=None, client=None)
+
+    assert extension(scope.extensions, "http.response.early_hint") is not None
+    assert extension(scope.extensions, "http.response.trailers") is None
 
 
 @pytest.mark.parametrize(

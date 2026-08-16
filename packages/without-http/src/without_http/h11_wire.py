@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from urllib.parse import unquote
 
 import h11
@@ -18,11 +20,15 @@ from without_asgi import ResponseTrailers
 from without_asgi import ServerPush
 from without_asgi import ZeroCopySend
 
-# The ASGI metadata this server advertises on every scope. `extensions` is left
-# `None`: an HTTP/1.1 transport offers none of the server-offload extensions
-# (zero-copy send, path send, server push), so a well-behaved app does not send
-# the corresponding `Outbound` events.
+# The ASGI metadata this server advertises on every scope.
 ASGI = Asgi(version="3.0", spec_version="2.4")
+
+# What an HTTP scope from this server advertises: early hints, which both wire layers
+# render as a 103, so a framework that checks the scope before sending `EarlyHint`, as
+# the spec tells it to, finds the extension. The server-offload extensions (server push,
+# zero-copy and path send, trailers, debug) raise `NotImplementedError` in the wire
+# layers and stay unadvertised.
+HTTP_EXTENSIONS: Mapping[str, Mapping[str, object]] = MappingProxyType({"http.response.early_hint": {}})
 
 # The wire is ASCII: request/response tokens (method, path, version) decode with it.
 # Naming the codec once keeps mutmut's codec-name mutations (an invalid `"XXasciiXX"`
@@ -59,7 +65,7 @@ def scope_from_request(
         headers=headers,
         client=client,
         server=server,
-        extensions=None,
+        extensions=HTTP_EXTENSIONS,
     )
 
 

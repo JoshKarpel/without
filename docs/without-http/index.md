@@ -470,11 +470,11 @@ one `stack` serves both. A decorated client is just another client, so you build
 you want and pass it to `request`:
 
 ```python
-from without_http import ConnectionPool, CookieJar, add_headers, cookies, follow_redirects, request, stack
+from without_http import ConnectionPool, CookieJar, bearer_auth, cookies, follow_redirects, request, stack
 
 jar = CookieJar()
 async with ConnectionPool() as pool:
-    client = stack(add_headers((b"authorization", b"Bearer ...")), follow_redirects(), cookies(jar))(pool)
+    client = stack(bearer_auth("..."), follow_redirects(), cookies(jar))(pool)
     async with request(client, "GET", url) as (head, body):
         ...
 ```
@@ -500,6 +500,15 @@ from without_http import ClientResponse, wrap
 
 byte_counter = wrap(response=lambda r: ClientResponse(r.head, counting(r.body)))
 ```
+
+Auth is the canonical fixed-header case, so the two challenge-free schemes ship
+as one-liners over `add_headers`: `basic_auth(username, password)` sends RFC
+7617 `Basic` credentials (UTF-8, base64), and `bearer_auth(token)` sends
+`authorization: Bearer <token>`. The scheme prefix is the part real APIs
+disagree on, so it is injectable: `bearer_auth(token, scheme="Token")` for the
+peers that spell it differently, or `scheme=""` to send the bare token.
+Digest, which answers a challenge, would be a looping middleware like
+`follow_redirects` and is not written.
 
 Content codings are middleware too, one per direction. `decompress()` offers
 `accept-encoding: br, gzip, zstd` (a request carrying its own offer keeps it) and

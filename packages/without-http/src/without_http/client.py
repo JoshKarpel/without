@@ -5,6 +5,7 @@ import logging
 import socket
 import ssl
 import zlib
+from base64 import b64encode
 from collections.abc import AsyncGenerator
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
@@ -1431,6 +1432,38 @@ def add_headers(*headers: tuple[bytes, bytes]) -> ClientMiddleware:
     """
     extra: RawHeaders = tuple(headers)
     return wrap(request=lambda request: replace(request, headers=extra + request.headers))
+
+
+def basic_auth(username: str, password: str) -> ClientMiddleware:
+    """
+    Client middleware that sends `Basic` authorization (RFC 7617) on every request.
+
+    A one-liner over `add_headers`: the credentials are fixed at composition, base64 of
+    `username:password` encoded as UTF-8 (the charset RFC 7617 names and servers expect
+    today). A colon in `username` is refused with `ValueError` rather than encoded: the
+    receiver splits the decoded pair at the *first* colon, so the colon would silently
+    move characters from the username into the password.
+    """
+    if ":" in username:
+        raise ValueError(f"a Basic auth username cannot contain a colon, got {username!r}")
+    credentials = b64encode(f"{username}:{password}".encode())
+    return add_headers((b"authorization", b"Basic " + credentials))
+
+
+def bearer_auth(token: str, *, scheme: str = "Bearer") -> ClientMiddleware:
+    """
+    Client middleware that sends bearer-style authorization on every request.
+
+    A one-liner over `add_headers`: `authorization: Bearer <token>` (RFC 6750) by
+    default. The `scheme` prefix is the part real APIs disagree on, so it is
+    injectable: pass the spelling the peer demands (`scheme="Token"`,
+    `scheme="token"`), or `scheme=""` to send the bare token with no prefix at all.
+    The header encodes as ASCII, which is the charset both the scheme and a bearer
+    token are allowed, so a stray non-ASCII byte fails loudly here rather than on
+    the wire.
+    """
+    value = f"{scheme} {token}" if scheme else token
+    return add_headers((b"authorization", value.encode(_ASCII)))
 
 
 def deadline(timeout: Timeout) -> ClientMiddleware:

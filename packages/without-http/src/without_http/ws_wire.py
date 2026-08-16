@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import assert_never
 from urllib.parse import unquote
 
@@ -27,6 +29,12 @@ from without_http.h11_wire import ASGI
 # codec once keeps mutmut's codec-name mutations on this line rather than every call site
 # (see docs/contributing/mutation-testing.md and without_http.h11_wire._ASCII).
 _ASCII = "ascii"
+
+# What a WebSocket scope from this server advertises: a `WebsocketResponseStart` before
+# the handshake is accepted becomes a full HTTP denial response on the wire
+# (`ws_events_from_outbound` renders it as a rejection), which is exactly the
+# `websocket.http.response` extension.
+WEBSOCKET_EXTENSIONS: Mapping[str, Mapping[str, object]] = MappingProxyType({"websocket.http.response": {}})
 
 
 def is_websocket_upgrade(request: h11.Request) -> bool:
@@ -63,7 +71,7 @@ def websocket_scope_from_request(
         client=client,
         server=server,
         subprotocols=_subprotocols(request),
-        extensions=None,
+        extensions=WEBSOCKET_EXTENSIONS,
     )
 
 

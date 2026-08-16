@@ -7,6 +7,7 @@ from without_asgi import HttpScope
 from without_asgi import RawHeaders
 
 from without_http.h11_wire import ASGI
+from without_http.h11_wire import HTTP_EXTENSIONS
 
 # The HTTP/2 connection preface a cleartext client sends before any frames. A
 # server detects "prior knowledge" h2c by sniffing it off the first bytes, since
@@ -74,7 +75,7 @@ def scope_from_h2_headers(
         headers=tuple(ordinary),
         client=client,
         server=server,
-        extensions=None,
+        extensions=HTTP_EXTENSIONS,
     )
 
 

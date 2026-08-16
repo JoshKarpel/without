@@ -76,7 +76,7 @@ mechanisms this package does not have.
 | Timeouts | [opt-in, per phase](index.md#timeouts), inactivity-based, typed errors | [5 s default](https://www.python-httpx.org/advanced/timeouts/) across four phases | [5 min total default](https://docs.aiohttp.org/en/stable/client_reference.html#clienttimeout) | [on by default, per method](https://niquests.readthedocs.io/en/latest/user/advanced.html) (30 s reads, 120 s writes) |
 | Redirects | opt-in middleware ([`follow_redirects()`](index.md#client-middleware)) | built-in, [off by default](https://www.python-httpx.org/compatibility/) | built-in, on by default | built-in, on by default |
 | Cookies | [explicit jar](cookies.md), attached by middleware | jar on the client | jar on the session | jar on the session |
-| Auth helpers | unwritten; [middleware-shaped](#how-a-gap-closes-here) | [Basic and Digest](https://www.python-httpx.org/quickstart/) | [Basic](https://docs.aiohttp.org/en/stable/client_reference.html#basicauth) | Basic and Digest |
+| Auth helpers | Basic and bearer ([`basic_auth`, `bearer_auth`](index.md#client-middleware)); Digest unwritten, [middleware-shaped](#how-a-gap-closes-here) | [Basic and Digest](https://www.python-httpx.org/quickstart/) | [Basic](https://docs.aiohttp.org/en/stable/client_reference.html#basicauth) | Basic and Digest |
 | Retries | unwritten; [middleware-shaped](#how-a-gap-closes-here) | [connect phase only](https://www.python-httpx.org/advanced/transports/) (`HTTPTransport(retries=)`) | third party ([`aiohttp-retry`](https://github.com/inyutin/aiohttp_retry)) | off by default; [first-class `retries=`](https://niquests.readthedocs.io/en/latest/user/advanced.html) (urllib3 `Retry`) |
 | Extension mechanism | [function composition over `Client`](index.md#client-middleware) | [event hooks](https://www.python-httpx.org/advanced/event-hooks/), custom transports | [client middlewares](https://docs.aiohttp.org/en/stable/client_reference.html) | requests-style hooks |
 | Certificate revocation, OS truststore | no (inject `ssl_context_factory`) | — | — | [OCSP, CRL, OS truststore](https://github.com/jawah/niquests) |
@@ -103,7 +103,7 @@ worth being specific:
 | Gap | The shape it takes |
 |---|---|
 | Multipart and form upload | A `Content` producer beside `json_content`; the encoding travels with its `content-type`. Parsing on the receiving side is a `without-web` extractor, not this package's concern. |
-| Auth | Basic and bearer are `add_headers` one-liners today; Digest is a looping middleware with the same shape as `follow_redirects`. |
+| Digest auth | A looping middleware with the same shape as `follow_redirects`, since Digest answers a challenge. The challenge-free schemes (`basic_auth`, `bearer_auth`) are `add_headers` one-liners and ship. |
 | Retries | A middleware that re-invokes its inner `Client`, rewriting the request's `Timeout` per attempt. The budget already rides on the request value so an attempt can shorten it. |
 | Proxies, Unix sockets, local address | `Connect` implementations. The pool takes `Connect` at construction; none of these are written, but none needs a new interface (`tcp_connect` is the shape, already shipped). |
 | DNS caching | A `Resolve` wrapper owning the cache, injected as `tcp_connect(resolve=...)`, so resolution policy stays with the caller instead of inside the pool. The interface ships; the cache does not, because `getaddrinfo` hides record TTLs, making any staleness bound the caller's policy to choose. |
@@ -186,15 +186,16 @@ capability a server either implements or does not.
 | `http.response.debug` | no | — | — | — |
 | `tls` | no; the app side [parses it](https://github.com/JoshKarpel/without/blob/main/packages/without-asgi/src/without_asgi/scope.py) when a server supplies it | — | — | [tracked](https://github.com/emmett-framework/granian/issues/788) |
 
-Two honest notes on the `without-http` column. First, the server implements
-denial responses and early hints but advertises no `extensions` mapping on the
-scopes it builds (all three scope builders set `extensions=None`), so a
-third-party ASGI framework that checks the scope before using an extension, as
-the spec tells it to, will never use them; a `without-asgi` app speaks the
-typed vocabulary directly and is unaffected. That is a real gap with a
-one-line shape. Second, the `no` cells are loud rather than silent:
-`without-asgi` types every one of these messages, and the wire layers raise
-`NotImplementedError` on the unsupported ones instead of dropping them.
+Two notes on the `without-http` column. First, the scopes advertise exactly
+what the wire layers implement (`http.response.early_hint` on HTTP scopes,
+`websocket.http.response` on WebSocket scopes, and the in-memory `asgi_client`
+adds `http.response.trailers`, the one extension memory can honor that the
+wire cannot), so a third-party ASGI framework that checks the scope before
+using an extension, as the spec tells it to, finds them; a `without-asgi` app
+can speak the typed vocabulary directly without checking. Second, the `no`
+cells are loud rather than silent: `without-asgi` types every one of these
+messages, and the wire layers raise `NotImplementedError` on the unsupported
+ones instead of dropping them.
 
 ### Operations
 

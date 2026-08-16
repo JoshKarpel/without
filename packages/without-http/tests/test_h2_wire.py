@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from without_asgi import extension
 from without_http import early_hint_headers
 from without_http import request_headers
 from without_http import response_headers
@@ -86,6 +87,15 @@ def test_scope_from_h2_headers_percent_decodes_the_path() -> None:
 
     assert scope.path == "/café"
     assert scope.raw_path == b"/caf%C3%A9"
+
+
+def test_scope_from_h2_headers_advertises_early_hints_and_no_offload_extensions() -> None:
+    headers = [(b":method", b"GET"), (b":path", b"/items"), (b":authority", b"t")]
+
+    scope = scope_from_h2_headers(headers, scheme="https", server=None, client=None)
+
+    assert extension(scope.extensions, "http.response.early_hint") is not None
+    assert extension(scope.extensions, "http.response.push") is None
 
 
 def test_response_headers_puts_status_first_and_lowercases_names() -> None:
