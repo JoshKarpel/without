@@ -58,7 +58,9 @@ needs, and in the package that owns the exchange shape it wraps.**
   uvicorn), because it wraps the handler rather than the socket. `limit_concurrent_requests`
   and `limit_request_body` (a `413` body-size cap) live here; natural neighbors are
   default response headers, gzip/decompression, a per-request timeout, request-ID
-  injection, structured access logging, and CORS preflight.
+  injection, trust-gated proxy headers, and CORS preflight. Access logging has the
+  same shape and deliberately does not ship: what belongs in the line is deployment
+  policy (see the server positions in `docs/without-http/alternatives.md`).
 - **`without-web`** holds route-aware middleware: anything keyed on the matched
   route or that maps exceptions to responses, plus route-scoped middleware and
   OpenAPI-aware pieces. Only that layer can see route metadata.

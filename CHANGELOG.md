@@ -1,5 +1,88 @@
 # Changelog
 
+## 0.0.4
+
+### Added
+
+- **`without-http`**: response decompression as opt-in middleware. `decompress()` offers
+  `accept-encoding` outbound and wraps the response body in an incremental decoder inbound, so a
+  streamed body decodes chunk by chunk and trailers pass through untouched. It is middleware rather
+  than pool behavior because the transport must never silently rewrite bytes: a caller that wants
+  the wire encoding reads the undecorated client. The coding table is the argument
+  (`DEFAULT_DECOMPRESSORS`, gzip and zstd from the stdlib and brotli from the bundled bindings), and
+  the `accept-encoding` offer is *derived from its keys*, so what is advertised and what can be
+  decoded cannot disagree; registering a coding this package does not ship is one entry
+  (`decompress({**DEFAULT_DECOMPRESSORS, b"lzma": make_lzma})`) rather than a fork. The decoded
+  response is self-consistent: `content-encoding` and `content-length` described the *encoded* body,
+  so both leave the head instead of contradicting the bytes the stream now yields, an unknown or
+  stacked coding passes through whole, and a truncated compressed stream raises `ConnectionError`
+  rather than passing a prefix off as the whole body. This is also how the no-unbidden-headers
+  position holds rather than bends: composing the middleware is how a client opts into offering
+  `accept-encoding` at all.
+- **`without-http`**: request compression, the same mechanism pointed the other way. `compressing`
+  is the middleware over any coding and a `Compressor` factory, with `gzip_compress`,
+  `zstd_compress`, and `brotli_compress` as the three that ship. Bodies compress as they stream, so
+  a large upload is never buffered whole, and per-call composition means one client can send
+  compressed to a peer that wants it and plain to one that does not.
+- **`without-http`**: `basic_auth(username, password)` and `bearer_auth(token)`. Both are
+  `add_headers` one-liners, which is the point: the challenge-free schemes need no new mechanism,
+  and naming them saves every caller from re-deriving the base64 and the scheme token. Digest is
+  deliberately still absent, because answering a challenge is a looping middleware rather than a
+  header.
+- **`without-http`**: `user_agent(*segments)`, and `USER_AGENT` as the library's own
+  `without-http/<version>` identity, which is what it sends when given no segments. Requests still
+  say exactly what the caller said; this is how a caller opts into an identity for the peers that
+  vary on one (and the ones, like the GitHub API, that refuse a request without it).
+- **`without-http`**: Happy Eyeballs on by default, and resolution as an injectable step.
+  `tcp_connect(resolve=..., happy_eyeballs_delay=...)` builds the pool's default `Connect`: it
+  races address families per [RFC 8305](https://datatracker.ietf.org/doc/html/rfc8305) through
+  [aiohappyeyeballs](https://github.com/aio-libs/aiohappyeyeballs), so a dual-stack host with one
+  black-holed family costs a 250 ms delay rather than a full connect timeout. Splitting `Resolve`
+  out is what makes DNS policy the caller's: a cache, DNS-over-HTTPS, or a test's canned addresses
+  swap in without touching how the winning address is connected. The race drives plain
+  `loop.sock_connect`, so it behaves the same on any event loop, where asyncio's own racing is fused
+  to its own resolution.
+- **`without-http`**: the server supplies the ASGI
+  [`tls` extension](https://asgi.readthedocs.io/en/latest/specs/tls.html) on every TLS scope, HTTP,
+  HTTP/2, and WebSocket alike, so an mTLS deployment's client certificate reaches the handler as a
+  PEM chain with its subject as an RFC 4514 distinguished name, and `parse_tls` finally has a
+  producer inside this stack rather than only a parser. The facts are read once per connection off
+  the finished handshake rather than per request, since a completed handshake does not change under
+  the connection. `server_cert` and `cipher_suite` are `None`, which the spec permits and which is a
+  CPython limit rather than a shortcut: an `ssl.SSLContext` never exposes the certificate it loaded,
+  and `SSLObject.cipher()` reports a suite by name with no IANA identifier. `client_cert_error` is
+  `None` because a certificate that fails verification fails the handshake, so no scope is ever
+  built for it.
+- **`without-http`**: two bounds on the request *head*, which was previously whatever h11 and h2
+  chose. They are separate knobs because the protocols measure different things:
+  `max_incomplete_event_bytes` is how much of an unfinished HTTP/1.1 event (a request line and its
+  headers, a chunk header) may accumulate before the parse is abandoned with a `431`, and
+  `max_header_list_bytes` is advertised over HTTP/2 as `MAX_HEADER_LIST_SIZE`, bounding an
+  *uncompressed* header list, which is what makes it a defense against an hpack bomb. Each defaults
+  to its protocol library's own default (16 KiB and 64 KiB), so the numbers differ; collapsing them
+  into one knob would have silently retightened or loosened one protocol. Both are on `serving`,
+  `served_pipe`, and `loopback_client`, like every other per-connection bound.
+- **`without-http`**: a served scope advertises the extensions its wire layer implements, where it
+  previously carried none at all: `http.response.early_hint` on HTTP scopes,
+  `websocket.http.response` on WebSocket scopes, and `tls` on both over TLS. A third-party ASGI
+  framework that checks the scope before using an extension, as the spec tells it to, now finds
+  them, where before it correctly concluded there were none; a `without-asgi` app speaks the typed
+  vocabulary directly and never had to check. The in-memory `asgi_client` already advertised
+  `http.response.trailers`, so the wire scopes are what changed.
+- **`without-asgi`**: `form_content` and `multipart_content`, joining `json_content` as producers of
+  the same `Content` value, plus `FilePart` and `StreamingContent`. A multipart body streams its
+  file parts rather than buffering them, which is why it is a `StreamingContent`: the shape follows
+  the size of what it carries rather than being uniform for its own sake. Both work as a request
+  body through `without-http`'s `request` and as a response body, since `Content` is the shared
+  vocabulary of the package both sides depend on.
+- Documentation: [Alternatives](https://without.help/without-http/alternatives/), a
+  feature-by-feature register of `without-http` against httpx, aiohttp, and niquests on the client
+  side, and against uvicorn, hypercorn, and granian on the server side. Every cell cites its
+  source, gaps are marked by *how they close* (a composition against an interface that already
+  ships, genuinely new mechanism, or a stated position with its cost named), and open gaps link
+  the issue tracking them.
+  It is a roadmap as much as a comparison, and it is what drove most of the additions above.
+
 ## 0.0.3
 
 ### Added

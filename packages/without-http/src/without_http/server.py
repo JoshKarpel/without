@@ -6,6 +6,7 @@ import ssl
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from collections.abc import Callable
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from contextlib import suppress
 from dataclasses import dataclass
@@ -58,12 +59,16 @@ from without_http.h2_wire import H2_PREFACE
 from without_http.h2_wire import early_hint_headers
 from without_http.h2_wire import response_headers
 from without_http.h2_wire import scope_from_h2_headers
+from without_http.h11_wire import HTTP_EXTENSIONS
 from without_http.h11_wire import h11_events_from_outbound
 from without_http.h11_wire import inbound_from_event
 from without_http.h11_wire import scope_from_request
 from without_http.lifespan import run_lifespan
 from without_http.socket_options import SocketOptions
 from without_http.socket_options import apply_socket_options
+from without_http.tls import extensions_with_tls
+from without_http.tls import tls_extension
+from without_http.ws_wire import WEBSOCKET_EXTENSIONS
 from without_http.ws_wire import is_websocket_upgrade
 from without_http.ws_wire import websocket_scope_from_request
 from without_http.ws_wire import ws_events_from_outbound
@@ -95,6 +100,11 @@ class _Limits:
     max_stream_resets: int = 200
     idle_timeout: timedelta | None = None
     max_websocket_message_bytes: int | None = None
+    # Each protocol's own library default, restated because neither exposes it as a
+    # public constant: h11's `max_incomplete_event_size` and h2's `MAX_HEADER_LIST_SIZE`.
+    # They differ because the two bounds are not the same measurement (see `serving`).
+    max_incomplete_event_bytes: int = 16 * 1024
+    max_header_list_bytes: int = 64 * 1024
 
 
 _DEFAULT_LIMITS = _Limits()
@@ -185,10 +195,11 @@ async def _run_request(
     server: tuple[str, int] | None,
     client: tuple[str, int] | None,
     request: h11.Request,
+    extensions: Mapping[str, Mapping[str, object]],
     idle_timeout: timedelta | None,
 ) -> bool:
     """Drive one request/response exchange. Returns whether the connection may keep alive."""
-    scope = scope_from_request(request, scheme=scheme, server=server, client=client)
+    scope = scope_from_request(request, scheme=scheme, server=server, client=client, extensions=extensions)
     method = scope.method
     request_done = False  # pragma: no mutate - initial sentinel, read only as a bool
     response_done = False  # pragma: no mutate - initial sentinel, read only as a bool
@@ -259,6 +270,7 @@ async def _serve_websocket(
     server: tuple[str, int] | None,
     client: tuple[str, int] | None,
     request: h11.Request,
+    extensions: Mapping[str, Mapping[str, object]],
     limits: _Limits,
 ) -> None:
     """
@@ -280,7 +292,9 @@ async def _serve_websocket(
     ws.initiate_upgrade_connection(handshake, request.target.decode(_LATIN1))
     for _ in ws.events():
         pass  # discard wsproto's Request; the scope is built from the h11 request
-    scope = encode_websocket_scope(websocket_scope_from_request(request, scheme=scheme, server=server, client=client))
+    scope = encode_websocket_scope(
+        websocket_scope_from_request(request, scheme=scheme, server=server, client=client, extensions=extensions)
+    )
 
     max_message = limits.max_websocket_message_bytes
     inbound: asyncio.Queue[RawMessage] = asyncio.Queue()
@@ -441,10 +455,13 @@ async def _serve_connection(
     ssl_object = writer.get_extra_info("ssl_object")
     secure = ssl_object is not None
     alpn = ssl_object.selected_alpn_protocol() if ssl_object is not None else None
+    # Read the connection's TLS facts once, here, rather than per request: they are
+    # fixed by the finished handshake, and every scope on this connection reports them.
+    tls = tls_extension(ssl_object) if ssl_object is not None else None
     try:
         if alpn == "h2":
             await _serve_h2_connection(
-                app, reader, writer, initial=b"", secure=secure, server=server, client=client, limits=limits
+                app, reader, writer, initial=b"", secure=secure, server=server, client=client, tls=tls, limits=limits
             )
             return
         initial = b""  # pragma: no mutate - only read when truthy; b"" and None both skip
@@ -452,11 +469,19 @@ async def _serve_connection(
             initial = await _read(reader, limits.idle_timeout)
             if initial.startswith(H2_PREFACE):
                 await _serve_h2_connection(
-                    app, reader, writer, initial=initial, secure=secure, server=server, client=client, limits=limits
+                    app,
+                    reader,
+                    writer,
+                    initial=initial,
+                    secure=secure,
+                    server=server,
+                    client=client,
+                    tls=tls,
+                    limits=limits,
                 )
                 return
         await _serve_h11_connection(
-            app, reader, writer, initial=initial, secure=secure, server=server, client=client, limits=limits
+            app, reader, writer, initial=initial, secure=secure, server=server, client=client, tls=tls, limits=limits
         )
     except TimeoutError:
         logger.info("Closing a connection idle beyond the idle timeout")
@@ -481,10 +506,12 @@ async def _serve_h11_connection(
     secure: bool,
     server: tuple[str, int] | None,
     client: tuple[str, int] | None,
+    tls: Mapping[str, object] | None,
     limits: _Limits,
 ) -> None:
     """Serve sequential HTTP/1.1 requests (and WebSocket upgrades) on one connection."""
-    conn = h11.Connection(our_role=h11.SERVER)
+    conn = h11.Connection(our_role=h11.SERVER, max_incomplete_event_size=limits.max_incomplete_event_bytes)
+    extensions = extensions_with_tls(HTTP_EXTENSIONS, tls)
     if initial:
         conn.receive_data(initial)
     while True:
@@ -501,7 +528,16 @@ async def _serve_h11_connection(
         if is_websocket_upgrade(request):
             scheme = "wss" if secure else "ws"
             await _serve_websocket(
-                app, conn, reader, writer, scheme=scheme, server=server, client=client, request=request, limits=limits
+                app,
+                conn,
+                reader,
+                writer,
+                scheme=scheme,
+                server=server,
+                client=client,
+                request=request,
+                extensions=extensions_with_tls(WEBSOCKET_EXTENSIONS, tls),
+                limits=limits,
             )
             return
         scheme = "https" if secure else "http"
@@ -514,6 +550,7 @@ async def _serve_h11_connection(
             server=server,
             client=client,
             request=request,
+            extensions=extensions,
             idle_timeout=limits.idle_timeout,
         )
         if not keep_alive:
@@ -554,6 +591,7 @@ async def _serve_h2_connection(
     secure: bool,
     server: tuple[str, int] | None,
     client: tuple[str, int] | None,
+    tls: Mapping[str, object] | None,
     limits: _Limits,
 ) -> None:
     """
@@ -581,6 +619,7 @@ async def _serve_h2_connection(
     inbound flow-control window bounds buffered body rather than reopening on receipt.
     """
     scheme = "https" if secure else "http"
+    extensions = extensions_with_tls(HTTP_EXTENSIONS, tls)
     config = h2.config.H2Configuration(client_side=False, header_encoding=None)  # pragma: no mutate - default is None
     conn = h2.connection.H2Connection(config=config)
     lock = asyncio.Lock()
@@ -665,7 +704,9 @@ async def _serve_h2_connection(
     async def run_stream(stream_id: int, headers: list[tuple[bytes, bytes]], stream: _H2Stream) -> None:
         try:
             try:
-                scope = scope_from_h2_headers(headers, scheme=scheme, server=server, client=client)
+                scope = scope_from_h2_headers(
+                    headers, scheme=scheme, server=server, client=client, extensions=extensions
+                )
             except UnicodeDecodeError:
                 # A non-ASCII `:method`/`:path` fails the header decode; answer a clean 400
                 # rather than letting the stream hang with nothing sent.
@@ -788,7 +829,12 @@ async def _serve_h2_connection(
 
     async with lock:
         conn.initiate_connection()
-        conn.update_settings({h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS: limits.max_concurrent_streams})
+        conn.update_settings(
+            {
+                h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS: limits.max_concurrent_streams,
+                h2.settings.SettingCodes.MAX_HEADER_LIST_SIZE: limits.max_header_list_bytes,
+            }
+        )
         writer.write(conn.data_to_send())
     await writer.drain()
     try:
@@ -854,6 +900,8 @@ async def serving(
     max_stream_resets: int = _DEFAULT_LIMITS.max_stream_resets,
     idle_timeout: timedelta | None = _DEFAULT_LIMITS.idle_timeout,
     max_websocket_message_bytes: int | None = _DEFAULT_LIMITS.max_websocket_message_bytes,
+    max_incomplete_event_bytes: int = _DEFAULT_LIMITS.max_incomplete_event_bytes,
+    max_header_list_bytes: int = _DEFAULT_LIMITS.max_header_list_bytes,
     ssl_context: ssl.SSLContext | None = None,
     ssl_handshake_timeout: float | None = None,
     ssl_shutdown_timeout: float | None = None,
@@ -888,15 +936,33 @@ async def serving(
     failures (pausing for `ACCEPT_RETRY_DELAY` on resource exhaustion) and binds every
     address `host` resolves to.
 
-    Four per-connection resource bounds harden a public deployment. `idle_timeout`
+    Six per-connection resource bounds harden a public deployment. `idle_timeout`
     (a `timedelta`, off by default) closes a connection whose peer stops sending data
     mid-exchange, defeating a slowloris; it also bounds an idle WebSocket. Over HTTP/2,
     `max_concurrent_streams` is advertised as `MAX_CONCURRENT_STREAMS` and
     `max_stream_resets` caps how many stream resets one connection may issue before it
     is dropped, together defeating the Rapid Reset flood (CVE-2023-44487).
     `max_websocket_message_bytes` (off by default) caps a reassembled WebSocket message.
-    Tune them at your composition root, e.g. from a settings value parsed by
+
+    The last two bound the request *head*, one per protocol, because the two protocols
+    measure it differently rather than as a matter of taste.
+    `max_incomplete_event_bytes` is h11's `max_incomplete_event_size`: how many bytes of
+    a not-yet-complete HTTP/1.1 event (a request line plus its headers, or a chunk
+    header) may accumulate before the parse is abandoned, so a peer cannot dribble an
+    endless header block. `max_header_list_bytes` is advertised over HTTP/2 as
+    `MAX_HEADER_LIST_SIZE`, bounding the *uncompressed* size of a header list, which is
+    what makes it a defense against an hpack bomb. Each defaults to its protocol
+    library's own default (16 KiB and 64 KiB), so the numbers differ; raise them
+    together if your peers send large headers.
+
+    Tune all of these at your composition root, e.g. from a settings value parsed by
     `without_env.EnvContext`, rather than reaching for the environment here.
+
+    Over TLS, every scope carries the
+    [`tls` extension](https://asgi.readthedocs.io/en/latest/specs/tls.html) with the
+    negotiated version and the client certificate chain, read once per connection off
+    the finished handshake; see `tls_extension` for the fields CPython's `ssl` module
+    cannot supply.
 
     Pass `ssl_context` to serve `https`/`wss` directly; `server_ssl_context` builds
     one for the common case. `ssl_handshake_timeout` bounds a single TLS handshake
@@ -916,6 +982,8 @@ async def serving(
         max_stream_resets=max_stream_resets,
         idle_timeout=idle_timeout,
         max_websocket_message_bytes=max_websocket_message_bytes,
+        max_incomplete_event_bytes=max_incomplete_event_bytes,
+        max_header_list_bytes=max_header_list_bytes,
     )
     live = _LiveConnections()
     connections: set[asyncio.Task[None]] = set()

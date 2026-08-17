@@ -352,6 +352,7 @@ async def test_a_malformed_request_lingers_so_the_client_reads_the_error(
         secure=False,
         server=None,
         client=None,
+        tls=None,
         limits=_DEFAULT_LIMITS,
     )
 
@@ -519,6 +520,27 @@ async def test_a_stalled_partial_body_hits_the_idle_timeout() -> None:
         response = await asyncio.wait_for(reader.read(), timeout=5)
 
     assert response.startswith(b"HTTP/1.1 500")
+
+
+@pytest.mark.security("an oversized HTTP/1.1 request head is refused rather than buffered without bound")
+async def test_a_request_head_over_the_cap_is_refused() -> None:
+    async with served_pipe(echo_app, max_incomplete_event_bytes=256) as (reader, writer):
+        # The headers are never terminated, so the bound is what ends this, not the parse.
+        writer.write(b"GET /x HTTP/1.1\r\nhost: test\r\nx-padding: " + b"a" * 1024)
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(), timeout=5)
+
+    assert response.startswith(b"HTTP/1.1 431")
+
+
+@pytest.mark.security("a request head within the cap is served normally")
+async def test_a_request_head_within_the_cap_is_served() -> None:
+    async with served_pipe(echo_app, max_incomplete_event_bytes=4096) as (reader, writer):
+        writer.write(b"GET /x HTTP/1.1\r\nhost: test\r\nx-padding: " + b"a" * 1024 + b"\r\n\r\n")
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(65536), timeout=5)
+
+    assert response.startswith(b"HTTP/1.1 200")
 
 
 @pytest.mark.security("closing a connection idle beyond the timeout is logged at INFO")
@@ -697,6 +719,7 @@ async def _drive_h11_over_socketpair(
         secure=False,
         server=None,
         client=None,
+        tls=None,
         limits=_DEFAULT_LIMITS,
     )
     return client_reader, (server_reader, server_writer)
@@ -720,6 +743,7 @@ async def test_a_malformed_request_lingers_with_both_stream_ends(
         secure=False,
         server=None,
         client=None,
+        tls=None,
         limits=_DEFAULT_LIMITS,
     )
 

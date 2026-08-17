@@ -55,8 +55,14 @@ def websocket_scope_from_request(
     scheme: str,
     server: tuple[str, int | None] | None,
     client: tuple[str, int] | None,
+    extensions: Mapping[str, Mapping[str, object]] = WEBSOCKET_EXTENSIONS,
 ) -> WebsocketScope:
-    """Build the typed `WebsocketScope` an ASGI app expects from the handshake `h11.Request`."""
+    """
+    Build the typed `WebsocketScope` an ASGI app expects from the handshake `h11.Request`.
+
+    `extensions` is what this connection offers: `WEBSOCKET_EXTENSIONS`, plus `tls`
+    when the handshake arrived over TLS.
+    """
     raw_path, _, query_string = request.target.partition(b"?")
     headers = tuple((bytes(name), bytes(value)) for name, value in request.headers)
     return WebsocketScope(
@@ -71,7 +77,7 @@ def websocket_scope_from_request(
         client=client,
         server=server,
         subprotocols=_subprotocols(request),
-        extensions=WEBSOCKET_EXTENSIONS,
+        extensions=extensions,
     )
 
 

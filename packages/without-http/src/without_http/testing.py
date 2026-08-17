@@ -467,6 +467,8 @@ async def served_pipe(
     max_stream_resets: int = _DEFAULT_LIMITS.max_stream_resets,
     idle_timeout: timedelta | None = _DEFAULT_LIMITS.idle_timeout,
     max_websocket_message_bytes: int | None = _DEFAULT_LIMITS.max_websocket_message_bytes,
+    max_incomplete_event_bytes: int = _DEFAULT_LIMITS.max_incomplete_event_bytes,
+    max_header_list_bytes: int = _DEFAULT_LIMITS.max_header_list_bytes,
 ) -> AsyncIterator[Endpoint]:
     """
     The client end of a `pipe` with `app` served on the other, for a test that writes bytes.
@@ -497,6 +499,8 @@ async def served_pipe(
         max_stream_resets=max_stream_resets,
         idle_timeout=idle_timeout,
         max_websocket_message_bytes=max_websocket_message_bytes,
+        max_incomplete_event_bytes=max_incomplete_event_bytes,
+        max_header_list_bytes=max_header_list_bytes,
     )
     async with run_lifespan(app):
         near, far = pipe()
@@ -528,6 +532,8 @@ async def loopback_client(
     max_stream_resets: int = _DEFAULT_LIMITS.max_stream_resets,
     idle_timeout: timedelta | None = _DEFAULT_LIMITS.idle_timeout,
     max_websocket_message_bytes: int | None = _DEFAULT_LIMITS.max_websocket_message_bytes,
+    max_incomplete_event_bytes: int = _DEFAULT_LIMITS.max_incomplete_event_bytes,
+    max_header_list_bytes: int = _DEFAULT_LIMITS.max_header_list_bytes,
 ) -> AsyncIterator[Client]:
     """
     A `Client` that reaches `app` through the real wire protocols, over no socket at all.
@@ -557,6 +563,8 @@ async def loopback_client(
         max_stream_resets=max_stream_resets,
         idle_timeout=idle_timeout,
         max_websocket_message_bytes=max_websocket_message_bytes,
+        max_incomplete_event_bytes=max_incomplete_event_bytes,
+        max_header_list_bytes=max_header_list_bytes,
     )
     connections: set[asyncio.Task[None]] = set()
 

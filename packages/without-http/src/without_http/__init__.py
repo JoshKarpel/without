@@ -52,7 +52,10 @@ from without_http.timeouts import ReadTimeout
 from without_http.timeouts import Timeout
 from without_http.timeouts import WriteTimeout
 from without_http.tls import ALPN_PROTOCOLS
+from without_http.tls import distinguished_name
+from without_http.tls import extensions_with_tls
 from without_http.tls import server_ssl_context
+from without_http.tls import tls_extension
 from without_http.ws_wire import is_websocket_upgrade
 from without_http.ws_wire import websocket_scope_from_request
 from without_http.ws_wire import ws_events_from_outbound
@@ -91,7 +94,9 @@ __all__ = [
     "cookies",
     "deadline",
     "decompress",
+    "distinguished_name",
     "early_hint_headers",
+    "extensions_with_tls",
     "follow_redirects",
     "gzip_compress",
     "h11_events_from_outbound",
@@ -111,6 +116,7 @@ __all__ = [
     "stack",
     "tcp_connect",
     "tcp_keepalive",
+    "tls_extension",
     "user_agent",
     "websocket_scope_from_request",
     "wrap",

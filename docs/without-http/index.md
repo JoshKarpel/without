@@ -101,8 +101,23 @@ What the server handles:
   Reset flood (CVE-2023-44487); a client reset also cancels the stream's app task, and
   received body is acked only as the app consumes it, so the flow-control window bounds
   buffered body. `max_websocket_message_bytes` caps a reassembled WebSocket message.
+  The request *head* is bounded per protocol, because the two protocols measure it
+  differently: `max_incomplete_event_bytes` is how much of an unfinished HTTP/1.1
+  event (a request line and its headers, a chunk header) may accumulate before the
+  parse is abandoned with a `431`, and `max_header_list_bytes` is advertised over
+  HTTP/2 as `MAX_HEADER_LIST_SIZE`, bounding an *uncompressed* header list against an
+  hpack bomb. Each defaults to its protocol library's own default, 16 KiB and 64 KiB.
   For a body-size cap that works under any transport, wrap the app in
   `without-asgi`'s `limit_request_body`, which answers `413`.
+- **TLS facts reach the app.** Over TLS, every scope carries the ASGI
+  [`tls` extension](https://asgi.readthedocs.io/en/latest/specs/tls.html), read once
+  per connection off the finished handshake, so an app calls `parse_tls` and gets the
+  negotiated version and the client certificate chain (PEM) with its subject as an
+  RFC 4514 distinguished name. `server_cert` and `cipher_suite` are `None`, which the
+  spec permits: an `ssl.SSLContext` never exposes the certificate it loaded, and
+  `SSLObject.cipher()` reports a suite by name with no IANA identifier. An mTLS
+  deployment configures verification on its own `ssl.SSLContext`, as usual; the
+  extension is how the result reaches the handler.
 
 The pure wire cores (`h11_wire`, `h2_wire`, `ws_wire`) are sans-IO and unit-tested:
 they map `h11`/`h2`/`wsproto` events to the typed `without-asgi` vocabulary and

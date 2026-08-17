@@ -43,13 +43,16 @@ def scope_from_request(
     scheme: str,
     server: tuple[str, int | None] | None,
     client: tuple[str, int] | None,
+    extensions: Mapping[str, Mapping[str, object]] = HTTP_EXTENSIONS,
 ) -> HttpScope:
     """
     Build the typed `HttpScope` an ASGI app expects from an `h11.Request`.
 
     Pure: it reads only the request event and the connection facts the transport
-    already knows (peer addresses, scheme). The ASGI `path` is the percent-decoded
-    target; `raw_path` keeps the bytes as received, the same split uvicorn makes.
+    already knows (peer addresses, scheme, and the `extensions` this connection
+    offers, which is `HTTP_EXTENSIONS` plus `tls` when the connection is over TLS).
+    The ASGI `path` is the percent-decoded target; `raw_path` keeps the bytes as
+    received, the same split uvicorn makes.
     """
     raw_path, _, query_string = request.target.partition(b"?")
     headers = tuple((bytes(name), bytes(value)) for name, value in request.headers)
@@ -65,7 +68,7 @@ def scope_from_request(
         headers=headers,
         client=client,
         server=server,
-        extensions=HTTP_EXTENSIONS,
+        extensions=extensions,
     )
 
 
