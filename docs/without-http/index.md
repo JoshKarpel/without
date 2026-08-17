@@ -515,6 +515,17 @@ peers that spell it differently, or `scheme=""` to send the bare token.
 Digest, which answers a challenge, would be a looping middleware like
 `follow_redirects` and is not written.
 
+The other fixed header peers commonly gate on is the user-agent, which this
+client never sends unbidden, and which some peers (the GitHub API) refuse to
+see absent. `user_agent()` is the opt-in: with no arguments it sends
+`USER_AGENT`, the library's own `without-http/<version>` identity read from the
+installed distribution, which is the same default every other client sends
+without asking; passing segments sends them joined with spaces, the separator
+RFC 9110 puts between product tokens, so `user_agent("myapp/1.0", USER_AGENT)`
+sends both identities and `user_agent("myapp/1.0")` sends exactly yours.
+`USER_AGENT` is public precisely so a caller can join it into their own value
+rather than choose between theirs and the library's.
+
 Content codings are middleware too, one per direction. `decompress()` offers
 `accept-encoding: br, gzip, zstd` (a request carrying its own offer keeps it) and
 decodes an encoded response body through an incremental decoder as it streams,

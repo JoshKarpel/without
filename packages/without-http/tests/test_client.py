@@ -10,6 +10,7 @@ from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC
 from datetime import timedelta
+from importlib import metadata
 from urllib.parse import urlsplit
 
 import h11
@@ -21,6 +22,7 @@ from without_asgi import Send
 from without_asgi import StreamingContent
 from without_asgi import json_content
 from without_asgi import parse_http_scope
+from without_http import USER_AGENT
 from without_http import Client
 from without_http import ClientRequest
 from without_http import ClientResponse
@@ -38,6 +40,7 @@ from without_http import follow_redirects
 from without_http import request
 from without_http import serving
 from without_http import tcp_connect
+from without_http import user_agent
 from without_http import wrap
 from without_http.client import _REDIRECT_STATUSES
 from without_http.client import Origin
@@ -215,6 +218,45 @@ async def test_bearer_auth_sends_the_injected_scheme(scheme: str, expected: byte
         pass
 
     assert (b"authorization", expected) in captured[0].headers
+
+
+async def test_user_agent_defaults_to_the_library_identity() -> None:
+    captured: list[ClientRequest] = []
+
+    client = user_agent()(_capturing(captured))
+    async with request(client, "GET", "http://example.test/items"):
+        pass
+
+    assert (b"user-agent", USER_AGENT.encode()) in captured[0].headers
+
+
+def test_user_agent_constant_names_this_distribution_and_its_version() -> None:
+    assert f"without-http/{metadata.version('without-http')}" == USER_AGENT
+
+
+async def test_user_agent_joins_segments_with_spaces() -> None:
+    captured: list[ClientRequest] = []
+
+    client = user_agent("myapp/1.0", USER_AGENT)(_capturing(captured))
+    async with request(client, "GET", "http://example.test/items"):
+        pass
+
+    assert (b"user-agent", b"myapp/1.0 " + USER_AGENT.encode()) in captured[0].headers
+
+
+async def test_user_agent_sends_a_single_segment_verbatim() -> None:
+    captured: list[ClientRequest] = []
+
+    client = user_agent("myapp/1.0 (compatible; probe)")(_capturing(captured))
+    async with request(client, "GET", "http://example.test/items"):
+        pass
+
+    assert (b"user-agent", b"myapp/1.0 (compatible; probe)") in captured[0].headers
+
+
+def test_user_agent_rejects_a_non_ascii_segment() -> None:
+    with pytest.raises(UnicodeEncodeError):
+        user_agent("myapp/1.0£")
 
 
 @pytest.mark.parametrize("status", sorted(_REDIRECT_STATUSES))

@@ -1,4 +1,5 @@
 from without_http.client import DEFAULT_DECOMPRESSORS
+from without_http.client import USER_AGENT
 from without_http.client import Client
 from without_http.client import ClientMiddleware
 from without_http.client import ClientRequest
@@ -25,6 +26,7 @@ from without_http.client import gzip_compress
 from without_http.client import request
 from without_http.client import stack
 from without_http.client import tcp_connect
+from without_http.client import user_agent
 from without_http.client import wrap
 from without_http.client import zstd_compress
 from without_http.h2_wire import early_hint_headers
@@ -58,6 +60,7 @@ from without_http.ws_wire import ws_events_from_outbound
 __all__ = [
     "ALPN_PROTOCOLS",
     "DEFAULT_DECOMPRESSORS",
+    "USER_AGENT",
     "Client",
     "ClientMiddleware",
     "ClientRequest",
@@ -108,6 +111,7 @@ __all__ = [
     "stack",
     "tcp_connect",
     "tcp_keepalive",
+    "user_agent",
     "websocket_scope_from_request",
     "wrap",
     "ws_events_from_outbound",

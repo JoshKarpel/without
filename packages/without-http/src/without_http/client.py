@@ -22,6 +22,7 @@ from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
 from email.utils import parsedate_to_datetime
+from importlib import metadata
 from typing import NamedTuple
 from typing import Protocol
 from typing import Self
@@ -1471,6 +1472,33 @@ def bearer_auth(token: str, *, scheme: str = "Bearer") -> ClientMiddleware:
     """
     value = f"{scheme} {token}" if scheme else token
     return add_headers((b"authorization", value.encode(_ASCII)))
+
+
+# This library's own identity, `without-http/<version>`, read from the installed
+# distribution so it cannot drift. `user_agent()` sends it when given no segments;
+# pass it as a segment to join it with your own product token
+# (`user_agent("myapp/1.0", USER_AGENT)`).
+USER_AGENT = f"without-http/{metadata.version('without-http')}"
+
+
+def user_agent(*segments: str) -> ClientMiddleware:
+    """
+    Client middleware that sends a `user-agent` header on every request.
+
+    No user-agent is sent unless a caller composes this middleware (or writes the
+    header itself): requests say exactly what the caller said. Some peers refuse an
+    absent user-agent outright (the GitHub API 403s such requests), so this is the
+    first header most callers reach for.
+
+    `segments` are joined with single spaces, the separator RFC 9110 defines between
+    product tokens, so `user_agent("myapp/1.0", USER_AGENT)` sends
+    `myapp/1.0 without-http/<version>`. With no segments, the header is `USER_AGENT`
+    alone: the same library-identity default httpx, requests, aiohttp, and niquests
+    send, opted into rather than unbidden. The value encodes as ASCII, failing
+    loudly here rather than on the wire.
+    """
+    value = " ".join(segments) if segments else USER_AGENT
+    return add_headers((b"user-agent", value.encode(_ASCII)))
 
 
 def deadline(timeout: Timeout) -> ClientMiddleware:

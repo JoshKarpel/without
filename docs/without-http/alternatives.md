@@ -1,7 +1,7 @@
 # Alternatives
 
 This page is a feature-by-feature register of where `without-http` stands
-against the clients people actually reach for:
+against the clients people usually reach for:
 [httpx](https://www.python-httpx.org/), [aiohttp](https://docs.aiohttp.org/),
 and [niquests](https://github.com/jawah/niquests), and of the server against
 the ASGI servers: [uvicorn](https://github.com/encode/uvicorn),
@@ -130,9 +130,11 @@ Positions, not gaps, each with its cost named:
   friendlier one on day one.
 - **No headers sent unbidden.** No user-agent, no `accept-encoding`. Requests
   say exactly what the caller said; the cost is that peers which vary on
-  user-agent see an empty one until you add it. Composing the `decompress`
-  middleware is how a client opts into an `accept-encoding` offer, which is the
-  position holding, not an exception to it.
+  user-agent see an empty one until you add it, and some (the GitHub API)
+  refuse the request outright. Composing the `decompress` middleware is how a
+  client opts into an `accept-encoding` offer, and composing `user_agent()` is
+  how it opts into an identity (the library's own `without-http/<version>` when
+  given no segments), which is the position holding, not an exception to it.
 - **No retry middleware.** The mechanism for a safe caller-side retry ships;
   the policy stays with the caller. Errors are typed per phase
   (`ConnectTimeout` vs `ReadTimeout`, so a loop can retry a failed connect and
