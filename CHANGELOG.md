@@ -83,6 +83,13 @@
   the issue tracking them.
   It is a roadmap as much as a comparison, and it is what drove most of the additions above.
 
+### Fixed
+
+- **`without-http`**: the wheel now ships the `py.typed` marker, so installed copies are
+  type-checked instead of treated as untyped ([PEP 561](https://peps.python.org/pep-0561/)).
+  It was the one package in the workspace missing the marker; a pre-commit hook now
+  creates the marker for any package missing one.
+
 ## 0.0.3
 
 ### Added
