@@ -522,13 +522,31 @@ byte_counter = wrap(response=lambda r: ClientResponse(r.head, counting(r.body)))
 ```
 
 Auth is the canonical fixed-header case, so the two challenge-free schemes ship
-as one-liners over `add_headers`: `basic_auth(username, password)` sends RFC
-7617 `Basic` credentials (UTF-8, base64), and `bearer_auth(token)` sends
+as named middleware: `basic_auth(username, password)` sends RFC 7617 `Basic`
+credentials (UTF-8, base64), and `bearer_auth(token)` sends
 `authorization: Bearer <token>`. The scheme prefix is the part real APIs
 disagree on, so it is injectable: `bearer_auth(token, scheme="Token")` for the
 peers that spell it differently, or `scheme=""` to send the bare token.
 Digest, which answers a challenge, would be a looping middleware like
 `follow_redirects` and is not written.
+
+Both set a default rather than a policy: `authorization` is a singleton field
+under RFC 9110, so a request carrying its own keeps it and the middleware adds
+nothing. That is what makes a composed client usable for the odd call that
+authenticates as someone else, where `add_headers` would prepend a second
+`authorization` and leave the peer to pick.
+
+That split is the whole difference between the two header middlewares, and it
+follows the field rather than the caller's taste. `add_headers` copies its
+headers onto every request whatever it already carries, which is what a field
+that may repeat (`accept`, `via`, a trace header) wants. `default_headers`
+adds each header only to a request that omits it, which is what a field RFC 9110
+allows once (`authorization`, `user-agent`, an API key) wants, and it decides
+each header separately, so a request stating one default and not another gets
+exactly the one it left out. The auth and user-agent middlewares are
+`default_headers` underneath. Neither imposes: a caller that must not be
+overridden composes its own client instead of handing out one that can be, the
+same position `deadline` takes on a time budget.
 
 The other fixed header peers commonly gate on is the user-agent, which this
 client never sends unbidden, and which some peers (the GitHub API) refuse to
@@ -539,14 +557,20 @@ without asking; passing segments sends them joined with spaces, the separator
 RFC 9110 puts between product tokens, so `user_agent("myapp/1.0", USER_AGENT)`
 sends both identities and `user_agent("myapp/1.0")` sends exactly yours.
 `USER_AGENT` is public precisely so a caller can join it into their own value
-rather than choose between theirs and the library's.
+rather than choose between theirs and the library's. `user-agent` is a
+singleton field too, so this is a default in the same sense as the auth
+middlewares: a request carrying its own keeps it.
 
 Content codings are middleware too, one per direction. `decompress()` offers
 `accept-encoding: br, gzip, zstd` (a request carrying its own offer keeps it) and
 decodes an encoded response body through an incremental decoder as it streams,
 dropping the `content-encoding` and `content-length` that described the encoded bytes
 so the response stays self-consistent; an encoding it cannot decode passes through
-whole. It is composition rather than pool behavior, so the transport never silently
+whole. Both gzip and zstd define a body as a *series* of streams, so a decoder that
+reaches the end of one hands its leftover bytes to a fresh one: a concatenated body
+(a `cat a.gz b.gz` asset, bgzip output, a proxy that joins two responses) decodes
+whole rather than silently stopping at the first member, and the truncation check
+then covers the last stream as well as the first. It is composition rather than pool behavior, so the transport never silently
 rewrites bytes. `gzip_compress()`, `zstd_compress()`, and `brotli_compress()` encode
 request bodies the same streaming way; requests have no `accept-encoding`
 negotiation, so all are opt-in for the clients whose upstreams are known to decode

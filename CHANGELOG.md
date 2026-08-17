@@ -15,8 +15,10 @@
   (`decompress({**DEFAULT_DECOMPRESSORS, b"lzma": make_lzma})`) rather than a fork. The decoded
   response is self-consistent: `content-encoding` and `content-length` described the *encoded* body,
   so both leave the head instead of contradicting the bytes the stream now yields, an unknown or
-  stacked coding passes through whole, and a truncated compressed stream raises `ConnectionError`
-  rather than passing a prefix off as the whole body. This is also how the no-unbidden-headers
+  stacked coding passes through whole, a body that concatenates streams (multi-member gzip,
+  back-to-back zstd frames) decodes whole rather than stopping at the first, and a truncated
+  compressed stream raises `ConnectionError` rather than passing a prefix off as the whole body.
+  This is also how the no-unbidden-headers
   position holds rather than bends: composing the middleware is how a client opts into offering
   `accept-encoding` at all.
 - **`without-http`**: request compression, the same mechanism pointed the other way. `compressing`
@@ -24,15 +26,25 @@
   `zstd_compress`, and `brotli_compress` as the three that ship. Bodies compress as they stream, so
   a large upload is never buffered whole, and per-call composition means one client can send
   compressed to a peer that wants it and plain to one that does not.
-- **`without-http`**: `basic_auth(username, password)` and `bearer_auth(token)`. Both are
-  `add_headers` one-liners, which is the point: the challenge-free schemes need no new mechanism,
-  and naming them saves every caller from re-deriving the base64 and the scheme token. Digest is
-  deliberately still absent, because answering a challenge is a looping middleware rather than a
-  header.
+- **`without-http`**: `default_headers(*headers)`, the counterpart to `add_headers` for a field
+  RFC 9110 allows only once. `add_headers` copies its headers onto every request whatever it already
+  carries, which is right for a field that may repeat and wrong for `authorization` or `user-agent`,
+  where a second copy leaves the peer to resolve a duplicate the spec says cannot happen and the
+  per-request value silently loses. `default_headers` adds each header only where the request omits
+  it, deciding each one on its own. It is a default rather than a policy: the call site's value
+  wins, and a caller that must not be overridden composes its own client, the same position
+  `deadline` takes on a time budget.
+- **`without-http`**: `basic_auth(username, password)` and `bearer_auth(token)`. The challenge-free
+  schemes need no new mechanism, and naming them saves every caller from re-deriving the base64 and
+  the scheme token. Both are `default_headers` underneath, so a request carrying its own
+  `authorization` keeps it and one call can authenticate as someone else without composing a second
+  client. Digest is deliberately still absent, because answering a challenge is a looping middleware
+  rather than a header.
 - **`without-http`**: `user_agent(*segments)`, and `USER_AGENT` as the library's own
   `without-http/<version>` identity, which is what it sends when given no segments. Requests still
   say exactly what the caller said; this is how a caller opts into an identity for the peers that
-  vary on one (and the ones, like the GitHub API, that refuse a request without it).
+  vary on one (and the ones, like the GitHub API, that refuse a request without it). It is
+  `default_headers` underneath too: a request carrying its own `user-agent` keeps it.
 - **`without-http`**: Happy Eyeballs on by default, and resolution as an injectable step.
   `tcp_connect(resolve=..., happy_eyeballs_delay=...)` builds the pool's default `Connect`: it
   races address families per [RFC 8305](https://datatracker.ietf.org/doc/html/rfc8305) through
@@ -67,8 +79,11 @@
   `websocket.http.response` on WebSocket scopes, and `tls` on both over TLS. A third-party ASGI
   framework that checks the scope before using an extension, as the spec tells it to, now finds
   them, where before it correctly concluded there were none; a `without-asgi` app speaks the typed
-  vocabulary directly and never had to check. The in-memory `asgi_client` already advertised
-  `http.response.trailers`, so the wire scopes are what changed.
+  vocabulary directly and never had to check. An HTTP/1.0 request is the exception:
+  [RFC 8297 §2](https://datatracker.ietf.org/doc/html/rfc8297#section-2) forbids a `103` to a client
+  with no notion of an interim response, so early hints are withheld from that scope rather than
+  advertised for an app to send and mis-frame the exchange with. The in-memory `asgi_client` already
+  advertised `http.response.trailers`, so the wire scopes are what changed.
 - **`without-asgi`**: `form_content` and `multipart_content`, joining `json_content` as producers of
   the same `Content` value, plus `FilePart` and `StreamingContent`. A multipart body streams its
   file parts rather than buffering them, which is why it is a `StreamingContent`: the shape follows

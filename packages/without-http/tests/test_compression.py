@@ -219,6 +219,55 @@ async def test_decompress_decodes_a_body_streamed_across_chunks() -> None:
             assert await body.read() == payload
 
 
+async def test_decompress_decodes_concatenated_gzip_members_in_one_chunk() -> None:
+    members = gzip.compress(b"first member ") + gzip.compress(b"second member ") + gzip.compress(b"third member")
+    async with serving(encoded_app(b"gzip", (members,))) as server, ConnectionPool() as pool:
+        client = decompress()(pool)
+        async with request(client, "GET", f"http://{server.host}:{server.port}/zipped") as (_head, body):
+            assert await body.read() == b"first member second member third member"
+
+
+async def test_decompress_decodes_gzip_members_arriving_as_separate_chunks() -> None:
+    chunks = (gzip.compress(b"member on its own chunk, "), gzip.compress(b"and the next one"))
+    async with serving(encoded_app(b"gzip", chunks)) as server, ConnectionPool() as pool:
+        client = decompress()(pool)
+        async with request(client, "GET", f"http://{server.host}:{server.port}/zipped") as (_head, body):
+            assert await body.read() == b"member on its own chunk, and the next one"
+
+
+async def test_decompress_decodes_gzip_members_whose_boundaries_fall_mid_chunk() -> None:
+    members = gzip.compress(b"alpha ") + gzip.compress(b"beta ") + gzip.compress(b"gamma")
+    third = len(members) // 3
+    chunks = (members[:third], members[third : 2 * third], members[2 * third :])
+    async with serving(encoded_app(b"gzip", chunks)) as server, ConnectionPool() as pool:
+        client = decompress()(pool)
+        async with request(client, "GET", f"http://{server.host}:{server.port}/zipped") as (_head, body):
+            assert await body.read() == b"alpha beta gamma"
+
+
+async def test_decompress_decodes_concatenated_zstd_frames() -> None:
+    frames = zstd.compress(b"first frame ") + zstd.compress(b"second frame")
+    async with serving(encoded_app(b"zstd", (frames,))) as server, ConnectionPool() as pool:
+        client = decompress()(pool)
+        async with request(client, "GET", f"http://{server.host}:{server.port}/zipped") as (_head, body):
+            assert await body.read() == b"first frame second frame"
+
+
+async def test_decompress_raises_when_a_later_gzip_member_is_truncated() -> None:
+    trailing = gzip.compress(b"cut short " * 40)
+
+    def answer(_request: ClientRequest) -> ClientResponse:
+        async def events() -> AsyncGenerator[bytes | ResponseTrailers]:
+            yield gzip.compress(b"whole member ") + trailing[: len(trailing) // 2]
+
+        return ClientResponse(ResponseHead(200, ((b"content-encoding", b"gzip"),)), ResponseBody(events()))
+
+    client = decompress()(mock_client(answer))
+    with pytest.raises(ConnectionError, match="compressed stream"):
+        async with request(client, "GET", "http://mock.test/zipped") as (_head, body):
+            await body.read()
+
+
 async def test_decompress_sends_its_accept_encoding_offer() -> None:
     async with serving(report_app) as server, ConnectionPool() as pool:
         client = decompress()(pool)

@@ -1435,43 +1435,78 @@ def add_headers(*headers: tuple[bytes, bytes]) -> ClientMiddleware:
 
     The mirror of a server's request-decorating middleware: it sits in the same
     `stack` and rewrites the request before the inner client runs. This is how a
-    caller sends default headers (auth tokens, a user agent) on every request, or a
-    single request adds its own.
+    caller sends the same headers on every request, or a single request adds its own.
+
+    Every request gets a copy, whatever it already carries, which is what a field that
+    may appear more than once (`accept`, `via`, a custom trace header) wants.
+    `default_headers` is the counterpart for a field that may not.
     """
     extra: RawHeaders = tuple(headers)
     return wrap(request=lambda request: replace(request, headers=extra + request.headers))
+
+
+def default_headers(*headers: tuple[bytes, bytes]) -> ClientMiddleware:
+    """
+    Client middleware that adds each of `headers` to a request not already carrying it.
+
+    The shape a *default* takes for a field RFC 9110 allows only once
+    (`authorization`, `user-agent`, an API key): `add_headers` would prepend a second
+    copy, leaving the peer to resolve a duplicate the spec says cannot happen, so the
+    per-request value the caller wrote to override the default is the one that silently
+    loses. Each header is decided on its own, so a request stating one default and not
+    another gets exactly the one it omitted.
+
+    This is a default, not a policy: the request's own value wins. A caller that must
+    not be overridden composes its own client rather than handing out one that can be,
+    the same position `deadline` takes on a time budget.
+    """
+    defaults: RawHeaders = tuple(headers)
+
+    def apply(request: ClientRequest) -> ClientRequest:
+        missing = tuple((name, value) for name, value in defaults if not _has(request.headers, name))
+        if not missing:
+            return request
+        return replace(request, headers=missing + request.headers)
+
+    return wrap(request=apply)
 
 
 def basic_auth(username: str, password: str) -> ClientMiddleware:
     """
     Client middleware that sends `Basic` authorization (RFC 7617) on every request.
 
-    A one-liner over `add_headers`: the credentials are fixed at composition, base64 of
-    `username:password` encoded as UTF-8 (the charset RFC 7617 names and servers expect
-    today). A colon in `username` is refused with `ValueError` rather than encoded: the
-    receiver splits the decoded pair at the *first* colon, so the colon would silently
-    move characters from the username into the password.
+    The credentials are fixed at composition, base64 of `username:password` encoded as
+    UTF-8 (the charset RFC 7617 names and servers expect today). A colon in `username`
+    is refused with `ValueError` rather than encoded: the receiver splits the decoded
+    pair at the *first* colon, so the colon would silently move characters from the
+    username into the password.
+
+    This is a default rather than a policy: a request carrying its own `authorization`
+    keeps it, so one call can authenticate as someone else without composing a second
+    client.
     """
     if ":" in username:
         raise ValueError(f"a Basic auth username cannot contain a colon, got {username!r}")
     credentials = b64encode(f"{username}:{password}".encode())
-    return add_headers((b"authorization", b"Basic " + credentials))
+    return default_headers((b"authorization", b"Basic " + credentials))
 
 
 def bearer_auth(token: str, *, scheme: str = "Bearer") -> ClientMiddleware:
     """
     Client middleware that sends bearer-style authorization on every request.
 
-    A one-liner over `add_headers`: `authorization: Bearer <token>` (RFC 6750) by
-    default. The `scheme` prefix is the part real APIs disagree on, so it is
-    injectable: pass the spelling the peer demands (`scheme="Token"`,
-    `scheme="token"`), or `scheme=""` to send the bare token with no prefix at all.
-    The header encodes as ASCII, which is the charset both the scheme and a bearer
-    token are allowed, so a stray non-ASCII byte fails loudly here rather than on
-    the wire.
+    Sends `authorization: Bearer <token>` (RFC 6750) by default. The `scheme` prefix is
+    the part real APIs disagree on, so it is injectable: pass the spelling the peer
+    demands (`scheme="Token"`, `scheme="token"`), or `scheme=""` to send the bare token
+    with no prefix at all. The header encodes as ASCII, which is the charset both the
+    scheme and a bearer token are allowed, so a stray non-ASCII byte fails loudly here
+    rather than on the wire.
+
+    Like `basic_auth`, this is a default: a request carrying its own `authorization`
+    keeps it.
     """
     value = f"{scheme} {token}" if scheme else token
-    return add_headers((b"authorization", value.encode(_ASCII)))
+    return default_headers((b"authorization", value.encode(_ASCII)))
 
 
 # This library's own identity, `without-http/<version>`, read from the installed
@@ -1495,10 +1530,11 @@ def user_agent(*segments: str) -> ClientMiddleware:
     `myapp/1.0 without-http/<version>`. With no segments, the header is `USER_AGENT`
     alone: the same library-identity default httpx, requests, aiohttp, and niquests
     send, opted into rather than unbidden. The value encodes as ASCII, failing
-    loudly here rather than on the wire.
+    loudly here rather than on the wire. A request carrying its own `user-agent` keeps
+    it: `user-agent` is a singleton field, so this is a default, not a policy.
     """
     value = " ".join(segments) if segments else USER_AGENT
-    return add_headers((b"user-agent", value.encode(_ASCII)))
+    return default_headers((b"user-agent", value.encode(_ASCII)))
 
 
 def deadline(timeout: Timeout) -> ClientMiddleware:
@@ -1523,7 +1559,7 @@ def deadline(timeout: Timeout) -> ClientMiddleware:
 
 
 _SENSITIVE_REDIRECT_HEADERS = frozenset({b"authorization", b"cookie", b"proxy-authorization"})
-_BODY_FRAMING_HEADERS = frozenset({b"content-length", b"content-type", b"transfer-encoding"})
+_BODY_FRAMING_HEADERS = frozenset({b"content-encoding", b"content-length", b"content-type", b"transfer-encoding"})
 
 
 def _strip_headers(headers: RawHeaders, drop: frozenset[bytes]) -> RawHeaders:
@@ -1717,13 +1753,16 @@ class Decompressor(Protocol):
     """
     The incremental decoder shape `decompress` drives: feed encoded chunks through
     `decompress`, with `eof` reporting whether a complete compressed stream has been
-    seen (the truncation check relies on it). `zlib.decompressobj` and
-    `zstd.ZstdDecompressor` satisfy it as-is; a third-party codec plugs in with a
+    seen (the truncation check relies on it) and `unused_data` holding the bytes that
+    followed it (the next stream, for a coding that concatenates). `zlib.decompressobj`
+    and `zstd.ZstdDecompressor` satisfy it as-is; a third-party codec plugs in with a
     thin adapter (e.g. mapping brotli's `is_finished()` to `eof`).
     """
 
     @property
     def eof(self) -> bool: ...
+    @property
+    def unused_data(self) -> bytes: ...
     def decompress(self, data: bytes, /) -> bytes: ...
 
 
@@ -1748,6 +1787,12 @@ class _BrotliDecompressor:
     def eof(self) -> bool:
         return self._raw.is_finished()
 
+    @property
+    def unused_data(self) -> bytes:
+        # `br` has no concatenation convention and the bindings hold nothing back: bytes
+        # after a finished stream make `process` raise rather than accumulate.
+        return b""
+
     def decompress(self, data: bytes, /) -> bytes:
         return self._raw.process(data)
 
@@ -1768,8 +1813,9 @@ _CONTENT_CODING_HEADERS = frozenset({b"content-encoding", b"content-length"})
 
 
 async def _decompressed(
-    events: AsyncIterator[bytes | ResponseTrailers], decompressor: Decompressor
+    events: AsyncIterator[bytes | ResponseTrailers], make_decompressor: Callable[[], Decompressor]
 ) -> AsyncGenerator[bytes | ResponseTrailers]:
+    decompressor = make_decompressor()
     saw_compressed_bytes = False
     async for item in events:
         if not isinstance(item, bytes):
@@ -1777,8 +1823,18 @@ async def _decompressed(
             continue
         if item:
             saw_compressed_bytes = True
-        if decoded := decompressor.decompress(item):
-            yield decoded
+        pending = item
+        while pending:
+            if decoded := decompressor.decompress(pending):
+                yield decoded
+            # RFC 1952 §2.2: a gzip body is a *series* of members, and zstd frames
+            # concatenate the same way, so a decoder that reaches the end of one holds
+            # back whatever followed it. Those bytes begin the next stream, which a
+            # fresh decoder takes; leaving them would drop the rest of the body. A
+            # decoder still mid-stream holds nothing back, so the loop runs once.
+            pending = decompressor.unused_data if decompressor.eof else b""
+            if pending:
+                decompressor = make_decompressor()
     # An empty body under a `content-encoding` head (a HEAD response, a 304) is fine;
     # a *partial* compressed stream inside a cleanly-ended body is not. Decompression
     # discards the transfer's own length signal, so this check is what stands in for it.
@@ -1814,7 +1870,10 @@ def decompress(
     head and body untouched.
 
     A truncated compressed stream raises `ConnectionError` rather than passing off a
-    prefix as the whole body, and corrupt bytes raise the codec's own error.
+    prefix as the whole body, and corrupt bytes raise the codec's own error. A body
+    that concatenates streams (multi-member gzip, back-to-back zstd frames, both of
+    which the formats define and origins do serve) decodes whole: each decoder that
+    ends hands its leftover bytes to a fresh one.
     """
     table = {name.lower(): make_decompressor for name, make_decompressor in decompressors.items()}
     offer = b", ".join(sorted(table))
@@ -1837,7 +1896,7 @@ def decompress(
 
             return ClientResponse(
                 ResponseHead(response.head.status, _strip_headers(response.head.headers, _CONTENT_CODING_HEADERS)),
-                ResponseBody(await _releasing(_decompressed(response.body.events(), make_decompressor()), release)),
+                ResponseBody(await _releasing(_decompressed(response.body.events(), make_decompressor), release)),
             )
 
         return exchange

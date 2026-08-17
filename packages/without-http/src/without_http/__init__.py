@@ -21,6 +21,7 @@ from without_http.client import compressing
 from without_http.client import cookies
 from without_http.client import deadline
 from without_http.client import decompress
+from without_http.client import default_headers
 from without_http.client import follow_redirects
 from without_http.client import gzip_compress
 from without_http.client import request
@@ -94,6 +95,7 @@ __all__ = [
     "cookies",
     "deadline",
     "decompress",
+    "default_headers",
     "distinguished_name",
     "early_hint_headers",
     "extensions_with_tls",

@@ -107,7 +107,7 @@ worth being specific:
 
 | Gap | The shape it takes |
 |---|---|
-| Digest auth ([#74](https://github.com/JoshKarpel/without/issues/74)) | A looping middleware with the same shape as `follow_redirects`, since Digest answers a challenge. The challenge-free schemes (`basic_auth`, `bearer_auth`) are `add_headers` one-liners and ship. |
+| Digest auth ([#74](https://github.com/JoshKarpel/without/issues/74)) | A looping middleware with the same shape as `follow_redirects`, since Digest answers a challenge. The challenge-free schemes (`basic_auth`, `bearer_auth`) need no loop and ship. |
 | Proxies ([#73](https://github.com/JoshKarpel/without/issues/73)), Unix sockets ([#72](https://github.com/JoshKarpel/without/issues/72)), local address | `Connect` implementations. The pool takes `Connect` at construction; none of these are written, but none needs a new interface (`tcp_connect` is the shape, already shipped). The proxy case has one edge that is *not* a `Connect`: a cleartext forward proxy wants the absolute URI in the request line, and the pool derives that target from the URL, so only the `CONNECT` tunnel fits the seam. |
 | DNS caching ([#75](https://github.com/JoshKarpel/without/issues/75)) | A `Resolve` wrapper owning the cache, injected as `tcp_connect(resolve=...)`, so resolution policy stays with the caller instead of inside the pool. The interface ships; the cache does not, because `getaddrinfo` hides record TTLs, making any staleness bound the caller's policy to choose. |
 | Server-sent events ([#71](https://github.com/JoshKarpel/without/issues/71)) | A parser from a byte stream to typed events that composes over any response body, and the encoder that is its mirror on the app side. It needs nothing from the client, so it may not even live in this package. |
@@ -213,7 +213,11 @@ connection is over TLS, and the in-memory `asgi_client` adds
 `http.response.trailers`, the one extension memory can honor that the
 wire cannot), so a third-party ASGI framework that checks the scope before
 using an extension, as the spec tells it to, finds them; a `without-asgi` app
-can speak the typed vocabulary directly without checking. Second, the `no`
+can speak the typed vocabulary directly without checking. Advertising follows
+what the *request* can use, not just what the wire layer can render: an
+HTTP/1.0 request gets no `http.response.early_hint`, since
+[RFC 8297](https://datatracker.ietf.org/doc/html/rfc8297#section-2) forbids a
+`103` to a client that would read it as the final response. Second, the `no`
 cells are loud rather than silent: `without-asgi` types every one of these
 messages, and the wire layers raise `NotImplementedError` on the unsupported
 ones instead of dropping them.

@@ -56,6 +56,21 @@ def test_scope_from_request_advertises_early_hints_and_no_offload_extensions() -
     assert extension(scope.extensions, "http.response.trailers") is None
 
 
+def test_scope_from_request_withholds_early_hints_from_an_http_1_0_client() -> None:
+    request = h11.Request(method="GET", target="/items", headers=[("host", "t")], http_version="1.0")
+
+    scope = scope_from_request(
+        request,
+        scheme="http",
+        server=None,
+        client=None,
+        extensions={"http.response.early_hint": {}, "tls": {"cipher_suite": 4867}},
+    )
+
+    assert extension(scope.extensions, "http.response.early_hint") is None
+    assert extension(scope.extensions, "tls") == {"cipher_suite": 4867}
+
+
 @pytest.mark.parametrize(
     ("event", "expected"),
     [

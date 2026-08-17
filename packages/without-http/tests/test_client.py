@@ -24,6 +24,7 @@ from without_asgi import json_content
 from without_asgi import parse_http_scope
 from without_http import USER_AGENT
 from without_http import Client
+from without_http import ClientMiddleware
 from without_http import ClientRequest
 from without_http import ClientResponse
 from without_http import ConnectionPool
@@ -36,6 +37,7 @@ from without_http import add_headers
 from without_http import basic_auth
 from without_http import bearer_auth
 from without_http import cookies
+from without_http import default_headers
 from without_http import follow_redirects
 from without_http import request
 from without_http import serving
@@ -257,6 +259,47 @@ async def test_user_agent_sends_a_single_segment_verbatim() -> None:
 def test_user_agent_rejects_a_non_ascii_segment() -> None:
     with pytest.raises(UnicodeEncodeError):
         user_agent("myapp/1.0£")
+
+
+@pytest.mark.parametrize(
+    ("middleware", "name", "own"),
+    [
+        (basic_auth("Aladdin", "open sesame"), b"authorization", b"Bearer per-request-token"),
+        (bearer_auth("default-token"), b"authorization", b"Basic cGVyOnJlcXVlc3Q="),
+        (user_agent("default/1.0"), b"user-agent", b"per-request/2.0"),
+    ],
+)
+async def test_a_default_header_middleware_leaves_a_requests_own_value_alone(
+    middleware: ClientMiddleware, name: bytes, own: bytes
+) -> None:
+    captured: list[ClientRequest] = []
+
+    client = middleware(_capturing(captured))
+    async with request(client, "GET", "http://example.test/items", headers=((name, own),)):
+        pass
+
+    assert captured[0].headers == ((name, own),)
+
+
+async def test_default_headers_supplies_every_header_a_request_omits() -> None:
+    captured: list[ClientRequest] = []
+
+    client = default_headers((b"x-api-key", b"key-abc"), (b"from", b"ops@example.test"))(_capturing(captured))
+    async with request(client, "GET", "http://example.test/items"):
+        pass
+
+    assert captured[0].headers == ((b"x-api-key", b"key-abc"), (b"from", b"ops@example.test"))
+
+
+async def test_default_headers_decides_each_header_on_its_own() -> None:
+    captured: list[ClientRequest] = []
+
+    client = default_headers((b"x-api-key", b"key-abc"), (b"from", b"ops@example.test"))(_capturing(captured))
+    url = "http://example.test/items"
+    async with request(client, "GET", url, headers=((b"X-API-Key", b"key-from-the-call-site"),)):
+        pass
+
+    assert captured[0].headers == ((b"from", b"ops@example.test"), (b"X-API-Key", b"key-from-the-call-site"))
 
 
 @pytest.mark.parametrize("status", sorted(_REDIRECT_STATUSES))
@@ -717,7 +760,11 @@ async def test_follow_redirects_downgrades_a_303_to_a_bodyless_get() -> None:
     request = ClientRequest(
         method="POST",
         url="https://api.victim.test/submit",
-        headers=((b"content-type", b"application/json"), (b"content-length", b"9")),
+        headers=(
+            (b"content-type", b"application/json"),
+            (b"content-length", b"9"),
+            (b"content-encoding", b"gzip"),
+        ),
     )
     await exchange(request)
 
