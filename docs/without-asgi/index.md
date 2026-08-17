@@ -124,8 +124,23 @@ from without_asgi import Response, json_content
 Response.from_content(201, json_content(todo))
 ```
 
-`json_content(payload, *, dumps=...)` is one producer of a `Content`; a form, text, or
-msgpack encoder is another, with equal standing. The *encoder* stays an argument, so an
+Three producers ship, each an encoding both sides of the stack kept re-deriving;
+a text or msgpack encoder would be another, with equal standing:
+
+- `json_content(payload, *, dumps=...)` encodes JSON.
+- `form_content(fields)` encodes `application/x-www-form-urlencoded`, the shape
+  HTML forms POST and OAuth2 token endpoints require. A mapping carries one value
+  per name; pass pairs when a name repeats.
+- `multipart_content(fields, files, *, boundary=None)` encodes
+  `multipart/form-data` (RFC 7578), the shape file-upload APIs take: each field a
+  text part, each `FilePart(name, filename, body, content_type)` a file part with
+  its own type, the boundary named in the `content-type` that travels with the
+  chunks. It produces a `StreamingContent` (below), so a `FilePart` whose body is
+  a `Stream[bytes]` is re-yielded chunk by chunk and a large upload is never held
+  whole. The boundary defaults to a random token; inject one for a
+  byte-reproducible body.
+
+For `json_content`, the *encoder* stays an argument, so an
 app that needs sorted keys, a faster library, or one that knows its domain types passes
 its own and changes nothing else:
 
@@ -150,6 +165,16 @@ JSON body says so there rather than rebuilding the body. The same value is what
 `without-http`'s client takes as a request body (`request(client, "POST", url,
 body=json_content(order))`), which is the point of it living here rather than in either
 package above.
+
+A `Content` is buffered by design: a value the caller holds whole, which is what
+makes it replayable and freely shareable. Its one-shot sibling `StreamingContent`
+carries the same headers-with-body pairing around a `Stream[bytes]`, for a body
+produced as chunks; `without-http`'s `request` takes either at `body=`, framing a
+buffered body with a `content-length` and a streaming one as chunked. The two
+collapse in one direction: `await streaming.buffered()` consumes the chunks into
+the `Content` they would have been, the request-side mirror of reading a response
+body whole. Producers ship stream-first where size is unbounded (multipart), and
+buffering stays a one-call convenience.
 
 ## Streaming a file
 

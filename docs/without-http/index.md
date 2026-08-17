@@ -180,7 +180,12 @@ async with request(client, "POST", url, body=json_content(order)) as (head, body
 ```
 
 An explicit `headers=` wins over what the content described, so overriding the
-`content-type` does not mean rebuilding the body.
+`content-type` does not mean rebuilding the body. `form_content` (URL-encoded
+forms, the shape OAuth2 token endpoints take) is the other buffered producer, and
+`multipart_content` (RFC 7578 file uploads) produces the streaming sibling
+`StreamingContent`, whose chunks ride `body=` with their describing headers the
+same way; `await ...buffered()` collapses one into a `Content` when a replayable
+body with a `content-length` matters more than streaming.
 
 ```python
 async def upload() -> AsyncIterator[bytes]:

@@ -43,6 +43,7 @@ from without import cancel_futures
 from without import stack
 from without_asgi import Content
 from without_asgi import RawHeaders
+from without_asgi import StreamingContent
 from without_asgi.headers import merge
 
 from without_http.h2_wire import request_headers
@@ -301,7 +302,11 @@ def _target(parts: SplitResult) -> str:
 
 
 def _build_request(
-    method: str, url: str, headers: RawHeaders, content: bytes | Stream[bytes] | Content, timeout: Timeout
+    method: str,
+    url: str,
+    headers: RawHeaders,
+    content: bytes | Stream[bytes] | Content | StreamingContent,
+    timeout: Timeout,
 ) -> ClientRequest:
     """
     Assemble a `ClientRequest`, picking the body framing from `content`.
@@ -310,11 +315,12 @@ def _build_request(
     gets `transfer-encoding: chunked` (HTTP/1.1 frames it as chunks; over HTTP/2 the
     framing headers are dropped and the body rides DATA frames either way).
 
-    A `Content` is bytes that already know what they are, so its headers go *under* the
-    caller's: an explicit `content-type` on the request wins over the one the encoding
-    supplied, and everything after this point sees plain bytes.
+    A `Content` or `StreamingContent` is a body that already knows what it is, so its
+    headers go *under* the caller's: an explicit `content-type` on the request wins
+    over the one the encoding supplied, and everything after this point sees a plain
+    body.
     """
-    if isinstance(content, Content):
+    if isinstance(content, Content | StreamingContent):
         headers = merge(content.headers, headers)
         content = content.body
     if isinstance(content, bytes):
@@ -1347,7 +1353,7 @@ async def request(
     url: str,
     *,
     headers: RawHeaders = (),
-    body: bytes | Stream[bytes] | Content = b"",
+    body: bytes | Stream[bytes] | Content | StreamingContent = b"",
     timeout: Timeout = _NO_TIMEOUT,
 ) -> AsyncIterator[ClientResponse]:
     """
@@ -1360,9 +1366,10 @@ async def request(
     `transfer-encoding: chunked`) and closing the response body on the way out, so a
     connection is never stranded by a body nobody read.
 
-    `body` takes bytes, a `Stream[bytes]` to stream them, or a `Content` when the caller
-    holds a *value* rather than bytes: `body=json_content(order)` sends the encoding and
-    the `content-type` describing it together, since neither is any use without the other.
+    `body` takes bytes, a `Stream[bytes]` to stream them, or a `Content` /
+    `StreamingContent` when the caller holds an *encoding* rather than bare bytes:
+    `body=json_content(order)` or `body=multipart_content(...)` sends the body and the
+    `content-type` describing it together, since neither is any use without the other.
 
     The yielded `ClientResponse` can be taken whole (`response.head`, `response.body`) or
     unpacked (`head, body = ...`); read the response body with `async for chunk in body`

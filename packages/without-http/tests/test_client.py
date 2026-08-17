@@ -18,6 +18,7 @@ from without_asgi import RawHeaders
 from without_asgi import RawScope
 from without_asgi import Receive
 from without_asgi import Send
+from without_asgi import StreamingContent
 from without_asgi import json_content
 from without_asgi import parse_http_scope
 from without_http import Client
@@ -800,6 +801,27 @@ async def test_a_content_body_reaches_the_server_as_bytes_and_a_content_type() -
         url = f"http://{server.host}:{server.port}/submit"
         async with request(pool, "POST", url, body=json_content({"n": 1})) as (_head, body):
             assert await body.read() == b'POST /submit test= body={"n": 1}'
+
+
+async def test_build_request_takes_a_streaming_contents_headers_and_chunks() -> None:
+    content = StreamingContent(_chunks(b"ab", b"cd"), ((b"content-type", b"multipart/form-data; boundary=bb"),))
+
+    outgoing = _build_request("POST", "http://h/x", ((b"x-trace", b"t-1"),), content, Timeout())
+
+    assert outgoing.headers == (
+        (b"content-type", b"multipart/form-data; boundary=bb"),
+        (b"x-trace", b"t-1"),
+        (b"transfer-encoding", b"chunked"),
+    )
+    assert [chunk async for chunk in outgoing.body] == [b"ab", b"cd"]
+
+
+async def test_a_streaming_content_body_reaches_the_server_with_its_headers() -> None:
+    async with serving(echo_app) as server, ConnectionPool() as pool:
+        url = f"http://{server.host}:{server.port}/submit"
+        content = StreamingContent(_chunks(b"part one ", b"part two"), ((b"x-test", b"paired"),))
+        async with request(pool, "POST", url, body=content) as (_head, body):
+            assert await body.read() == b"POST /submit test=paired body=part one part two"
 
 
 def test_build_request_carries_the_timeout_onto_the_request() -> None:

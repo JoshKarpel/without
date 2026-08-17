@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 
 import pytest
 from without_asgi import Content
 from without_asgi import EarlyHint
+from without_asgi import FilePart
 from without_asgi import LifespanReply
 from without_asgi import Outbound
 from without_asgi import PathSend
@@ -33,7 +35,9 @@ from without_asgi import encode_lifespan_reply
 from without_asgi import encode_outbound
 from without_asgi import encode_response
 from without_asgi import encode_websocket_outbound
+from without_asgi import form_content
 from without_asgi import json_content
+from without_asgi import multipart_content
 from without_asgi import parse_lifespan_reply
 from without_asgi import parse_outbound
 from without_asgi import parse_websocket_outbound
@@ -99,6 +103,100 @@ def test_json_content_refuses_a_payload_that_is_not_json() -> None:
     # than at whoever reads the response.
     with pytest.raises(ValueError, match="Out of range float"):
         json_content({"ratio": float("nan")})
+
+
+def test_form_content_pairs_the_encoding_with_the_content_type() -> None:
+    content = form_content({"grant_type": "client_credentials", "scope": "read write"})
+
+    assert content == Content(
+        b"grant_type=client_credentials&scope=read+write",
+        ((b"content-type", b"application/x-www-form-urlencoded"),),
+    )
+
+
+def test_form_content_takes_pairs_when_a_name_repeats() -> None:
+    content = form_content([("tag", "alpha"), ("tag", "beta")])
+
+    assert content.body == b"tag=alpha&tag=beta"
+
+
+def test_form_content_percent_encodes_utf8() -> None:
+    content = form_content({"name": "café"})
+
+    assert content.body == b"name=caf%C3%A9"
+
+
+async def test_multipart_content_frames_fields_and_files_with_the_boundary() -> None:
+    content = multipart_content(
+        {"purpose": "assistants"},
+        [FilePart(name="upload", filename="notes.txt", body=b"line one", content_type=b"text/plain")],
+        boundary=b"fixedboundary",
+    )
+
+    assert await content.buffered() == Content(
+        b"--fixedboundary\r\n"
+        b'content-disposition: form-data; name="purpose"\r\n'
+        b"\r\n"
+        b"assistants\r\n"
+        b"--fixedboundary\r\n"
+        b'content-disposition: form-data; name="upload"; filename="notes.txt"\r\n'
+        b"content-type: text/plain\r\n"
+        b"\r\n"
+        b"line one\r\n"
+        b"--fixedboundary--\r\n",
+        ((b"content-type", b"multipart/form-data; boundary=fixedboundary"),),
+    )
+
+
+async def test_multipart_content_streams_a_file_part_between_its_framing() -> None:
+    async def file_chunks() -> AsyncIterator[bytes]:
+        yield b"first chunk "
+        yield b"second chunk"
+
+    content = multipart_content(
+        files=[FilePart(name="upload", filename="big.bin", body=file_chunks())],
+        boundary=b"bb",
+    )
+
+    assert (await content.buffered()).body == (
+        b"--bb\r\n"
+        b'content-disposition: form-data; name="upload"; filename="big.bin"\r\n'
+        b"content-type: application/octet-stream\r\n"
+        b"\r\n"
+        b"first chunk second chunk\r\n"
+        b"--bb--\r\n"
+    )
+
+
+async def test_multipart_content_defaults_a_file_part_to_octet_stream() -> None:
+    content = multipart_content(files=[FilePart(name="blob", filename="a.bin", body=b"\x01")], boundary=b"bb")
+
+    assert b"content-type: application/octet-stream\r\n" in (await content.buffered()).body
+
+
+async def test_multipart_content_generates_a_boundary_named_in_the_content_type() -> None:
+    content = multipart_content({"field": "value"})
+
+    ((_, content_type),) = content.headers
+    boundary = content_type.removeprefix(b"multipart/form-data; boundary=")
+    assert boundary
+    body = (await content.buffered()).body
+    assert body.startswith(b"--" + boundary + b"\r\n")
+    assert body.endswith(b"--" + boundary + b"--\r\n")
+    ((_, second_content_type),) = multipart_content({"field": "value"}).headers
+    assert boundary != second_content_type.removeprefix(b"multipart/form-data; boundary=")
+
+
+async def test_multipart_content_escapes_quotes_and_newlines_in_names() -> None:
+    content = multipart_content(
+        {'na"me': "value"},
+        [FilePart(name="file", filename='evil"\r\n.txt', body=b"x")],
+        boundary=b"bb",
+    )
+
+    body = (await content.buffered()).body
+    assert b'name="na%22me"' in body
+    assert b'filename="evil%22%0D%0A.txt"' in body
 
 
 def test_response_from_content_carries_the_body_and_its_headers() -> None:

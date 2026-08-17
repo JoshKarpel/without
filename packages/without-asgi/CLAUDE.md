@@ -64,9 +64,9 @@ needs, and in the package that owns the exchange shape it wraps.**
   OpenAPI-aware pieces. Only that layer can see route metadata.
 - **`without-http`** holds the **client** middleware, since a `Client`
   (`ClientRequest -> ClientResponse`) is a `Processor` too and lives there
-  (`add_headers`, `follow_redirects`, `cookies` over a caller-owned `CookieJar`,
-  the content codings `decompress` / `gzip_compress` / `zstd_compress` /
-  `brotli_compress`, and future retry / auth). Its server side keeps only the
+  (`add_headers`, `basic_auth` / `bearer_auth`, `follow_redirects`, `cookies`
+  over a caller-owned `CookieJar`, and the content codings `decompress` /
+  `gzip_compress` / `zstd_compress` / `brotli_compress`). Its server side keeps only the
   concerns that **cannot** be
   middleware because they run below the app: the wire protocols and TLS. (It used to
   also own a connection-admission cap; that was dropped in favour of the kernel
