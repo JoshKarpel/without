@@ -97,19 +97,21 @@ testpaths = ["packages/**/tests"]
 # replies) fails loudly instead of hanging the suite. `thread` works without
 # signals, so it is xdist-safe.
 #
-# The bound is deliberately tight. A deadlock is the *expected* way to fail here, so
-# the budget is what waiting on one costs, and a mutation run stalls the scheduler on
-# purpose over and over: the without-dag run spent longer waiting out a 30-second
-# budget than running every other mutant. Five seconds is roughly five times the
-# slowest test in the suite (`just durations` reports it: one that waits a deliberate
-# one-second `wait_for` to prove a socket buffer fills) and sixteen times the next.
-# Raise it per-test with `@pytest.mark.timeout(...)` rather than globally.
+# The bound stays tight. A deadlock is the *expected* way to fail here, so the budget
+# is what waiting on one costs, and a mutation run stalls the scheduler on purpose over
+# and over: the without-dag run spent longer waiting out a 30-second budget than running
+# every other mutant. Ten seconds is ten times the slowest test in the suite
+# (`just durations` reports it: one that waits a deliberate one-second `wait_for` to
+# prove a socket buffer fills), which leaves the headroom a loaded CI runner needs: the
+# budget covers setup and teardown as well as the call, so a session fixture's first use
+# (issuing the test CA's certificates) is charged to whichever test happens to draw it.
+# Raise it further per-test with `@pytest.mark.timeout(...)` rather than globally.
 #
 # A `@given` test is exempt, and `packages/conftest.py` exempts every one of them rather
 # than leaving it to a mark per test: a property test's duration is the example count
 # times the body, so a bound on it measures how fast the machine is rather than the
 # deadlock this bound is for. Hypothesis's own per-example `deadline` covers that.
-timeout = 5
+timeout = 10
 timeout_method = "thread"
 
 markers = [
