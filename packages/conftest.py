@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import gc
 import sys
 from collections.abc import Callable
 
@@ -32,20 +31,6 @@ if sys.platform != "win32":  # pragma: no cover
 
 def pytest_asyncio_loop_factories() -> dict[str, LoopFactory]:
     return _LOOP_FACTORIES
-
-
-def pytest_runtest_teardown() -> None:
-    # A leaked socket or transport is only reported when its deallocator runs, and a
-    # transport sits in a reference cycle with its protocol, so refcounting never frees
-    # it: the `ResourceWarning` waits for a collection and lands on whichever test the
-    # collector happened to interrupt, often in another file entirely. Collecting here
-    # pins it to the test that leaked. pytest's own unraisable plugin drains the queue
-    # `trylast` in this same phase, so what this frees is reported against this test.
-    #
-    # Generation 1, not a full collection: an object abandoned by the test that just ran
-    # has survived at most a couple of collections, so it is young, and asking for every
-    # generation costs the suite about 2.5x while this costs nothing measurable.
-    gc.collect(1)
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
