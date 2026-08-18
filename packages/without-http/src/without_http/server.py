@@ -105,6 +105,7 @@ class _Limits:
     # They differ because the two bounds are not the same measurement (see `serving`).
     max_incomplete_event_bytes: int = 16 * 1024
     max_header_list_bytes: int = 64 * 1024
+    close_timeout: timedelta = timedelta(seconds=5)
 
 
 _DEFAULT_LIMITS = _Limits()
@@ -494,7 +495,16 @@ async def _serve_connection(
     finally:
         with suppress(OSError):
             writer.close()
-            await writer.wait_closed()
+            # `close()` hands the socket back only once the write buffer drains, and a peer
+            # that has stopped reading never lets it: asyncio holds `connection_lost`, and
+            # with it the fd, until those bytes leave. So the wait is bounded and followed
+            # by an abort, which releases the socket whether or not the peer took delivery.
+            # Without the bound a shutdown waits on that peer forever; without the abort
+            # the transport keeps the fd until the process ends.
+            with suppress(TimeoutError):
+                async with timeout(limits.close_timeout):
+                    await writer.wait_closed()
+            writer.transport.abort()
 
 
 async def _serve_h11_connection(
@@ -902,6 +912,7 @@ async def serving(
     max_websocket_message_bytes: int | None = _DEFAULT_LIMITS.max_websocket_message_bytes,
     max_incomplete_event_bytes: int = _DEFAULT_LIMITS.max_incomplete_event_bytes,
     max_header_list_bytes: int = _DEFAULT_LIMITS.max_header_list_bytes,
+    close_timeout: timedelta = _DEFAULT_LIMITS.close_timeout,
     ssl_context: ssl.SSLContext | None = None,
     ssl_handshake_timeout: float | None = None,
     ssl_shutdown_timeout: float | None = None,
@@ -936,7 +947,7 @@ async def serving(
     failures (pausing for `ACCEPT_RETRY_DELAY` on resource exhaustion) and binds every
     address `host` resolves to.
 
-    Six per-connection resource bounds harden a public deployment. `idle_timeout`
+    Seven per-connection resource bounds harden a public deployment. `idle_timeout`
     (a `timedelta`, off by default) closes a connection whose peer stops sending data
     mid-exchange, defeating a slowloris; it also bounds an idle WebSocket. Over HTTP/2,
     `max_concurrent_streams` is advertised as `MAX_CONCURRENT_STREAMS` and
@@ -954,6 +965,14 @@ async def serving(
     what makes it a defense against an hpack bomb. Each defaults to its protocol
     library's own default (16 KiB and 64 KiB), so the numbers differ; raise them
     together if your peers send large headers.
+
+    `close_timeout` (5 seconds) bounds the other end of a connection's life: how long a
+    closing connection waits for a response it has already queued to reach the peer.
+    Asyncio hands the socket back only once that buffer drains, so a peer that stops
+    reading would otherwise hold the file descriptor, and hold a shutdown, indefinitely;
+    past the bound the connection is aborted and the peer loses whatever was still in
+    flight. Raise it for large responses to slow clients, lower it for a tighter
+    shutdown.
 
     Tune all of these at your composition root, e.g. from a settings value parsed by
     `without_env.EnvContext`, rather than reaching for the environment here.
@@ -984,6 +1003,7 @@ async def serving(
         max_websocket_message_bytes=max_websocket_message_bytes,
         max_incomplete_event_bytes=max_incomplete_event_bytes,
         max_header_list_bytes=max_header_list_bytes,
+        close_timeout=close_timeout,
     )
     live = _LiveConnections()
     connections: set[asyncio.Task[None]] = set()

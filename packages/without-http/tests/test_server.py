@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 import ssl
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from contextlib import suppress
+from dataclasses import replace
 from datetime import timedelta
 from typing import cast
 
@@ -18,6 +20,7 @@ import h11
 import httpx
 import pytest
 from pytest_mock import MockerFixture
+from without import cancel_futures
 from without_asgi import ASGIApp
 from without_asgi import HttpScope
 from without_asgi import RawMessage
@@ -298,11 +301,22 @@ class _ResettingReader:
         raise ConnectionResetError(104, "connection reset by peer")
 
 
+class _RecordingTransport:
+    """The slice of a transport the connection teardown reaches for."""
+
+    def __init__(self) -> None:
+        self.aborted = False
+
+    def abort(self) -> None:
+        self.aborted = True
+
+
 class _RecordingWriter:
-    """A writer that records only what `_serve_connection` needs: extra info and close."""
+    """A writer that records what `_serve_connection` needs: extra info, close, and the abort."""
 
     def __init__(self) -> None:
         self.closed = False
+        self.transport = _RecordingTransport()
 
     def get_extra_info(self, _name: str) -> None:
         return None
@@ -330,6 +344,7 @@ async def test_a_peer_reset_while_awaiting_a_request_ends_the_connection_without
     )
 
     assert writer.closed
+    assert writer.transport.aborted  # the fd goes back even when the peer left first
 
 
 async def test_a_malformed_request_lingers_so_the_client_reads_the_error(
@@ -702,6 +717,59 @@ async def test_lingering_close_is_bounded_by_the_linger_timeout(mocker: MockerFi
     )
 
     assert writer.closed
+
+
+async def _pinned_pair() -> tuple[_Endpoint, _Endpoint]:
+    """Two connected endpoints whose kernel buffers are too small to absorb a large write."""
+    loop = asyncio.get_running_loop()
+
+    async def endpoint(sock: socket.socket) -> _Endpoint:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        reader = asyncio.StreamReader()
+        protocol = asyncio.StreamReaderProtocol(reader)
+        transport, _ = await loop.create_connection(lambda: protocol, sock=sock)
+        return reader, asyncio.StreamWriter(transport, protocol, reader, loop)
+
+    left, right = socket.socketpair()
+    return await endpoint(left), await endpoint(right)
+
+
+@pytest.mark.security("a peer that stops reading cannot hold a file descriptor or a shutdown")
+async def test_a_connection_whose_writes_never_drain_is_aborted_at_the_close_timeout() -> None:
+    # asyncio hands the socket back only once the write buffer drains, so a peer that
+    # stops reading keeps the fd (which surfaces later as an unclosed-transport
+    # `ResourceWarning`) and keeps a cancelling shutdown waiting on it. The bounded wait
+    # plus the abort is what ends both: the fd comes back and the cancel completes.
+    answered = asyncio.Event()
+
+    async def answers_then_waits(scope: RawMessage, receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+        answered.set()
+
+    # Its own endpoints rather than `stream_pair`, because it queues bytes behind the
+    # connection's back and has to own when each end goes away.
+    (server_reader, server_writer), (_client_reader, client_writer) = await _pinned_pair()
+    server_socket = server_writer.get_extra_info("socket")
+    try:
+        limits = replace(_DEFAULT_LIMITS, close_timeout=timedelta(seconds=0.05))
+        connection = asyncio.create_task(_serve_connection(answers_then_waits, server_reader, server_writer, limits))
+        client_writer.write(b"GET /answered HTTP/1.1\r\nhost: test\r\n\r\n")
+        await client_writer.drain()
+        await answered.wait()  # the connection is served and back on its keep-alive read
+
+        # Queue far more than the pinned buffers can carry to a client that never reads it.
+        server_writer.write(b"z" * 4_000_000)
+        assert server_writer.transport.get_write_buffer_size() > 0
+
+        await asyncio.wait_for(cancel_futures([connection]), timeout=5)
+
+        assert server_socket.fileno() == -1  # the abort handed the descriptor back
+    finally:
+        client_writer.close()
+        with suppress(OSError):
+            await client_writer.wait_closed()
 
 
 async def _drive_h11_over_socketpair(

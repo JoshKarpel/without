@@ -107,6 +107,11 @@ What the server handles:
   parse is abandoned with a `431`, and `max_header_list_bytes` is advertised over
   HTTP/2 as `MAX_HEADER_LIST_SIZE`, bounding an *uncompressed* header list against an
   hpack bomb. Each defaults to its protocol library's own default, 16 KiB and 64 KiB.
+  `close_timeout` (5 seconds) bounds the far end of a connection's life: how long a
+  closing connection waits for a response it already queued to reach the peer. Asyncio
+  hands the socket back only once that buffer drains, so a peer that stops reading would
+  otherwise hold the descriptor, and hold a shutdown, indefinitely; past the bound the
+  connection is aborted and the peer loses whatever was still in flight.
   For a body-size cap that works under any transport, wrap the app in
   `without-asgi`'s `limit_request_body`, which answers `413`.
 - **TLS facts reach the app.** Over TLS, every scope carries the ASGI

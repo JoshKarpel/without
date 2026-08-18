@@ -100,6 +100,14 @@
 
 ### Fixed
 
+- **`without-http`**: a served connection whose queued response the peer never read no
+  longer holds its file descriptor, or a shutdown, forever. Asyncio releases a socket only
+  once the transport's write buffer drains, which a peer that has stopped reading never
+  lets happen, so `close()` alone left the descriptor with the transport until the process
+  ended, and the wait for it blocked `serving`'s shutdown indefinitely. The wait is now
+  bounded by `close_timeout` (5 seconds, a new `serving` argument) and followed by an
+  abort, so the descriptor comes back whether or not the peer took delivery. Raise it for
+  large responses to slow clients, lower it for a tighter shutdown.
 - **`without-http`**: the wheel now ships the `py.typed` marker, so installed copies are
   type-checked instead of treated as untyped ([PEP 561](https://peps.python.org/pep-0561/)).
   It was the one package in the workspace missing the marker; a pre-commit hook now
