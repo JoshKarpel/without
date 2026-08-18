@@ -802,14 +802,17 @@ async def test_a_connection_accepted_moments_before_shutdown_does_not_leak_its_s
     assert [str(w.message) for w in caught if issubclass(w.category, ResourceWarning)] == []
 
 
-def test_an_accept_task_that_has_not_taken_its_first_step_counts_as_mid_accept() -> None:
+def test_only_an_unstarted_accept_task_counts_as_a_connection_mid_accept() -> None:
     # Only the stdlib selector loop accepts through a task, so the window the test above
-    # races for cannot occur on a proactor loop. The task is built here instead of raced
-    # for, which pins the predicate's own behaviour on every platform.
-    assert not _has_connections_mid_accept(asyncio.AbstractEventLoop())  # no accept machinery at all, as on uvloop
+    # races for cannot occur on the proactor loop the Windows leg runs. Building the tasks
+    # here rather than racing for one pins the predicate's behaviour on every platform.
+    assert not _has_connections_mid_accept(cast(asyncio.AbstractEventLoop, object()))  # no accept machinery at all
 
     loop = asyncio.SelectorEventLoop()
     try:
+        assert not _has_connections_mid_accept(loop)
+
+        unrelated = loop.create_task(asyncio.sleep(0))  # unstarted, but not an accept
         assert not _has_connections_mid_accept(loop)
 
         accept = getattr(type(loop), "_accept_connection2")  # noqa: B009 - a name the stubs do not carry
@@ -819,7 +822,8 @@ def test_an_accept_task_that_has_not_taken_its_first_step_counts_as_mid_accept()
         accepting.cancel()
         with suppress(asyncio.CancelledError):
             loop.run_until_complete(accepting)
-        assert not _has_connections_mid_accept(loop)
+        loop.run_until_complete(unrelated)
+        assert not _has_connections_mid_accept(loop)  # the accept took its first step and is gone
     finally:
         loop.close()
 
