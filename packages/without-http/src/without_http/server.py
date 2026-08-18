@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import ssl
 from collections.abc import AsyncIterator
@@ -11,6 +12,8 @@ from contextlib import asynccontextmanager
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import timedelta
+from types import CoroutineType
+from types import FunctionType
 
 import h2.config
 import h2.connection
@@ -899,6 +902,40 @@ class Server:
         return self._connections.in_flight
 
 
+# The stdlib selector loop turns each accepted connection into a transport inside its
+# own task (`BaseSelectorEventLoop._accept_connection2`), so for one loop tick after
+# `sock.accept()` the connection exists nowhere a shutdown can see: not in `connections`
+# (`handle` runs later still) and not in `asyncio.Server`'s own client set (the transport
+# does not exist yet). Worse than being merely invisible, a transport built after
+# `Server.close()` trips `assert self._sockets is not None` in `Server._attach`, and the
+# accept task swallows that error *without closing the accepted socket*, leaking the
+# half-built transport and its file descriptor
+# (https://github.com/python/cpython/issues/109564). So the listener must not close
+# while any accept task has yet to take its first step; this predicate is how the
+# shutdown waits that out. An unstarted accept task is one whose coroutine is still
+# `CORO_CREATED`; once it has run at all, its transport exists and is attached, and the
+# rest of the teardown can reach it. A loop without this machinery (uvloop schedules
+# `connection_made` from its accept callback with no task in between) reports nothing
+# to wait for.
+def _has_connections_mid_accept(loop: asyncio.AbstractEventLoop) -> bool:
+    accept = getattr(type(loop), "_accept_connection2", None)
+    if not isinstance(accept, FunctionType):
+        return False
+    return any(
+        isinstance(coro := task.get_coro(), CoroutineType)
+        and coro.cr_code is accept.__code__
+        and inspect.getcoroutinestate(coro) == inspect.CORO_CREATED
+        for task in asyncio.all_tasks(loop)
+    )
+
+
+# Bounds the shutdown's wait for mid-accept connections. One tick almost always
+# suffices; the bound only matters under a sustained flood of new connections arriving
+# faster than one per tick, where closing anyway (and eating the stdlib's dropped
+# stragglers) beats stalling the shutdown indefinitely.
+_MID_ACCEPT_FLUSH_TICKS = 100
+
+
 @asynccontextmanager
 async def serving(
     app: ASGIApp,
@@ -1014,12 +1051,15 @@ async def serving(
 
     def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         # Deliberately not a coroutine function. `start_server` runs a plain callback
-        # while the connection is being made, so the task is in `connections` before the
-        # accept returns; hand it a coroutine instead and it builds the task itself, which
-        # registers only once it first runs. A shutdown that reads this set in between
-        # would then leave that connection tracked by nobody: nothing cancels it, so
-        # nothing runs the teardown that closes its socket, and the descriptor outlives
-        # the server.
+        # synchronously from the transport's `connection_made`, so the task is in
+        # `connections` the moment the connection is up; hand it a coroutine instead and
+        # it builds the task itself, which registers only once it first runs, a tick
+        # later. A shutdown that reads this set in that gap would leave the connection
+        # tracked by nobody: nothing cancels it, so nothing runs the teardown that
+        # closes its socket, and the descriptor outlives the server. (Before the
+        # transport exists nothing can register at all; the shutdown path holds the
+        # listener open until that earlier window is empty, see
+        # `_has_connections_mid_accept`.)
         task = asyncio.create_task(serve(reader, writer))
         connections.add(task)
 
@@ -1049,9 +1089,39 @@ async def serving(
         try:
             yield Server(host=bound_host, port=bound_port, _connections=live)
         finally:
-            # Closing the listener first is what makes the set below complete: no further
-            # connection is accepted after it, and every one already accepted registered
-            # its task as it arrived, so cancelling them reaches all of them.
-            server.close()
-            await cancel_futures(connections)
-            await server.wait_closed()
+            try:
+                # A connection accepted a moment ago may not have a transport yet, and
+                # closing the listener while it is in that state leaks its socket (see
+                # `_has_connections_mid_accept`). Waiting a tick lets each such
+                # connection materialize, where the teardown below can reach it; a
+                # connection the loop has not accepted at all by the time the listener
+                # closes dies in the kernel and never touches the process.
+                for _ in range(_MID_ACCEPT_FLUSH_TICKS):
+                    if not _has_connections_mid_accept(asyncio.get_running_loop()):
+                        break
+                    await asyncio.sleep(0)
+                else:  # pragma: no cover - needs a sustained connect flood at shutdown
+                    logger.warning(
+                        f"Closing the listener with connections still mid-accept after {_MID_ACCEPT_FLUSH_TICKS} loop ticks;"
+                        " their sockets are dropped by asyncio without cleanup"
+                    )
+            finally:
+                # Closing the listener first is what makes the cancellation below
+                # complete: no further connection is accepted after it, and every
+                # accepted connection registered its task as its transport came up, so
+                # cancelling them reaches all of them.
+                server.close()
+                await cancel_futures(connections)
+                # A transport that came up during the flush may not have reached
+                # `handle` yet (its `connection_made` is still queued), and over TLS the
+                # handshake can hold that off for seconds, so the cancellation above
+                # cannot be the whole story. Abort whatever the listener still tracks
+                # (a no-op for everything the cancellation already closed), then give
+                # the queued callbacks one tick to register their tasks and cancel
+                # those too, so nothing serves on past the shutdown.
+                abort_clients: Callable[[], None] | None = getattr(server, "abort_clients", None)
+                if abort_clients is not None:  # uvloop's Server has no abort_clients
+                    abort_clients()
+                await asyncio.sleep(0)
+                await cancel_futures(connections)
+                await server.wait_closed()

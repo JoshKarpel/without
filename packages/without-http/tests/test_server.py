@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import socket
 import ssl
+import warnings
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from collections.abc import Callable
@@ -770,6 +772,32 @@ async def test_a_connection_whose_writes_never_drain_is_aborted_at_the_close_tim
         client_writer.close()
         with suppress(OSError):
             await client_writer.wait_closed()
+
+
+async def test_a_connection_accepted_moments_before_shutdown_does_not_leak_its_socket() -> None:
+    # Accepting a connection takes the stdlib loop several ticks: the selector callback
+    # runs `sock.accept()` and spawns an internal task, and only that task's first step
+    # builds the transport. The two `sleep(0)`s park this test exactly in between (the
+    # first resumes before the selector callback has run; the second resumes after it
+    # ran, but before the task it spawned starts), so exiting `serving` here used to
+    # close the listener under a connection that had no transport, no handler task, and
+    # no place in any tracking set. asyncio then dropped it without closing its socket
+    # (https://github.com/python/cpython/issues/109564), which surfaced as unraisable
+    # `ResourceWarning`s on whatever test happened to be running at the next collection.
+    # The shutdown now waits the window out; collection is forced here so a regression
+    # fails this test, as recorded warnings, rather than an arbitrary later one.
+    gc.collect()  # nothing already-doomed should get collected, and blamed, inside the recording block
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        async with serving(echo_app) as server:
+            with socket.create_connection((server.host, server.port)):
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+        for _ in range(5):  # let the loop's internal accept task run to completion
+            await asyncio.sleep(0)
+        gc.collect()
+
+    assert [str(w.message) for w in caught if issubclass(w.category, ResourceWarning)] == []
 
 
 async def _drive_h11_over_socketpair(

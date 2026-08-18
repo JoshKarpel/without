@@ -105,10 +105,26 @@
   that handler first ran, so a connection accepted late enough was tracked by nobody: the
   shutdown's cancel never reached it, nothing ran the teardown that closes its socket, and
   the descriptor outlived the server. The accept callback is now a plain function rather
-  than a coroutine, which `asyncio.start_server` runs while the connection is being made,
-  so every accepted connection is registered before the accept returns; and the task's
-  completion aborts the transport, which is the only closer for one cancelled before it
-  ever ran.
+  than a coroutine, which `asyncio.start_server` calls synchronously as each connection's
+  transport comes up; handed a coroutine instead, it builds the task itself, which
+  registers only once it first runs, a tick later, where a shutdown can slip in between.
+  And the task's completion aborts the transport, which is the only closer for one
+  cancelled before it ever ran.
+- **`without-http`**: `serving`'s shutdown no longer races the event loop's own accept
+  machinery, which was leaking the socket of a connection caught one step earlier in its
+  life than the fix above reaches. The stdlib loop turns an accepted connection into a
+  transport inside an internal task, one tick after taking it off the listener, and a
+  connection in that gap is invisible: it has no transport, no handler, and no place in
+  any tracking set. Closing the listener under it trips a CPython bug
+  ([python/cpython#109564](https://github.com/python/cpython/issues/109564)): the
+  transport construction fails an internal assertion against the closed server and
+  asyncio drops the error *and* the connection without closing its socket, which
+  surfaced as unraisable `ResourceWarning`s blaming whichever test ran at the next
+  garbage collection. The shutdown now waits for every connection mid-accept to
+  materialize before closing the listener, then aborts any transport no handler ever
+  registered for (over TLS, the handshake can hold that registration off for seconds)
+  and cancels handlers that registered while it was tearing down, so a connection is
+  closed no matter where in its accept the shutdown caught it.
 - **`without-http`**: a served connection whose queued response the peer never read no
   longer holds its file descriptor, or a shutdown, forever. Asyncio releases a socket only
   once the transport's write buffer drains, which a peer that has stopped reading never
