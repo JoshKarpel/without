@@ -4,7 +4,14 @@ on:
   push:
     branches:
       - main
+  # `labeled` and `unlabeled` join the three defaults, which naming any type at all makes
+  # explicit, so that adding `tracemalloc:N` starts a run by itself and removing it starts
+  # the run that gives a verdict. Neither can come from re-running an existing run: a
+  # re-run replays the event that started it rather than reading the labels as they stand
+  # now, so the label would otherwise take a fresh commit to have any effect. Every label
+  # change rebuilds, not only that one, which is the price of driving it from a label.
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_dispatch:
 
 permissions:
@@ -36,7 +43,10 @@ jobs:
       run:
         shell: bash
     runs-on: ${{ matrix.platform }}
-    timeout-minutes: 15
+    # A tracemalloc run is minutes rather than seconds (see the label step below), and the
+    # clock has to be set before any step runs, so this reads the label itself rather than
+    # the variable that step exports.
+    timeout-minutes: ${{ contains(toJSON(github.event.pull_request.labels.*.name), 'tracemalloc:') && 30 || 15 }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v7.0.1
@@ -46,8 +56,63 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # Label a PR `tracemalloc:N` to hunt an unclosed socket or transport. The run then
+      # tracks allocations N frames deep, so a `ResourceWarning` carries the
+      # "Object allocated at" traceback naming the line that opened the leaked object.
+      # Three other settings have to move with it, or the label reports nothing:
+      #
+      # - `ResourceWarning` drops from the ini's `error` to a printed warning, because
+      #   that traceback is added when the warning is *formatted*, and the error filter
+      #   raises before any of that happens.
+      # - The per-test timeout is relaxed, because the 5s cap is written for a run without
+      #   tracking. It cannot merely be raised a little: `timeout_method = "thread"` kills
+      #   the process rather than failing the test, which under xdist reads as
+      #   `node down: Not properly terminated` and loses the run's output.
+      # - xdist and random ordering are turned off, because neither earns its keep here.
+      #   The allocation traceback names the line that leaked, so nothing depends any more
+      #   on which test the GC happened to interrupt, and one process in a fixed order
+      #   gives a coherent warnings summary and a timeout that fails visibly.
+      #
+      # The cost scales with the depth asked for, so keep N small: a labelled run of the
+      # suite takes about 8x an ordinary one at 10, and an allocation-heavy module 40x at
+      # 20. Serializing is a small part of that, since tracking dominates CPU so thoroughly
+      # that the workers were buying under a fifth of the wall clock anyway.
+      #
+      # Relaxing the filter is what makes a labelled run a diagnostic rather than a verdict:
+      # a leak now prints instead of failing, so a green result would mean "nothing was
+      # checked", not "nothing leaked". The last step below fails the job for exactly that
+      # reason, so the only way to a passing build is a run without the label.
+      #
+      # The labels arrive through `env` rather than interpolated into the script: a label
+      # name is text someone else wrote, and `${{ }}` in a `run:` block would execute it.
+      - name: Read the tracemalloc depth from the PR labels
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          depth=$(printf '%s' "$LABELS" | sed -nE 's/.*"tracemalloc:([0-9]+)".*/\1/p' | head -n 1)
+          if [[ -z "$depth" ]]; then
+            echo "TRACEMALLOC_PYTEST_ARGS=" >> "$GITHUB_ENV"
+            echo "No tracemalloc label, so allocation tracking stays off."
+            exit 0
+          fi
+          echo "PYTHONTRACEMALLOC=$depth" >> "$GITHUB_ENV"
+          echo "TRACEMALLOC_PYTEST_ARGS=-W always::ResourceWarning --timeout=300 -n0 -p no:randomly" >> "$GITHUB_ENV"
+          echo "Tracking allocations $depth frames deep; leaks are reported rather than raised,"
+          echo "so this job fails by design at the end whatever the tests say."
+
       - name: Run type checking and tests
-        run: just test --durations 20 -vvv
+        run: just test --durations 20 -vvv $TRACEMALLOC_PYTEST_ARGS
+
+      # `!cancelled()` rather than `always()`, so cancelling the run does not turn into a
+      # failure, and so the reason is still stated when the tests themselves failed.
+      - name: Refuse to pass a tracemalloc run
+        if: ${{ !cancelled() && env.PYTHONTRACEMALLOC != '' }}
+        run: |
+          echo "This run tracked allocations $PYTHONTRACEMALLOC frames deep, which downgrades"
+          echo "a leaked socket or transport from a failure to a warning. Read the warnings"
+          echo "summary above for 'Object allocated at', then drop the tracemalloc label to"
+          echo "get a run whose result means something."
+          exit 1
 
   docs:
     name: Docs

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 from collections.abc import AsyncGenerator
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
@@ -9,6 +10,7 @@ from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC
 from datetime import timedelta
+from importlib import metadata
 from urllib.parse import urlsplit
 
 import h11
@@ -17,8 +19,12 @@ from without_asgi import RawHeaders
 from without_asgi import RawScope
 from without_asgi import Receive
 from without_asgi import Send
+from without_asgi import StreamingContent
 from without_asgi import json_content
 from without_asgi import parse_http_scope
+from without_http import USER_AGENT
+from without_http import Client
+from without_http import ClientMiddleware
 from without_http import ClientRequest
 from without_http import ClientResponse
 from without_http import ConnectionPool
@@ -28,10 +34,15 @@ from without_http import ResponseHead
 from without_http import ResponseTrailers
 from without_http import Timeout
 from without_http import add_headers
+from without_http import basic_auth
+from without_http import bearer_auth
 from without_http import cookies
+from without_http import default_headers
 from without_http import follow_redirects
 from without_http import request
 from without_http import serving
+from without_http import tcp_connect
+from without_http import user_agent
 from without_http import wrap
 from without_http.client import _REDIRECT_STATUSES
 from without_http.client import Origin
@@ -141,6 +152,154 @@ async def test_add_headers_middleware_injects_a_header_seen_server_side() -> Non
         client = add_headers((b"x-test", b"injected"))(pool)
         async with request(client, "GET", f"http://{server.host}:{server.port}/items") as (_head, body):
             assert await body.read() == b"GET /items test=injected body="
+
+
+def _capturing(captured: list[ClientRequest]) -> Client:
+    """A `Client` that records each request and answers `200 ok`."""
+
+    async def capture(outgoing: ClientRequest) -> ClientResponse:
+        captured.append(outgoing)
+
+        async def events() -> AsyncGenerator[bytes | ResponseTrailers]:
+            yield b"ok"
+
+        return ClientResponse(ResponseHead(200, ()), ResponseBody(events()))
+
+    return capture
+
+
+async def test_basic_auth_sends_the_base64_credential_pair() -> None:
+    captured: list[ClientRequest] = []
+
+    client = basic_auth("Aladdin", "open sesame")(_capturing(captured))
+    async with request(client, "GET", "http://example.test/items") as (head, body):
+        assert head.status == 200
+        assert await body.read() == b"ok"
+
+    assert (b"authorization", b"Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==") in captured[0].headers
+
+
+async def test_basic_auth_encodes_non_ascii_credentials_as_utf8() -> None:
+    captured: list[ClientRequest] = []
+
+    client = basic_auth("test", "123£")(_capturing(captured))
+    async with request(client, "GET", "http://example.test/items"):
+        pass
+
+    assert (b"authorization", b"Basic dGVzdDoxMjPCow==") in captured[0].headers
+
+
+def test_basic_auth_rejects_a_colon_in_the_username() -> None:
+    with pytest.raises(ValueError, match="colon"):
+        basic_auth("user:name", "hunter2")
+
+
+async def test_bearer_auth_defaults_to_the_bearer_scheme() -> None:
+    captured: list[ClientRequest] = []
+
+    client = bearer_auth("sesame-token")(_capturing(captured))
+    async with request(client, "GET", "http://example.test/items"):
+        pass
+
+    assert (b"authorization", b"Bearer sesame-token") in captured[0].headers
+
+
+@pytest.mark.parametrize(
+    ("scheme", "expected"),
+    [
+        ("Token", b"Token abc123"),
+        ("token", b"token abc123"),
+        ("", b"abc123"),
+    ],
+)
+async def test_bearer_auth_sends_the_injected_scheme(scheme: str, expected: bytes) -> None:
+    captured: list[ClientRequest] = []
+
+    client = bearer_auth("abc123", scheme=scheme)(_capturing(captured))
+    async with request(client, "GET", "http://example.test/items"):
+        pass
+
+    assert (b"authorization", expected) in captured[0].headers
+
+
+async def test_user_agent_defaults_to_the_library_identity() -> None:
+    captured: list[ClientRequest] = []
+
+    client = user_agent()(_capturing(captured))
+    async with request(client, "GET", "http://example.test/items"):
+        pass
+
+    assert (b"user-agent", USER_AGENT.encode()) in captured[0].headers
+
+
+def test_user_agent_constant_names_this_distribution_and_its_version() -> None:
+    assert f"without-http/{metadata.version('without-http')}" == USER_AGENT
+
+
+async def test_user_agent_joins_segments_with_spaces() -> None:
+    captured: list[ClientRequest] = []
+
+    client = user_agent("myapp/1.0", USER_AGENT)(_capturing(captured))
+    async with request(client, "GET", "http://example.test/items"):
+        pass
+
+    assert (b"user-agent", b"myapp/1.0 " + USER_AGENT.encode()) in captured[0].headers
+
+
+async def test_user_agent_sends_a_single_segment_verbatim() -> None:
+    captured: list[ClientRequest] = []
+
+    client = user_agent("myapp/1.0 (compatible; probe)")(_capturing(captured))
+    async with request(client, "GET", "http://example.test/items"):
+        pass
+
+    assert (b"user-agent", b"myapp/1.0 (compatible; probe)") in captured[0].headers
+
+
+def test_user_agent_rejects_a_non_ascii_segment() -> None:
+    with pytest.raises(UnicodeEncodeError):
+        user_agent("myapp/1.0£")
+
+
+@pytest.mark.parametrize(
+    ("middleware", "name", "own"),
+    [
+        (basic_auth("Aladdin", "open sesame"), b"authorization", b"Bearer per-request-token"),
+        (bearer_auth("default-token"), b"authorization", b"Basic cGVyOnJlcXVlc3Q="),
+        (user_agent("default/1.0"), b"user-agent", b"per-request/2.0"),
+    ],
+)
+async def test_a_default_header_middleware_leaves_a_requests_own_value_alone(
+    middleware: ClientMiddleware, name: bytes, own: bytes
+) -> None:
+    captured: list[ClientRequest] = []
+
+    client = middleware(_capturing(captured))
+    async with request(client, "GET", "http://example.test/items", headers=((name, own),)):
+        pass
+
+    assert captured[0].headers == ((name, own),)
+
+
+async def test_default_headers_supplies_every_header_a_request_omits() -> None:
+    captured: list[ClientRequest] = []
+
+    client = default_headers((b"x-api-key", b"key-abc"), (b"from", b"ops@example.test"))(_capturing(captured))
+    async with request(client, "GET", "http://example.test/items"):
+        pass
+
+    assert captured[0].headers == ((b"x-api-key", b"key-abc"), (b"from", b"ops@example.test"))
+
+
+async def test_default_headers_decides_each_header_on_its_own() -> None:
+    captured: list[ClientRequest] = []
+
+    client = default_headers((b"x-api-key", b"key-abc"), (b"from", b"ops@example.test"))(_capturing(captured))
+    url = "http://example.test/items"
+    async with request(client, "GET", url, headers=((b"X-API-Key", b"key-from-the-call-site"),)):
+        pass
+
+    assert captured[0].headers == ((b"from", b"ops@example.test"), (b"X-API-Key", b"key-from-the-call-site"))
 
 
 @pytest.mark.parametrize("status", sorted(_REDIRECT_STATUSES))
@@ -601,7 +760,11 @@ async def test_follow_redirects_downgrades_a_303_to_a_bodyless_get() -> None:
     request = ClientRequest(
         method="POST",
         url="https://api.victim.test/submit",
-        headers=((b"content-type", b"application/json"), (b"content-length", b"9")),
+        headers=(
+            (b"content-type", b"application/json"),
+            (b"content-length", b"9"),
+            (b"content-encoding", b"gzip"),
+        ),
     )
     await exchange(request)
 
@@ -729,6 +892,27 @@ async def test_a_content_body_reaches_the_server_as_bytes_and_a_content_type() -
             assert await body.read() == b'POST /submit test= body={"n": 1}'
 
 
+async def test_build_request_takes_a_streaming_contents_headers_and_chunks() -> None:
+    content = StreamingContent(_chunks(b"ab", b"cd"), ((b"content-type", b"multipart/form-data; boundary=bb"),))
+
+    outgoing = _build_request("POST", "http://h/x", ((b"x-trace", b"t-1"),), content, Timeout())
+
+    assert outgoing.headers == (
+        (b"content-type", b"multipart/form-data; boundary=bb"),
+        (b"x-trace", b"t-1"),
+        (b"transfer-encoding", b"chunked"),
+    )
+    assert [chunk async for chunk in outgoing.body] == [b"ab", b"cd"]
+
+
+async def test_a_streaming_content_body_reaches_the_server_with_its_headers() -> None:
+    async with serving(echo_app) as server, ConnectionPool() as pool:
+        url = f"http://{server.host}:{server.port}/submit"
+        content = StreamingContent(_chunks(b"part one ", b"part two"), ((b"x-test", b"paired"),))
+        async with request(pool, "POST", url, body=content) as (_head, body):
+            assert await body.read() == b"POST /submit test=paired body=part one part two"
+
+
 def test_build_request_carries_the_timeout_onto_the_request() -> None:
     budget = Timeout(read=timedelta(seconds=3))
     outgoing = _build_request("GET", "http://api.example.test/x", (), b"", budget)
@@ -745,6 +929,38 @@ async def test_open_reports_http_1_1_for_a_cleartext_connection() -> None:
             writer.close()
             with suppress(OSError):
                 await writer.wait_closed()
+
+
+async def test_tcp_connect_tunes_the_happy_eyeballs_delay() -> None:
+    connect = tcp_connect(happy_eyeballs_delay=timedelta(milliseconds=50))
+    async with serving(echo_app) as server, ConnectionPool(connect=connect) as pool:
+        async with request(pool, "GET", f"http://{server.host}:{server.port}/raced") as (head, body):
+            assert head.status == 200
+            assert await body.read() == b"GET /raced test= body="
+
+
+async def test_tcp_connect_connects_sequentially_without_a_delay() -> None:
+    connect = tcp_connect(happy_eyeballs_delay=None)
+    async with serving(echo_app) as server, ConnectionPool(connect=connect) as pool:
+        async with request(pool, "GET", f"http://{server.host}:{server.port}/serial") as (head, body):
+            assert head.status == 200
+            assert await body.read() == b"GET /serial test= body="
+
+
+async def test_tcp_connect_takes_an_injected_resolver() -> None:
+    # The URL names a host no DNS knows; the injected resolver maps it to the live
+    # server, proving resolution policy swaps without monkeypatching.
+    async with serving(echo_app) as server:
+
+        async def canned(host: str, port: int) -> list[tuple[int, int, int, str, tuple[str, int]]]:
+            assert (host, port) == ("fake.internal", 80)
+            return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", server.port))]
+
+        async with ConnectionPool(connect=tcp_connect(resolve=canned)) as pool:
+            async with request(pool, "GET", "http://fake.internal/resolved") as (head, body):
+                assert head.status == 200
+                body_bytes = await body.read()
+            assert body_bytes == b"GET /resolved test= body="
 
 
 async def test_follow_redirects_defaults_to_five_hops() -> None:

@@ -9,6 +9,7 @@ from without_asgi import WebsocketResponseBody
 from without_asgi import WebsocketResponseStart
 from without_asgi import WebsocketSend
 from without_asgi import WebsocketText
+from without_asgi import extension
 from without_http.ws_wire import is_websocket_upgrade
 from without_http.ws_wire import websocket_scope_from_request
 from without_http.ws_wire import ws_events_from_outbound
@@ -74,6 +75,17 @@ def test_websocket_scope_splits_the_query_at_the_first_question_mark() -> None:
     assert scope.raw_path == b"/live"
     assert scope.query_string == b"room=lobby?ignored=1"
     assert scope.path == "/live"
+
+
+def test_websocket_scope_advertises_denial_responses() -> None:
+    scope = websocket_scope_from_request(
+        _handshake("/live"),
+        scheme="ws",
+        server=("example.test", 80),
+        client=("198.51.100.7", 5000),
+    )
+
+    assert extension(scope.extensions, "websocket.http.response") is not None
 
 
 def test_ws_events_from_outbound_renders_an_accept() -> None:

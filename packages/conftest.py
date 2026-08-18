@@ -5,6 +5,7 @@ import sys
 from collections.abc import Callable
 
 import pytest
+from hypothesis import is_hypothesis_test
 
 # Shared across every workspace package: pytest loads this conftest for all tests
 # under `packages/**/tests`, so the whole suite runs under every event loop the
@@ -33,6 +34,23 @@ def pytest_asyncio_loop_factories() -> dict[str, LoopFactory]:
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    # The global timeout is there to catch a deadlock, which is a property of one call:
+    # a server that never replies hangs whether it is asked once or a hundred times. A
+    # `@given` test is the case the bound does not describe, since its duration is the
+    # example count times the body, so what it measures is how fast the machine is. Left
+    # under the bound, the slowest property test in the suite crosses five seconds on a
+    # loaded macOS runner, and `timeout_method = "thread"` kills the process rather than
+    # failing the test, so the overrun reads as `node down: Not properly terminated` and
+    # costs the whole xdist worker's output. Hypothesis has its own per-example
+    # `deadline` for the thing a timeout would have caught here.
+    #
+    # `is_hypothesis_test` rather than the `hypothesis` marker: that marker is added by
+    # Hypothesis's own plugin from this same hook, and a conftest runs before the plugins
+    # registered by entry point, so it is not there to read yet.
+    for item in items:
+        if isinstance(item, pytest.Function) and is_hypothesis_test(item.obj):
+            item.add_marker(pytest.mark.timeout(0))
+
     # Enforce the convention that every `@pytest.mark.security` test names the gap it
     # closes as its first positional argument (see the marker note in pyproject). The
     # guard arms are excluded from coverage because a healthy suite never trips them:

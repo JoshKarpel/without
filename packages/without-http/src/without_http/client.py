@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 import ssl
+import zlib
+from base64 import b64encode
 from collections.abc import AsyncGenerator
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from collections.abc import Callable
+from collections.abc import Mapping
+from collections.abc import Sequence
+from compression import zstd
 from contextlib import asynccontextmanager
 from contextlib import suppress
 from dataclasses import dataclass
@@ -14,7 +20,9 @@ from dataclasses import field
 from dataclasses import replace
 from datetime import UTC
 from datetime import datetime
+from datetime import timedelta
 from email.utils import parsedate_to_datetime
+from importlib import metadata
 from typing import NamedTuple
 from typing import Protocol
 from typing import Self
@@ -22,17 +30,21 @@ from urllib.parse import SplitResult
 from urllib.parse import urljoin
 from urllib.parse import urlsplit
 
+import brotli
 import h2.config
 import h2.connection
 import h2.events
 import h2.exceptions
 import h11
+from aiohappyeyeballs import AddrInfoType
+from aiohappyeyeballs import start_connection
 from without import Endo
 from without import Stream
 from without import cancel_futures
 from without import stack
 from without_asgi import Content
 from without_asgi import RawHeaders
+from without_asgi import StreamingContent
 from without_asgi.headers import merge
 
 from without_http.h2_wire import request_headers
@@ -291,7 +303,11 @@ def _target(parts: SplitResult) -> str:
 
 
 def _build_request(
-    method: str, url: str, headers: RawHeaders, content: bytes | Stream[bytes] | Content, timeout: Timeout
+    method: str,
+    url: str,
+    headers: RawHeaders,
+    content: bytes | Stream[bytes] | Content | StreamingContent,
+    timeout: Timeout,
 ) -> ClientRequest:
     """
     Assemble a `ClientRequest`, picking the body framing from `content`.
@@ -300,11 +316,12 @@ def _build_request(
     gets `transfer-encoding: chunked` (HTTP/1.1 frames it as chunks; over HTTP/2 the
     framing headers are dropped and the body rides DATA frames either way).
 
-    A `Content` is bytes that already know what they are, so its headers go *under* the
-    caller's: an explicit `content-type` on the request wins over the one the encoding
-    supplied, and everything after this point sees plain bytes.
+    A `Content` or `StreamingContent` is a body that already knows what it is, so its
+    headers go *under* the caller's: an explicit `content-type` on the request wins
+    over the one the encoding supplied, and everything after this point sees a plain
+    body.
     """
-    if isinstance(content, Content):
+    if isinstance(content, Content | StreamingContent):
         headers = merge(content.headers, headers)
         content = content.body
     if isinstance(content, bytes):
@@ -322,37 +339,7 @@ def _build_request(
 
 _ALPN_H2 = ("h2", "http/1.1")
 _ALPN_HTTP11 = ("http/1.1",)
-
-
-async def _open(
-    host: str,
-    port: int,
-    *,
-    ssl_context: ssl.SSLContext | None,
-    timeout: Timeout = _NO_TIMEOUT,
-    socket_options: SocketOptions = (),
-) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, str]:
-    """
-    Open a connection and report the negotiated wire protocol.
-
-    `ssl_context` is `None` for cleartext, which has no negotiation and is always
-    `http/1.1` (prior-knowledge h2c is opened directly by the pool instead), or a ready
-    context whose ALPN offer the pool has already settled. Over TLS the protocol is
-    whatever ALPN selected: `h2` when the server takes the offer, else `http/1.1`. The
-    `connect` bound covers the TCP connect and, over TLS, the handshake, since both
-    happen in the one `open_connection` await; the ALPN read after it is synchronous.
-
-    `socket_options` is applied to the new socket exactly as given: one already-combined
-    set to hand to the kernel, with nothing added to it here.
-    """
-    async with timeout.connecting():
-        reader, writer = await asyncio.open_connection(host, port, ssl=ssl_context)
-    apply_socket_options(writer.get_extra_info("socket"), socket_options)
-    if ssl_context is None:
-        return reader, writer, "http/1.1"
-    ssl_object = writer.get_extra_info("ssl_object")
-    negotiated = ssl_object.selected_alpn_protocol() if ssl_object is not None else None
-    return reader, writer, "h2" if negotiated == "h2" else "http/1.1"
+_HAPPY_EYEBALLS_DELAY = timedelta(milliseconds=250)  # RFC 8305 §5's recommended connection attempt delay
 
 
 class Connect(Protocol):
@@ -360,8 +347,8 @@ class Connect(Protocol):
     How a pool reaches an origin: the one step that touches the network.
 
     Injected into `ConnectionPool` so the rest of it (reuse, bounds, protocol selection)
-    stays independent of how a connection is made. `_open` is the default and speaks
-    TCP; a test dials an in-memory pipe, and a unix-socket or proxy connector would slot
+    stays independent of how a connection is made. `tcp_connect()` builds the default;
+    a test dials an in-memory pipe, and a unix-socket or proxy connector would slot
     in the same way. The negotiated wire protocol comes back alongside the streams
     because only the connector can know it: ALPN is read off the finished handshake.
     """
@@ -375,6 +362,94 @@ class Connect(Protocol):
         timeout: Timeout = ...,
         socket_options: SocketOptions = (),
     ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, str]: ...
+
+
+class Resolve(Protocol):
+    """
+    How a connector turns a name into candidate addresses: the resolution step alone.
+
+    Injected into `tcp_connect`, defaulting to the operating system's resolver
+    (`loop.getaddrinfo`), so resolution policy swaps without touching how the winning
+    address is connected: a cache keyed however the caller likes, DNS over HTTPS, or a
+    test's canned addresses. It returns `getaddrinfo`-shaped tuples (aiohappyeyeballs'
+    `AddrInfoType`), which the connect race consumes directly. A cache lives in a
+    wrapper here rather than in the pool, and its staleness bound is the caller's
+    policy to choose, since `getaddrinfo` does not surface record TTLs.
+    """
+
+    async def __call__(self, host: str, port: int) -> Sequence[AddrInfoType]: ...
+
+
+async def _getaddrinfo(host: str, port: int) -> Sequence[AddrInfoType]:
+    return await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+
+
+def tcp_connect(
+    *,
+    resolve: Resolve = _getaddrinfo,
+    happy_eyeballs_delay: timedelta | None = _HAPPY_EYEBALLS_DELAY,
+) -> Connect:
+    """
+    A `Connect` over TCP: resolve the name, race the addresses, negotiate ALPN.
+
+    This builds the default connect (`ConnectionPool()` behaves as
+    `ConnectionPool(connect=tcp_connect())`), with its two steps injectable:
+
+    - `resolve` turns the name into candidate addresses, defaulting to the OS
+      resolver; see `Resolve` for what plugs in here.
+    - [`aiohappyeyeballs`](https://github.com/aio-libs/aiohappyeyeballs) connects,
+      racing address families per
+      [RFC 8305](https://datatracker.ietf.org/doc/html/rfc8305) (Happy Eyeballs) with
+      `happy_eyeballs_delay` between attempts (default 250 ms, the RFC's
+      recommendation), so a dual-stack host with one black-holed family costs one
+      delay rather than a full connect timeout; `None` tries the addresses strictly
+      in turn. The race drives plain `loop.sock_connect`, so it behaves the same on
+      any event loop, and it takes already-resolved addresses, which is what lets
+      `resolve` be a separate step at all (asyncio's own racing is fused to its own
+      resolution).
+
+    The returned connector reports the negotiated wire protocol alongside the
+    streams. `ssl_context` is `None` for cleartext, which has no negotiation and is
+    always `http/1.1` (prior-knowledge h2c is opened directly by the pool instead),
+    or a ready context whose ALPN offer the pool has already settled; over TLS the
+    protocol is whatever ALPN selected. The `connect` timeout bound covers
+    resolution, the connect race, and, over TLS, the handshake. `socket_options` is
+    applied to the winning socket exactly as given.
+    """
+    seconds = None if happy_eyeballs_delay is None else happy_eyeballs_delay.total_seconds()
+
+    async def connect(
+        host: str,
+        port: int,
+        *,
+        ssl_context: ssl.SSLContext | None,
+        timeout: Timeout = _NO_TIMEOUT,
+        socket_options: SocketOptions = (),
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, str]:
+        async with timeout.connecting():
+            addr_infos = await resolve(host, port)
+            sock = await start_connection(addr_infos, happy_eyeballs_delay=seconds)
+            try:
+                if ssl_context is None:
+                    reader, writer = await asyncio.open_connection(sock=sock)
+                else:
+                    reader, writer = await asyncio.open_connection(sock=sock, ssl=ssl_context, server_hostname=host)
+            except BaseException:
+                # The winning socket is ours until a transport owns it; a failed or
+                # cancelled handshake must not leak it.
+                sock.close()
+                raise
+        apply_socket_options(writer.get_extra_info("socket"), socket_options)
+        if ssl_context is None:
+            return reader, writer, "http/1.1"
+        ssl_object = writer.get_extra_info("ssl_object")
+        negotiated = ssl_object.selected_alpn_protocol() if ssl_object is not None else None
+        return reader, writer, "h2" if negotiated == "h2" else "http/1.1"
+
+    return connect
+
+
+_open = tcp_connect()  # the pool's default `Connect`
 
 
 @dataclass(slots=True, eq=False)
@@ -1009,9 +1084,11 @@ class ConnectionPool:
     live context, precisely because ALPN can only be set context-wide: a shared context
     would be mutated out from under other pools or libraries using it.
 
-    `connect` is how the pool reaches an origin, defaulting to a TCP connect (see
-    `Connect`). It is the only part of the pool that touches the network, so replacing
-    it points the same pooling, protocol selection, and keep-alive at somewhere else.
+    `connect` is how the pool reaches an origin, defaulting to a TCP connect that
+    races dual-stack addresses per RFC 8305 (see `Connect` and `tcp_connect`, whose
+    knobs also inject the resolver). It is the only part of the pool that touches the
+    network, so replacing it points the same pooling, protocol selection, and
+    keep-alive at somewhere else.
 
     Decoration (default headers, redirect following, cookies, a deadline) is *not* a
     pool concern: compose it around the pool with `stack`, which yields another `Client`.
@@ -1277,7 +1354,7 @@ async def request(
     url: str,
     *,
     headers: RawHeaders = (),
-    body: bytes | Stream[bytes] | Content = b"",
+    body: bytes | Stream[bytes] | Content | StreamingContent = b"",
     timeout: Timeout = _NO_TIMEOUT,
 ) -> AsyncIterator[ClientResponse]:
     """
@@ -1290,9 +1367,10 @@ async def request(
     `transfer-encoding: chunked`) and closing the response body on the way out, so a
     connection is never stranded by a body nobody read.
 
-    `body` takes bytes, a `Stream[bytes]` to stream them, or a `Content` when the caller
-    holds a *value* rather than bytes: `body=json_content(order)` sends the encoding and
-    the `content-type` describing it together, since neither is any use without the other.
+    `body` takes bytes, a `Stream[bytes]` to stream them, or a `Content` /
+    `StreamingContent` when the caller holds an *encoding* rather than bare bytes:
+    `body=json_content(order)` or `body=multipart_content(...)` sends the body and the
+    `content-type` describing it together, since neither is any use without the other.
 
     The yielded `ClientResponse` can be taken whole (`response.head`, `response.body`) or
     unpacked (`head, body = ...`); read the response body with `async for chunk in body`
@@ -1357,11 +1435,106 @@ def add_headers(*headers: tuple[bytes, bytes]) -> ClientMiddleware:
 
     The mirror of a server's request-decorating middleware: it sits in the same
     `stack` and rewrites the request before the inner client runs. This is how a
-    caller sends default headers (auth tokens, a user agent) on every request, or a
-    single request adds its own.
+    caller sends the same headers on every request, or a single request adds its own.
+
+    Every request gets a copy, whatever it already carries, which is what a field that
+    may appear more than once (`accept`, `via`, a custom trace header) wants.
+    `default_headers` is the counterpart for a field that may not.
     """
     extra: RawHeaders = tuple(headers)
     return wrap(request=lambda request: replace(request, headers=extra + request.headers))
+
+
+def default_headers(*headers: tuple[bytes, bytes]) -> ClientMiddleware:
+    """
+    Client middleware that adds each of `headers` to a request not already carrying it.
+
+    The shape a *default* takes for a field RFC 9110 allows only once
+    (`authorization`, `user-agent`, an API key): `add_headers` would prepend a second
+    copy, leaving the peer to resolve a duplicate the spec says cannot happen, so the
+    per-request value the caller wrote to override the default is the one that silently
+    loses. Each header is decided on its own, so a request stating one default and not
+    another gets exactly the one it omitted.
+
+    This is a default, not a policy: the request's own value wins. A caller that must
+    not be overridden composes its own client rather than handing out one that can be,
+    the same position `deadline` takes on a time budget.
+    """
+    defaults: RawHeaders = tuple(headers)
+
+    def apply(request: ClientRequest) -> ClientRequest:
+        missing = tuple((name, value) for name, value in defaults if not _has(request.headers, name))
+        if not missing:
+            return request
+        return replace(request, headers=missing + request.headers)
+
+    return wrap(request=apply)
+
+
+def basic_auth(username: str, password: str) -> ClientMiddleware:
+    """
+    Client middleware that sends `Basic` authorization (RFC 7617) on every request.
+
+    The credentials are fixed at composition, base64 of `username:password` encoded as
+    UTF-8 (the charset RFC 7617 names and servers expect today). A colon in `username`
+    is refused with `ValueError` rather than encoded: the receiver splits the decoded
+    pair at the *first* colon, so the colon would silently move characters from the
+    username into the password.
+
+    This is a default rather than a policy: a request carrying its own `authorization`
+    keeps it, so one call can authenticate as someone else without composing a second
+    client.
+    """
+    if ":" in username:
+        raise ValueError(f"a Basic auth username cannot contain a colon, got {username!r}")
+    credentials = b64encode(f"{username}:{password}".encode())
+    return default_headers((b"authorization", b"Basic " + credentials))
+
+
+def bearer_auth(token: str, *, scheme: str = "Bearer") -> ClientMiddleware:
+    """
+    Client middleware that sends bearer-style authorization on every request.
+
+    Sends `authorization: Bearer <token>` (RFC 6750) by default. The `scheme` prefix is
+    the part real APIs disagree on, so it is injectable: pass the spelling the peer
+    demands (`scheme="Token"`, `scheme="token"`), or `scheme=""` to send the bare token
+    with no prefix at all. The header encodes as ASCII, which is the charset both the
+    scheme and a bearer token are allowed, so a stray non-ASCII byte fails loudly here
+    rather than on the wire.
+
+    Like `basic_auth`, this is a default: a request carrying its own `authorization`
+    keeps it.
+    """
+    value = f"{scheme} {token}" if scheme else token
+    return default_headers((b"authorization", value.encode(_ASCII)))
+
+
+# This library's own identity, `without-http/<version>`, read from the installed
+# distribution so it cannot drift. `user_agent()` sends it when given no segments;
+# pass it as a segment to join it with your own product token
+# (`user_agent("myapp/1.0", USER_AGENT)`).
+USER_AGENT = f"without-http/{metadata.version('without-http')}"
+
+
+def user_agent(*segments: str) -> ClientMiddleware:
+    """
+    Client middleware that sends a `user-agent` header on every request.
+
+    No user-agent is sent unless a caller composes this middleware (or writes the
+    header itself): requests say exactly what the caller said. Some peers refuse an
+    absent user-agent outright (the GitHub API 403s such requests), so this is the
+    first header most callers reach for.
+
+    `segments` are joined with single spaces, the separator RFC 9110 defines between
+    product tokens, so `user_agent("myapp/1.0", USER_AGENT)` sends
+    `myapp/1.0 without-http/<version>`. With no segments, the header is `USER_AGENT`
+    alone: the same library-identity default httpx, requests, aiohttp, and niquests
+    send, opted into rather than unbidden. The value encodes as ASCII, failing
+    loudly here rather than on the wire. A request carrying its own `user-agent` keeps
+    it: `user-agent` is a singleton field, so this is a default, not a policy.
+    """
+    value = " ".join(segments) if segments else USER_AGENT
+    return default_headers((b"user-agent", value.encode(_ASCII)))
 
 
 def deadline(timeout: Timeout) -> ClientMiddleware:
@@ -1386,7 +1559,7 @@ def deadline(timeout: Timeout) -> ClientMiddleware:
 
 
 _SENSITIVE_REDIRECT_HEADERS = frozenset({b"authorization", b"cookie", b"proxy-authorization"})
-_BODY_FRAMING_HEADERS = frozenset({b"content-length", b"content-type", b"transfer-encoding"})
+_BODY_FRAMING_HEADERS = frozenset({b"content-encoding", b"content-length", b"content-type", b"transfer-encoding"})
 
 
 def _strip_headers(headers: RawHeaders, drop: frozenset[bytes]) -> RawHeaders:
@@ -1435,6 +1608,296 @@ def follow_redirects(max_hops: int = 5) -> ClientMiddleware:
                 request = replace(request, url=target.geturl(), headers=headers, method=method, body=body)
                 response = await inner(request)
             return response
+
+        return exchange
+
+    return middleware
+
+
+_REQUEST_FRAMING_HEADERS = frozenset({b"content-length", b"transfer-encoding"})
+_GZIP_CONTAINER = zlib.MAX_WBITS | 16  # the wbits offset that selects the gzip wrapper around DEFLATE
+
+
+class Compressor(Protocol):
+    """
+    The incremental compressor shape `compressing` drives: feed chunks through
+    `compress`, then `flush` ends the stream. `zlib.compressobj` and
+    `zstd.ZstdCompressor` satisfy it as-is; a third-party codec plugs in with
+    whatever thin adapter its own surface needs.
+    """
+
+    def compress(self, data: bytes, /) -> bytes: ...
+    def flush(self) -> bytes: ...
+
+
+async def _compressed(body: Stream[bytes], compressor: Compressor) -> AsyncIterator[bytes]:
+    async for chunk in body:
+        if compressed := compressor.compress(chunk):
+            yield compressed
+    yield compressor.flush()
+
+
+def compressing(coding: bytes, make_compressor: Callable[[], Compressor]) -> ClientMiddleware:
+    """
+    A `ClientMiddleware` that encodes every request body with `coding`.
+
+    The mechanism behind `gzip_compress` and `zstd_compress`, public so any coding
+    those two do not ship arrives the same way: name the `content-encoding` token and
+    supply a factory for a fresh `Compressor` per request
+    (`compressing(b"br", make_brotli)`), and the rest is inherited rather than
+    reimplemented.
+
+    That rest: the lazy body `Stream[bytes]` is wrapped in the incremental compressor,
+    so a streamed upload compresses chunk by chunk and nothing buffers; and the
+    framing follows the rewrite, `content-length` no longer describes the body, so it
+    is dropped and the compressed stream goes out `transfer-encoding: chunked` (over
+    HTTP/2 the framing header is dropped with the other hop-by-hop headers and the
+    body rides DATA frames as usual).
+
+    Two kinds of request pass through untouched: one already carrying a
+    `content-encoding` (the body is already encoded; re-compressing would corrupt it),
+    and one with no body at all (neither `content-length` nor `transfer-encoding`,
+    which is how `request` frames bodyless requests), so a plain `GET` does not grow
+    an empty-payload compressed shell.
+    """
+
+    def apply(request: ClientRequest) -> ClientRequest:
+        if _has(request.headers, b"content-encoding"):
+            return request
+        if not _has(request.headers, b"content-length") and not _has(request.headers, b"transfer-encoding"):
+            return request
+        headers = (
+            *_strip_headers(request.headers, _REQUEST_FRAMING_HEADERS),
+            (b"content-encoding", coding),
+            (b"transfer-encoding", b"chunked"),
+        )
+        return replace(request, headers=headers, body=_compressed(request.body, make_compressor()))
+
+    return wrap(request=apply)
+
+
+def gzip_compress(level: int = zlib.Z_DEFAULT_COMPRESSION) -> ClientMiddleware:
+    """
+    Client middleware that gzips every request body sent through it.
+
+    Requests have no `accept-encoding` negotiation, so this stays opt-in: compose it
+    onto the clients whose upstreams are known to accept gzip requests, while the same
+    pool backs uncompressed clients beside them. The scope is wherever the composition
+    happens: decorate once at assembly for a whole client, or inline at one call site
+    (`request(gzip_compress()(client), ...)`) for a single request, since decorating a
+    client is a stateless function wrap.
+
+    The body streams through an incremental compressor and the framing follows the
+    rewrite (see `compressing` for both, and for which requests pass through
+    untouched). `level` is zlib's compression level, defaulting to zlib's own
+    default. `zstd_compress` and `brotli_compress` are the same middleware over their
+    codings, and `compressing` is the shared mechanism for any coding beyond those;
+    the response-side counterpart to all of them is `decompress`.
+    """
+    return compressing(b"gzip", lambda: zlib.compressobj(level, zlib.DEFLATED, _GZIP_CONTAINER))
+
+
+def zstd_compress(level: int | None = None) -> ClientMiddleware:
+    """
+    Client middleware that zstd-compresses every request body sent through it.
+
+    `gzip_compress`'s sibling: everything there (why it is opt-in, how the body
+    streams, which requests pass through untouched) holds here, and only the coding
+    differs. gzip is the coding everything decodes; reach for zstd where the upstream
+    is known to decode it.
+
+    `level` is zstd's compression level, defaulting to the library's own default.
+    """
+    return compressing(b"zstd", lambda: zstd.ZstdCompressor(level))
+
+
+class _RawBrotliCompressor(Protocol):
+    """The slice of `brotli.Compressor` the adapter drives (the bindings ship no types)."""
+
+    def process(self, data: bytes, /) -> bytes: ...
+    def finish(self) -> bytes: ...
+
+
+@dataclass(slots=True, eq=False)
+class _BrotliCompressor:
+    """
+    Adapt `brotli.Compressor` to the `Compressor` shape.
+
+    Brotli's bindings spell the incremental surface `process`/`finish` (their `flush`
+    is a mid-stream flush that keeps the stream open), so the adapter maps `compress`
+    to `process` and `flush` to `finish`.
+    """
+
+    _raw: _RawBrotliCompressor
+
+    def compress(self, data: bytes, /) -> bytes:
+        return self._raw.process(data)
+
+    def flush(self) -> bytes:
+        return self._raw.finish()
+
+
+def brotli_compress(quality: int = 11) -> ClientMiddleware:
+    """
+    Client middleware that brotli-compresses every request body sent through it.
+
+    `gzip_compress`'s sibling over brotli ([Google's own bindings](https://github.com/google/brotli),
+    a bundled dependency since the stdlib has no brotli): everything there holds here,
+    and only the coding differs. `quality` is brotli's compression quality (0-11),
+    defaulting to the library's own default (11, the maximum).
+    """
+    return compressing(b"br", lambda: _BrotliCompressor(brotli.Compressor(quality=quality)))
+
+
+class Decompressor(Protocol):
+    """
+    The incremental decoder shape `decompress` drives: feed encoded chunks through
+    `decompress`, with `eof` reporting whether a complete compressed stream has been
+    seen (the truncation check relies on it) and `unused_data` holding the bytes that
+    followed it (the next stream, for a coding that concatenates). `zlib.decompressobj`
+    and `zstd.ZstdDecompressor` satisfy it as-is; a third-party codec plugs in with a
+    thin adapter (e.g. mapping brotli's `is_finished()` to `eof`).
+    """
+
+    @property
+    def eof(self) -> bool: ...
+    @property
+    def unused_data(self) -> bytes: ...
+    def decompress(self, data: bytes, /) -> bytes: ...
+
+
+def _gzip_decompressor() -> Decompressor:
+    return zlib.decompressobj(wbits=_GZIP_CONTAINER)
+
+
+class _RawBrotliDecompressor(Protocol):
+    """The slice of `brotli.Decompressor` the adapter drives (the bindings ship no types)."""
+
+    def process(self, data: bytes, /) -> bytes: ...
+    def is_finished(self) -> bool: ...
+
+
+@dataclass(slots=True, eq=False)
+class _BrotliDecompressor:
+    """Adapt `brotli.Decompressor` to the `Decompressor` shape (`process`/`is_finished` to `decompress`/`eof`)."""
+
+    _raw: _RawBrotliDecompressor
+
+    @property
+    def eof(self) -> bool:
+        return self._raw.is_finished()
+
+    @property
+    def unused_data(self) -> bytes:
+        # `br` has no concatenation convention and the bindings hold nothing back: bytes
+        # after a finished stream make `process` raise rather than accumulate.
+        return b""
+
+    def decompress(self, data: bytes, /) -> bytes:
+        return self._raw.process(data)
+
+
+def _brotli_decompressor() -> Decompressor:
+    return _BrotliDecompressor(brotli.Decompressor())
+
+
+# The codings decoded out of the box: gzip and zstd from the stdlib, brotli from the
+# bundled bindings. `decompress`'s default table.
+DEFAULT_DECOMPRESSORS: Mapping[bytes, Callable[[], Decompressor]] = {
+    b"br": _brotli_decompressor,
+    b"gzip": _gzip_decompressor,
+    b"zstd": zstd.ZstdDecompressor,
+}
+
+_CONTENT_CODING_HEADERS = frozenset({b"content-encoding", b"content-length"})
+
+
+async def _decompressed(
+    events: AsyncIterator[bytes | ResponseTrailers], make_decompressor: Callable[[], Decompressor]
+) -> AsyncGenerator[bytes | ResponseTrailers]:
+    decompressor = make_decompressor()
+    saw_compressed_bytes = False
+    async for item in events:
+        if not isinstance(item, bytes):
+            yield item
+            continue
+        if item:
+            saw_compressed_bytes = True
+        pending = item
+        while pending:
+            if decoded := decompressor.decompress(pending):
+                yield decoded
+            # RFC 1952 §2.2: a gzip body is a *series* of members, and zstd frames
+            # concatenate the same way, so a decoder that reaches the end of one holds
+            # back whatever followed it. Those bytes begin the next stream, which a
+            # fresh decoder takes; leaving them would drop the rest of the body. A
+            # decoder still mid-stream holds nothing back, so the loop runs once.
+            pending = decompressor.unused_data if decompressor.eof else b""
+            if pending:
+                decompressor = make_decompressor()
+    # An empty body under a `content-encoding` head (a HEAD response, a 304) is fine;
+    # a *partial* compressed stream inside a cleanly-ended body is not. Decompression
+    # discards the transfer's own length signal, so this check is what stands in for it.
+    if saw_compressed_bytes and not decompressor.eof:
+        raise ConnectionError("the response body ended before its compressed stream did")
+
+
+def decompress(
+    decompressors: Mapping[bytes, Callable[[], Decompressor]] = DEFAULT_DECOMPRESSORS,
+) -> ClientMiddleware:
+    """
+    Client middleware that negotiates and decodes compressed response bodies.
+
+    Outbound it offers `accept-encoding` (a request already carrying its own keeps
+    it); inbound it wraps the response body stream in an incremental decoder, so a
+    streamed body decodes chunk by chunk and trailers pass through untouched.
+    Middleware rather than pool behavior, so the transport never silently rewrites
+    bytes: a caller that wants the wire encoding reads the undecorated client.
+
+    `decompressors` maps each coding to a factory for a fresh `Decompressor`,
+    defaulting to `DEFAULT_DECOMPRESSORS` (gzip and zstd via the stdlib, brotli via
+    the bundled bindings). The offer is *derived from its keys*, so what is
+    advertised and what is decoded cannot disagree; register a coding this package
+    does not ship by extending the table
+    (`decompress({**DEFAULT_DECOMPRESSORS, b"lzma": make_lzma})`) with any factory
+    whose product satisfies `Decompressor`. The mapping is snapshotted, keys
+    lowercased, when the middleware is built.
+
+    The decoded response is self-consistent: `content-encoding` and `content-length`
+    described the *encoded* body, so both are dropped from the head rather than left
+    to contradict the bytes the stream now yields. A response whose `content-encoding`
+    is not in the table (an unknown coding, or a stack of them) passes through whole,
+    head and body untouched.
+
+    A truncated compressed stream raises `ConnectionError` rather than passing off a
+    prefix as the whole body, and corrupt bytes raise the codec's own error. A body
+    that concatenates streams (multi-member gzip, back-to-back zstd frames, both of
+    which the formats define and origins do serve) decodes whole: each decoder that
+    ends hands its leftover bytes to a fresh one.
+    """
+    table = {name.lower(): make_decompressor for name, make_decompressor in decompressors.items()}
+    offer = b", ".join(sorted(table))
+
+    def middleware(inner: Client) -> Client:
+        async def exchange(request: ClientRequest) -> ClientResponse:
+            if not _has(request.headers, b"accept-encoding"):
+                request = replace(request, headers=(*request.headers, (b"accept-encoding", offer)))
+            response = await inner(request)
+            encoding = next(
+                (value for name, value in response.head.headers if name.lower() == b"content-encoding"), b""
+            )
+            make_decompressor = table.get(encoding.strip().lower())
+            if make_decompressor is None:
+                return response
+
+            async def release(fully_read: bool) -> None:
+                if not fully_read:
+                    await response.body.aclose()
+
+            return ClientResponse(
+                ResponseHead(response.head.status, _strip_headers(response.head.headers, _CONTENT_CODING_HEADERS)),
+                ResponseBody(await _releasing(_decompressed(response.body.events(), make_decompressor), release)),
+            )
 
         return exchange
 

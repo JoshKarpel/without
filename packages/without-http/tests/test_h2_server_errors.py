@@ -353,6 +353,24 @@ async def test_advertises_the_configured_max_concurrent_streams() -> None:
         assert conn.remote_settings.max_concurrent_streams == 7
 
 
+@pytest.mark.security("the server advertises MAX_HEADER_LIST_SIZE to bound an uncompressed header list")
+async def test_advertises_the_configured_max_header_list_size() -> None:
+    async with served_pipe(echo_app, max_header_list_bytes=4096) as (reader, writer):
+        conn = h2_client()
+        conn.initiate_connection()
+        writer.write(conn.data_to_send())
+        await writer.drain()
+        settings_seen = False
+        async with asyncio.timeout(5):
+            while not settings_seen:
+                for event in conn.receive_data(await reader.read(65536)):
+                    if isinstance(event, h2.events.RemoteSettingsChanged):
+                        settings_seen = True
+                writer.write(conn.data_to_send())
+                await writer.drain()
+        assert conn.remote_settings.max_header_list_size == 4096
+
+
 @pytest.mark.security("a stream-reset flood past the budget drops the connection (Rapid Reset)", cve="CVE-2023-44487")
 async def test_a_reset_flood_closes_the_connection() -> None:
     async with served_pipe(echo_app, max_stream_resets=2) as (reader, writer):
