@@ -56,8 +56,9 @@ needs, and in the package that owns the exchange shape it wraps.**
   that needs only the `HttpScope` / `Inbound` / `Outbound` / `Response` vocabulary,
   so it works under any router and any transport (HTTP/1.1, HTTP/2, HTTP/3, and even
   uvicorn), because it wraps the handler rather than the socket. `limit_concurrent_requests`
-  and `limit_request_body` (a `413` body-size cap) live here; natural neighbors are
-  default response headers, gzip/decompression, a per-request timeout, request-ID
+  and `limit_request_body` (a `413` body-size cap) live in `routing.py`, and `compress`
+  (negotiated response content coding) in `compression.py`; natural neighbors are
+  default response headers, a per-request timeout, request-ID
   injection, trust-gated proxy headers, and CORS preflight. Access logging has the
   same shape and deliberately does not ship: what belongs in the line is deployment
   policy (see the server positions in `docs/without-http/alternatives.md`).

@@ -585,9 +585,12 @@ for a whole client, or inline at one call site
 client is a stateless function wrap.
 
 gzip and zstd decode via the stdlib; brotli via
-[Google's own bindings](https://github.com/google/brotli), a bundled dependency
-because the stdlib has no brotli and there is exactly one library, so `decompress()`
-just works against the codings the web actually serves. The codings are table
+[Google's own bindings](https://github.com/google/brotli), a dependency rather than
+an extra because it makes no choice for anyone (the stdlib has no brotli and there
+is exactly one library, so see
+[the philosophy on dependencies](../philosophy.md#a-dependency-is-a-choice-so-take-only-the-ones-that-arent)),
+which is what lets `decompress()` just work against the codings the web actually
+serves. The codings are table
 entries, not a property of the library: `decompress` takes a mapping from coding to
 `Decompressor` factory, defaulting to `DEFAULT_DECOMPRESSORS` and deriving its offer
 from the keys so what is advertised and what is decoded cannot disagree; and
@@ -596,6 +599,17 @@ compressors. A codec this package does not ship plugs into either direction with
 factory whose product satisfies the small `Compressor` / `Decompressor` protocols,
 inheriting the framing rewrite, streaming, and truncation check instead of
 reimplementing them.
+
+The server counterpart is
+[`compress()`](../without-asgi/index.md#negotiated-response-compression), an ASGI
+middleware in `without-asgi`: it reads the `accept-encoding` that `decompress()`
+sends and encodes the response body the client will decode. `Compressor` and the
+brotli adapter behind `brotli_compress` both live in `without-asgi`, the lower of
+the two packages, and are re-exported here, so one codec serves a coding in both
+directions and the same three codings are decoded inbound and produced outbound.
+`brotli_compress` keeps the bindings' own quality of 11 while the server table
+defaults lower: a client compressing an upload it holds whole is the case that
+ratio is worth paying for, and a response encoded per request is not.
 
 State a middleware carries lives in a value you own, not in the transport. A `CookieJar`
 is the canonical case: you construct the jar and hand it to `cookies(jar)`, so cookie

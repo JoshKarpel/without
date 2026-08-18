@@ -2049,11 +2049,15 @@ name = "without-asgi"
 version = "0.0.0"
 source = { editable = "packages/without-asgi" }
 dependencies = [
+    { name = "brotli" },
     { name = "without-core" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "without-core", editable = "packages/without" }]
+requires-dist = [
+    { name = "brotli", specifier = ">=1.1" },
+    { name = "without-core", editable = "packages/without" },
+]
 
 [[package]]
 name = "without-configmap"

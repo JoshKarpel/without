@@ -169,7 +169,7 @@ async def test_compressing_composes_a_coding_the_package_does_not_ship() -> None
 async def test_decompress_decodes_a_coding_from_a_caller_extended_table() -> None:
     payload = b"weird stuff " * 40
     async with serving(encoded_app(b"bzip2", (bz2.compress(payload),))) as server, ConnectionPool() as pool:
-        client = decompress({**DEFAULT_DECOMPRESSORS, b"bzip2": bz2.BZ2Decompressor})(pool)
+        client = decompress(DEFAULT_DECOMPRESSORS | {b"bzip2": bz2.BZ2Decompressor})(pool)
         async with request(client, "GET", f"http://{server.host}:{server.port}/zipped") as (head, body):
             assert not any(name == b"content-encoding" for name, _ in head.headers)
             assert await body.read() == payload
@@ -177,7 +177,7 @@ async def test_decompress_decodes_a_coding_from_a_caller_extended_table() -> Non
 
 async def test_decompress_derives_its_offer_from_the_table_with_keys_lowercased() -> None:
     async with serving(report_app) as server, ConnectionPool() as pool:
-        client = decompress({**DEFAULT_DECOMPRESSORS, b"BZIP2": bz2.BZ2Decompressor})(pool)
+        client = decompress(DEFAULT_DECOMPRESSORS | {b"BZIP2": bz2.BZ2Decompressor})(pool)
         async with request(client, "GET", f"http://{server.host}:{server.port}/items") as (_head, body):
             assert await body.read() == b"encoding=absent length=absent accept=br, bzip2, gzip, zstd type=absent body="
 

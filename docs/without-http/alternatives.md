@@ -250,8 +250,32 @@ that does it.
 | Proxy headers (`x-forwarded-*`) | unwritten; ASGI-middleware-shaped, [#76](https://github.com/JoshKarpel/without/issues/76) | [on by default, trusted-IP gated](https://uvicorn.dev/settings/) | [`ProxyFixMiddleware`](https://hypercorn.readthedocs.io/en/latest/how_to_guides/proxy_fix.html), shipped as ASGI middleware | — |
 | Access logging | [no, by position](#what-the-server-leaves-out) (an ASGI middleware the caller writes) | [yes](https://uvicorn.dev/settings/) | [`accesslog` + format](https://hypercorn.readthedocs.io/en/latest/how_to_guides/configuring.html) | [opt-in, custom format](https://github.com/emmett-framework/granian) |
 | Static file serving | app-side ([`file_response`](../without-asgi/index.md#streaming-a-file)); no directory mount ([#77](https://github.com/JoshKarpel/without/issues/77)), `Range`, or conditional requests ([#70](https://github.com/JoshKarpel/without/issues/70)) | no | no | [directory mount below Python](https://github.com/emmett-framework/granian) (`--static-path-mount`, `--static-path-route`) |
+| Response compression | app-side ([`compress()` middleware](../without-asgi/index.md#negotiated-response-compression): brotli, zstd, and gzip, injectable coding table, RFC 9110 weights, [Heal The Breach padding](../without-asgi/index.md#compression-and-secrets) opt-in) | no; app-side ([Starlette's `GZipMiddleware`](https://www.starlette.io/middleware/#gzipmiddleware), gzip only) | no; app-side | no; app-side ([precompressed *static* files](https://github.com/emmett-framework/granian/pull/791) in flight) |
 | Metrics | live [`in_flight` count on the `Server` value](index.md#server); [no exporter, by position](#what-the-server-leaves-out) | no | — | [Prometheus exporter](https://github.com/emmett-framework/granian) |
 | Graceful shutdown | [drain on exit; budget composed by the caller](index.md#server) | [`--timeout-graceful-shutdown`](https://uvicorn.dev/settings/) | [`graceful_timeout`](https://hypercorn.readthedocs.io/en/latest/how_to_guides/configuring.html) | [kill timeout](https://github.com/emmett-framework/granian) |
+
+The compression row is the one where every column agrees, and the agreement is
+worth reading rather than skipping. No ASGI server compresses responses, and
+none should: the ASGI spec defines no extension for it, the decision needs the
+response's media type and the request's `accept-encoding` rather than anything
+about the socket, and coverage wants to be scoped per route. It is middleware
+everywhere, which is why `compress()` lives in `without-asgi` beside
+`limit_request_body` rather than in the server here.
+
+What differs is *how much* of RFC 9110 §12.5.3 the middleware implements, and
+the ecosystem answer is "the first line of it". Starlette, Django, BlackSheep,
+and aiohttp all decide by substring or word match on the raw header, so
+`gzip;q=0` selects gzip in every one of them, `identity;q=0` is ignored, and
+weights never rank anything; aiohttp picks in `ContentCoding` declaration order,
+so a browser offering `gzip, deflate, br` is answered in deflate.
+`Vary: Accept-Encoding` is the other common gap: Django patches it
+unconditionally, Starlette omits it on responses below its size threshold, and
+BlackSheep never sets it. Django is also the only one of the four to mitigate
+BREACH, through the Heal The Breach padding its `max_random_bytes` controls;
+`PADDED_COMPRESSORS` is the same mitigation here, extended to zstd's skippable
+frames alongside gzip's filename field. [`negotiate_coding`](../without-asgi/reference.md) is the whole section
+instead, weights included, as a pure function that can be read and tested apart
+from the middleware that calls it.
 
 ### Limits and robustness
 

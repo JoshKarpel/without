@@ -4,9 +4,12 @@
 `receive`/`send` into typed event streams and back. This package is *only* the
 boundary: it parses raw ASGI
 event dicts into typed values, encodes typed values back into the dicts a server
-expects, and exposes `receive` as a `Stream` and `send` as a `Sink`. Routing,
-middleware, and handlers are left to the application, which hooks processors
-together in its own code. The one piece of protocol the adapter does drive is
+expects, and exposes `receive` as a `Stream` and `send` as a `Sink`. Routing and
+handlers are left to the application, which hooks processors together in its own
+code, and so is middleware apart from the few pieces that need nothing but this
+vocabulary and therefore work under any router and any server:
+`limit_concurrent_requests`, `limit_request_body`, and
+[`compress`](#negotiated-response-compression). The one piece of protocol the adapter does drive is
 lifespan (see `make_asgi_app` below), because that is boundary work, not app
 policy. See the [`without_asgi` API reference](../without-asgi/reference.md) for
 the full surface.
@@ -155,7 +158,8 @@ a cost every response would pay.
 
 A `Content` describes what its bytes *are*; *transforming* an exchange (compressing a
 request body, decoding a response) is middleware's job, in `without-http`'s client
-vocabulary, where it streams instead of buffering and applies at whatever scope the
+vocabulary and in [`compress()`](#negotiated-response-compression) here, where it
+streams instead of buffering and applies at whatever scope the
 composition happens. A caller who wants one compressed request decorates the client
 inline for that call (`gzip_compress()(client)`) rather than wrapping the value.
 
@@ -242,6 +246,151 @@ return spool(await file_response(path), ahead=2)
 through a bounded queue on a background task, so the next `read` overlaps the
 current chunk's send; `ahead` still bounds the memory held and applies
 backpressure.
+
+## Negotiated response compression
+
+`compress()` is an `HttpMiddleware` that reads the request's `accept-encoding`,
+picks a content coding, and encodes the response body with it. It is the
+server-side mirror of `without-http`'s client `decompress()`, the same mechanism
+pointed the other way, and it lives here rather than in the server for the reason
+[no ASGI server implements one](../without-http/alternatives.md#operations):
+the decision needs the response's media type and the request's headers, not
+anything about the socket.
+
+```python
+from without_asgi.compression import compress
+from without_asgi.routing import stack
+
+middleware = stack(compress(), catching(recover))
+```
+
+`compressors` is a mapping from coding to a `Compressor` factory, defaulting to
+brotli, zstd, and gzip. What is negotiated is *derived from its keys*, so what can
+be produced and what is offered cannot disagree, and **its order is the server's
+preference**, settling a tie between codings the client weighted equally. Best
+ratio leads, which is the order to want because a client only offers what it can
+decode: brotli's built-in text dictionary wins on the HTML and JSON most responses
+are, zstd is the cheapest of the three to encode and decode but newer on the
+client, and gzip is what everything understands.
+
+Brotli is a dependency rather than an opt-in extra because it makes no choice for
+anyone: the stdlib has none and Google's bindings are the implementation, so
+declining it would buy nothing and cost every user an assembly step (see
+[the philosophy on dependencies](../philosophy.md#a-dependency-is-a-choice-so-take-only-the-ones-that-arent)).
+Its quality defaults to `DYNAMIC_BROTLI_QUALITY` (5) rather than the bindings' own
+11: a table entry encodes a response per request, where 11 costs much more CPU
+without a ratio to show for it at response sizes (on a 2 KB JSON body and a 2.7 KB
+HTML one, quality 5 matched or beat 11 outright, since 11's wider window has little
+to find in a few kilobytes). Raise it for bodies large enough to pay for that
+window, or register a coding that does not ship, by extending the table rather than
+forking:
+
+```python
+from without_asgi.compression import DEFAULT_COMPRESSORS, brotli_compressor, compress
+
+compress(DEFAULT_COMPRESSORS | {b"br": lambda: brotli_compressor(11)})
+```
+
+### What the client can ask for
+
+`negotiate_coding(accept_encoding, available)` is the negotiation on its own: a
+pure function of the header and the codings the server has, implementing
+[RFC 9110 §12.5.3](https://www.rfc-editor.org/rfc/rfc9110#section-12.5.3) whole.
+Weights are the part usually skipped, and skipping them is not harmless: a client
+writing `gzip;q=0` is *refusing* gzip, and a server matching on substrings reads
+it as asking for it. Here `q=0` excludes, the highest non-zero weight wins,
+`*` matches every coding not named, and `identity` outranking the alternatives
+(named or reached through a wildcard) means no coding at all.
+
+Two of its answers are choices rather than requirements. A request with **no**
+`accept-encoding` is answered unencoded, though rule 1 of that section would
+permit any coding: a request that never mentions the field is more often a client
+that does not decode than one that quietly would, and an over-eager coding is a
+broken response where a missed one is only a larger one. Note that an *empty*
+`accept-encoding` is a different request, and that one does say identity. And a
+request that marks identity unacceptable while accepting nothing the server has
+is still answered with identity rather than a `406`, since failing a request over
+a preference serves nobody.
+
+### What gets compressed
+
+Three properties of the *response* decide candidacy, before any client preference
+is consulted: a `204` or `304` carries no content, a response already carrying
+`content-encoding` is already encoded, and the media type has to be worth the CPU.
+That last is `is_compressible`, an allowlist (`text/*`, the `+json` / `+xml` /
+`+text` structured suffixes, and a short list of the rest) in the shape nginx's
+`gzip_types` takes, so an unrecognized type yields a larger response rather than
+cycles spent re-compressing a JPEG. `text/event-stream` is excluded despite being
+`text/`: an incremental compressor holds bytes back until it has a block, which is
+exactly the latency an event stream exists to avoid. Pass your own predicate as
+`compressible` to decide differently.
+
+Every candidate gets `Vary: Accept-Encoding` whether or not *this* client got an
+encoded body, because candidacy is a property of the resource and a shared cache
+has to key on the header that decides the answer; a non-candidate gets none, since
+nothing about it varies. A strong `etag` is weakened to `W/` when the body is
+encoded, since [RFC 9110 §8.8.1](https://www.rfc-editor.org/rfc/rfc9110#section-8.8.1)
+defines a strong validator as one that changes whenever the content does. Weakening
+rather than dropping keeps it true in the way it still is: the two representations
+stay semantically equivalent, so a conditional request still matches under weak
+comparison while a `Range` request, which needs strong comparison, correctly stops.
+
+`minimum_size` (500 bytes by default) is the floor below which gzip's framing costs
+more than the text saves. It gates on the *bytes*, not on `content-length`, so it
+holds for a streaming response that never declares one: the middleware buffers up to
+that much of the body to learn which side of the gate it falls on, then either
+releases the prefix untouched or commits and streams the rest through the compressor
+chunk by chunk. A body that arrives whole is re-described with an exact
+`content-length` for its encoded form rather than falling back to chunked; one still
+streaming when it crosses the gate loses `content-length` and is framed by the
+transport, as any streaming body is.
+
+### Compression and secrets
+
+Compressing a response that mixes a secret (a CSRF token, a session identifier)
+with attacker-influenced text leaks the secret through the response's *length*.
+That is the BREACH attack, and it is not a gzip quirk: every coding in the default
+table is an LZ77 family compressor whose output shrinks when a guess matches the
+secret, which is the whole oracle. Measured against a page reflecting a guess 50
+times beside a token, gzip narrowed the next character to two candidates and
+brotli picked it out uniquely; brotli leaks *fastest*, because the wider window and
+built-in dictionary that make it compress best also make it match best.
+
+`PADDED_COMPRESSORS` is the mitigation, and `compress` takes it like any other
+table:
+
+```python
+from without_asgi.compression import PADDED_COMPRESSORS, compress
+
+sensitive = mount("/account", compress(PADDED_COMPRESSORS))
+```
+
+This is [Heal The Breach](https://ieeexplore.ieee.org/document/9754554) (Palacios
+et al., IEEE Access 2022), the mitigation Django adopted in 4.2. Each response
+carries a random-length run of bytes in a part of the container the decoder is
+required to ignore, so the length stops being a function of the content alone and
+an oracle has to average the noise away before it reads anything. The paper puts
+the delay that imposes at roughly 500x for a 10-byte budget and 500,000x for
+`MAX_RANDOM_BYTES` (100, the default here and Django's), against a cost of about
+half the budget per response.
+
+The padding is per *container*, which is why that table is shorter than
+`DEFAULT_COMPRESSORS` rather than a padded copy of it. gzip has the optional
+filename field after its fixed header ([RFC 1952 §2.3.1](https://www.rfc-editor.org/rfc/rfc1952#section-2.3.1)),
+zstd has skippable frames ([RFC 8878 §3.1.2](https://www.rfc-editor.org/rfc/rfc8878#section-3.1.2)),
+and brotli's bindings expose only `process`, `flush`, and `finish`, with no
+metadata block to write into and no concatenation to prepend one as. Dropping `br`
+is the design rather than a gap: a table where one coding silently went unpadded
+would promise a guarantee it does not keep, and it would be the coding browsers
+reach for first.
+
+Two things follow. Padding raises the sample count an attack needs rather than
+removing the leak, so it is defense in depth, not a reason to stop asking which
+responses reflect input back beside credentials. And because middleware coverage
+is decided by *where* it is mounted (`without-web`'s `mount` and `with_middleware`
+scope it to a prefix or a single route), both answers are route-scoped: pay the
+padding and lose brotli where secrets and reflections meet, and keep
+`DEFAULT_COMPRESSORS` everywhere else.
 
 ## The codec runs both directions
 

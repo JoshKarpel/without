@@ -12,7 +12,7 @@
   (`DEFAULT_DECOMPRESSORS`, gzip and zstd from the stdlib and brotli from the bundled bindings), and
   the `accept-encoding` offer is *derived from its keys*, so what is advertised and what can be
   decoded cannot disagree; registering a coding this package does not ship is one entry
-  (`decompress({**DEFAULT_DECOMPRESSORS, b"lzma": make_lzma})`) rather than a fork. The decoded
+  (`decompress(DEFAULT_DECOMPRESSORS | {b"lzma": make_lzma})`) rather than a fork. The decoded
   response is self-consistent: `content-encoding` and `content-length` described the *encoded* body,
   so both leave the head instead of contradicting the bytes the stream now yields, an unknown or
   stacked coding passes through whole, a body that concatenates streams (multi-member gzip,
@@ -26,6 +26,53 @@
   `zstd_compress`, and `brotli_compress` as the three that ship. Bodies compress as they stream, so
   a large upload is never buffered whole, and per-call composition means one client can send
   compressed to a peer that wants it and plain to one that does not.
+- **`without-asgi`**: negotiated response compression, closing the exchange the two above open.
+  `without_asgi.compression.compress()` is an `HttpMiddleware` that reads a request's
+  `accept-encoding` and encodes the response body with the coding it picks. It is middleware rather
+  than server behavior because the decision needs the response's media type and the request's
+  headers rather than anything about the socket, which is also why no ASGI server implements one; it
+  therefore applies under any transport and any router, and its coverage is decided by where it is
+  mounted. The coding table is the argument (`DEFAULT_COMPRESSORS`: brotli, zstd, and gzip) and what
+  is negotiated is derived from its keys, with the *order* of those keys serving as the server's own
+  preference between codings a client weighted equally, best ratio first. `Compressor` and the
+  brotli adapter now live here rather than in `without-http`, which re-exports both, so one codec
+  serves a coding in both directions. `brotli_compressor` defaults to
+  `DYNAMIC_BROTLI_QUALITY` (5) rather than the bindings' 11, since a table entry encodes a response
+  per request; the request-side `brotli_compress` keeps 11, where a client compressing one upload
+  makes the ratio worth its cost. This adds `brotli` to `without-asgi`'s dependencies, which
+  `PHILOSOPHY.md` now states the test for: a dependency that makes no choice for anyone (no stdlib
+  brotli, one implementation) is taken so it just works, where one with live alternatives (a JSON
+  encoder) stays an argument.
+- **`without-asgi`**: `negotiate_coding(accept_encoding, available)`, the negotiation as a pure
+  function, implementing [RFC 9110 §12.5.3](https://www.rfc-editor.org/rfc/rfc9110#section-12.5.3)
+  whole. Weights are the part the ecosystem skips, and skipping them inverts requests: matching on
+  substrings reads `gzip;q=0`, which *refuses* gzip, as asking for it. Here `q=0` excludes, the
+  highest non-zero weight wins, `*` matches every coding not named, and identity outranking the
+  alternatives means no coding. Two answers are choices rather than requirements, both documented on
+  the function: a request with no `accept-encoding` is answered unencoded although rule 1 would
+  permit any coding, and one that refuses identity while accepting nothing available still gets
+  identity rather than a `406`.
+- **`without-asgi`**: `PADDED_COMPRESSORS`, a coding table that mitigates BREACH, for the routes whose
+  responses mix a secret with attacker-influenced text. It implements
+  [Heal The Breach](https://ieeexplore.ieee.org/document/9754554) (Palacios et al., IEEE Access 2022),
+  the mitigation Django adopted in 4.2: each response carries a random-length run of up to
+  `MAX_RANDOM_BYTES` (100) in a part of the container the decoder must ignore, so the response length
+  stops being a function of the content alone and a length oracle has to average the noise away
+  first. It is a table rather than a flag because the padding is per *container*: gzip has the
+  optional filename field after its fixed header (RFC 1952 §2.3.1) and zstd has skippable frames
+  (RFC 8878 §3.1.2), while brotli's bindings expose no metadata block and reject concatenation, so
+  `br` is absent by construction. A table that silently left one coding unpadded would promise a
+  guarantee it does not keep, and it would be the coding browsers reach for first. Padding raises the
+  sample count an attack needs rather than removing the leak, so mount it where secrets and
+  reflections meet and keep `DEFAULT_COMPRESSORS`, with its brotli, everywhere else.
+- **`without-asgi`**: `Vary: Accept-Encoding` on every response `compress` could have encoded,
+  whether or not this client got an encoded body, since candidacy is a property of the resource and a
+  shared cache has to key on the header that decides the answer. A strong `etag` is weakened to `W/`
+  when the body is encoded, per [RFC 9110 §8.8.1](https://www.rfc-editor.org/rfc/rfc9110#section-8.8.1):
+  weak comparison still matches the two representations, `Range` correctly stops matching. Bodies
+  below `minimum_size` are left alone, gated on the bytes rather than on `content-length` so the
+  floor holds for a streaming response; a body held whole is re-described with an exact
+  `content-length` for its encoded form instead of falling back to chunked.
 - **`without-http`**: `default_headers(*headers)`, the counterpart to `add_headers` for a field
   RFC 9110 allows only once. `add_headers` copies its headers onto every request whatever it already
   carries, which is right for a field that may repeat and wrong for `authorization` or `user-agent`,

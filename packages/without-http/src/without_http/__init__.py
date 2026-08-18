@@ -1,4 +1,5 @@
 from without_http.client import DEFAULT_DECOMPRESSORS
+from without_http.client import GZIP_CONTAINER
 from without_http.client import USER_AGENT
 from without_http.client import Client
 from without_http.client import ClientMiddleware
@@ -17,6 +18,7 @@ from without_http.client import add_headers
 from without_http.client import basic_auth
 from without_http.client import bearer_auth
 from without_http.client import brotli_compress
+from without_http.client import brotli_compressor
 from without_http.client import compressing
 from without_http.client import cookies
 from without_http.client import deadline
@@ -64,6 +66,7 @@ from without_http.ws_wire import ws_events_from_outbound
 __all__ = [
     "ALPN_PROTOCOLS",
     "DEFAULT_DECOMPRESSORS",
+    "GZIP_CONTAINER",
     "USER_AGENT",
     "Client",
     "ClientMiddleware",
@@ -91,6 +94,7 @@ __all__ = [
     "basic_auth",
     "bearer_auth",
     "brotli_compress",
+    "brotli_compressor",
     "compressing",
     "cookies",
     "deadline",

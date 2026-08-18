@@ -199,6 +199,38 @@ queue with a caller-chosen capacity and a visible drop count is policy made
 observable; an unbounded queue chosen silently on the caller's behalf is a
 decision taken from them.
 
+### A dependency is a choice, so take only the ones that aren't
+
+The same test governs what we install, because a dependency in a library's
+metadata is a decision imposed on everyone downstream. The question is not "how
+few dependencies can we have"; it is *how few choices do we make on the user's
+behalf*. Those come apart, and reading the first for the second produces a
+library that reimplements a protocol badly to keep a number low.
+
+So the criterion is whether a real choice exists. Where a capability has one
+obvious implementation and no live alternatives with different trade-offs, taking
+the dependency decides nothing: nobody was going to pick differently, and
+declining it means shipping a worse copy of the same thing, or pushing an
+assembly step onto every user to no end. Brotli is that case (the stdlib has no
+brotli and Google's bindings are the implementation), and so are
+`aiohappyeyeballs` for dual-stack connection ordering and `h11` / `h2` /
+`wsproto` for sans-IO protocol state machines. We take those, and they belong in
+the layer that needs them rather than the layer that happens to already have
+them, so `br` is in the server's default coding table and works without ceremony.
+
+Where the alternatives are real, the choice is the user's and a default that
+picks one is the layer deciding above itself. JSON encoding is the clearest
+example: the stdlib, `orjson`, `msgspec`, and the rest trade speed against type
+coverage against strictness, and which trade is right is a property of the
+application. So `json_content` takes a `dumps` argument, defaults to the stdlib
+because a default must add no dependency, and the fast encoder is one argument
+away for whoever wants it. The same shape recurs everywhere the layers meet: a
+coding table, a serializer, a resolver, a schema generator.
+
+The two halves of the test are worth stating together, since only the second is
+about counting. Take the dependency when it makes no choice for anyone; make it
+an argument when it does.
+
 ### Each layer describes itself, and the whole is a merge
 
 Whichever layer parses or produces a value is the single source of truth for that
