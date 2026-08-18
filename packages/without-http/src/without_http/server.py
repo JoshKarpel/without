@@ -1008,15 +1008,30 @@ async def serving(
     live = _LiveConnections()
     connections: set[asyncio.Task[None]] = set()
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        task = asyncio.current_task()
-        assert task is not None
+    async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        async with live.tracked():
+            await _serve_connection(app, reader, writer, limits)
+
+    def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        # Deliberately not a coroutine function. `start_server` runs a plain callback
+        # while the connection is being made, so the task is in `connections` before the
+        # accept returns; hand it a coroutine instead and it builds the task itself, which
+        # registers only once it first runs. A shutdown that reads this set in between
+        # would then leave that connection tracked by nobody: nothing cancels it, so
+        # nothing runs the teardown that closes its socket, and the descriptor outlives
+        # the server.
+        task = asyncio.create_task(serve(reader, writer))
         connections.add(task)
-        try:
-            async with live.tracked():
-                await _serve_connection(app, reader, writer, limits)
-        finally:
-            connections.discard(task)
+
+        def finished(done: asyncio.Task[None]) -> None:
+            connections.discard(done)
+            # A task cancelled before its first step never reaches `_serve_connection`, so
+            # nothing else would ever close this connection. Aborting is idempotent, and
+            # every task that did run has already aborted its own transport, so this costs
+            # the ordinary path nothing and is the only closer for the one that did not.
+            writer.transport.abort()
+
+        task.add_done_callback(finished)
 
     async with run_lifespan(app):
         server = await asyncio.start_server(
@@ -1034,6 +1049,9 @@ async def serving(
         try:
             yield Server(host=bound_host, port=bound_port, _connections=live)
         finally:
+            # Closing the listener first is what makes the set below complete: no further
+            # connection is accepted after it, and every one already accepted registered
+            # its task as it arrived, so cancelling them reaches all of them.
             server.close()
             await cancel_futures(connections)
             await server.wait_closed()

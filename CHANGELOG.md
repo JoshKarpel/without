@@ -100,6 +100,15 @@
 
 ### Fixed
 
+- **`without-http`**: `serving` no longer leaves behind the socket of a connection it
+  accepted moments before shutdown. Its connection set was populated by each handler once
+  that handler first ran, so a connection accepted late enough was tracked by nobody: the
+  shutdown's cancel never reached it, nothing ran the teardown that closes its socket, and
+  the descriptor outlived the server. The accept callback is now a plain function rather
+  than a coroutine, which `asyncio.start_server` runs while the connection is being made,
+  so every accepted connection is registered before the accept returns; and the task's
+  completion aborts the transport, which is the only closer for one cancelled before it
+  ever ran.
 - **`without-http`**: a served connection whose queued response the peer never read no
   longer holds its file descriptor, or a shutdown, forever. Asyncio releases a socket only
   once the transport's write buffer drains, which a peer that has stopped reading never
