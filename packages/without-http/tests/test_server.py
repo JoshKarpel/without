@@ -33,8 +33,10 @@ from without_asgi import make_asgi_app
 from without_asgi.routing import buffered
 from without_http import serving
 from without_http.server import _DEFAULT_LIMITS
+from without_http.server import _MID_ACCEPT_FLUSH_TICKS
 from without_http.server import _address
 from without_http.server import _consume_buffered_request
+from without_http.server import _has_connections_mid_accept
 from without_http.server import _lingering_close
 from without_http.server import _LiveConnections
 from without_http.server import _send_simple
@@ -798,6 +800,79 @@ async def test_a_connection_accepted_moments_before_shutdown_does_not_leak_its_s
         gc.collect()
 
     assert [str(w.message) for w in caught if issubclass(w.category, ResourceWarning)] == []
+
+
+def test_an_accept_task_that_has_not_taken_its_first_step_counts_as_mid_accept() -> None:
+    # Only the stdlib selector loop accepts through a task, so the window the test above
+    # races for cannot occur on a proactor loop. The task is built here instead of raced
+    # for, which pins the predicate's own behaviour on every platform.
+    assert not _has_connections_mid_accept(asyncio.AbstractEventLoop())  # no accept machinery at all, as on uvloop
+
+    loop = asyncio.SelectorEventLoop()
+    try:
+        assert not _has_connections_mid_accept(loop)
+
+        accept = getattr(type(loop), "_accept_connection2")  # noqa: B009 - a name the stubs do not carry
+        accepting = loop.create_task(accept(loop, None, None, None))
+        assert _has_connections_mid_accept(loop)
+
+        accepting.cancel()
+        with suppress(asyncio.CancelledError):
+            loop.run_until_complete(accepting)
+        assert not _has_connections_mid_accept(loop)
+    finally:
+        loop.close()
+
+
+async def test_the_shutdown_waits_for_a_connection_that_is_still_mid_accept(mocker: MockerFixture) -> None:
+    # Whether a connection is mid-accept is the loop's business (only a selector loop
+    # opens that window at all), so the answer is dictated here: the shutdown must keep
+    # ticking while one is in flight and stop as soon as the window is empty.
+    mid_accept = mocker.patch("without_http.server._has_connections_mid_accept", side_effect=[True, True, False])
+
+    async with serving(echo_app):
+        pass
+
+    assert mid_accept.call_count == 3
+
+
+async def test_the_shutdown_closes_the_listener_anyway_after_the_tick_bound(
+    mocker: MockerFixture, caplog: pytest.LogCaptureFixture
+) -> None:
+    mid_accept = mocker.patch("without_http.server._has_connections_mid_accept", return_value=True)
+
+    with caplog.at_level(logging.WARNING, logger="without_http.server"):
+        async with serving(echo_app):
+            pass
+
+    assert mid_accept.call_count == _MID_ACCEPT_FLUSH_TICKS
+    assert f"after {_MID_ACCEPT_FLUSH_TICKS} loop ticks" in caplog.text
+
+
+async def test_the_shutdown_closes_connections_for_a_server_that_cannot_abort_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # uvloop's `Server` has no `abort_clients`, and uvloop ships no Windows wheels, so
+    # deleting the stdlib's is how every platform exercises the teardown without it. The
+    # abstract base declares it too, and would otherwise answer the lookup by raising.
+    monkeypatch.delattr(asyncio.Server, "abort_clients")
+    monkeypatch.delattr(asyncio.AbstractServer, "abort_clients")
+
+    async with serving(echo_app) as server:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        writer.write(b"GET /x HTTP/1.1\r\nhost: test\r\n\r\n")
+        await writer.drain()
+        assert (await asyncio.wait_for(reader.read(65536), timeout=5)).startswith(b"HTTP/1.1 200")
+
+    try:
+        # The teardown reaches the connection without `abort_clients`, so the keep-alive
+        # read ends rather than hanging, whether the close lands as EOF or as a reset.
+        with suppress(OSError):
+            assert await asyncio.wait_for(reader.read(), timeout=5) == b""
+    finally:
+        writer.close()
+        with suppress(OSError):
+            await writer.wait_closed()
 
 
 async def _drive_h11_over_socketpair(

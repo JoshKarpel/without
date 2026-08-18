@@ -1100,7 +1100,7 @@ async def serving(
                     if not _has_connections_mid_accept(asyncio.get_running_loop()):
                         break
                     await asyncio.sleep(0)
-                else:  # pragma: no cover - needs a sustained connect flood at shutdown
+                else:
                     logger.warning(
                         f"Closing the listener with connections still mid-accept after {_MID_ACCEPT_FLUSH_TICKS} loop ticks;"
                         " their sockets are dropped by asyncio without cleanup"
