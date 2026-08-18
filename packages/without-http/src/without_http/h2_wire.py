@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from collections.abc import Mapping
 from urllib.parse import unquote
 
 from without_asgi import HttpScope
 from without_asgi import RawHeaders
 
 from without_http.h11_wire import ASGI
+from without_http.h11_wire import HTTP_EXTENSIONS
 
 # The HTTP/2 connection preface a cleartext client sends before any frames. A
 # server detects "prior knowledge" h2c by sniffing it off the first bytes, since
@@ -31,12 +33,15 @@ def scope_from_h2_headers(
     scheme: str,
     server: tuple[str, int | None] | None,
     client: tuple[str, int] | None,
+    extensions: Mapping[str, Mapping[str, object]] = HTTP_EXTENSIONS,
 ) -> HttpScope:
     """
     Build the typed `HttpScope` an ASGI app expects from an h2 request's headers.
 
     Pure: it reads only the request pseudo-headers (`:method`/`:path`/`:authority`)
-    and the connection facts the transport already knows (peer addresses, scheme).
+    and the connection facts the transport already knows (peer addresses, scheme,
+    and the `extensions` this connection offers, which is `HTTP_EXTENSIONS` plus
+    `tls` when the connection is over TLS).
     The `scheme` is taken from the transport, not the client-asserted `:scheme`. The
     `:authority` is folded into a synthesized `host` header when the request carries
     none, the same mapping uvicorn makes for HTTP/2.
@@ -74,7 +79,7 @@ def scope_from_h2_headers(
         headers=tuple(ordinary),
         client=client,
         server=server,
-        extensions=None,
+        extensions=extensions,
     )
 
 

@@ -21,8 +21,10 @@ the guide is that directory's `index.md`, its API reference is the generated
 `reference.md` beside it, and any deep-dive sub-pages live alongside. So: the
 core (`without/index.md`), the ASGI boundary (`without-asgi/index.md`), the HTTP
 server and client (`without-http/index.md`, with cookie handling, connection-close
-security, and the in-memory test clients split into `without-http/cookies.md`,
-`without-http/security.md`, and `without-http/testing.md`), the opinionated router
+security, the in-memory test clients, and the feature register against httpx,
+aiohttp, niquests, and the ASGI servers split into `without-http/cookies.md`,
+`without-http/security.md`, `without-http/testing.md`, and
+`without-http/alternatives.md`), the opinionated router
 (`without-web/index.md`), the
 config sources (`without-env/index.md`, `without-configmap/index.md`), the DAG
 executor (`without-dag/index.md`), and durable workflows

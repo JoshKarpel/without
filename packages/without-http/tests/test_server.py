@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
+import socket
 import ssl
+import warnings
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from contextlib import suppress
+from dataclasses import replace
 from datetime import timedelta
 from typing import cast
 
@@ -18,6 +22,7 @@ import h11
 import httpx
 import pytest
 from pytest_mock import MockerFixture
+from without import cancel_futures
 from without_asgi import ASGIApp
 from without_asgi import HttpScope
 from without_asgi import RawMessage
@@ -28,8 +33,10 @@ from without_asgi import make_asgi_app
 from without_asgi.routing import buffered
 from without_http import serving
 from without_http.server import _DEFAULT_LIMITS
+from without_http.server import _MID_ACCEPT_FLUSH_TICKS
 from without_http.server import _address
 from without_http.server import _consume_buffered_request
+from without_http.server import _has_connections_mid_accept
 from without_http.server import _lingering_close
 from without_http.server import _LiveConnections
 from without_http.server import _send_simple
@@ -298,11 +305,22 @@ class _ResettingReader:
         raise ConnectionResetError(104, "connection reset by peer")
 
 
+class _RecordingTransport:
+    """The slice of a transport the connection teardown reaches for."""
+
+    def __init__(self) -> None:
+        self.aborted = False
+
+    def abort(self) -> None:
+        self.aborted = True
+
+
 class _RecordingWriter:
-    """A writer that records only what `_serve_connection` needs: extra info and close."""
+    """A writer that records what `_serve_connection` needs: extra info, close, and the abort."""
 
     def __init__(self) -> None:
         self.closed = False
+        self.transport = _RecordingTransport()
 
     def get_extra_info(self, _name: str) -> None:
         return None
@@ -330,6 +348,7 @@ async def test_a_peer_reset_while_awaiting_a_request_ends_the_connection_without
     )
 
     assert writer.closed
+    assert writer.transport.aborted  # the fd goes back even when the peer left first
 
 
 async def test_a_malformed_request_lingers_so_the_client_reads_the_error(
@@ -352,6 +371,7 @@ async def test_a_malformed_request_lingers_so_the_client_reads_the_error(
         secure=False,
         server=None,
         client=None,
+        tls=None,
         limits=_DEFAULT_LIMITS,
     )
 
@@ -521,6 +541,27 @@ async def test_a_stalled_partial_body_hits_the_idle_timeout() -> None:
     assert response.startswith(b"HTTP/1.1 500")
 
 
+@pytest.mark.security("an oversized HTTP/1.1 request head is refused rather than buffered without bound")
+async def test_a_request_head_over_the_cap_is_refused() -> None:
+    async with served_pipe(echo_app, max_incomplete_event_bytes=256) as (reader, writer):
+        # The headers are never terminated, so the bound is what ends this, not the parse.
+        writer.write(b"GET /x HTTP/1.1\r\nhost: test\r\nx-padding: " + b"a" * 1024)
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(), timeout=5)
+
+    assert response.startswith(b"HTTP/1.1 431")
+
+
+@pytest.mark.security("a request head within the cap is served normally")
+async def test_a_request_head_within_the_cap_is_served() -> None:
+    async with served_pipe(echo_app, max_incomplete_event_bytes=4096) as (reader, writer):
+        writer.write(b"GET /x HTTP/1.1\r\nhost: test\r\nx-padding: " + b"a" * 1024 + b"\r\n\r\n")
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(65536), timeout=5)
+
+    assert response.startswith(b"HTTP/1.1 200")
+
+
 @pytest.mark.security("closing a connection idle beyond the timeout is logged at INFO")
 async def test_idle_timeout_logs_the_close_reason(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.INFO, logger="without_http.server"):
@@ -682,6 +723,162 @@ async def test_lingering_close_is_bounded_by_the_linger_timeout(mocker: MockerFi
     assert writer.closed
 
 
+async def _pinned_pair() -> tuple[_Endpoint, _Endpoint]:
+    """Two connected endpoints whose kernel buffers are too small to absorb a large write."""
+    loop = asyncio.get_running_loop()
+
+    async def endpoint(sock: socket.socket) -> _Endpoint:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        reader = asyncio.StreamReader()
+        protocol = asyncio.StreamReaderProtocol(reader)
+        transport, _ = await loop.create_connection(lambda: protocol, sock=sock)
+        return reader, asyncio.StreamWriter(transport, protocol, reader, loop)
+
+    left, right = socket.socketpair()
+    return await endpoint(left), await endpoint(right)
+
+
+@pytest.mark.security("a peer that stops reading cannot hold a file descriptor or a shutdown")
+async def test_a_connection_whose_writes_never_drain_is_aborted_at_the_close_timeout() -> None:
+    # asyncio hands the socket back only once the write buffer drains, so a peer that
+    # stops reading keeps the fd (which surfaces later as an unclosed-transport
+    # `ResourceWarning`) and keeps a cancelling shutdown waiting on it. The bounded wait
+    # plus the abort is what ends both: the fd comes back and the cancel completes.
+    answered = asyncio.Event()
+
+    async def answers_then_waits(scope: RawMessage, receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+        answered.set()
+
+    # Its own endpoints rather than `stream_pair`, because it queues bytes behind the
+    # connection's back and has to own when each end goes away.
+    (server_reader, server_writer), (_client_reader, client_writer) = await _pinned_pair()
+    server_socket = server_writer.get_extra_info("socket")
+    try:
+        limits = replace(_DEFAULT_LIMITS, close_timeout=timedelta(seconds=0.05))
+        connection = asyncio.create_task(_serve_connection(answers_then_waits, server_reader, server_writer, limits))
+        client_writer.write(b"GET /answered HTTP/1.1\r\nhost: test\r\n\r\n")
+        await client_writer.drain()
+        await answered.wait()  # the connection is served and back on its keep-alive read
+
+        # Queue far more than the pinned buffers can carry to a client that never reads it.
+        server_writer.write(b"z" * 4_000_000)
+        assert server_writer.transport.get_write_buffer_size() > 0
+
+        await asyncio.wait_for(cancel_futures([connection]), timeout=5)
+
+        assert server_socket.fileno() == -1  # the abort handed the descriptor back
+    finally:
+        client_writer.close()
+        with suppress(OSError):
+            await client_writer.wait_closed()
+
+
+async def test_a_connection_accepted_moments_before_shutdown_does_not_leak_its_socket() -> None:
+    # Accepting a connection takes the stdlib loop several ticks: the selector callback
+    # runs `sock.accept()` and spawns an internal task, and only that task's first step
+    # builds the transport. The two `sleep(0)`s park this test exactly in between (the
+    # first resumes before the selector callback has run; the second resumes after it
+    # ran, but before the task it spawned starts), so exiting `serving` here used to
+    # close the listener under a connection that had no transport, no handler task, and
+    # no place in any tracking set. asyncio then dropped it without closing its socket
+    # (https://github.com/python/cpython/issues/109564), which surfaced as unraisable
+    # `ResourceWarning`s on whatever test happened to be running at the next collection.
+    # The shutdown now waits the window out; collection is forced here so a regression
+    # fails this test, as recorded warnings, rather than an arbitrary later one.
+    gc.collect()  # nothing already-doomed should get collected, and blamed, inside the recording block
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        async with serving(echo_app) as server:
+            with socket.create_connection((server.host, server.port)):
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+        for _ in range(5):  # let the loop's internal accept task run to completion
+            await asyncio.sleep(0)
+        gc.collect()
+
+    assert [str(w.message) for w in caught if issubclass(w.category, ResourceWarning)] == []
+
+
+def test_only_an_unstarted_accept_task_counts_as_a_connection_mid_accept() -> None:
+    # Only the stdlib selector loop accepts through a task, so the window the test above
+    # races for cannot occur on the proactor loop the Windows leg runs. Building the tasks
+    # here rather than racing for one pins the predicate's behaviour on every platform.
+    assert not _has_connections_mid_accept(cast(asyncio.AbstractEventLoop, object()))  # no accept machinery at all
+
+    loop = asyncio.SelectorEventLoop()
+    try:
+        assert not _has_connections_mid_accept(loop)
+
+        unrelated = loop.create_task(asyncio.sleep(0))  # unstarted, but not an accept
+        assert not _has_connections_mid_accept(loop)
+
+        accept = getattr(type(loop), "_accept_connection2")  # noqa: B009 - a name the stubs do not carry
+        accepting = loop.create_task(accept(loop, None, None, None))
+        assert _has_connections_mid_accept(loop)
+
+        accepting.cancel()
+        with suppress(asyncio.CancelledError):
+            loop.run_until_complete(accepting)
+        loop.run_until_complete(unrelated)
+        assert not _has_connections_mid_accept(loop)  # the accept took its first step and is gone
+    finally:
+        loop.close()
+
+
+async def test_the_shutdown_waits_for_a_connection_that_is_still_mid_accept(mocker: MockerFixture) -> None:
+    # Whether a connection is mid-accept is the loop's business (only a selector loop
+    # opens that window at all), so the answer is dictated here: the shutdown must keep
+    # ticking while one is in flight and stop as soon as the window is empty.
+    mid_accept = mocker.patch("without_http.server._has_connections_mid_accept", side_effect=[True, True, False])
+
+    async with serving(echo_app):
+        pass
+
+    assert mid_accept.call_count == 3
+
+
+async def test_the_shutdown_closes_the_listener_anyway_after_the_tick_bound(
+    mocker: MockerFixture, caplog: pytest.LogCaptureFixture
+) -> None:
+    mid_accept = mocker.patch("without_http.server._has_connections_mid_accept", return_value=True)
+
+    with caplog.at_level(logging.WARNING, logger="without_http.server"):
+        async with serving(echo_app):
+            pass
+
+    assert mid_accept.call_count == _MID_ACCEPT_FLUSH_TICKS
+    assert f"after {_MID_ACCEPT_FLUSH_TICKS} loop ticks" in caplog.text
+
+
+async def test_the_shutdown_closes_connections_for_a_server_that_cannot_abort_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # uvloop's `Server` has no `abort_clients`, and uvloop ships no Windows wheels, so
+    # deleting the stdlib's is how every platform exercises the teardown without it. The
+    # abstract base declares it too, and would otherwise answer the lookup by raising.
+    monkeypatch.delattr(asyncio.Server, "abort_clients")
+    monkeypatch.delattr(asyncio.AbstractServer, "abort_clients")
+
+    async with serving(echo_app) as server:
+        reader, writer = await asyncio.open_connection(server.host, server.port)
+        writer.write(b"GET /x HTTP/1.1\r\nhost: test\r\n\r\n")
+        await writer.drain()
+        assert (await asyncio.wait_for(reader.read(65536), timeout=5)).startswith(b"HTTP/1.1 200")
+
+    try:
+        # The teardown reaches the connection without `abort_clients`, so the keep-alive
+        # read ends rather than hanging, whether the close lands as EOF or as a reset.
+        with suppress(OSError):
+            assert await asyncio.wait_for(reader.read(), timeout=5) == b""
+    finally:
+        writer.close()
+        with suppress(OSError):
+            await writer.wait_closed()
+
+
 async def _drive_h11_over_socketpair(
     app: ASGIApp, request: bytes, stream_pair: _StreamPairFactory
 ) -> tuple[asyncio.StreamReader, _Endpoint]:
@@ -697,6 +894,7 @@ async def _drive_h11_over_socketpair(
         secure=False,
         server=None,
         client=None,
+        tls=None,
         limits=_DEFAULT_LIMITS,
     )
     return client_reader, (server_reader, server_writer)
@@ -720,6 +918,7 @@ async def test_a_malformed_request_lingers_with_both_stream_ends(
         secure=False,
         server=None,
         client=None,
+        tls=None,
         limits=_DEFAULT_LIMITS,
     )
 

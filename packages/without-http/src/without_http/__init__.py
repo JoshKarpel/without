@@ -1,20 +1,35 @@
+from without_http.client import DEFAULT_DECOMPRESSORS
+from without_http.client import USER_AGENT
 from without_http.client import Client
 from without_http.client import ClientMiddleware
 from without_http.client import ClientRequest
 from without_http.client import ClientResponse
+from without_http.client import Compressor
 from without_http.client import Connect
 from without_http.client import ConnectionPool
 from without_http.client import CookieJar
+from without_http.client import Decompressor
+from without_http.client import Resolve
 from without_http.client import ResponseBody
 from without_http.client import ResponseHead
 from without_http.client import ResponseTrailers
 from without_http.client import add_headers
+from without_http.client import basic_auth
+from without_http.client import bearer_auth
+from without_http.client import brotli_compress
+from without_http.client import compressing
 from without_http.client import cookies
 from without_http.client import deadline
+from without_http.client import decompress
+from without_http.client import default_headers
 from without_http.client import follow_redirects
+from without_http.client import gzip_compress
 from without_http.client import request
 from without_http.client import stack
+from without_http.client import tcp_connect
+from without_http.client import user_agent
 from without_http.client import wrap
+from without_http.client import zstd_compress
 from without_http.h2_wire import early_hint_headers
 from without_http.h2_wire import request_headers
 from without_http.h2_wire import response_headers
@@ -38,25 +53,33 @@ from without_http.timeouts import ReadTimeout
 from without_http.timeouts import Timeout
 from without_http.timeouts import WriteTimeout
 from without_http.tls import ALPN_PROTOCOLS
+from without_http.tls import distinguished_name
+from without_http.tls import extensions_with_tls
 from without_http.tls import server_ssl_context
+from without_http.tls import tls_extension
 from without_http.ws_wire import is_websocket_upgrade
 from without_http.ws_wire import websocket_scope_from_request
 from without_http.ws_wire import ws_events_from_outbound
 
 __all__ = [
     "ALPN_PROTOCOLS",
+    "DEFAULT_DECOMPRESSORS",
+    "USER_AGENT",
     "Client",
     "ClientMiddleware",
     "ClientRequest",
     "ClientResponse",
+    "Compressor",
     "Connect",
     "ConnectTimeout",
     "ConnectionPool",
     "CookieJar",
+    "Decompressor",
     "HTTPTimeout",
     "LifespanError",
     "PoolTimeout",
     "ReadTimeout",
+    "Resolve",
     "ResponseBody",
     "ResponseHead",
     "ResponseTrailers",
@@ -65,10 +88,19 @@ __all__ = [
     "Timeout",
     "WriteTimeout",
     "add_headers",
+    "basic_auth",
+    "bearer_auth",
+    "brotli_compress",
+    "compressing",
     "cookies",
     "deadline",
+    "decompress",
+    "default_headers",
+    "distinguished_name",
     "early_hint_headers",
+    "extensions_with_tls",
     "follow_redirects",
+    "gzip_compress",
     "h11_events_from_outbound",
     "inbound_from_event",
     "is_websocket_upgrade",
@@ -84,8 +116,12 @@ __all__ = [
     "server_ssl_context",
     "serving",
     "stack",
+    "tcp_connect",
     "tcp_keepalive",
+    "tls_extension",
+    "user_agent",
     "websocket_scope_from_request",
     "wrap",
     "ws_events_from_outbound",
+    "zstd_compress",
 ]

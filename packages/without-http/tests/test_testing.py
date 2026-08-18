@@ -18,6 +18,7 @@ from without_http import ClientRequest
 from without_http import ClientResponse
 from without_http import ConnectionPool
 from without_http import request
+from without_http import serving
 from without_http import stack
 from without_http.testing import SERVER_ADDRESS
 from without_http.testing import Endpoint
@@ -462,15 +463,17 @@ async def test_loopback_client_gives_the_server_both_ends_of_the_connection() ->
 
 async def test_the_no_socket_probe_can_fail() -> None:
     # The proof that the two probes above assert something: the same patch, pointed at a
-    # pool that does open a connection, stops it dead.
+    # pool that does open a connection, stops it dead. The target is a live server so the
+    # TCP connect itself succeeds and the pool genuinely reaches the patched call (the
+    # default connect dials the socket first and only then wraps it in streams).
     async def refuse(*args: object, **kwargs: object) -> None:
         raise AssertionError("this pool must not open a connection")
 
     with pytest.MonkeyPatch.context() as patched:
         patched.setattr(asyncio, "open_connection", refuse)
-        async with ConnectionPool() as pool:
+        async with serving(echo_app) as server, ConnectionPool() as pool:
             with pytest.raises(AssertionError, match="must not open a connection"):  # pragma: no branch
-                async with request(pool, "GET", "http://127.0.0.1:9/items") as _response:
+                async with request(pool, "GET", f"http://{server.host}:{server.port}/items") as _response:
                     pass  # pragma: no cover
 
 

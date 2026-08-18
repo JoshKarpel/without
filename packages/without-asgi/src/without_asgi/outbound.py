@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncGenerator
 from collections.abc import Callable
 from collections.abc import Iterable
 from collections.abc import Mapping
 from dataclasses import dataclass
+from secrets import token_hex
 from typing import Protocol
 from typing import assert_never
 from typing import runtime_checkable
+from urllib.parse import urlencode
+
+from without import Stream
 
 from without_asgi.headers import merge
 from without_asgi.narrow import narrow
@@ -109,13 +114,39 @@ class Content:
     policy, so `json_content` is one producer of it and a form, text, or msgpack encoder
     is another, all with equal standing.
 
-    The body is `bytes` because a `Content` is a value the caller already holds whole.
-    Streaming a body is a different situation (nothing to describe yet, and no length),
-    and `without-http`'s `request` takes a `Stream[bytes]` directly for it.
+    The body is `bytes` because a `Content` is a value the caller already holds whole,
+    which is what makes it comparable, shareable, and replayable. A body produced as
+    chunks is the same pairing with a different lifetime: `StreamingContent`, below.
     """
 
     body: bytes
     headers: RawHeaders = ()
+
+
+@dataclass(frozen=True, slots=True)
+class StreamingContent:
+    """
+    A streaming body and the headers that describe it: `Content`'s one-shot sibling.
+
+    The same pairing (chunks plus the `content-type` naming them travel together),
+    but the body is a `Stream[bytes]` consumed exactly once, so unlike a `Content`
+    this is not a value to compare, cache, or replay; re-sending one means rebuilding
+    it. `without-http`'s `request` takes either at `body=`; a streaming body whose
+    length is unknown is framed as `transfer-encoding: chunked` where a buffered one
+    gets a `content-length`.
+
+    `buffered()` collapses one into the `Content` it would have been, the
+    request-side mirror of reading a response body whole: produce as a stream
+    first-class, buffer as the convenience.
+    """
+
+    body: Stream[bytes]
+    headers: RawHeaders = ()
+
+    async def buffered(self) -> Content:
+        """Consume the chunks into a `Content`: same headers, body held whole."""
+        chunks = [chunk async for chunk in self.body]
+        return Content(b"".join(chunks), self.headers)
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +198,96 @@ def json_content(payload: object, *, dumps: Callable[[object], str] = _dumps) ->
     helper, and test that answered or sent a JSON body.
     """
     return Content(dumps(payload).encode(), ((b"content-type", JSON_MEDIA_TYPE),))
+
+
+FORM_MEDIA_TYPE = b"application/x-www-form-urlencoded"
+
+
+def form_content(fields: Mapping[str, str] | Iterable[tuple[str, str]]) -> Content:
+    """
+    Encode `fields` as an `application/x-www-form-urlencoded` `Content`.
+
+    The encoding HTML forms POST and OAuth2 token endpoints require
+    (`grant_type=client_credentials&scope=...`). Names and values are percent-encoded
+    as UTF-8 by the stdlib's `urlencode`. A mapping carries one value per name; pass
+    pairs (`[("tag", "a"), ("tag", "b")]`) when a name repeats.
+    """
+    pairs = fields.items() if isinstance(fields, Mapping) else fields
+    return Content(urlencode(list(pairs)).encode(), ((b"content-type", FORM_MEDIA_TYPE),))
+
+
+@dataclass(frozen=True, slots=True)
+class FilePart:
+    """
+    One file part of a `multipart_content` body: a named file carrying its own type.
+
+    The body is `bytes` when the file is held whole, or a `Stream[bytes]` to stream a
+    file too large to hold; a streaming part makes the whole `multipart_content`
+    one-shot in practice as well as in type.
+    """
+
+    name: str
+    filename: str
+    body: bytes | Stream[bytes]
+    content_type: bytes = b"application/octet-stream"
+
+
+def _disposition_value(value: str) -> bytes:
+    # RFC 7578 §4.2: a quote or newline inside a part name or filename is
+    # percent-encoded (the WHATWG form encoding) so it cannot break out of the
+    # quoted-string framing of the `content-disposition` header.
+    return value.replace('"', "%22").replace("\r", "%0D").replace("\n", "%0A").encode()
+
+
+def multipart_content(
+    fields: Mapping[str, str] | Iterable[tuple[str, str]] = (),
+    files: Iterable[FilePart] = (),
+    *,
+    boundary: bytes | None = None,
+) -> StreamingContent:
+    """
+    Encode form fields and files as a `multipart/form-data` `StreamingContent` (RFC 7578).
+
+    The encoding file-upload APIs take: each field becomes a text part, each `FilePart`
+    a file part with its own `content-type`, and the chunks travel with the
+    `multipart/form-data` header naming the boundary, so the pair cannot be separated.
+    `fields` follows `form_content` (a mapping, or pairs when a name repeats).
+    `boundary` defaults to a random token; inject one for a byte-reproducible body.
+
+    Streaming is the one shape, so a large file part never has to be held whole: a
+    `FilePart` whose body is a `Stream[bytes]` is re-yielded chunk by chunk between
+    its framing. When the payload is small and a replayable value with a
+    `content-length` is worth more than the streaming, collapse it:
+    `await multipart_content(...).buffered()`.
+    """
+    chosen = boundary if boundary is not None else token_hex(16).encode()
+    pairs = tuple(fields.items() if isinstance(fields, Mapping) else fields)
+    parts = tuple(files)
+
+    async def chunks() -> AsyncGenerator[bytes]:
+        delimiter = b"--%s\r\n" % chosen
+        for name, value in pairs:
+            yield b'%scontent-disposition: form-data; name="%s"\r\n\r\n%s\r\n' % (
+                delimiter,
+                _disposition_value(name),
+                value.encode(),
+            )
+        for part in parts:
+            yield b'%scontent-disposition: form-data; name="%s"; filename="%s"\r\ncontent-type: %s\r\n\r\n' % (
+                delimiter,
+                _disposition_value(part.name),
+                _disposition_value(part.filename),
+                part.content_type,
+            )
+            if isinstance(part.body, bytes):
+                yield part.body
+            else:
+                async for chunk in part.body:
+                    yield chunk
+            yield b"\r\n"
+        yield b"--%s--\r\n" % chosen
+
+    return StreamingContent(chunks(), ((b"content-type", b"multipart/form-data; boundary=" + chosen),))
 
 
 @dataclass(frozen=True, slots=True)

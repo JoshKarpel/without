@@ -31,6 +31,8 @@ dependencies = [
     "h11>=0.16",
     "h2>=4.1",
     "wsproto>=1.2",
+    "aiohappyeyeballs>=2.6",
+    "brotli>=1.1",
 ]
 
 [tool.uv.sources]

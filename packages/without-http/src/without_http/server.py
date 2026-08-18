@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import ssl
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from collections.abc import Callable
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import timedelta
+from types import CoroutineType
+from types import FunctionType
 
 import h2.config
 import h2.connection
@@ -58,12 +62,16 @@ from without_http.h2_wire import H2_PREFACE
 from without_http.h2_wire import early_hint_headers
 from without_http.h2_wire import response_headers
 from without_http.h2_wire import scope_from_h2_headers
+from without_http.h11_wire import HTTP_EXTENSIONS
 from without_http.h11_wire import h11_events_from_outbound
 from without_http.h11_wire import inbound_from_event
 from without_http.h11_wire import scope_from_request
 from without_http.lifespan import run_lifespan
 from without_http.socket_options import SocketOptions
 from without_http.socket_options import apply_socket_options
+from without_http.tls import extensions_with_tls
+from without_http.tls import tls_extension
+from without_http.ws_wire import WEBSOCKET_EXTENSIONS
 from without_http.ws_wire import is_websocket_upgrade
 from without_http.ws_wire import websocket_scope_from_request
 from without_http.ws_wire import ws_events_from_outbound
@@ -95,6 +103,12 @@ class _Limits:
     max_stream_resets: int = 200
     idle_timeout: timedelta | None = None
     max_websocket_message_bytes: int | None = None
+    # Each protocol's own library default, restated because neither exposes it as a
+    # public constant: h11's `max_incomplete_event_size` and h2's `MAX_HEADER_LIST_SIZE`.
+    # They differ because the two bounds are not the same measurement (see `serving`).
+    max_incomplete_event_bytes: int = 16 * 1024
+    max_header_list_bytes: int = 64 * 1024
+    close_timeout: timedelta = timedelta(seconds=5)
 
 
 _DEFAULT_LIMITS = _Limits()
@@ -185,10 +199,11 @@ async def _run_request(
     server: tuple[str, int] | None,
     client: tuple[str, int] | None,
     request: h11.Request,
+    extensions: Mapping[str, Mapping[str, object]],
     idle_timeout: timedelta | None,
 ) -> bool:
     """Drive one request/response exchange. Returns whether the connection may keep alive."""
-    scope = scope_from_request(request, scheme=scheme, server=server, client=client)
+    scope = scope_from_request(request, scheme=scheme, server=server, client=client, extensions=extensions)
     method = scope.method
     request_done = False  # pragma: no mutate - initial sentinel, read only as a bool
     response_done = False  # pragma: no mutate - initial sentinel, read only as a bool
@@ -259,6 +274,7 @@ async def _serve_websocket(
     server: tuple[str, int] | None,
     client: tuple[str, int] | None,
     request: h11.Request,
+    extensions: Mapping[str, Mapping[str, object]],
     limits: _Limits,
 ) -> None:
     """
@@ -280,7 +296,9 @@ async def _serve_websocket(
     ws.initiate_upgrade_connection(handshake, request.target.decode(_LATIN1))
     for _ in ws.events():
         pass  # discard wsproto's Request; the scope is built from the h11 request
-    scope = encode_websocket_scope(websocket_scope_from_request(request, scheme=scheme, server=server, client=client))
+    scope = encode_websocket_scope(
+        websocket_scope_from_request(request, scheme=scheme, server=server, client=client, extensions=extensions)
+    )
 
     max_message = limits.max_websocket_message_bytes
     inbound: asyncio.Queue[RawMessage] = asyncio.Queue()
@@ -441,10 +459,13 @@ async def _serve_connection(
     ssl_object = writer.get_extra_info("ssl_object")
     secure = ssl_object is not None
     alpn = ssl_object.selected_alpn_protocol() if ssl_object is not None else None
+    # Read the connection's TLS facts once, here, rather than per request: they are
+    # fixed by the finished handshake, and every scope on this connection reports them.
+    tls = tls_extension(ssl_object) if ssl_object is not None else None
     try:
         if alpn == "h2":
             await _serve_h2_connection(
-                app, reader, writer, initial=b"", secure=secure, server=server, client=client, limits=limits
+                app, reader, writer, initial=b"", secure=secure, server=server, client=client, tls=tls, limits=limits
             )
             return
         initial = b""  # pragma: no mutate - only read when truthy; b"" and None both skip
@@ -452,11 +473,19 @@ async def _serve_connection(
             initial = await _read(reader, limits.idle_timeout)
             if initial.startswith(H2_PREFACE):
                 await _serve_h2_connection(
-                    app, reader, writer, initial=initial, secure=secure, server=server, client=client, limits=limits
+                    app,
+                    reader,
+                    writer,
+                    initial=initial,
+                    secure=secure,
+                    server=server,
+                    client=client,
+                    tls=tls,
+                    limits=limits,
                 )
                 return
         await _serve_h11_connection(
-            app, reader, writer, initial=initial, secure=secure, server=server, client=client, limits=limits
+            app, reader, writer, initial=initial, secure=secure, server=server, client=client, tls=tls, limits=limits
         )
     except TimeoutError:
         logger.info("Closing a connection idle beyond the idle timeout")
@@ -469,7 +498,16 @@ async def _serve_connection(
     finally:
         with suppress(OSError):
             writer.close()
-            await writer.wait_closed()
+            # `close()` hands the socket back only once the write buffer drains, and a peer
+            # that has stopped reading never lets it: asyncio holds `connection_lost`, and
+            # with it the fd, until those bytes leave. So the wait is bounded and followed
+            # by an abort, which releases the socket whether or not the peer took delivery.
+            # Without the bound a shutdown waits on that peer forever; without the abort
+            # the transport keeps the fd until the process ends.
+            with suppress(TimeoutError):
+                async with timeout(limits.close_timeout):
+                    await writer.wait_closed()
+            writer.transport.abort()
 
 
 async def _serve_h11_connection(
@@ -481,10 +519,12 @@ async def _serve_h11_connection(
     secure: bool,
     server: tuple[str, int] | None,
     client: tuple[str, int] | None,
+    tls: Mapping[str, object] | None,
     limits: _Limits,
 ) -> None:
     """Serve sequential HTTP/1.1 requests (and WebSocket upgrades) on one connection."""
-    conn = h11.Connection(our_role=h11.SERVER)
+    conn = h11.Connection(our_role=h11.SERVER, max_incomplete_event_size=limits.max_incomplete_event_bytes)
+    extensions = extensions_with_tls(HTTP_EXTENSIONS, tls)
     if initial:
         conn.receive_data(initial)
     while True:
@@ -501,7 +541,16 @@ async def _serve_h11_connection(
         if is_websocket_upgrade(request):
             scheme = "wss" if secure else "ws"
             await _serve_websocket(
-                app, conn, reader, writer, scheme=scheme, server=server, client=client, request=request, limits=limits
+                app,
+                conn,
+                reader,
+                writer,
+                scheme=scheme,
+                server=server,
+                client=client,
+                request=request,
+                extensions=extensions_with_tls(WEBSOCKET_EXTENSIONS, tls),
+                limits=limits,
             )
             return
         scheme = "https" if secure else "http"
@@ -514,6 +563,7 @@ async def _serve_h11_connection(
             server=server,
             client=client,
             request=request,
+            extensions=extensions,
             idle_timeout=limits.idle_timeout,
         )
         if not keep_alive:
@@ -554,6 +604,7 @@ async def _serve_h2_connection(
     secure: bool,
     server: tuple[str, int] | None,
     client: tuple[str, int] | None,
+    tls: Mapping[str, object] | None,
     limits: _Limits,
 ) -> None:
     """
@@ -581,6 +632,7 @@ async def _serve_h2_connection(
     inbound flow-control window bounds buffered body rather than reopening on receipt.
     """
     scheme = "https" if secure else "http"
+    extensions = extensions_with_tls(HTTP_EXTENSIONS, tls)
     config = h2.config.H2Configuration(client_side=False, header_encoding=None)  # pragma: no mutate - default is None
     conn = h2.connection.H2Connection(config=config)
     lock = asyncio.Lock()
@@ -665,7 +717,9 @@ async def _serve_h2_connection(
     async def run_stream(stream_id: int, headers: list[tuple[bytes, bytes]], stream: _H2Stream) -> None:
         try:
             try:
-                scope = scope_from_h2_headers(headers, scheme=scheme, server=server, client=client)
+                scope = scope_from_h2_headers(
+                    headers, scheme=scheme, server=server, client=client, extensions=extensions
+                )
             except UnicodeDecodeError:
                 # A non-ASCII `:method`/`:path` fails the header decode; answer a clean 400
                 # rather than letting the stream hang with nothing sent.
@@ -788,7 +842,12 @@ async def _serve_h2_connection(
 
     async with lock:
         conn.initiate_connection()
-        conn.update_settings({h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS: limits.max_concurrent_streams})
+        conn.update_settings(
+            {
+                h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS: limits.max_concurrent_streams,
+                h2.settings.SettingCodes.MAX_HEADER_LIST_SIZE: limits.max_header_list_bytes,
+            }
+        )
         writer.write(conn.data_to_send())
     await writer.drain()
     try:
@@ -843,6 +902,40 @@ class Server:
         return self._connections.in_flight
 
 
+# The stdlib selector loop turns each accepted connection into a transport inside its
+# own task (`BaseSelectorEventLoop._accept_connection2`), so for one loop tick after
+# `sock.accept()` the connection exists nowhere a shutdown can see: not in `connections`
+# (`handle` runs later still) and not in `asyncio.Server`'s own client set (the transport
+# does not exist yet). Worse than being merely invisible, a transport built after
+# `Server.close()` trips `assert self._sockets is not None` in `Server._attach`, and the
+# accept task swallows that error *without closing the accepted socket*, leaking the
+# half-built transport and its file descriptor
+# (https://github.com/python/cpython/issues/109564). So the listener must not close
+# while any accept task has yet to take its first step; this predicate is how the
+# shutdown waits that out. An unstarted accept task is one whose coroutine is still
+# `CORO_CREATED`; once it has run at all, its transport exists and is attached, and the
+# rest of the teardown can reach it. A loop without this machinery (uvloop schedules
+# `connection_made` from its accept callback with no task in between) reports nothing
+# to wait for.
+def _has_connections_mid_accept(loop: asyncio.AbstractEventLoop) -> bool:
+    accept = getattr(type(loop), "_accept_connection2", None)
+    if not isinstance(accept, FunctionType):
+        return False
+    return any(
+        isinstance(coro := task.get_coro(), CoroutineType)
+        and coro.cr_code is accept.__code__
+        and inspect.getcoroutinestate(coro) == inspect.CORO_CREATED
+        for task in asyncio.all_tasks(loop)
+    )
+
+
+# Bounds the shutdown's wait for mid-accept connections. One tick almost always
+# suffices; the bound only matters under a sustained flood of new connections arriving
+# faster than one per tick, where closing anyway (and eating the stdlib's dropped
+# stragglers) beats stalling the shutdown indefinitely.
+_MID_ACCEPT_FLUSH_TICKS = 100
+
+
 @asynccontextmanager
 async def serving(
     app: ASGIApp,
@@ -854,6 +947,9 @@ async def serving(
     max_stream_resets: int = _DEFAULT_LIMITS.max_stream_resets,
     idle_timeout: timedelta | None = _DEFAULT_LIMITS.idle_timeout,
     max_websocket_message_bytes: int | None = _DEFAULT_LIMITS.max_websocket_message_bytes,
+    max_incomplete_event_bytes: int = _DEFAULT_LIMITS.max_incomplete_event_bytes,
+    max_header_list_bytes: int = _DEFAULT_LIMITS.max_header_list_bytes,
+    close_timeout: timedelta = _DEFAULT_LIMITS.close_timeout,
     ssl_context: ssl.SSLContext | None = None,
     ssl_handshake_timeout: float | None = None,
     ssl_shutdown_timeout: float | None = None,
@@ -888,15 +984,41 @@ async def serving(
     failures (pausing for `ACCEPT_RETRY_DELAY` on resource exhaustion) and binds every
     address `host` resolves to.
 
-    Four per-connection resource bounds harden a public deployment. `idle_timeout`
+    Seven per-connection resource bounds harden a public deployment. `idle_timeout`
     (a `timedelta`, off by default) closes a connection whose peer stops sending data
     mid-exchange, defeating a slowloris; it also bounds an idle WebSocket. Over HTTP/2,
     `max_concurrent_streams` is advertised as `MAX_CONCURRENT_STREAMS` and
     `max_stream_resets` caps how many stream resets one connection may issue before it
     is dropped, together defeating the Rapid Reset flood (CVE-2023-44487).
     `max_websocket_message_bytes` (off by default) caps a reassembled WebSocket message.
-    Tune them at your composition root, e.g. from a settings value parsed by
+
+    The last two bound the request *head*, one per protocol, because the two protocols
+    measure it differently rather than as a matter of taste.
+    `max_incomplete_event_bytes` is h11's `max_incomplete_event_size`: how many bytes of
+    a not-yet-complete HTTP/1.1 event (a request line plus its headers, or a chunk
+    header) may accumulate before the parse is abandoned, so a peer cannot dribble an
+    endless header block. `max_header_list_bytes` is advertised over HTTP/2 as
+    `MAX_HEADER_LIST_SIZE`, bounding the *uncompressed* size of a header list, which is
+    what makes it a defense against an hpack bomb. Each defaults to its protocol
+    library's own default (16 KiB and 64 KiB), so the numbers differ; raise them
+    together if your peers send large headers.
+
+    `close_timeout` (5 seconds) bounds the other end of a connection's life: how long a
+    closing connection waits for a response it has already queued to reach the peer.
+    Asyncio hands the socket back only once that buffer drains, so a peer that stops
+    reading would otherwise hold the file descriptor, and hold a shutdown, indefinitely;
+    past the bound the connection is aborted and the peer loses whatever was still in
+    flight. Raise it for large responses to slow clients, lower it for a tighter
+    shutdown.
+
+    Tune all of these at your composition root, e.g. from a settings value parsed by
     `without_env.EnvContext`, rather than reaching for the environment here.
+
+    Over TLS, every scope carries the
+    [`tls` extension](https://asgi.readthedocs.io/en/latest/specs/tls.html) with the
+    negotiated version and the client certificate chain, read once per connection off
+    the finished handshake; see `tls_extension` for the fields CPython's `ssl` module
+    cannot supply.
 
     Pass `ssl_context` to serve `https`/`wss` directly; `server_ssl_context` builds
     one for the common case. `ssl_handshake_timeout` bounds a single TLS handshake
@@ -916,19 +1038,40 @@ async def serving(
         max_stream_resets=max_stream_resets,
         idle_timeout=idle_timeout,
         max_websocket_message_bytes=max_websocket_message_bytes,
+        max_incomplete_event_bytes=max_incomplete_event_bytes,
+        max_header_list_bytes=max_header_list_bytes,
+        close_timeout=close_timeout,
     )
     live = _LiveConnections()
     connections: set[asyncio.Task[None]] = set()
 
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        task = asyncio.current_task()
-        assert task is not None
+    async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        async with live.tracked():
+            await _serve_connection(app, reader, writer, limits)
+
+    def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        # Deliberately not a coroutine function. `start_server` runs a plain callback
+        # synchronously from the transport's `connection_made`, so the task is in
+        # `connections` the moment the connection is up; hand it a coroutine instead and
+        # it builds the task itself, which registers only once it first runs, a tick
+        # later. A shutdown that reads this set in that gap would leave the connection
+        # tracked by nobody: nothing cancels it, so nothing runs the teardown that
+        # closes its socket, and the descriptor outlives the server. (Before the
+        # transport exists nothing can register at all; the shutdown path holds the
+        # listener open until that earlier window is empty, see
+        # `_has_connections_mid_accept`.)
+        task = asyncio.create_task(serve(reader, writer))
         connections.add(task)
-        try:
-            async with live.tracked():
-                await _serve_connection(app, reader, writer, limits)
-        finally:
-            connections.discard(task)
+
+        def finished(done: asyncio.Task[None]) -> None:
+            connections.discard(done)
+            # A task cancelled before its first step never reaches `_serve_connection`, so
+            # nothing else would ever close this connection. Aborting is idempotent, and
+            # every task that did run has already aborted its own transport, so this costs
+            # the ordinary path nothing and is the only closer for the one that did not.
+            writer.transport.abort()
+
+        task.add_done_callback(finished)
 
     async with run_lifespan(app):
         server = await asyncio.start_server(
@@ -946,6 +1089,39 @@ async def serving(
         try:
             yield Server(host=bound_host, port=bound_port, _connections=live)
         finally:
-            server.close()
-            await cancel_futures(connections)
-            await server.wait_closed()
+            try:
+                # A connection accepted a moment ago may not have a transport yet, and
+                # closing the listener while it is in that state leaks its socket (see
+                # `_has_connections_mid_accept`). Waiting a tick lets each such
+                # connection materialize, where the teardown below can reach it; a
+                # connection the loop has not accepted at all by the time the listener
+                # closes dies in the kernel and never touches the process.
+                for _ in range(_MID_ACCEPT_FLUSH_TICKS):
+                    if not _has_connections_mid_accept(asyncio.get_running_loop()):
+                        break
+                    await asyncio.sleep(0)
+                else:
+                    logger.warning(
+                        f"Closing the listener with connections still mid-accept after {_MID_ACCEPT_FLUSH_TICKS} loop ticks;"
+                        " their sockets are dropped by asyncio without cleanup"
+                    )
+            finally:
+                # Closing the listener first is what makes the cancellation below
+                # complete: no further connection is accepted after it, and every
+                # accepted connection registered its task as its transport came up, so
+                # cancelling them reaches all of them.
+                server.close()
+                await cancel_futures(connections)
+                # A transport that came up during the flush may not have reached
+                # `handle` yet (its `connection_made` is still queued), and over TLS the
+                # handshake can hold that off for seconds, so the cancellation above
+                # cannot be the whole story. Abort whatever the listener still tracks
+                # (a no-op for everything the cancellation already closed), then give
+                # the queued callbacks one tick to register their tasks and cancel
+                # those too, so nothing serves on past the shutdown.
+                abort_clients: Callable[[], None] | None = getattr(server, "abort_clients", None)
+                if abort_clients is not None:  # uvloop's Server has no abort_clients
+                    abort_clients()
+                await asyncio.sleep(0)
+                await cancel_futures(connections)
+                await server.wait_closed()

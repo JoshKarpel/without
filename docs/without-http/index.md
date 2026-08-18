@@ -15,6 +15,11 @@ The wire-protocol state machines are themselves sans-IO libraries:
 those state machines, and uses `without-asgi`'s server-direction codecs to
 translate between typed events and the ASGI dicts an app expects.
 
+For a feature-by-feature register of where the client stands against httpx,
+aiohttp, and niquests (and the server against uvicorn, hypercorn, and granian),
+including which absences are gaps and which are positions, see
+[Alternatives](alternatives.md).
+
 ## Server
 
 ```python
@@ -96,8 +101,28 @@ What the server handles:
   Reset flood (CVE-2023-44487); a client reset also cancels the stream's app task, and
   received body is acked only as the app consumes it, so the flow-control window bounds
   buffered body. `max_websocket_message_bytes` caps a reassembled WebSocket message.
+  The request *head* is bounded per protocol, because the two protocols measure it
+  differently: `max_incomplete_event_bytes` is how much of an unfinished HTTP/1.1
+  event (a request line and its headers, a chunk header) may accumulate before the
+  parse is abandoned with a `431`, and `max_header_list_bytes` is advertised over
+  HTTP/2 as `MAX_HEADER_LIST_SIZE`, bounding an *uncompressed* header list against an
+  hpack bomb. Each defaults to its protocol library's own default, 16 KiB and 64 KiB.
+  `close_timeout` (5 seconds) bounds the far end of a connection's life: how long a
+  closing connection waits for a response it already queued to reach the peer. Asyncio
+  hands the socket back only once that buffer drains, so a peer that stops reading would
+  otherwise hold the descriptor, and hold a shutdown, indefinitely; past the bound the
+  connection is aborted and the peer loses whatever was still in flight.
   For a body-size cap that works under any transport, wrap the app in
   `without-asgi`'s `limit_request_body`, which answers `413`.
+- **TLS facts reach the app.** Over TLS, every scope carries the ASGI
+  [`tls` extension](https://asgi.readthedocs.io/en/latest/specs/tls.html), read once
+  per connection off the finished handshake, so an app calls `parse_tls` and gets the
+  negotiated version and the client certificate chain (PEM) with its subject as an
+  RFC 4514 distinguished name. `server_cert` and `cipher_suite` are `None`, which the
+  spec permits: an `ssl.SSLContext` never exposes the certificate it loaded, and
+  `SSLObject.cipher()` reports a suite by name with no IANA identifier. An mTLS
+  deployment configures verification on its own `ssl.SSLContext`, as usual; the
+  extension is how the result reaches the handler.
 
 The pure wire cores (`h11_wire`, `h2_wire`, `ws_wire`) are sans-IO and unit-tested:
 they map `h11`/`h2`/`wsproto` events to the typed `without-asgi` vocabulary and
@@ -175,7 +200,12 @@ async with request(client, "POST", url, body=json_content(order)) as (head, body
 ```
 
 An explicit `headers=` wins over what the content described, so overriding the
-`content-type` does not mean rebuilding the body.
+`content-type` does not mean rebuilding the body. `form_content` (URL-encoded
+forms, the shape OAuth2 token endpoints take) is the other buffered producer, and
+`multipart_content` (RFC 7578 file uploads) produces the streaming sibling
+`StreamingContent`, whose chunks ride `body=` with their describing headers the
+same way; `await ...buffered()` collapses one into a `Content` when a replayable
+body with a `content-length` matters more than streaming.
 
 ```python
 async def upload() -> AsyncIterator[bytes]:
@@ -251,6 +281,21 @@ pool ramps up to `max_connections_per_host` under load but settles back down to
 unbounded by default (every reusable connection is kept); a value above
 `max_connections_per_host` is never reached, since idle connections cannot outnumber
 concurrent checkouts. Both knobs, when set, must be `>= 1`.
+
+How the pool reaches an origin is itself injected: `connect` is a `Connect`, the one
+step that touches the network. The default resolves with `getaddrinfo` and then
+connects with [aiohappyeyeballs](https://github.com/aio-libs/aiohappyeyeballs) (the
+CPython-extracted implementation aiohttp uses), racing address families per
+[RFC 8305](https://datatracker.ietf.org/doc/html/rfc8305) with 250 ms between
+attempts, so a dual-stack host with a black-holed IPv6 route costs one delay rather
+than a full connect timeout; the race drives plain `loop.sock_connect`, so it behaves
+the same on any event loop. Both steps are knobs on `tcp_connect`, the producer
+behind the default: `happy_eyeballs_delay` tunes or disables the race, and `resolve`
+injects the resolution step itself, a `(host, port) -> addr_infos` function, so a
+DNS cache, DNS over HTTPS, or a test's canned addresses swap in without touching how
+the winning address is connected. A cache's staleness bound stays the caller's
+policy: `getaddrinfo` hides record TTLs, so no honest default exists. The same
+`connect` slot is where a proxy or unix-socket connector would plug in.
 
 ### Duplex and bidirectional streaming
 
@@ -450,11 +495,11 @@ one `stack` serves both. A decorated client is just another client, so you build
 you want and pass it to `request`:
 
 ```python
-from without_http import ConnectionPool, CookieJar, add_headers, cookies, follow_redirects, request, stack
+from without_http import ConnectionPool, CookieJar, bearer_auth, cookies, follow_redirects, request, stack
 
 jar = CookieJar()
 async with ConnectionPool() as pool:
-    client = stack(add_headers((b"authorization", b"Bearer ...")), follow_redirects(), cookies(jar))(pool)
+    client = stack(bearer_auth("..."), follow_redirects(), cookies(jar))(pool)
     async with request(client, "GET", url) as (head, body):
         ...
 ```
@@ -480,6 +525,77 @@ from without_http import ClientResponse, wrap
 
 byte_counter = wrap(response=lambda r: ClientResponse(r.head, counting(r.body)))
 ```
+
+Auth is the canonical fixed-header case, so the two challenge-free schemes ship
+as named middleware: `basic_auth(username, password)` sends RFC 7617 `Basic`
+credentials (UTF-8, base64), and `bearer_auth(token)` sends
+`authorization: Bearer <token>`. The scheme prefix is the part real APIs
+disagree on, so it is injectable: `bearer_auth(token, scheme="Token")` for the
+peers that spell it differently, or `scheme=""` to send the bare token.
+Digest, which answers a challenge, would be a looping middleware like
+`follow_redirects` and is not written.
+
+Both set a default rather than a policy: `authorization` is a singleton field
+under RFC 9110, so a request carrying its own keeps it and the middleware adds
+nothing. That is what makes a composed client usable for the odd call that
+authenticates as someone else, where `add_headers` would prepend a second
+`authorization` and leave the peer to pick.
+
+That split is the whole difference between the two header middlewares, and it
+follows the field rather than the caller's taste. `add_headers` copies its
+headers onto every request whatever it already carries, which is what a field
+that may repeat (`accept`, `via`, a trace header) wants. `default_headers`
+adds each header only to a request that omits it, which is what a field RFC 9110
+allows once (`authorization`, `user-agent`, an API key) wants, and it decides
+each header separately, so a request stating one default and not another gets
+exactly the one it left out. The auth and user-agent middlewares are
+`default_headers` underneath. Neither imposes: a caller that must not be
+overridden composes its own client instead of handing out one that can be, the
+same position `deadline` takes on a time budget.
+
+The other fixed header peers commonly gate on is the user-agent, which this
+client never sends unbidden, and which some peers (the GitHub API) refuse to
+see absent. `user_agent()` is the opt-in: with no arguments it sends
+`USER_AGENT`, the library's own `without-http/<version>` identity read from the
+installed distribution, which is the same default every other client sends
+without asking; passing segments sends them joined with spaces, the separator
+RFC 9110 puts between product tokens, so `user_agent("myapp/1.0", USER_AGENT)`
+sends both identities and `user_agent("myapp/1.0")` sends exactly yours.
+`USER_AGENT` is public precisely so a caller can join it into their own value
+rather than choose between theirs and the library's. `user-agent` is a
+singleton field too, so this is a default in the same sense as the auth
+middlewares: a request carrying its own keeps it.
+
+Content codings are middleware too, one per direction. `decompress()` offers
+`accept-encoding: br, gzip, zstd` (a request carrying its own offer keeps it) and
+decodes an encoded response body through an incremental decoder as it streams,
+dropping the `content-encoding` and `content-length` that described the encoded bytes
+so the response stays self-consistent; an encoding it cannot decode passes through
+whole. Both gzip and zstd define a body as a *series* of streams, so a decoder that
+reaches the end of one hands its leftover bytes to a fresh one: a concatenated body
+(a `cat a.gz b.gz` asset, bgzip output, a proxy that joins two responses) decodes
+whole rather than silently stopping at the first member, and the truncation check
+then covers the last stream as well as the first. It is composition rather than pool behavior, so the transport never silently
+rewrites bytes. `gzip_compress()`, `zstd_compress()`, and `brotli_compress()` encode
+request bodies the same streaming way; requests have no `accept-encoding`
+negotiation, so all are opt-in for the clients whose upstreams are known to decode
+them. The opt-in scope is wherever the composition happens: decorate once at assembly
+for a whole client, or inline at one call site
+(`request(gzip_compress()(client), ...)`) for a single request, since decorating a
+client is a stateless function wrap.
+
+gzip and zstd decode via the stdlib; brotli via
+[Google's own bindings](https://github.com/google/brotli), a bundled dependency
+because the stdlib has no brotli and there is exactly one library, so `decompress()`
+just works against the codings the web actually serves. The codings are table
+entries, not a property of the library: `decompress` takes a mapping from coding to
+`Decompressor` factory, defaulting to `DEFAULT_DECOMPRESSORS` and deriving its offer
+from the keys so what is advertised and what is decoded cannot disagree; and
+`compressing(coding, make_compressor)` is the public mechanism behind the shipped
+compressors. A codec this package does not ship plugs into either direction with a
+factory whose product satisfies the small `Compressor` / `Decompressor` protocols,
+inheriting the framing rewrite, streaming, and truncation check instead of
+reimplementing them.
 
 State a middleware carries lives in a value you own, not in the transport. A `CookieJar`
 is the canonical case: you construct the jar and hand it to `cookies(jar)`, so cookie

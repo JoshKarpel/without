@@ -58,14 +58,18 @@ needs, and in the package that owns the exchange shape it wraps.**
   uvicorn), because it wraps the handler rather than the socket. `limit_concurrent_requests`
   and `limit_request_body` (a `413` body-size cap) live here; natural neighbors are
   default response headers, gzip/decompression, a per-request timeout, request-ID
-  injection, structured access logging, and CORS preflight.
+  injection, trust-gated proxy headers, and CORS preflight. Access logging has the
+  same shape and deliberately does not ship: what belongs in the line is deployment
+  policy (see the server positions in `docs/without-http/alternatives.md`).
 - **`without-web`** holds route-aware middleware: anything keyed on the matched
   route or that maps exceptions to responses, plus route-scoped middleware and
   OpenAPI-aware pieces. Only that layer can see route metadata.
 - **`without-http`** holds the **client** middleware, since a `Client`
   (`ClientRequest -> ClientResponse`) is a `Processor` too and lives there
-  (`add_headers`, `follow_redirects`, `cookies` over a caller-owned `CookieJar`,
-  and future retry / auth / response decompression). Its server side keeps only the concerns that **cannot** be
+  (`add_headers`, `basic_auth` / `bearer_auth`, `follow_redirects`, `cookies`
+  over a caller-owned `CookieJar`, and the content codings `decompress` /
+  `gzip_compress` / `zstd_compress` / `brotli_compress`). Its server side keeps only the
+  concerns that **cannot** be
   middleware because they run below the app: the wire protocols and TLS. (It used to
   also own a connection-admission cap; that was dropped in favour of the kernel
   listen backlog plus the `limit_concurrent_requests` middleware.)
