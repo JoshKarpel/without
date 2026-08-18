@@ -38,7 +38,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     # a server that never replies hangs whether it is asked once or a hundred times. A
     # `@given` test is the case the bound does not describe, since its duration is the
     # example count times the body, so what it measures is how fast the machine is. Left
-    # under the bound, the slowest property test in the suite crosses five seconds on a
+    # under the bound, the slowest property test in the suite runs for seconds on a
     # loaded macOS runner, and `timeout_method = "thread"` kills the process rather than
     # failing the test, so the overrun reads as `node down: Not properly terminated` and
     # costs the whole xdist worker's output. Hypothesis has its own per-example
