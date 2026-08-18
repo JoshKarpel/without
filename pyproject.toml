@@ -104,6 +104,11 @@ testpaths = ["packages/**/tests"]
 # slowest test in the suite (`just durations` reports it: one that waits a deliberate
 # one-second `wait_for` to prove a socket buffer fills) and sixteen times the next.
 # Raise it per-test with `@pytest.mark.timeout(...)` rather than globally.
+#
+# A `@given` test is exempt, and `packages/conftest.py` exempts every one of them rather
+# than leaving it to a mark per test: a property test's duration is the example count
+# times the body, so a bound on it measures how fast the machine is rather than the
+# deadlock this bound is for. Hypothesis's own per-example `deadline` covers that.
 timeout = 5
 timeout_method = "thread"
 
