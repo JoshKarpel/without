@@ -4,7 +4,14 @@ on:
   push:
     branches:
       - main
+  # `labeled` and `unlabeled` join the three defaults, which naming any type at all makes
+  # explicit, so that adding `tracemalloc:N` starts a run by itself and removing it starts
+  # the run that gives a verdict. Neither can come from re-running an existing run: a
+  # re-run replays the event that started it rather than reading the labels as they stand
+  # now, so the label would otherwise take a fresh commit to have any effect. Every label
+  # change rebuilds, not only that one, which is the price of driving it from a label.
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_dispatch:
 
 permissions:
