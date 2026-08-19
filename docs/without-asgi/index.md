@@ -321,11 +321,13 @@ the CPU. That last is `is_compressible`, an allowlist (`text/*`, the `+json` /
 `+xml` / `+text` structured suffixes, and a short list of the rest) in the shape
 nginx's `gzip_types` takes, so an unrecognized type yields a larger response rather
 than cycles spent re-compressing a JPEG. `text/event-stream` is excluded despite
-being `text/`, and for the size gate below rather than the coding: the gate buffers
-the start of a body to learn which side of it the response falls on, so the opening
-events of a stream would be held back until enough had accumulated to decide, which
-is exactly the latency an event stream exists to avoid. Pass your own predicate as
-`compressible` to decide differently.
+being `text/`, for a reason about the connection rather than the bytes: an event
+stream is the one response held open for as long as the client stays, so every event
+on it is encoded against a window holding every event before it, and an attacker who
+can inject one event reads the length of the next. That is
+[BREACH](#compression-and-secrets) with as many samples as it cares to take, on a
+connection it never has to re-establish. Pass your own predicate as `compressible` to
+decide differently.
 
 Three statuses are excluded, each for its own reason. `204` and `304` carry no
 content, so there is nothing to encode. A `206` does carry bytes, but they are a
@@ -355,15 +357,33 @@ rather than dropping keeps it true in the way it still is: the two representatio
 stay semantically equivalent, so a conditional request still matches under weak
 comparison while a `Range` request, which needs strong comparison, correctly stops.
 
+The `304` inherits that weakening, but only for a client whose `accept-encoding`
+negotiates a coding. The stored entry such a `304` updates is the one its `Vary` key
+selects, so it is the encoded variant, and
+[RFC 9111 §4.3.4](https://www.rfc-editor.org/rfc/rfc9111#section-4.3.4) has the cache
+copy the `304`'s fields onto it. A strong tag landing there undoes the weakening: a
+later `If-Range` matches under strong comparison, and the `206` the middleware never
+encodes hands back identity bytes to stitch into an encoded body. A client that
+negotiates nothing holds the identity representation, so its validator is left
+exactly as the app stated it.
+
 `minimum_size` (500 bytes by default) is the floor below which gzip's framing costs
 more than the text saves. It gates on the *bytes*, not on `content-length`, so it
-holds for a streaming response that never declares one: the middleware buffers up to
-that much of the body to learn which side of the gate it falls on, then either
-releases the prefix untouched or commits and streams the rest through the compressor
-chunk by chunk. A body that arrives whole is re-described with an exact
-`content-length` for its encoded form rather than falling back to chunked; one still
-streaming when it crosses the gate loses `content-length` and is framed by the
-transport, as any streaming body is.
+holds for a response that arrives whole behind a head that never declared one, and
+that body is re-described with an exact `content-length` for its encoded form rather
+than falling back to chunked.
+
+A body the app *streams* is weighed by `streaming_minimum_size` instead, which
+defaults to holding none of it: the middleware commits on the first non-empty chunk,
+drops the `content-length` it can no longer state, and streams the rest through the
+compressor chunk by chunk. The two gates are separate because holding costs a
+streamed body something a buffered one never pays. Weighing a stream means keeping
+bytes the app has already produced until enough of them accumulate to decide, so a
+feed emitting a line a second delivers nothing for as many seconds as it takes to
+reach the gate, and how long that is belongs to the app rather than to the
+middleware. Zero spends the framing bytes instead, which is the trade a response the
+app chose to stream usually wants. Raise it to weigh a stream the way a buffered body
+is weighed, at that latency.
 
 Streaming past that gate means ending a block per chunk, and that is a demand on the
 codec rather than a detail of the loop. What a `compress` call returns is the codec's
@@ -379,6 +399,19 @@ get the lesser protocol, since both spell a block flush as a mode argument to `f
 rather than a method of its own. A coding whose factory produces a plain `Compressor`
 still encodes responses that arrive whole, and its streaming ones go out unencoded
 instead: that costs bytes, where encoding them would cost the delivery.
+
+An offloaded body is the one shape that cannot follow a commitment. The
+`http.response.zerocopysend` and `http.response.pathsend` extensions both send bytes
+the middleware never sees, and `zerocopysend` carries `more_body` precisely so it can
+follow body events the app has already sent. Arriving *before* any body event, an
+offload passes through and the response goes out unencoded. Arriving after the head
+has declared `content-encoding`, there is no correct response left to write: the
+offloaded bytes are not encoded, and appending them to the encoded stream produces a
+body no decoder can read. `compress` raises `OffloadedBodyAfterEncoding` rather than
+writing it, so what reaches the client is a truncated response, which every transport
+already signals as one. An app that means to stream a prefix and then offload the
+rest raises `streaming_minimum_size` above the prefix, which leaves the middleware
+uncommitted while the prefix goes by.
 
 ### Compression and secrets
 

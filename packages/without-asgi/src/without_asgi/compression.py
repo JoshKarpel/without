@@ -19,8 +19,10 @@ from without import Stream
 
 from without_asgi import headers
 from without_asgi.outbound import Outbound
+from without_asgi.outbound import PathSend
 from without_asgi.outbound import ResponseBody
 from without_asgi.outbound import ResponseStart
+from without_asgi.outbound import ZeroCopySend
 from without_asgi.routing import HttpMiddleware
 from without_asgi.routing import wrap
 from without_asgi.scope import HttpScope
@@ -33,6 +35,7 @@ __all__ = [
     "MAX_RANDOM_BYTES",
     "PADDED_COMPRESSORS",
     "Compressor",
+    "OffloadedBodyAfterEncoding",
     "StreamingCompressor",
     "brotli_compressor",
     "compress",
@@ -489,11 +492,13 @@ def is_compressible(content_type: bytes | None) -> bool:
     Two exceptions to the shape. A response with no `content-type` is not
     compressed, since compression here is driven by the declared media type and
     there is nothing to drive it. And `text/event-stream` is excluded despite the
-    `text/` prefix, because of `compress`'s size gate rather than the coding: the
-    gate buffers the start of a body to learn which side of `minimum_size` it falls
-    on, so the opening events of a stream would be held back until enough of them
-    had accumulated to decide, which is exactly the latency an event stream exists
-    to avoid.
+    `text/` prefix, for a reason about the connection rather than the bytes: an
+    event stream is the one response held open for as long as the client stays, so
+    every event on it is encoded against a window holding every event before it,
+    and an attacker who can inject one event reads the length of the next. That is
+    BREACH (see `compress`) with as many samples as it cares to take, on a
+    connection it never has to re-establish. A deployment that wants them encoded
+    anyway passes its own `compressible` to `compress`.
     """
     if content_type is None:
         return False
@@ -588,10 +593,47 @@ def _deliverable(compressor: StreamingCompressor, chunk: bytes) -> bytes:
     return compressor.compress(chunk) + compressor.flush_block()
 
 
+# The events that carry body bytes this middleware never sees. Both extensions hand
+# the transfer to the server, which reads the file itself, so there is nothing here
+# to feed a compressor.
+_OFFLOADED_BODY = (ZeroCopySend, PathSend)
+
+
+class OffloadedBodyAfterEncoding(Exception):
+    """
+    Raised when a response offloads the rest of its body after `compress` has already
+    committed to a content coding.
+
+    The `http.response.zerocopysend` and `http.response.pathsend` extensions both
+    send bytes the middleware never sees, and `zerocopysend` carries `more_body`
+    precisely so it can follow the body events an app has already sent. A response
+    that has not been committed to a coding yet takes that combination in stride,
+    releasing what it held and passing the offload through unencoded. Once the head
+    has gone out declaring `content-encoding`, there is no version of it that is
+    correct: the offloaded bytes are not encoded, and appending them to the encoded
+    stream produces a body no decoder can read.
+
+    So `compress` raises rather than writing that body. What reaches the client is a
+    truncated response, which every transport already signals as one, in place of a
+    complete-looking response that decodes to garbage.
+
+    Two ways out of it, for an app that means to stream a prefix and then offload the
+    rest. Raise `compress`'s `streaming_minimum_size` above the prefix, which leaves
+    the middleware uncommitted while the prefix goes by; or send the whole response
+    through the offload, since an offload arriving before any body event is the case
+    that always passes through.
+    """
+
+
+def _offloaded_after(coding: bytes) -> str:
+    return f"a body already committed to content-encoding {coding!r} cannot be offloaded"
+
+
 def compress(
     compressors: Mapping[bytes, Callable[[], Compressor]] = DEFAULT_COMPRESSORS,
     *,
     minimum_size: int = 500,
+    streaming_minimum_size: int = 0,
     compressible: Callable[[bytes | None], bool] = is_compressible,
 ) -> HttpMiddleware[object]:
     """
@@ -633,19 +675,30 @@ def compress(
 
     A body shorter than `minimum_size` is sent unencoded, because gzip's framing
     costs more than a few hundred bytes of text saves. The gate is applied to the
-    bytes rather than to `content-length`, so it holds for a streaming response
-    that never declares one: the middleware buffers up to `minimum_size` of the
-    body to find out which side of the gate it falls on, then either releases the
-    prefix untouched or commits to encoding and streams the rest through the
-    compressor chunk by chunk, ending a block per chunk so each one reaches the
-    client as it is produced rather than accumulating inside the codec until the
-    response finishes. Committing needs a `StreamingCompressor`; a coding whose
-    factory produces a plain `Compressor` still encodes responses that arrive
-    whole, and leaves streaming ones unencoded rather than stalling them. A
-    response that arrives whole gets an exact `content-length` for its encoded
-    body; one still streaming when it crosses the gate loses `content-length` and
-    is framed by the transport, as any streaming body is. A strong `etag` is
-    weakened when the body is encoded (see `_weakened`).
+    bytes rather than to `content-length`, so it holds for a response that arrives
+    whole behind a head that never declared one.
+
+    A body the app *streams* is weighed by `streaming_minimum_size` instead, which
+    defaults to holding none of it: the middleware commits on the first non-empty
+    chunk and streams the rest through the compressor, ending a block per chunk so
+    each one reaches the client as it is produced rather than accumulating inside
+    the codec until the response finishes. The two gates are separate because
+    holding costs a streamed body something a buffered one never pays. Weighing a
+    stream means keeping bytes the app has already produced until enough of them
+    accumulate to decide, so a feed emitting a line a second delivers nothing for as
+    many seconds as it takes to reach the gate, and how long that is belongs to the
+    app rather than to this middleware. Zero spends the framing bytes instead, which
+    is the trade a response the app chose to stream usually wants. Raise it to weigh
+    a stream the way a buffered body is weighed, at that latency, and to leave the
+    middleware uncommitted for a response that streams a prefix before offloading
+    the rest (see `OffloadedBodyAfterEncoding`).
+
+    Committing needs a `StreamingCompressor`; a coding whose factory produces a
+    plain `Compressor` still encodes responses that arrive whole, and leaves
+    streaming ones unencoded rather than stalling them. A response that arrives
+    whole gets an exact `content-length` for its encoded body; a streamed one loses
+    `content-length` and is framed by the transport, as any streaming body is. A
+    strong `etag` is weakened when the body is encoded (see `_weakened`).
 
     !!! warning "Compression and secrets"
 
@@ -695,7 +748,19 @@ def compress(
             # on a header the representation does not really vary by shares a little
             # less, while one missing a header it does vary by hands a client an
             # encoding it cannot read.
-            yield replace(start, headers=_varying(start.headers))
+            revalidated = _varying(start.headers)
+            if negotiate_coding(_accept_encoding(scope.headers), available) is not None:
+                # The stored entry this `304` updates is the one its `vary` key
+                # selects, so for a client that negotiates a coding it is the encoded
+                # variant, and RFC 9111 §4.3.4 has the cache copy these fields onto
+                # it. A strong validator copied onto encoded bytes is the lie
+                # `_weakened` exists to prevent, and it undoes itself: a later
+                # `If-Range` matches under strong comparison, and the `206` this
+                # middleware never encodes returns identity bytes to stitch into an
+                # encoded body. A client that negotiates nothing holds the identity
+                # representation, so its validator is left as the app stated it.
+                revalidated = _weakened(revalidated)
+            yield replace(start, headers=revalidated)
             async for event in outbound:
                 yield event
             return
@@ -714,9 +779,11 @@ def compress(
                 yield event
             return
 
-        # Hold the head and buffer the body's prefix until the size gate resolves:
-        # committing to a `content-encoding` before knowing the body is big enough
-        # to deserve one is the one decision that cannot be taken back.
+        # Hold the head until a size gate resolves: committing to a
+        # `content-encoding` before knowing the body is big enough to deserve one is
+        # the one decision that cannot be taken back. Which gate decides is a
+        # property of the body, `minimum_size` for one that ends in the event being
+        # read and `streaming_minimum_size` for one still being produced.
         prefix: list[bytes] = []
         buffered = 0
         async for event in outbound:
@@ -740,19 +807,25 @@ def compress(
                 if buffered < minimum_size:
                     yield start
                     yield ResponseBody(body=body, more_body=False)
-                else:
-                    compressor = table[coding]()
-                    encoded = compressor.compress(body) + compressor.flush()
-                    yield replace(start, headers=_encoded(start.headers, coding, len(encoded)))
-                    yield ResponseBody(body=encoded, more_body=False)
+                    async for rest in outbound:
+                        yield rest
+                    return
+                compressor = table[coding]()
+                encoded = compressor.compress(body) + compressor.flush()
+                yield replace(start, headers=_encoded(start.headers, coding, len(encoded)))
+                yield ResponseBody(body=encoded, more_body=False)
                 # Trailers may still follow a finished body.
                 async for rest in outbound:
+                    if isinstance(rest, _OFFLOADED_BODY):
+                        raise OffloadedBodyAfterEncoding(_offloaded_after(coding))
                     yield rest
                 return
 
-            if buffered >= minimum_size:
+            if buffered and buffered >= streaming_minimum_size:
                 # Past the gate with more body coming: commit to encoding, release
-                # the prefix through the compressor, and stream the rest.
+                # what was held through the compressor, and stream the rest. An empty
+                # chunk cannot carry the response past a gate of zero, since there is
+                # nothing yet to encode and nothing to deliver if there were.
                 compressor = table[coding]()
                 if not isinstance(compressor, StreamingCompressor):
                     # This codec can only make its output deliverable by ending the
@@ -766,9 +839,10 @@ def compress(
                         yield rest
                     return
                 yield replace(start, headers=_encoded(start.headers, coding, None))
-                if encoded := _deliverable(compressor, b"".join(prefix)):
-                    yield ResponseBody(body=encoded, more_body=True)
+                yield ResponseBody(body=_deliverable(compressor, b"".join(prefix)), more_body=True)
                 async for rest in outbound:
+                    if isinstance(rest, _OFFLOADED_BODY):
+                        raise OffloadedBodyAfterEncoding(_offloaded_after(coding))
                     if not isinstance(rest, ResponseBody):
                         yield rest
                     elif rest.more_body:

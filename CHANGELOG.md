@@ -78,12 +78,33 @@
   the fields its `200` would have and names `Vary` among them because that is how a shared cache
   picks the stored variant to update. A strong `etag` is weakened to `W/`
   when the body is encoded, per [RFC 9110 §8.8.1](https://www.rfc-editor.org/rfc/rfc9110#section-8.8.1):
-  weak comparison still matches the two representations, `Range` correctly stops matching. Bodies
-  below `minimum_size` are left alone, gated on the bytes rather than on `content-length` so the
-  floor holds for a streaming response; a body held whole is re-described with an exact
+  weak comparison still matches the two representations, `Range` correctly stops matching. The `304`
+  inherits that weakening for a client whose `accept-encoding` negotiates a coding, since the stored
+  entry it updates is then the encoded variant and
+  [RFC 9111 §4.3.4](https://www.rfc-editor.org/rfc/rfc9111#section-4.3.4) has the cache copy the
+  `304`'s fields onto it; a strong tag landing there would let a later `If-Range` match under strong
+  comparison and stitch identity range bytes into an encoded body. Bodies below `minimum_size` are
+  left alone, gated on the bytes rather than on `content-length` so the floor holds for a body that
+  arrives whole behind a head that declared no length, and such a body is re-described with an exact
   `content-length` for its encoded form instead of falling back to chunked. A `206` is never encoded:
   its `content-range` names offsets into the *identity* representation and nothing here can restate
   them for an encoded one, so a client reassembling ranges would stitch them at the wrong offsets.
+- **`without-asgi`**: `compress`'s two size gates. `minimum_size` (500 bytes) weighs a body that
+  arrives whole; a body the app *streams* is weighed by `streaming_minimum_size`, which defaults to
+  holding none of it, so the middleware commits on the first non-empty chunk and encodes from there.
+  They are separate because holding costs a streamed body something a buffered one never pays: one
+  threshold for both means keeping bytes the app has already produced until enough of them
+  accumulate to decide, so a feed emitting a line a second delivers nothing for as many seconds as
+  it takes to reach the gate, and how long that is belongs to the app rather than to the middleware.
+  Zero spends the framing bytes instead, which is the trade a response the app chose to stream
+  usually wants; raise it to weigh a stream the way a buffered body is weighed, at that latency.
+  An offloaded body is the one shape that cannot follow a commitment, since
+  `http.response.zerocopysend` and `http.response.pathsend` both send bytes the middleware never
+  sees and the former carries `more_body` so it can follow body events already sent: arriving before
+  any body event an offload passes through unencoded, and arriving after the head has declared
+  `content-encoding` it raises `OffloadedBodyAfterEncoding` rather than write a body no decoder can
+  read. Raising `streaming_minimum_size` above the prefix is what lets an app stream one and then
+  offload the rest.
 - **`without-asgi`**: `StreamingCompressor`, the `Compressor` that can be flushed without being
   ended, and what `compress` needs to encode a response that is still streaming. What a `compress`
   call returns is the codec's choice rather than the caller's: fed the small pieces a streaming body

@@ -26,11 +26,13 @@ from without_asgi import RawHeaders
 from without_asgi import ResponseBody
 from without_asgi import ResponseStart
 from without_asgi import ResponseTrailers
+from without_asgi import ZeroCopySend
 from without_asgi.compression import DEFAULT_COMPRESSORS
 from without_asgi.compression import GZIP_CONTAINER
 from without_asgi.compression import MAX_RANDOM_BYTES
 from without_asgi.compression import PADDED_COMPRESSORS
 from without_asgi.compression import Compressor
+from without_asgi.compression import OffloadedBodyAfterEncoding
 from without_asgi.compression import StreamingCompressor
 from without_asgi.compression import _PaddedGzipCompressor
 from without_asgi.compression import compress
@@ -44,6 +46,14 @@ from without_asgi.routing import HttpMiddleware
 # enough that the encoded form is unmistakably shorter than the plain one.
 BODY = b'{"todos":[' + b'{"title":"write the docs","done":false},' * 40 + b"]}"
 SHORT = b'{"ok":true}'
+
+
+@dataclass(frozen=True, slots=True)
+class _FileDescriptor:
+    """The whole of what `ZeroCopySend` asks of a file: something with a descriptor."""
+
+    def fileno(self) -> int:
+        return 7  # pragma: no cover - only its presence satisfies the SupportsFileno protocol; never called
 
 
 def _scope(*, headers: RawHeaders = ()) -> HttpScope:
@@ -338,13 +348,10 @@ class TestVary:
         events = await _run(compress(), _accepting(b"gzip"), source)
         assert _values(_head(events), b"vary") == [b"accept-encoding"]
 
-    async def test_leaves_a_revalidated_response_otherwise_untouched(self) -> None:
-        """The `etag` a `304` matches on is the stored one, so weakening it would break the match."""
+    async def test_encodes_nothing_on_a_revalidated_response(self) -> None:
         source = (ResponseStart(status=304, headers=((b"etag", b'"v1"'),)),)
         events = await _run(compress(), _accepting(b"gzip"), source)
-        head = _head(events)
-        assert _one(head, b"etag") == b'"v1"'
-        assert _one(head, b"content-encoding") is None
+        assert _one(_head(events), b"content-encoding") is None
 
 
 class TestEtag:
@@ -360,6 +367,23 @@ class TestEtag:
 
     async def test_leaves_a_strong_validator_alone_when_nothing_is_encoded(self) -> None:
         source = _json_response(headers=((b"etag", b'"v1"'),))
+        events = await _run(compress(), _scope(), source)
+        assert _one(_head(events), b"etag") == b'"v1"'
+
+    async def test_weakens_a_revalidated_validator_for_a_client_that_negotiates_a_coding(self) -> None:
+        """
+        RFC 9111 §4.3.4 has a cache copy a `304`'s fields onto the stored entry its
+        `vary` key selects, which for this client is the encoded one. A strong tag
+        landing there would let a later `If-Range` match under strong comparison and
+        stitch identity range bytes into an encoded body.
+        """
+        source = (ResponseStart(status=304, headers=((b"etag", b'"v1"'),)),)
+        events = await _run(compress(), _accepting(b"gzip"), source)
+        assert _one(_head(events), b"etag") == b'W/"v1"'
+
+    async def test_leaves_a_revalidated_validator_alone_for_a_client_holding_identity_bytes(self) -> None:
+        """A client that negotiates no coding holds the unencoded body, so its tag is still true of it."""
+        source = (ResponseStart(status=304, headers=((b"etag", b'"v1"'),)),)
         events = await _run(compress(), _scope(), source)
         assert _one(_head(events), b"etag") == b'"v1"'
 
@@ -382,8 +406,24 @@ def _streamed(chunks: Sequence[bytes], *, headers: RawHeaders = ()) -> tuple[Out
     )
 
 
+def _recorded(chunks: Sequence[bytes]) -> tuple[HttpHandler, list[bytes]]:
+    """A streaming handler, paired with the list of chunks it has released so far."""
+    released: list[bytes] = []
+
+    def handler(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
+        async def events() -> AsyncIterator[Outbound]:
+            yield ResponseStart(status=200, headers=((b"content-type", b"application/x-ndjson"),))
+            for index, chunk in enumerate(chunks):
+                released.append(chunk)
+                yield ResponseBody(body=chunk, more_body=index < len(chunks) - 1)
+
+        return events()
+
+    return handler, released
+
+
 class TestStreamingResponses:
-    async def test_encodes_a_stream_that_crosses_the_gate(self) -> None:
+    async def test_encodes_a_streamed_body(self) -> None:
         chunks = [BODY[:300], BODY[300:600], BODY[600:]]
         events = await _run(compress(), _accepting(b"gzip"), _streamed(chunks))
         head = _head(events)
@@ -400,41 +440,66 @@ class TestStreamingResponses:
         bodies = [event for event in events if isinstance(event, ResponseBody)]
         assert [event.more_body for event in bodies] == [*([True] * (len(bodies) - 1)), False]
 
-    async def test_releases_a_stream_that_never_reaches_the_gate(self) -> None:
+    async def test_encodes_a_stream_too_small_for_the_buffered_gate(self) -> None:
+        """`minimum_size` weighs a body that arrives whole; a streamed one is committed regardless."""
         chunks = [SHORT, SHORT]
         events = await _run(compress(), _accepting(b"gzip"), _streamed(chunks))
+        assert _one(_head(events), b"content-encoding") == b"gzip"
+        assert gzip.decompress(_body(events)) == b"".join(chunks)
+
+    async def test_releases_a_stream_that_never_reaches_a_raised_gate(self) -> None:
+        chunks = [SHORT, SHORT]
+        events = await _run(compress(streaming_minimum_size=500), _accepting(b"gzip"), _streamed(chunks))
         head = _head(events)
         assert _one(head, b"content-encoding") is None
         assert _body(events) == b"".join(chunks)
 
-    async def test_holds_the_head_until_the_gate_resolves(self) -> None:
+    async def test_releases_the_head_with_the_first_chunk_of_a_stream(self) -> None:
         """
-        The head cannot go out before the size is known, since it carries the
-        `content-encoding` that decision produces.
+        The head carries the `content-encoding`, so holding it holds the whole
+        response. Committing on the first chunk is what keeps a slow stream moving:
+        nothing waits on bytes the app has not produced yet.
         """
-        released: list[bytes] = []
-
-        async def source(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
-            yield ResponseStart(status=200, headers=((b"content-type", b"application/x-ndjson"),))
-            for chunk in (BODY[:100], BODY[100:]):
-                released.append(chunk)
-                yield ResponseBody(body=chunk, more_body=chunk != BODY[100:])
-
+        source, released = _recorded([BODY[:100], BODY[100:600], BODY[600:]])
         handler = compress()(source, None, _accepting(b"gzip"))
         seen: list[Outbound] = []
         async for event in handler(stream_from_iterable(())):
             if isinstance(event, ResponseStart):
-                assert len(released) == 2
+                assert released == [BODY[:100]]
             seen.append(event)
         assert gzip.decompress(_body(seen)) == BODY
 
-    async def test_passes_a_truncated_stream_through_unencoded(self) -> None:
-        """A body that stops without a final event is already broken; encoding it would hide that."""
+    async def test_holds_the_head_until_a_raised_gate_resolves(self) -> None:
+        """What a raised gate buys in bytes it spends here, holding produced chunks to weigh them."""
+        source, released = _recorded([BODY[:100], BODY[100:600], BODY[600:]])
+        handler = compress(streaming_minimum_size=500)(source, None, _accepting(b"gzip"))
+        seen: list[Outbound] = []
+        async for event in handler(stream_from_iterable(())):
+            if isinstance(event, ResponseStart):
+                assert released == [BODY[:100], BODY[100:600]]
+            seen.append(event)
+        assert gzip.decompress(_body(seen)) == BODY
+
+    async def test_leaves_a_truncated_stream_truncated(self) -> None:
+        """
+        A body that stops without a final event is already broken. Committed on its
+        first chunk, what goes out is an encoded stream that stops too, which is the
+        breakage the transport already signals rather than a second one.
+        """
         source = (
             ResponseStart(status=200, headers=((b"content-type", b"application/x-ndjson"),)),
             ResponseBody(body=SHORT, more_body=True),
         )
         events = await _run(compress(), _accepting(b"gzip"), source)
+        assert _one(_head(events), b"content-encoding") == b"gzip"
+        assert zlib.decompressobj(GZIP_CONTAINER).decompress(_body(events)) == SHORT
+
+    async def test_passes_a_truncated_stream_below_a_raised_gate_through_unencoded(self) -> None:
+        source = (
+            ResponseStart(status=200, headers=((b"content-type", b"application/x-ndjson"),)),
+            ResponseBody(body=SHORT, more_body=True),
+        )
+        events = await _run(compress(streaming_minimum_size=500), _accepting(b"gzip"), source)
         assert _one(_head(events), b"content-encoding") is None
         assert _body(events) == SHORT
 
@@ -451,7 +516,7 @@ class TestStreamingResponses:
         assert events[-1] == trailers
         assert gzip.decompress(_body(events)) == BODY
 
-    async def test_encodes_every_chunk_after_the_gate(self) -> None:
+    async def test_encodes_every_chunk_of_a_stream(self) -> None:
         chunks = [BODY[:300], BODY[300:600], BODY[600:800], BODY[800:]]
         events = await _run(compress(), _accepting(b"gzip"), _streamed(chunks))
         assert gzip.decompress(_body(events)) == BODY
@@ -459,7 +524,9 @@ class TestStreamingResponses:
     async def test_spends_no_event_on_an_empty_chunk(self) -> None:
         """
         An empty chunk has nothing to deliver, and ending a block for it would spend
-        framing bytes on nothing, so it produces no event at all.
+        framing bytes on nothing, so it produces no event at all. A leading one
+        cannot commit the response either, for the same reason: there is nothing yet
+        to encode.
         """
         source = (
             ResponseStart(status=200, headers=((b"content-type", b"application/x-ndjson"),)),
@@ -468,7 +535,7 @@ class TestStreamingResponses:
             ResponseBody(body=b"", more_body=True),
             ResponseBody(body=BODY[300:], more_body=False),
         )
-        events = await _run(compress(minimum_size=0), _accepting(b"gzip"), source)
+        events = await _run(compress(), _accepting(b"gzip"), source)
         assert _one(_head(events), b"content-encoding") == b"gzip"
         bodies = [event.body for event in events if isinstance(event, ResponseBody)]
         assert len(bodies) == 2
@@ -488,9 +555,8 @@ class TestStreamingResponses:
         assert _one(_head(events), b"content-encoding") == coding
         decode = INCREMENTAL_DECODERS[coding]()
         bodies = [event.body for event in events if isinstance(event, ResponseBody)]
-        # The prefix held for the gate is released as one piece; each chunk after it
-        # decodes whole out of its own event.
-        assert [decode(body) for body in bodies] == [b"".join(chunks[:2]), chunks[2], chunks[3]]
+        # Every chunk decodes whole out of an event of its own.
+        assert [decode(body) for body in bodies] == chunks
 
 
 class TestOtherEvents:
@@ -506,6 +572,12 @@ class TestOtherEvents:
         assert events[-1] == trailers
         assert gzip.decompress(_body(events)) == BODY
 
+    async def test_passes_trailers_through_after_a_body_under_the_minimum_size(self) -> None:
+        trailers = ResponseTrailers(headers=((b"digest", b"sha-256=abc"),))
+        events = await _run(compress(), _accepting(b"gzip"), (*_json_response(SHORT), trailers))
+        assert events[-1] == trailers
+        assert _body(events) == SHORT
+
     async def test_leaves_an_offloaded_body_unencoded(self) -> None:
         """`PathSend` hands the transfer below Python, so there are no bytes here to encode."""
         offloaded = PathSend(path="/srv/data.json")
@@ -520,15 +592,46 @@ class TestOtherEvents:
         assert not [event for event in events if isinstance(event, ResponseBody)]
 
     async def test_releases_a_buffered_prefix_before_an_offloaded_body(self) -> None:
+        """A gate the prefix has not cleared leaves the middleware uncommitted, so the offload still fits."""
         offloaded = PathSend(path="/srv/data.json")
         source = (
             ResponseStart(status=200, headers=((b"content-type", b"application/json"),)),
             ResponseBody(body=SHORT, more_body=True),
             offloaded,
         )
-        events = await _run(compress(), _accepting(b"gzip"), source)
+        events = await _run(compress(streaming_minimum_size=500), _accepting(b"gzip"), source)
+        assert _one(_head(events), b"content-encoding") is None
         assert _body(events) == SHORT
         assert events[-1] == offloaded
+
+    @pytest.mark.parametrize(
+        "offloaded",
+        [
+            pytest.param(PathSend(path="/srv/data.json"), id="path-send"),
+            pytest.param(ZeroCopySend(file=_FileDescriptor()), id="zero-copy-send"),
+        ],
+    )
+    async def test_refuses_to_offload_a_body_it_has_committed_to_encoding(self, offloaded: Outbound) -> None:
+        """
+        `ZeroCopySend` carries `more_body` precisely so it can follow body events the
+        app has already sent, and the bytes either extension sends are ones this
+        middleware never sees. Spliced into a stream whose head declares
+        `content-encoding`, they make a body no decoder can read, so the response is
+        truncated instead.
+        """
+        source = (
+            ResponseStart(status=200, headers=((b"content-type", b"application/json"),)),
+            ResponseBody(body=BODY, more_body=True),
+            offloaded,
+        )
+        with pytest.raises(OffloadedBodyAfterEncoding):
+            await _run(compress(), _accepting(b"gzip"), source)
+
+    async def test_refuses_to_offload_after_an_encoded_body_has_finished(self) -> None:
+        """The stream is closed by then, so the offloaded bytes would trail a complete encoded body."""
+        source = (*_json_response(), PathSend(path="/srv/data.json"))
+        with pytest.raises(OffloadedBodyAfterEncoding):
+            await _run(compress(), _accepting(b"gzip"), source)
 
     async def test_passes_events_after_an_offloaded_body_through(self) -> None:
         trailers = ResponseTrailers(headers=((b"digest", b"sha-256=abc"),))
@@ -637,14 +740,10 @@ class TestCodingTable:
         chunks = [BODY[:300], BODY[300:600], BODY[600:800], BODY[800:]]
         events = await _run(compress({b"funky": _Doubler}), _accepting(b"funky"), _streamed(chunks))
         bodies = [event.body for event in events if isinstance(event, ResponseBody)]
-        # The prefix is released as one chunk and each later chunk keeps its own
-        # event, every one of them flushed. The last rides out on the flush that
-        # ends the stream rather than paying for a block of its own.
-        assert bodies == [
-            b"".join(chunks[:2]) * 2 + b"|",
-            chunks[2] * 2 + b"|",
-            chunks[3] * 2 + b"!",
-        ]
+        # Every chunk keeps its own event and every one of them is flushed. The last
+        # rides out on the flush that ends the stream rather than paying for a block
+        # of its own.
+        assert bodies == [*(chunk * 2 + b"|" for chunk in chunks[:-1]), chunks[-1] * 2 + b"!"]
 
     async def test_leaves_a_stream_unencoded_for_a_codec_that_cannot_flush(self) -> None:
         """
