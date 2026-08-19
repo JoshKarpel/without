@@ -600,13 +600,29 @@ factory whose product satisfies the small `Compressor` / `Decompressor` protocol
 inheriting the framing rewrite, streaming, and truncation check instead of
 reimplementing them.
 
+For the encoding direction that protocol has a second rung, because streaming a body
+is a demand on the codec rather than only on the loop around it. What a `compress`
+call returns is the codec's choice: fed a chunk at a time, zlib and zstd return almost
+nothing until the stream ends, so a body wrapped in one of them raw would sit whole
+inside the codec while every line of code around it looked like it streamed. A
+`StreamingCompressor` is a `Compressor` that can also end a block without ending the
+stream, which is what releases each chunk, and `gzip_compressor`, `zstd_compressor`,
+and `brotli_compressor` are the shipped factories that produce one (all three live in
+`without-asgi` and are re-exported here). Reach for those rather than
+`zlib.compressobj` or `zstd.ZstdCompressor` directly, since the raw objects satisfy
+`Compressor` and not the second rung. A plain `Compressor` still encodes correctly and
+still holds the body to the end: a coding the caller named has no unencoded answer to
+fall back on the way a negotiated response does. A body that arrives whole is one
+chunk and encodes to identical bytes under either.
+
 The server counterpart is
 [`compress()`](../without-asgi/index.md#negotiated-response-compression), an ASGI
 middleware in `without-asgi`: it reads the `accept-encoding` that `decompress()`
-sends and encodes the response body the client will decode. `Compressor` and the
-brotli adapter behind `brotli_compress` both live in `without-asgi`, the lower of
-the two packages, and are re-exported here, so one codec serves a coding in both
-directions and the same three codings are decoded inbound and produced outbound.
+sends and encodes the response body the client will decode. The two `Compressor`
+protocols and the three codec factories behind `gzip_compress`, `zstd_compress`, and
+`brotli_compress` all live in `without-asgi`, the lower of the two packages, and are
+re-exported here, so one codec serves a coding in both directions and the same three
+codings are decoded inbound and produced outbound.
 `brotli_compress` keeps the bindings' own quality of 11 while the server table
 defaults lower: a client compressing an upload it holds whole is the case that
 ratio is worth paying for, and a response encoded per request is not.

@@ -14,6 +14,7 @@ from without_http.client import Resolve
 from without_http.client import ResponseBody
 from without_http.client import ResponseHead
 from without_http.client import ResponseTrailers
+from without_http.client import StreamingCompressor
 from without_http.client import add_headers
 from without_http.client import basic_auth
 from without_http.client import bearer_auth
@@ -26,12 +27,14 @@ from without_http.client import decompress
 from without_http.client import default_headers
 from without_http.client import follow_redirects
 from without_http.client import gzip_compress
+from without_http.client import gzip_compressor
 from without_http.client import request
 from without_http.client import stack
 from without_http.client import tcp_connect
 from without_http.client import user_agent
 from without_http.client import wrap
 from without_http.client import zstd_compress
+from without_http.client import zstd_compressor
 from without_http.h2_wire import early_hint_headers
 from without_http.h2_wire import request_headers
 from without_http.h2_wire import response_headers
@@ -88,6 +91,7 @@ __all__ = [
     "ResponseTrailers",
     "Server",
     "SocketOptions",
+    "StreamingCompressor",
     "Timeout",
     "WriteTimeout",
     "add_headers",
@@ -105,6 +109,7 @@ __all__ = [
     "extensions_with_tls",
     "follow_redirects",
     "gzip_compress",
+    "gzip_compressor",
     "h11_events_from_outbound",
     "inbound_from_event",
     "is_websocket_upgrade",
@@ -128,4 +133,5 @@ __all__ = [
     "wrap",
     "ws_events_from_outbound",
     "zstd_compress",
+    "zstd_compressor",
 ]

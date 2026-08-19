@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import zlib
 from collections.abc import AsyncIterator
 from collections.abc import Callable
 from collections.abc import Iterable
@@ -8,6 +9,7 @@ from collections.abc import Sequence
 from compression import zstd
 from dataclasses import dataclass
 from dataclasses import field
+from typing import cast
 
 import brotli
 import pytest
@@ -25,9 +27,11 @@ from without_asgi import ResponseBody
 from without_asgi import ResponseStart
 from without_asgi import ResponseTrailers
 from without_asgi.compression import DEFAULT_COMPRESSORS
+from without_asgi.compression import GZIP_CONTAINER
 from without_asgi.compression import MAX_RANDOM_BYTES
 from without_asgi.compression import PADDED_COMPRESSORS
 from without_asgi.compression import Compressor
+from without_asgi.compression import StreamingCompressor
 from without_asgi.compression import _PaddedGzipCompressor
 from without_asgi.compression import compress
 from without_asgi.compression import is_compressible
@@ -244,16 +248,46 @@ class TestCandidacy:
         assert _values(head, b"vary") == []
         assert _body(events) == BODY
 
-    @pytest.mark.parametrize("status", [204, 304])
-    async def test_leaves_a_bodyless_status_untouched(self, status: int) -> None:
+    @pytest.mark.parametrize("status", [204, 206, 304])
+    async def test_leaves_a_status_no_coding_applies_to_untouched(self, status: int) -> None:
         source = (
             ResponseStart(status=status, headers=((b"content-type", b"application/json"),)),
-            ResponseBody(body=b"", more_body=False),
+            ResponseBody(body=BODY, more_body=False),
         )
         events = await _run(compress(minimum_size=0), _accepting(b"gzip"), source)
         head = _head(events)
         assert _one(head, b"content-encoding") is None
-        assert _values(head, b"vary") == []
+        assert _body(events) == BODY
+
+    @pytest.mark.parametrize("status", [204, 206])
+    async def test_declares_no_variance_on_a_status_it_never_encodes(self, status: int) -> None:
+        source = (
+            ResponseStart(status=status, headers=((b"content-type", b"application/json"),)),
+            ResponseBody(body=BODY, more_body=False),
+        )
+        events = await _run(compress(minimum_size=0), _accepting(b"gzip"), source)
+        assert _values(_head(events), b"vary") == []
+
+    async def test_leaves_a_range_response_describing_the_bytes_it_still_carries(self) -> None:
+        """
+        `content-range` names offsets into the *identity* representation, so encoding
+        the range would leave it describing bytes the client no longer holds.
+        """
+        source = (
+            ResponseStart(
+                status=206,
+                headers=(
+                    (b"content-type", b"application/json"),
+                    (b"content-range", b"bytes 0-499/10000"),
+                ),
+            ),
+            ResponseBody(body=BODY, more_body=False),
+        )
+        events = await _run(compress(minimum_size=0), _accepting(b"gzip"), source)
+        head = _head(events)
+        assert _one(head, b"content-encoding") is None
+        assert _one(head, b"content-range") == b"bytes 0-499/10000"
+        assert _body(events) == BODY
 
     async def test_honors_an_injected_compressibility_policy(self) -> None:
         source = (
@@ -288,6 +322,30 @@ class TestVary:
         events = await _run(compress(), _accepting(b"gzip"), source)
         assert _values(_head(events), b"vary") == [b"*"]
 
+    async def test_declares_the_variance_on_a_revalidated_response(self) -> None:
+        """
+        RFC 9110 §15.4.5 asks a `304` to carry the fields its `200` would have, and
+        names `vary` because a shared cache reads it to pick the stored variant to
+        update. A `304` that dropped it would leave the cache updating whichever
+        encoding it happened to hold.
+        """
+        source = (ResponseStart(status=304, headers=((b"etag", b'"v1"'),)),)
+        events = await _run(compress(), _accepting(b"gzip"), source)
+        assert _values(_head(events), b"vary") == [b"accept-encoding"]
+
+    async def test_does_not_repeat_a_variance_a_revalidated_response_declared(self) -> None:
+        source = (ResponseStart(status=304, headers=((b"vary", b"accept-encoding"),)),)
+        events = await _run(compress(), _accepting(b"gzip"), source)
+        assert _values(_head(events), b"vary") == [b"accept-encoding"]
+
+    async def test_leaves_a_revalidated_response_otherwise_untouched(self) -> None:
+        """The `etag` a `304` matches on is the stored one, so weakening it would break the match."""
+        source = (ResponseStart(status=304, headers=((b"etag", b'"v1"'),)),)
+        events = await _run(compress(), _accepting(b"gzip"), source)
+        head = _head(events)
+        assert _one(head, b"etag") == b'"v1"'
+        assert _one(head, b"content-encoding") is None
+
 
 class TestEtag:
     async def test_weakens_a_strong_validator_when_the_bytes_change(self) -> None:
@@ -304,6 +362,16 @@ class TestEtag:
         source = _json_response(headers=((b"etag", b'"v1"'),))
         events = await _run(compress(), _scope(), source)
         assert _one(_head(events), b"etag") == b'"v1"'
+
+
+# A decoder fed one encoded event at a time, which is what makes "delivered as it is
+# produced" checkable: a codec buffering its output leaves these returning nothing
+# until the very end.
+INCREMENTAL_DECODERS: dict[bytes, Callable[[], Callable[[bytes], bytes]]] = {
+    b"gzip": lambda: zlib.decompressobj(GZIP_CONTAINER).decompress,
+    b"zstd": lambda: zstd.ZstdDecompressor().decompress,
+    b"br": lambda: brotli.Decompressor().process,
+}
 
 
 def _streamed(chunks: Sequence[bytes], *, headers: RawHeaders = ()) -> tuple[Outbound, ...]:
@@ -388,6 +456,42 @@ class TestStreamingResponses:
         events = await _run(compress(), _accepting(b"gzip"), _streamed(chunks))
         assert gzip.decompress(_body(events)) == BODY
 
+    async def test_spends_no_event_on_an_empty_chunk(self) -> None:
+        """
+        An empty chunk has nothing to deliver, and ending a block for it would spend
+        framing bytes on nothing, so it produces no event at all.
+        """
+        source = (
+            ResponseStart(status=200, headers=((b"content-type", b"application/x-ndjson"),)),
+            ResponseBody(body=b"", more_body=True),
+            ResponseBody(body=BODY[:300], more_body=True),
+            ResponseBody(body=b"", more_body=True),
+            ResponseBody(body=BODY[300:], more_body=False),
+        )
+        events = await _run(compress(minimum_size=0), _accepting(b"gzip"), source)
+        assert _one(_head(events), b"content-encoding") == b"gzip"
+        bodies = [event.body for event in events if isinstance(event, ResponseBody)]
+        assert len(bodies) == 2
+        assert gzip.decompress(b"".join(bodies)) == BODY
+
+    @pytest.mark.parametrize("coding", [b"gzip", b"zstd", b"br"])
+    async def test_delivers_each_chunk_as_the_app_produces_it(self, coding: bytes) -> None:
+        """
+        Streaming past the gate has to mean *streaming*. Left to decide for itself, a
+        codec emits almost nothing per `compress` call and holds the rest until the
+        stream ends, so a body that arrives in pieces would reach the client as one
+        burst at the end, with every byte of it resident in the codec until then.
+        Decoding event by event is what tells the two apart.
+        """
+        chunks = [BODY[:300], BODY[300:600], BODY[600:800], BODY[800:]]
+        events = await _run(compress(), _accepting(coding), _streamed(chunks))
+        assert _one(_head(events), b"content-encoding") == coding
+        decode = INCREMENTAL_DECODERS[coding]()
+        bodies = [event.body for event in events if isinstance(event, ResponseBody)]
+        # The prefix held for the gate is released as one piece; each chunk after it
+        # decodes whole out of its own event.
+        assert [decode(body) for body in bodies] == [b"".join(chunks[:2]), chunks[2], chunks[3]]
+
 
 class TestOtherEvents:
     async def test_passes_events_before_the_head_through_untouched(self) -> None:
@@ -447,13 +551,16 @@ class TestOtherEvents:
 
 @dataclass(slots=True, eq=False)
 class _Doubler:
-    """A `Compressor` that plugs into the table without any real codec behind it."""
+    """A `StreamingCompressor` that plugs into the table without any real codec behind it."""
 
     chunks: list[bytes] = field(default_factory=list)
 
     def compress(self, data: bytes, /) -> bytes:
         self.chunks.append(data)
         return data * 2
+
+    def flush_block(self) -> bytes:
+        return b"|"
 
     def flush(self) -> bytes:
         return b"!"
@@ -462,11 +569,12 @@ class _Doubler:
 @dataclass(slots=True, eq=False)
 class _Hoarder:
     """
-    A `Compressor` that emits nothing until the stream ends.
+    A `Compressor` with no way to flush short of ending the stream.
 
     Real codecs buffer, so how much comes back from any one `compress` call is not
     something a test should depend on. These two fakes pin the extremes instead:
-    `_Doubler` emits on every call, `_Hoarder` on none until `flush`.
+    `_Doubler` can be flushed at any point, `_Hoarder` only at the end, which is the
+    difference `StreamingCompressor` names and the middleware branches on.
     """
 
     held: list[bytes] = field(default_factory=list)
@@ -525,24 +633,38 @@ class TestCodingTable:
         await _run(middleware, _accepting(b"funky"), _json_response())
         assert len(made) == 2
 
-    async def test_forwards_a_streaming_codecs_output_as_it_is_produced(self) -> None:
+    async def test_flushes_a_block_per_chunk_out_of_a_streaming_codec(self) -> None:
         chunks = [BODY[:300], BODY[300:600], BODY[600:800], BODY[800:]]
         events = await _run(compress({b"funky": _Doubler}), _accepting(b"funky"), _streamed(chunks))
         bodies = [event.body for event in events if isinstance(event, ResponseBody)]
-        # The prefix is released as one chunk, then each later chunk keeps its own event.
+        # The prefix is released as one chunk and each later chunk keeps its own
+        # event, every one of them flushed. The last rides out on the flush that
+        # ends the stream rather than paying for a block of its own.
         assert bodies == [
-            b"".join(chunks[:2]) * 2,
-            chunks[2] * 2,
-            chunks[3] * 2,
-            b"!",
+            b"".join(chunks[:2]) * 2 + b"|",
+            chunks[2] * 2 + b"|",
+            chunks[3] * 2 + b"!",
         ]
 
-    async def test_emits_no_body_event_for_a_codec_holding_bytes_back(self) -> None:
+    async def test_leaves_a_stream_unencoded_for_a_codec_that_cannot_flush(self) -> None:
+        """
+        `_Hoarder` can only be emptied by ending the stream, so encoding through it
+        would hold the whole body back and deliver it in one burst. Unencoded is the
+        honest answer: it costs bytes, where encoding would cost the incremental
+        delivery the app streamed for.
+        """
         chunks = [BODY[:300], BODY[300:600], BODY[600:800], BODY[800:]]
         events = await _run(compress({b"funky": _Hoarder}), _accepting(b"funky"), _streamed(chunks))
-        bodies = [event for event in events if isinstance(event, ResponseBody)]
-        assert [event.body for event in bodies] == [BODY]
-        assert [event.more_body for event in bodies] == [False]
+        head = _head(events)
+        assert _one(head, b"content-encoding") is None
+        assert _values(head, b"vary") == [b"accept-encoding"]
+        assert _body(events) == BODY
+
+    async def test_still_encodes_a_buffered_body_for_a_codec_that_cannot_flush(self) -> None:
+        """The buffered case never needs a mid-stream flush, so the plain protocol is enough for it."""
+        events = await _run(compress({b"funky": _Hoarder}), _accepting(b"funky"), _json_response())
+        assert _one(_head(events), b"content-encoding") == b"funky"
+        assert _body(events) == BODY
 
 
 def _encoded(make: Callable[[], Compressor], data: bytes, *, chunk: int | None = None) -> bytes:
@@ -578,6 +700,28 @@ class TestPaddedCompressors:
     def test_padded_output_still_decodes_when_fed_in_pieces(self, coding: bytes) -> None:
         """Gzip's header arrives with whichever `compress` call zlib decides to emit it on."""
         assert DECODERS[coding](_encoded(PADDED_COMPRESSORS[coding], BODY, chunk=7)) == BODY
+
+    @pytest.mark.parametrize("coding", [b"gzip", b"zstd"])
+    def test_padded_output_still_decodes_when_flushed_per_chunk(self, coding: bytes) -> None:
+        """The streaming path ends a block per chunk, which the padding has to survive."""
+        compressor = PADDED_COMPRESSORS[coding]()
+        assert isinstance(compressor, StreamingCompressor)
+        pieces = (BODY[start : start + 7] for start in range(0, len(BODY), 7))
+        encoded = b"".join(compressor.compress(piece) + compressor.flush_block() for piece in pieces)
+        assert DECODERS[coding](encoded + compressor.flush()) == BODY
+
+    def test_padded_zstd_decodes_for_a_reader_that_stops_at_the_first_frame(self) -> None:
+        """
+        A decoder is entitled to stop at the end of the frame it just read, and the
+        stdlib's incremental one does. Padding placed *before* the data would hand it
+        an empty body and strand the whole payload in `unused_data`, so the skippable
+        frame goes last, where every decoder has already seen the content.
+        """
+        decompressor = zstd.ZstdDecompressor()
+        assert decompressor.decompress(_encoded(padded_zstd_compressor, BODY)) == BODY
+        # What such a reader is left holding is the padding alone, which it may
+        # discard: the body was already whole before it stopped.
+        assert zstd.decompress(decompressor.unused_data) == b""
 
     @pytest.mark.parametrize("coding", [b"gzip", b"zstd"])
     def test_an_empty_budget_costs_only_the_container_field(self, coding: bytes) -> None:
@@ -632,7 +776,9 @@ class TestPaddedCompressors:
         class _Dribbler:
             """A gzip `Compressor` that hands its header back a byte at a time."""
 
-            _real: Compressor = field(default_factory=lambda: DEFAULT_COMPRESSORS[b"gzip"]())
+            _real: StreamingCompressor = field(
+                default_factory=lambda: cast(StreamingCompressor, DEFAULT_COMPRESSORS[b"gzip"]())
+            )
             _pending: bytes = b""
 
             def compress(self, data: bytes, /) -> bytes:
@@ -640,10 +786,14 @@ class TestPaddedCompressors:
                 head, self._pending = self._pending[:1], self._pending[1:]
                 return head
 
+            def flush_block(self) -> bytes:
+                held, self._pending = self._pending, b""
+                return held + self._real.flush_block()
+
             def flush(self) -> bytes:
                 return self._pending + self._real.flush()
 
         padded = _PaddedGzipCompressor(_Dribbler(), b"deadbeef")
         pieces = (BODY[start : start + 7] for start in range(0, len(BODY), 7))
-        encoded = b"".join(padded.compress(piece) for piece in pieces) + padded.flush()
-        assert gzip.decompress(encoded) == BODY
+        encoded = b"".join(padded.compress(piece) + padded.flush_block() for piece in pieces)
+        assert gzip.decompress(encoded + padded.flush()) == BODY

@@ -48,7 +48,10 @@ from without_asgi import RawHeaders
 from without_asgi import StreamingContent
 from without_asgi.compression import GZIP_CONTAINER
 from without_asgi.compression import Compressor
+from without_asgi.compression import StreamingCompressor
 from without_asgi.compression import brotli_compressor
+from without_asgi.compression import gzip_compressor
+from without_asgi.compression import zstd_compressor
 from without_asgi.headers import merge
 
 from without_http.h2_wire import request_headers
@@ -1622,10 +1625,25 @@ _REQUEST_FRAMING_HEADERS = frozenset({b"content-length", b"transfer-encoding"})
 
 
 async def _compressed(body: Stream[bytes], compressor: Compressor) -> AsyncIterator[bytes]:
+    # A codec decides for itself what any one `compress` call returns, and fed the
+    # pieces a streamed body arrives in it usually returns nothing, holding the whole
+    # upload until the stream ends. Ending a block per chunk is what releases it; a
+    # codec with no way to do that (a plain `Compressor`) has to hold it, since unlike
+    # a negotiated response there is no unencoded answer available to a caller who
+    # asked for this coding by name.
+    flush_block: Callable[[], bytes] = (
+        compressor.flush_block if isinstance(compressor, StreamingCompressor) else lambda: b""
+    )
+    # One chunk of lookahead, so the last one is known to be last and rides out on the
+    # flush that ends the stream rather than paying for a block of its own. A body that
+    # arrives whole is one chunk, so it still encodes to exactly the bytes it would
+    # have without any of this.
+    held: bytes | None = None
     async for chunk in body:
-        if compressed := compressor.compress(chunk):
+        if held and (compressed := compressor.compress(held) + flush_block()):
             yield compressed
-    yield compressor.flush()
+        held = chunk
+    yield compressor.compress(held or b"") + compressor.flush()
 
 
 def compressing(coding: bytes, make_compressor: Callable[[], Compressor]) -> ClientMiddleware:
@@ -1639,11 +1657,21 @@ def compressing(coding: bytes, make_compressor: Callable[[], Compressor]) -> Cli
     reimplemented.
 
     That rest: the lazy body `Stream[bytes]` is wrapped in the incremental compressor,
-    so a streamed upload compresses chunk by chunk and nothing buffers; and the
-    framing follows the rewrite, `content-length` no longer describes the body, so it
-    is dropped and the compressed stream goes out `transfer-encoding: chunked` (over
-    HTTP/2 the framing header is dropped with the other hop-by-hop headers and the
-    body rides DATA frames as usual).
+    so a streamed upload compresses chunk by chunk and holds no more than one of them;
+    and the framing follows the rewrite, `content-length` no longer describes the body,
+    so it is dropped and the compressed stream goes out `transfer-encoding: chunked`
+    (over HTTP/2 the framing header is dropped with the other hop-by-hop headers and
+    the body rides DATA frames as usual).
+
+    Holding no more than a chunk is a demand on the codec, not just on the loop: what
+    `compress` returns is the codec's choice, and fed a chunk at a time zlib and zstd
+    return almost nothing until the stream ends, which would buffer the whole upload
+    inside the codec while looking like it streamed. `make_compressor` should therefore
+    produce a `StreamingCompressor`, as `gzip_compressor`, `zstd_compressor`, and
+    `brotli_compressor` all do; a plain `Compressor` still encodes correctly and still
+    buffers, because a coding named by the caller has no unencoded answer to fall back
+    on the way a negotiated response does. A body that arrives whole is one chunk
+    either way, and encodes to the same bytes under both.
 
     Two kinds of request pass through untouched: one already carrying a
     `content-encoding` (the body is already encoded; re-compressing would corrupt it),
@@ -1685,7 +1713,7 @@ def gzip_compress(level: int = zlib.Z_DEFAULT_COMPRESSION) -> ClientMiddleware:
     codings, and `compressing` is the shared mechanism for any coding beyond those;
     the response-side counterpart to all of them is `decompress`.
     """
-    return compressing(b"gzip", lambda: zlib.compressobj(level, zlib.DEFLATED, GZIP_CONTAINER))
+    return compressing(b"gzip", lambda: gzip_compressor(level))
 
 
 def zstd_compress(level: int | None = None) -> ClientMiddleware:
@@ -1699,7 +1727,7 @@ def zstd_compress(level: int | None = None) -> ClientMiddleware:
 
     `level` is zstd's compression level, defaulting to the library's own default.
     """
-    return compressing(b"zstd", lambda: zstd.ZstdCompressor(level))
+    return compressing(b"zstd", lambda: zstd_compressor(level))
 
 
 def brotli_compress(quality: int = 11) -> ClientMiddleware:

@@ -315,21 +315,41 @@ a preference serves nobody.
 ### What gets compressed
 
 Three properties of the *response* decide candidacy, before any client preference
-is consulted: a `204` or `304` carries no content, a response already carrying
-`content-encoding` is already encoded, and the media type has to be worth the CPU.
-That last is `is_compressible`, an allowlist (`text/*`, the `+json` / `+xml` /
-`+text` structured suffixes, and a short list of the rest) in the shape nginx's
-`gzip_types` takes, so an unrecognized type yields a larger response rather than
-cycles spent re-compressing a JPEG. `text/event-stream` is excluded despite being
-`text/`: an incremental compressor holds bytes back until it has a block, which is
-exactly the latency an event stream exists to avoid. Pass your own predicate as
+is consulted: the status has to be one a coding can apply to, a response already
+carrying `content-encoding` is already encoded, and the media type has to be worth
+the CPU. That last is `is_compressible`, an allowlist (`text/*`, the `+json` /
+`+xml` / `+text` structured suffixes, and a short list of the rest) in the shape
+nginx's `gzip_types` takes, so an unrecognized type yields a larger response rather
+than cycles spent re-compressing a JPEG. `text/event-stream` is excluded despite
+being `text/`, and for the size gate below rather than the coding: the gate buffers
+the start of a body to learn which side of it the response falls on, so the opening
+events of a stream would be held back until enough had accumulated to decide, which
+is exactly the latency an event stream exists to avoid. Pass your own predicate as
 `compressible` to decide differently.
+
+Three statuses are excluded, each for its own reason. `204` and `304` carry no
+content, so there is nothing to encode. A `206` does carry bytes, but they are a
+range of the *identity* representation and its `content-range` names offsets into
+that representation, which the middleware has no way to restate for an encoded one:
+encoding the range would leave the field describing bytes the client no longer
+holds, and a client reassembling several ranges would stitch them at the wrong
+offsets.
 
 Every candidate gets `Vary: Accept-Encoding` whether or not *this* client got an
 encoded body, because candidacy is a property of the resource and a shared cache
 has to key on the header that decides the answer; a non-candidate gets none, since
-nothing about it varies. A strong `etag` is weakened to `W/` when the body is
-encoded, since [RFC 9110 §8.8.1](https://www.rfc-editor.org/rfc/rfc9110#section-8.8.1)
+nothing about it varies. The `304` is the exception among the excluded statuses:
+it updates the stored `200` it revalidates, and
+[RFC 9110 §15.4.5](https://www.rfc-editor.org/rfc/rfc9110#section-15.4.5) asks it
+to carry the fields that `200` would have, naming `Vary` because that is how a
+shared cache picks the stored variant to update. It gets the field unconditionally
+rather than run past `compressible` first, since the same section's field list
+omits `content-type` and a `304` usually arrives without one: a cache keyed on a
+header the representation does not really vary by shares a little less, while one
+missing a header it does vary by hands a client an encoding it cannot read.
+
+A strong `etag` is weakened to `W/` when the body is encoded, since
+[RFC 9110 §8.8.1](https://www.rfc-editor.org/rfc/rfc9110#section-8.8.1)
 defines a strong validator as one that changes whenever the content does. Weakening
 rather than dropping keeps it true in the way it still is: the two representations
 stay semantically equivalent, so a conditional request still matches under weak
@@ -344,6 +364,21 @@ chunk by chunk. A body that arrives whole is re-described with an exact
 `content-length` for its encoded form rather than falling back to chunked; one still
 streaming when it crosses the gate loses `content-length` and is framed by the
 transport, as any streaming body is.
+
+Streaming past that gate means ending a block per chunk, and that is a demand on the
+codec rather than a detail of the loop. What a `compress` call returns is the codec's
+choice, not the caller's: fed the small pieces a streaming body arrives in, zlib
+emits its 10-byte header and then nothing until the stream ends, and zstd emits
+nothing at all. Left that way the whole body accumulates inside the codec and lands
+on the client as one burst at the end, which round-trips perfectly and has quietly
+removed the incremental delivery the response was streamed for. `StreamingCompressor`
+is the `Compressor` that can be flushed without being ended, and `gzip_compressor`,
+`zstd_compressor`, and `brotli_compressor` are the shipped factories that produce one.
+Build a table entry from `zlib.compressobj` or `zstd.ZstdCompressor` directly and you
+get the lesser protocol, since both spell a block flush as a mode argument to `flush`
+rather than a method of its own. A coding whose factory produces a plain `Compressor`
+still encodes responses that arrive whole, and its streaming ones go out unencoded
+instead: that costs bytes, where encoding them would cost the delivery.
 
 ### Compression and secrets
 
@@ -378,7 +413,10 @@ The padding is per *container*, which is why that table is shorter than
 `DEFAULT_COMPRESSORS` rather than a padded copy of it. gzip has the optional
 filename field after its fixed header ([RFC 1952 §2.3.1](https://www.rfc-editor.org/rfc/rfc1952#section-2.3.1)),
 zstd has skippable frames ([RFC 8878 §3.1.2](https://www.rfc-editor.org/rfc/rfc8878#section-3.1.2)),
-and brotli's bindings expose only `process`, `flush`, and `finish`, with no
+placed *after* the data rather than before it because a decoder is entitled to stop
+at the end of the frame it just read, and the stdlib's `ZstdDecompressor` does:
+padding that led would hand it an empty body with the whole payload stranded in
+`unused_data`. Brotli's bindings expose only `process`, `flush`, and `finish`, with no
 metadata block to write into and no concatenation to prepend one as. Dropping `br`
 is the design rather than a gap: a table where one coding silently went unpadded
 would promise a guarantee it does not keep, and it would be the coding browsers

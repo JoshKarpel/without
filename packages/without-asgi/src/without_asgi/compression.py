@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from dataclasses import replace
 from types import MappingProxyType
 from typing import Protocol
+from typing import runtime_checkable
 
 import brotli
 from without import Stream
@@ -32,12 +33,15 @@ __all__ = [
     "MAX_RANDOM_BYTES",
     "PADDED_COMPRESSORS",
     "Compressor",
+    "StreamingCompressor",
     "brotli_compressor",
     "compress",
+    "gzip_compressor",
     "is_compressible",
     "negotiate_coding",
     "padded_gzip_compressor",
     "padded_zstd_compressor",
+    "zstd_compressor",
 ]
 
 # The `wbits` value that selects the gzip wrapper around DEFLATE, for both
@@ -53,42 +57,130 @@ class Compressor(Protocol):
     """
     The incremental compressor shape `compress` drives: feed chunks through
     `compress`, then `flush` ends the stream. `zlib.compressobj` and
-    `zstd.ZstdCompressor` satisfy it as-is; a third-party codec plugs in with
+    `zstd.ZstdCompressor` satisfy it as-is, and a third-party codec plugs in with
     whatever thin adapter its own surface needs.
 
-    The same shape drives `without-http`'s request-side `compressing`, which
-    re-exports this protocol, so one adapter serves both directions.
+    This is the lesser of two rungs, and which one a table entry lands on decides
+    what happens to a streaming body: a codec that satisfies only this protocol can
+    be emptied only by ending the stream, which is enough for a response that arrives
+    whole and not for one still being produced. Prefer the `StreamingCompressor` that
+    `gzip_compressor`, `zstd_compressor`, and `brotli_compressor` produce over a raw
+    codec, which reaches only this rung.
+
+    The same two shapes drive `without-http`'s request-side `compressing`, which
+    re-exports both, so one adapter serves both directions.
     """
 
     def compress(self, data: bytes, /) -> bytes: ...
     def flush(self) -> bytes: ...
 
 
-def _gzip_compressor() -> Compressor:
-    return zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, GZIP_CONTAINER)
+@runtime_checkable
+class StreamingCompressor(Compressor, Protocol):
+    """
+    A `Compressor` that can also make what it has swallowed deliverable *without*
+    ending the stream.
+
+    Every codec buffers, and what any one `compress` call returns is the codec's
+    choice rather than the caller's: fed the small pieces a streaming body arrives
+    in, zlib emits its header and then nothing until `flush`, and zstd emits
+    nothing at all. That is right for a body held whole, where the buffering is what
+    buys the ratio, and wrong for one being streamed, where it converts incremental
+    delivery into a single burst at the end and grows the held bytes without bound.
+    `flush_block` ends the current block so everything fed so far decodes now, and
+    leaves the stream open for what follows.
+
+    A separate protocol rather than a third method on `Compressor`, because a codec
+    without one is still perfectly good at the buffered case and there is no reason
+    to shut it out of the table. `compress` reads the difference at the point it
+    matters: a coding whose factory produces a plain `Compressor` encodes responses
+    that arrive whole and leaves streaming ones unencoded, which costs bytes rather
+    than latency.
+    """
+
+    def flush_block(self) -> bytes: ...
+
+
+@dataclass(slots=True, eq=False)
+class _FlushingCompressor:
+    """
+    Assemble a `StreamingCompressor` out of the three calls a codec already has.
+
+    `zlib.compressobj` and `zstd.ZstdCompressor` both spell every flush as one
+    method, separating "end a block" from "end the stream" by a *mode* argument
+    whose constants are each codec's own. Binding the three calls at construction
+    keeps that difference in the factory that knows the codec, rather than pushing a
+    mode type through an adapter shared by codecs that spell it incompatibly.
+    """
+
+    _compress: Callable[[bytes], bytes]
+    _flush_block: Callable[[], bytes]
+    _flush: Callable[[], bytes]
+
+    def compress(self, data: bytes, /) -> bytes:
+        return self._compress(data)
+
+    def flush_block(self) -> bytes:
+        return self._flush_block()
+
+    def flush(self) -> bytes:
+        return self._flush()
+
+
+def gzip_compressor(level: int = zlib.Z_DEFAULT_COMPRESSION) -> StreamingCompressor:
+    """
+    A fresh gzip `StreamingCompressor`, the codec behind `DEFAULT_COMPRESSORS`' `gzip` entry.
+
+    `level` is zlib's compression level, defaulting to zlib's own default. Called with
+    no argument it is already the zero-argument factory a table wants.
+
+    Public because `zlib.compressobj` is not a substitute for it: the raw object is a
+    `Compressor` and *not* a `StreamingCompressor`, since ending a block is a mode
+    argument to its `flush` rather than a method of its own, so a table entry built
+    from it directly would silently take the buffered path for every streaming
+    response. `without-http`'s request-side `gzip_compress` drives this same factory.
+    """
+    raw = zlib.compressobj(level, zlib.DEFLATED, GZIP_CONTAINER)
+    return _FlushingCompressor(raw.compress, lambda: raw.flush(zlib.Z_SYNC_FLUSH), raw.flush)
+
+
+def zstd_compressor(level: int | None = None) -> StreamingCompressor:
+    """
+    A fresh zstd `StreamingCompressor`, the codec behind `DEFAULT_COMPRESSORS`' `zstd` entry.
+
+    `level` is zstd's compression level, defaulting to the library's own. Everything in
+    `gzip_compressor` about why the raw `zstd.ZstdCompressor` is not a substitute
+    applies here: it spells a block flush as a mode argument too.
+    """
+    raw = zstd.ZstdCompressor(level)
+    return _FlushingCompressor(raw.compress, lambda: raw.flush(raw.FLUSH_BLOCK), raw.flush)
 
 
 class _RawBrotliCompressor(Protocol):
     """The slice of `brotli.Compressor` the adapter drives (the bindings ship no types)."""
 
     def process(self, data: bytes, /) -> bytes: ...
+    def flush(self) -> bytes: ...
     def finish(self) -> bytes: ...
 
 
 @dataclass(slots=True, eq=False)
 class _BrotliCompressor:
     """
-    Adapt `brotli.Compressor` to the `Compressor` shape.
+    Adapt `brotli.Compressor` to the `StreamingCompressor` shape.
 
-    Brotli's bindings spell the incremental surface `process`/`finish` (their `flush`
-    is a mid-stream flush that keeps the stream open), so the adapter maps `compress`
-    to `process` and `flush` to `finish`.
+    Brotli's bindings spell the incremental surface `process`/`flush`/`finish`,
+    where `flush` keeps the stream open and `finish` ends it, so the adapter maps
+    `compress` to `process`, `flush_block` to `flush`, and `flush` to `finish`.
     """
 
     _raw: _RawBrotliCompressor
 
     def compress(self, data: bytes, /) -> bytes:
         return self._raw.process(data)
+
+    def flush_block(self) -> bytes:
+        return self._raw.flush()
 
     def flush(self) -> bytes:
         return self._raw.finish()
@@ -103,7 +195,7 @@ class _BrotliCompressor:
 DYNAMIC_BROTLI_QUALITY = 5
 
 
-def brotli_compressor(quality: int = DYNAMIC_BROTLI_QUALITY) -> Compressor:
+def brotli_compressor(quality: int = DYNAMIC_BROTLI_QUALITY) -> StreamingCompressor:
     """
     A fresh brotli `Compressor`, the codec behind `DEFAULT_COMPRESSORS`' `br` entry.
 
@@ -135,8 +227,8 @@ def brotli_compressor(quality: int = DYNAMIC_BROTLI_QUALITY) -> Compressor:
 DEFAULT_COMPRESSORS: MappingProxyType[bytes, Callable[[], Compressor]] = MappingProxyType(
     {
         b"br": brotli_compressor,
-        b"zstd": zstd.ZstdCompressor,
-        b"gzip": _gzip_compressor,
+        b"zstd": zstd_compressor,
+        b"gzip": gzip_compressor,
     }
 )
 
@@ -175,7 +267,7 @@ class _PaddedGzipCompressor:
     accumulated rather than at a known call.
     """
 
-    _inner: Compressor
+    _inner: StreamingCompressor
     _filename: bytes
     _held: bytes = b""
     _spliced: bool = False
@@ -194,6 +286,9 @@ class _PaddedGzipCompressor:
     def compress(self, data: bytes, /) -> bytes:
         return self._splice(self._inner.compress(data))
 
+    def flush_block(self) -> bytes:
+        return self._splice(self._inner.flush_block())
+
     def flush(self) -> bytes:
         return self._splice(self._inner.flush())
 
@@ -201,37 +296,43 @@ class _PaddedGzipCompressor:
 @dataclass(slots=True, eq=False)
 class _PaddedZstdCompressor:
     """
-    A zstd `Compressor` that leads with a random-length skippable frame.
+    A zstd `Compressor` that closes with a random-length skippable frame.
 
     zstd's answer to gzip's filename field: RFC 8878 §3.1.2 reserves a frame kind a
     decoder must skip over, so a random-length one carries the same noise into the
     response length. Everything in `_PaddedGzipCompressor` about why applies here.
+
+    The frame *trails* the data rather than leading it, because a decoder is
+    entitled to stop at the end of the first frame it reads, and the stdlib's own
+    `zstd.ZstdDecompressor` does: given the padding first it returns an empty body
+    and reports the entire payload as `unused_data`, leaving recovery to a caller
+    that thought to loop. Trailing it hands every decoder the whole payload before
+    the frame it is asked to ignore.
     """
 
-    _inner: Compressor
-    _preamble: bytes
-
-    def _lead(self, chunk: bytes) -> bytes:
-        preamble, self._preamble = self._preamble, b""
-        return preamble + chunk
+    _inner: StreamingCompressor
+    _trailer: bytes
 
     def compress(self, data: bytes, /) -> bytes:
-        return self._lead(self._inner.compress(data))
+        return self._inner.compress(data)
+
+    def flush_block(self) -> bytes:
+        return self._inner.flush_block()
 
     def flush(self) -> bytes:
-        return self._lead(self._inner.flush())
+        return self._inner.flush() + self._trailer
 
 
-def padded_gzip_compressor(max_random_bytes: int = MAX_RANDOM_BYTES) -> Compressor:
+def padded_gzip_compressor(max_random_bytes: int = MAX_RANDOM_BYTES) -> StreamingCompressor:
     """A gzip `Compressor` whose output length carries up to `max_random_bytes` of noise."""
-    return _PaddedGzipCompressor(_gzip_compressor(), _random_run(max_random_bytes))
+    return _PaddedGzipCompressor(gzip_compressor(), _random_run(max_random_bytes))
 
 
-def padded_zstd_compressor(max_random_bytes: int = MAX_RANDOM_BYTES) -> Compressor:
+def padded_zstd_compressor(max_random_bytes: int = MAX_RANDOM_BYTES) -> StreamingCompressor:
     """A zstd `Compressor` whose output length carries up to `max_random_bytes` of noise."""
     payload = _random_run(max_random_bytes)
-    preamble = struct.pack("<II", _ZSTD_SKIPPABLE_FRAME, len(payload)) + payload
-    return _PaddedZstdCompressor(zstd.ZstdCompressor(), preamble)
+    trailer = struct.pack("<II", _ZSTD_SKIPPABLE_FRAME, len(payload)) + payload
+    return _PaddedZstdCompressor(zstd_compressor(), trailer)
 
 
 # `compress`'s table for a router whose responses mix a secret with text an attacker
@@ -388,9 +489,11 @@ def is_compressible(content_type: bytes | None) -> bool:
     Two exceptions to the shape. A response with no `content-type` is not
     compressed, since compression here is driven by the declared media type and
     there is nothing to drive it. And `text/event-stream` is excluded despite the
-    `text/` prefix: an incremental compressor holds bytes back until it has enough
-    to emit a block, which is exactly the latency an event stream exists to avoid,
-    so compressing one stalls events rather than shrinking them.
+    `text/` prefix, because of `compress`'s size gate rather than the coding: the
+    gate buffers the start of a body to learn which side of `minimum_size` it falls
+    on, so the opening events of a stream would be held back until enough of them
+    had accumulated to decide, which is exactly the latency an event stream exists
+    to avoid.
     """
     if content_type is None:
         return False
@@ -404,9 +507,17 @@ def is_compressible(content_type: bytes | None) -> bool:
     return media in _COMPRESSIBLE_TYPES
 
 
-# `204` and `304` carry no content by definition, so there is nothing to encode and
-# a `content-encoding` on either would describe a body that does not exist.
-_BODYLESS_STATUSES = frozenset({204, 304})
+# Statuses no coding can be applied to, each for its own reason. `204` and `304`
+# carry no content by definition, so there is nothing to encode and a
+# `content-encoding` on either would describe a body that does not exist. A `206`
+# does carry bytes, but they are a range of the *identity* representation and its
+# `content-range` names offsets into that representation, which this middleware has
+# no way to restate for an encoded one: encoding the range would leave the field
+# describing bytes the client no longer holds, and a client reassembling several
+# ranges would stitch them at the wrong offsets.
+_UNENCODABLE_STATUSES = frozenset({204, 206, 304})
+
+_NOT_MODIFIED = 304
 
 
 def _accept_encoding(raw: RawHeaders) -> bytes | None:
@@ -456,11 +567,25 @@ def _encoded(raw: RawHeaders, coding: bytes, length: int | None) -> RawHeaders:
 
 
 def _is_candidate(start: ResponseStart, compressible: Callable[[bytes | None], bool]) -> bool:
-    if start.status in _BODYLESS_STATUSES:
+    if start.status in _UNENCODABLE_STATUSES:
         return False
     if headers.first(start.headers, b"content-encoding") is not None:
         return False
     return compressible(headers.first(start.headers, b"content-type"))
+
+
+def _deliverable(compressor: StreamingCompressor, chunk: bytes) -> bytes:
+    """
+    `chunk` encoded into bytes the client can decode *now*.
+
+    A bare `compress` call returns whatever the codec chose to emit, which for the
+    small pieces a streaming body arrives in is usually nothing, so the block is
+    ended here to push them out. An empty chunk gets no block of its own: ending one
+    costs framing bytes and there is nothing behind them to deliver.
+    """
+    if not chunk:
+        return b""
+    return compressor.compress(chunk) + compressor.flush_block()
 
 
 def compress(
@@ -497,13 +622,14 @@ def compress(
 
     Three things decide whether a response is a *candidate* at all, before any
     client preference is consulted, because all three are properties of the
-    response rather than the request: a `204` or `304` carries no content, a
-    response already carrying `content-encoding` is already encoded, and the media
-    type has to be worth compressing (`compressible`, defaulting to
-    `is_compressible`). Every candidate gets `Vary: Accept-Encoding` whether or
-    not this particular client got a compressed body, so a shared cache keys on
-    the header that decides the answer; a non-candidate gets no `Vary`, since
-    nothing about it varies.
+    response rather than the request: the status has to be one a coding can apply
+    to (see `_UNENCODABLE_STATUSES`), a response already carrying
+    `content-encoding` is already encoded, and the media type has to be worth
+    compressing (`compressible`, defaulting to `is_compressible`). Every candidate
+    gets `Vary: Accept-Encoding` whether or not this particular client got a
+    compressed body, so a shared cache keys on the header that decides the answer;
+    a non-candidate gets no `Vary`, since nothing about it varies, except the `304`
+    that revalidates one and inherits the field with the rest of its head.
 
     A body shorter than `minimum_size` is sent unencoded, because gzip's framing
     costs more than a few hundred bytes of text saves. The gate is applied to the
@@ -511,10 +637,15 @@ def compress(
     that never declares one: the middleware buffers up to `minimum_size` of the
     body to find out which side of the gate it falls on, then either releases the
     prefix untouched or commits to encoding and streams the rest through the
-    compressor chunk by chunk. A response that arrives whole gets an exact
-    `content-length` for its encoded body; one still streaming when it crosses the
-    gate loses `content-length` and is framed by the transport, as any streaming
-    body is. A strong `etag` is weakened when the body is encoded (see `_weakened`).
+    compressor chunk by chunk, ending a block per chunk so each one reaches the
+    client as it is produced rather than accumulating inside the codec until the
+    response finishes. Committing needs a `StreamingCompressor`; a coding whose
+    factory produces a plain `Compressor` still encodes responses that arrive
+    whole, and leaves streaming ones unencoded rather than stalling them. A
+    response that arrives whole gets an exact `content-length` for its encoded
+    body; one still streaming when it crosses the gate loses `content-length` and
+    is framed by the transport, as any streaming body is. A strong `etag` is
+    weakened when the body is encoded (see `_weakened`).
 
     !!! warning "Compression and secrets"
 
@@ -552,6 +683,21 @@ def compress(
             yield start
             start = await anext(outbound, None)
         if start is None:
+            return
+
+        if start.status == _NOT_MODIFIED:
+            # A `304` updates the stored `200` it revalidates, and RFC 9110 §15.4.5
+            # asks it to carry the header fields that `200` would have, naming
+            # `vary` among them because that is how a shared cache picks the stored
+            # variant to update. It is declared here rather than run past
+            # `compressible` first, since the same section's field list omits
+            # `content-type` and a `304` usually arrives without one: a cache keyed
+            # on a header the representation does not really vary by shares a little
+            # less, while one missing a header it does vary by hands a client an
+            # encoding it cannot read.
+            yield replace(start, headers=_varying(start.headers))
+            async for event in outbound:
+                yield event
             return
 
         if not _is_candidate(start, compressible):
@@ -608,17 +754,30 @@ def compress(
                 # Past the gate with more body coming: commit to encoding, release
                 # the prefix through the compressor, and stream the rest.
                 compressor = table[coding]()
+                if not isinstance(compressor, StreamingCompressor):
+                    # This codec can only make its output deliverable by ending the
+                    # stream, so encoding here would hold the whole body inside it
+                    # and deliver the response in one burst at the end. Unencoded
+                    # instead, which costs bytes rather than the incremental
+                    # delivery the app asked for by streaming.
+                    yield start
+                    yield ResponseBody(body=b"".join(prefix), more_body=True)
+                    async for rest in outbound:
+                        yield rest
+                    return
                 yield replace(start, headers=_encoded(start.headers, coding, None))
-                if encoded := compressor.compress(b"".join(prefix)):
+                if encoded := _deliverable(compressor, b"".join(prefix)):
                     yield ResponseBody(body=encoded, more_body=True)
                 async for rest in outbound:
                     if not isinstance(rest, ResponseBody):
                         yield rest
-                        continue
-                    if encoded := compressor.compress(rest.body):
-                        yield ResponseBody(body=encoded, more_body=True)
-                    if not rest.more_body:
-                        yield ResponseBody(body=compressor.flush(), more_body=False)
+                    elif rest.more_body:
+                        if encoded := _deliverable(compressor, rest.body):
+                            yield ResponseBody(body=encoded, more_body=True)
+                    else:
+                        # Ending the stream is itself a flush, so the last chunk
+                        # rides out on it rather than paying for a block of its own.
+                        yield ResponseBody(body=compressor.compress(rest.body) + compressor.flush(), more_body=False)
                 return
 
         # The stream ended without a final body event: the response is already

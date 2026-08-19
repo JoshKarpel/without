@@ -25,7 +25,11 @@
   is the middleware over any coding and a `Compressor` factory, with `gzip_compress`,
   `zstd_compress`, and `brotli_compress` as the three that ship. Bodies compress as they stream, so
   a large upload is never buffered whole, and per-call composition means one client can send
-  compressed to a peer that wants it and plain to one that does not.
+  compressed to a peer that wants it and plain to one that does not. Streaming that way is a demand
+  on the codec rather than only on the loop, so the three shipped codings are built from
+  `StreamingCompressor` factories (`gzip_compressor`, `zstd_compressor`, `brotli_compressor`); a
+  factory producing a plain `Compressor` encodes correctly but holds the body to the end, since a
+  coding the caller named has no unencoded answer to fall back on the way a negotiated response does.
 - **`without-asgi`**: negotiated response compression, closing the exchange the two above open.
   `without_asgi.compression.compress()` is an `HttpMiddleware` that reads a request's
   `accept-encoding` and encodes the response body with the coding it picks. It is middleware rather
@@ -34,9 +38,10 @@
   therefore applies under any transport and any router, and its coverage is decided by where it is
   mounted. The coding table is the argument (`DEFAULT_COMPRESSORS`: brotli, zstd, and gzip) and what
   is negotiated is derived from its keys, with the *order* of those keys serving as the server's own
-  preference between codings a client weighted equally, best ratio first. `Compressor` and the
-  brotli adapter now live here rather than in `without-http`, which re-exports both, so one codec
-  serves a coding in both directions. `brotli_compressor` defaults to
+  preference between codings a client weighted equally, best ratio first. The `Compressor` protocols
+  and the `gzip_compressor` / `zstd_compressor` / `brotli_compressor` factories now live here rather
+  than in `without-http`, which re-exports them, so one codec serves a coding in both directions.
+  `brotli_compressor` defaults to
   `DYNAMIC_BROTLI_QUALITY` (5) rather than the bindings' 11, since a table entry encodes a response
   per request; the request-side `brotli_compress` keeps 11, where a client compressing one upload
   makes the ratio worth its cost. This adds `brotli` to `without-asgi`'s dependencies, which
@@ -60,19 +65,39 @@
   stops being a function of the content alone and a length oracle has to average the noise away
   first. It is a table rather than a flag because the padding is per *container*: gzip has the
   optional filename field after its fixed header (RFC 1952 §2.3.1) and zstd has skippable frames
-  (RFC 8878 §3.1.2), while brotli's bindings expose no metadata block and reject concatenation, so
+  (RFC 8878 §3.1.2), placed after the data rather than before it since a decoder may stop at the end
+  of the frame it just read, while brotli's bindings expose no metadata block and reject concatenation, so
   `br` is absent by construction. A table that silently left one coding unpadded would promise a
   guarantee it does not keep, and it would be the coding browsers reach for first. Padding raises the
   sample count an attack needs rather than removing the leak, so mount it where secrets and
   reflections meet and keep `DEFAULT_COMPRESSORS`, with its brotli, everywhere else.
 - **`without-asgi`**: `Vary: Accept-Encoding` on every response `compress` could have encoded,
   whether or not this client got an encoded body, since candidacy is a property of the resource and a
-  shared cache has to key on the header that decides the answer. A strong `etag` is weakened to `W/`
+  shared cache has to key on the header that decides the answer, and on the `304` that revalidates
+  one, which [RFC 9110 §15.4.5](https://www.rfc-editor.org/rfc/rfc9110#section-15.4.5) asks to carry
+  the fields its `200` would have and names `Vary` among them because that is how a shared cache
+  picks the stored variant to update. A strong `etag` is weakened to `W/`
   when the body is encoded, per [RFC 9110 §8.8.1](https://www.rfc-editor.org/rfc/rfc9110#section-8.8.1):
   weak comparison still matches the two representations, `Range` correctly stops matching. Bodies
   below `minimum_size` are left alone, gated on the bytes rather than on `content-length` so the
   floor holds for a streaming response; a body held whole is re-described with an exact
-  `content-length` for its encoded form instead of falling back to chunked.
+  `content-length` for its encoded form instead of falling back to chunked. A `206` is never encoded:
+  its `content-range` names offsets into the *identity* representation and nothing here can restate
+  them for an encoded one, so a client reassembling ranges would stitch them at the wrong offsets.
+- **`without-asgi`**: `StreamingCompressor`, the `Compressor` that can be flushed without being
+  ended, and what `compress` needs to encode a response that is still streaming. What a `compress`
+  call returns is the codec's choice rather than the caller's: fed the small pieces a streaming body
+  arrives in, zlib emits its header and then nothing until the stream ends and zstd emits nothing at
+  all, so encoding a stream without ending a block per chunk holds the whole body inside the codec
+  and delivers it as one burst at the end. That round-trips perfectly, which is why it reads as a
+  working feature while having removed the incremental delivery the response was streamed for. The
+  three shipped codings satisfy the protocol (zlib and zstd through a flush mode, brotli through its
+  own `flush`); a coding whose factory produces a plain `Compressor` still encodes responses that
+  arrive whole, and its streaming ones go out unencoded, which costs bytes rather than delivery.
+  `gzip_compressor` and `zstd_compressor` are public alongside `brotli_compressor` for the same
+  reason: `zlib.compressobj` and `zstd.ZstdCompressor` spell a block flush as a mode argument rather
+  than a method, so a table built from them directly satisfies `Compressor` alone and would take the
+  buffered path for every stream.
 - **`without-http`**: `default_headers(*headers)`, the counterpart to `add_headers` for a field
   RFC 9110 allows only once. `add_headers` copies its headers onto every request whatever it already
   carries, which is right for a field that may repeat and wrong for `authorization` or `user-agent`,
