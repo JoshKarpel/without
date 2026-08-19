@@ -42,7 +42,7 @@ from without_asgi.compression import padded_gzip_compressor
 from without_asgi.compression import padded_zstd_compressor
 from without_asgi.routing import HttpMiddleware
 
-# A body long enough to clear the default `minimum_size` gate, and compressible
+# A body long enough to clear the default `minimum_size` floor, and compressible
 # enough that the encoded form is unmistakably shorter than the plain one.
 BODY = b'{"todos":[' + b'{"title":"write the docs","done":false},' * 40 + b"]}"
 SHORT = b'{"ok":true}'
@@ -223,6 +223,15 @@ class TestBufferedResponses:
         assert _one(head, b"content-encoding") is None
         assert _body(events) == SHORT
 
+    async def test_weighs_a_body_that_declares_no_length_by_its_bytes(self) -> None:
+        source = (
+            ResponseStart(status=200, headers=((b"content-type", b"application/json"),)),
+            ResponseBody(body=SHORT, more_body=False),
+        )
+        events = await _run(compress(), _accepting(b"gzip"), source)
+        assert _one(_head(events), b"content-encoding") is None
+        assert _body(events) == SHORT
+
     async def test_honors_a_lowered_minimum_size(self) -> None:
         events = await _run(compress(minimum_size=1), _accepting(b"gzip"), _json_response(SHORT))
         assert _one(_head(events), b"content-encoding") == b"gzip"
@@ -387,6 +396,35 @@ class TestEtag:
         events = await _run(compress(), _scope(), source)
         assert _one(_head(events), b"etag") == b'"v1"'
 
+    async def test_weakens_a_revalidated_validator_for_a_type_it_would_have_encoded(self) -> None:
+        source = (ResponseStart(status=304, headers=((b"content-type", b"application/json"), (b"etag", b'"v1"'))),)
+        events = await _run(compress(), _accepting(b"gzip"), source)
+        head = _head(events)
+        assert _one(head, b"etag") == b'W/"v1"'
+        assert _values(head, b"vary") == [b"accept-encoding"]
+
+    @pytest.mark.parametrize(
+        "described",
+        [
+            pytest.param((b"content-type", b"video/mp4"), id="a-type-no-coding-applies-to"),
+            pytest.param((b"content-encoding", b"br"), id="a-body-the-app-encoded-itself"),
+        ],
+    )
+    async def test_leaves_a_revalidated_validator_alone_for_bytes_it_never_encodes(
+        self, described: tuple[bytes, bytes]
+    ) -> None:
+        """
+        A `304` that says what it revalidates settles what the stored `200` is. Where
+        that is a representation this middleware never re-encodes, the stored bytes
+        are the ones the strong tag was stated for, and weakening it would break
+        every later `If-Range`, which needs strong comparison, into a full response.
+        """
+        source = (ResponseStart(status=304, headers=(described, (b"etag", b'"v1"'))),)
+        events = await _run(compress(), _accepting(b"gzip"), source)
+        head = _head(events)
+        assert _one(head, b"etag") == b'"v1"'
+        assert _values(head, b"vary") == []
+
 
 # A decoder fed one encoded event at a time, which is what makes "delivered as it is
 # produced" checkable: a codec buffering its output leaves these returning nothing
@@ -406,13 +444,13 @@ def _streamed(chunks: Sequence[bytes], *, headers: RawHeaders = ()) -> tuple[Out
     )
 
 
-def _recorded(chunks: Sequence[bytes]) -> tuple[HttpHandler, list[bytes]]:
+def _recorded(chunks: Sequence[bytes], *, headers: RawHeaders = ()) -> tuple[HttpHandler, list[bytes]]:
     """A streaming handler, paired with the list of chunks it has released so far."""
     released: list[bytes] = []
 
     def handler(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
         async def events() -> AsyncIterator[Outbound]:
-            yield ResponseStart(status=200, headers=((b"content-type", b"application/x-ndjson"),))
+            yield ResponseStart(status=200, headers=((b"content-type", b"application/x-ndjson"), *headers))
             for index, chunk in enumerate(chunks):
                 released.append(chunk)
                 yield ResponseBody(body=chunk, more_body=index < len(chunks) - 1)
@@ -440,16 +478,37 @@ class TestStreamingResponses:
         bodies = [event for event in events if isinstance(event, ResponseBody)]
         assert [event.more_body for event in bodies] == [*([True] * (len(bodies) - 1)), False]
 
-    async def test_encodes_a_stream_too_small_for_the_buffered_gate(self) -> None:
-        """`minimum_size` weighs a body that arrives whole; a streamed one is committed regardless."""
+    async def test_encodes_an_undeclared_stream_too_small_for_the_floor(self) -> None:
+        """Nothing weighs a stream whose head declared no length, so it commits on its first chunk."""
         chunks = [SHORT, SHORT]
         events = await _run(compress(), _accepting(b"gzip"), _streamed(chunks))
         assert _one(_head(events), b"content-encoding") == b"gzip"
         assert gzip.decompress(_body(events)) == b"".join(chunks)
 
-    async def test_releases_a_stream_that_never_reaches_a_raised_gate(self) -> None:
+    async def test_leaves_a_stream_behind_a_declared_small_length_alone(self) -> None:
+        """
+        A declared length answers the floor for a stream with none of the holding
+        `weigh_undeclared_bodies` costs. Without it the floor never reaches a
+        `file_response`, which stats the size and then yields the file chunk by
+        chunk, so a stylesheet gzip can only grow would go out encoded.
+        """
+        declared = str(2 * len(SHORT)).encode()
+        source = _streamed([SHORT, SHORT], headers=((b"content-length", declared),))
+        events = await _run(compress(), _accepting(b"gzip"), source)
+        head = _head(events)
+        assert _one(head, b"content-encoding") is None
+        assert _one(head, b"content-length") == declared
+        assert _body(events) == SHORT * 2
+
+    async def test_weighs_the_bytes_of_a_stream_whose_declared_length_cannot_be_read(self) -> None:
+        source = _streamed([BODY[:600], BODY[600:]], headers=((b"content-length", b"about a kilobyte"),))
+        events = await _run(compress(), _accepting(b"gzip"), source)
+        assert _one(_head(events), b"content-encoding") == b"gzip"
+        assert gzip.decompress(_body(events)) == BODY
+
+    async def test_releases_a_weighed_stream_that_never_reaches_the_floor(self) -> None:
         chunks = [SHORT, SHORT]
-        events = await _run(compress(streaming_minimum_size=500), _accepting(b"gzip"), _streamed(chunks))
+        events = await _run(compress(weigh_undeclared_bodies=True), _accepting(b"gzip"), _streamed(chunks))
         head = _head(events)
         assert _one(head, b"content-encoding") is None
         assert _body(events) == b"".join(chunks)
@@ -469,14 +528,31 @@ class TestStreamingResponses:
             seen.append(event)
         assert gzip.decompress(_body(seen)) == BODY
 
-    async def test_holds_the_head_until_a_raised_gate_resolves(self) -> None:
-        """What a raised gate buys in bytes it spends here, holding produced chunks to weigh them."""
+    async def test_holds_the_head_of_a_weighed_stream_until_the_floor_resolves(self) -> None:
+        """What weighing a stream buys in bytes it spends here, holding produced chunks to weigh them."""
         source, released = _recorded([BODY[:100], BODY[100:600], BODY[600:]])
-        handler = compress(streaming_minimum_size=500)(source, None, _accepting(b"gzip"))
+        handler = compress(weigh_undeclared_bodies=True)(source, None, _accepting(b"gzip"))
         seen: list[Outbound] = []
         async for event in handler(stream_from_iterable(())):
             if isinstance(event, ResponseStart):
                 assert released == [BODY[:100], BODY[100:600]]
+            seen.append(event)
+        assert gzip.decompress(_body(seen)) == BODY
+
+    async def test_commits_a_declared_stream_on_its_first_chunk_even_when_weighing(self) -> None:
+        """
+        A declared length answered the floor before any body event, so there is
+        nothing left for weighing to hold for: what `weigh_undeclared_bodies` buys
+        is an answer for a body whose size is *unknown*, and paying its latency for
+        a known one would buy nothing.
+        """
+        declared = ((b"content-length", str(len(BODY)).encode()),)
+        source, released = _recorded([BODY[:100], BODY[100:600], BODY[600:]], headers=declared)
+        handler = compress(weigh_undeclared_bodies=True)(source, None, _accepting(b"gzip"))
+        seen: list[Outbound] = []
+        async for event in handler(stream_from_iterable(())):
+            if isinstance(event, ResponseStart):
+                assert released == [BODY[:100]]
             seen.append(event)
         assert gzip.decompress(_body(seen)) == BODY
 
@@ -494,12 +570,12 @@ class TestStreamingResponses:
         assert _one(_head(events), b"content-encoding") == b"gzip"
         assert zlib.decompressobj(GZIP_CONTAINER).decompress(_body(events)) == SHORT
 
-    async def test_passes_a_truncated_stream_below_a_raised_gate_through_unencoded(self) -> None:
+    async def test_passes_a_truncated_weighed_stream_below_the_floor_through_unencoded(self) -> None:
         source = (
             ResponseStart(status=200, headers=((b"content-type", b"application/x-ndjson"),)),
             ResponseBody(body=SHORT, more_body=True),
         )
-        events = await _run(compress(streaming_minimum_size=500), _accepting(b"gzip"), source)
+        events = await _run(compress(weigh_undeclared_bodies=True), _accepting(b"gzip"), source)
         assert _one(_head(events), b"content-encoding") is None
         assert _body(events) == SHORT
 
@@ -544,7 +620,7 @@ class TestStreamingResponses:
     @pytest.mark.parametrize("coding", [b"gzip", b"zstd", b"br"])
     async def test_delivers_each_chunk_as_the_app_produces_it(self, coding: bytes) -> None:
         """
-        Streaming past the gate has to mean *streaming*. Left to decide for itself, a
+        Streaming past the floor has to mean *streaming*. Left to decide for itself, a
         codec emits almost nothing per `compress` call and holds the rest until the
         stream ends, so a body that arrives in pieces would reach the client as one
         burst at the end, with every byte of it resident in the codec until then.
@@ -572,9 +648,20 @@ class TestOtherEvents:
         assert events[-1] == trailers
         assert gzip.decompress(_body(events)) == BODY
 
-    async def test_passes_trailers_through_after_a_body_under_the_minimum_size(self) -> None:
+    async def test_passes_trailers_through_after_a_declared_body_under_the_floor(self) -> None:
         trailers = ResponseTrailers(headers=((b"digest", b"sha-256=abc"),))
         events = await _run(compress(), _accepting(b"gzip"), (*_json_response(SHORT), trailers))
+        assert events[-1] == trailers
+        assert _body(events) == SHORT
+
+    async def test_passes_trailers_through_after_an_undeclared_body_under_the_floor(self) -> None:
+        trailers = ResponseTrailers(headers=((b"digest", b"sha-256=abc"),))
+        source = (
+            ResponseStart(status=200, headers=((b"content-type", b"application/json"),)),
+            ResponseBody(body=SHORT, more_body=False),
+            trailers,
+        )
+        events = await _run(compress(), _accepting(b"gzip"), source)
         assert events[-1] == trailers
         assert _body(events) == SHORT
 
@@ -592,14 +679,14 @@ class TestOtherEvents:
         assert not [event for event in events if isinstance(event, ResponseBody)]
 
     async def test_releases_a_buffered_prefix_before_an_offloaded_body(self) -> None:
-        """A gate the prefix has not cleared leaves the middleware uncommitted, so the offload still fits."""
+        """A floor the prefix has not cleared leaves the middleware uncommitted, so the offload still fits."""
         offloaded = PathSend(path="/srv/data.json")
         source = (
             ResponseStart(status=200, headers=((b"content-type", b"application/json"),)),
             ResponseBody(body=SHORT, more_body=True),
             offloaded,
         )
-        events = await _run(compress(streaming_minimum_size=500), _accepting(b"gzip"), source)
+        events = await _run(compress(weigh_undeclared_bodies=True), _accepting(b"gzip"), source)
         assert _one(_head(events), b"content-encoding") is None
         assert _body(events) == SHORT
         assert events[-1] == offloaded

@@ -326,8 +326,10 @@ stream is the one response held open for as long as the client stays, so every e
 on it is encoded against a window holding every event before it, and an attacker who
 can inject one event reads the length of the next. That is
 [BREACH](#compression-and-secrets) with as many samples as it cares to take, on a
-connection it never has to re-establish. Pass your own predicate as `compressible` to
-decide differently.
+connection it never has to re-establish. That exclusion is keyed on the media type
+because a media type is all the predicate sees, while the exposure belongs to
+*streaming*, which the [secrets section](#compression-and-secrets) picks up. Pass your
+own predicate as `compressible` to decide differently.
 
 Three statuses are excluded, each for its own reason. `204` and `304` carry no
 content, so there is nothing to encode. A `206` does carry bytes, but they are a
@@ -344,11 +346,14 @@ nothing about it varies. The `304` is the exception among the excluded statuses:
 it updates the stored `200` it revalidates, and
 [RFC 9110 §15.4.5](https://www.rfc-editor.org/rfc/rfc9110#section-15.4.5) asks it
 to carry the fields that `200` would have, naming `Vary` because that is how a
-shared cache picks the stored variant to update. It gets the field unconditionally
-rather than run past `compressible` first, since the same section's field list
-omits `content-type` and a `304` usually arrives without one: a cache keyed on a
-header the representation does not really vary by shares a little less, while one
-missing a header it does vary by hands a client an encoding it cannot read.
+shared cache picks the stored variant to update. Which stored `200` that is, the
+same section leaves mostly unsaid: its field list omits `content-type` and most
+`304`s arrive without one, so the middleware assumes the candidate, on the grounds
+that a cache keyed on a header the representation does not really vary by shares a
+little less while one missing a header it does vary by hands a client an encoding it
+cannot read. A `304` that *does* say what it revalidates settles it instead, and one
+naming a type no coding applies to, or a `content-encoding` the app applied itself,
+is left exactly as it arrived.
 
 A strong `etag` is weakened to `W/` when the body is encoded, since
 [RFC 9110 §8.8.1](https://www.rfc-editor.org/rfc/rfc9110#section-8.8.1)
@@ -358,34 +363,50 @@ stay semantically equivalent, so a conditional request still matches under weak
 comparison while a `Range` request, which needs strong comparison, correctly stops.
 
 The `304` inherits that weakening, but only for a client whose `accept-encoding`
-negotiates a coding. The stored entry such a `304` updates is the one its `Vary` key
-selects, so it is the encoded variant, and
+negotiates a coding, and only where the stored `200` is one the middleware would have
+encoded. The stored entry such a `304` updates is the one its `Vary` key selects, so
+it is the encoded variant, and
 [RFC 9111 §4.3.4](https://www.rfc-editor.org/rfc/rfc9111#section-4.3.4) has the cache
 copy the `304`'s fields onto it. A strong tag landing there undoes the weakening: a
 later `If-Range` matches under strong comparison, and the `206` the middleware never
-encodes hands back identity bytes to stitch into an encoded body. A client that
-negotiates nothing holds the identity representation, so its validator is left
-exactly as the app stated it.
+encodes hands back identity bytes to stitch into an encoded body. Weakening where
+nothing was encoded is the same error pointed the other way: a `video/mp4` is stored
+as the identity bytes its strong tag was stated for, so a `W/` copied onto it breaks
+every later range request into a full response for a re-encoding that never happened.
+A client that negotiates nothing holds the identity representation either way, so its
+validator is left exactly as the app stated it.
+
+### How big is big enough
 
 `minimum_size` (500 bytes by default) is the floor below which gzip's framing costs
-more than the text saves. It gates on the *bytes*, not on `content-length`, so it
-holds for a response that arrives whole behind a head that never declared one, and
-that body is re-described with an exact `content-length` for its encoded form rather
-than falling back to chunked.
+more than the text saves, and it is the *only* floor. What decides how it gets
+answered is what the head said, not how the body arrives:
 
-A body the app *streams* is weighed by `streaming_minimum_size` instead, which
-defaults to holding none of it: the middleware commits on the first non-empty chunk,
-drops the `content-length` it can no longer state, and streams the rest through the
-compressor chunk by chunk. The two gates are separate because holding costs a
-streamed body something a buffered one never pays. Weighing a stream means keeping
-bytes the app has already produced until enough of them accumulate to decide, so a
-feed emitting a line a second delivers nothing for as many seconds as it takes to
-reach the gate, and how long that is belongs to the app rather than to the
-middleware. Zero spends the framing bytes instead, which is the trade a response the
-app chose to stream usually wants. Raise it to weigh a stream the way a buffered body
-is weighed, at that latency.
+- a declared `content-length` answers it before a single body event is read
+- a body that ends in the events read so far answers it exactly, from its own bytes,
+  and is re-described with an exact `content-length` for its encoded form rather than
+  falling back to chunked
+- a body still being produced behind a head that declared no length is the one case
+  that cannot be answered without holding bytes the app has already made
 
-Streaming past that gate means ending a block per chunk, and that is a demand on the
+`weigh_undeclared_bodies` decides that last case, and it is a policy rather than a
+second floor because the only two honest answers are to hold or not to. Holding means
+keeping produced bytes until `minimum_size` of them accumulate, so a feed emitting a
+line a second delivers nothing for as many seconds as that takes, and how long that
+is belongs to the app rather than to the middleware. The default does not hold: the
+middleware commits on the first non-empty chunk, drops the `content-length` it can no
+longer state, and streams the rest through the compressor chunk by chunk. That spends
+framing bytes on a body too small to earn them, bounded by the floor, which is the
+trade a response the app chose to stream usually wants.
+
+An app that wants both, incremental delivery *and* the floor, declares a
+`content-length`, which answers the floor for nothing. `file_response` does: it stats
+the file before emitting anything and then yields it chunk by chunk, so a stylesheet
+gzip could only grow is weighed exactly like a buffered one and goes out untouched.
+
+### What a committed stream demands of a codec
+
+Streaming past the floor means ending a block per chunk, and that is a demand on the
 codec rather than a detail of the loop. What a `compress` call returns is the codec's
 choice, not the caller's: fed the small pieces a streaming body arrives in, zlib
 emits its 10-byte header and then nothing until the stream ends, and zstd emits
@@ -410,8 +431,7 @@ offloaded bytes are not encoded, and appending them to the encoded stream produc
 body no decoder can read. `compress` raises `OffloadedBodyAfterEncoding` rather than
 writing it, so what reaches the client is a truncated response, which every transport
 already signals as one. An app that means to stream a prefix and then offload the
-rest raises `streaming_minimum_size` above the prefix, which leaves the middleware
-uncommitted while the prefix goes by.
+rest sends the whole response through the offload instead.
 
 ### Compression and secrets
 
@@ -462,6 +482,19 @@ is decided by *where* it is mounted (`without-web`'s `mount` and `with_middlewar
 scope it to a prefix or a single route), both answers are route-scoped: pay the
 padding and lose brotli where secrets and reflections meet, and keep
 `DEFAULT_COMPRESSORS` everywhere else.
+
+Streaming is its own exposure, and neither answer covers it. A committed stream ends
+a block per chunk, so each chunk the app produces carries its own observable length:
+an attacker reads the length of the part holding the secret rather than of the whole
+response, which is a *cleaner* oracle than the buffered case, and padding does not
+blunt it, since a padded container carries one random run for the whole response and
+none of the chunks behind the first. That is what `is_compressible` excludes
+`text/event-stream` for, but the property is the streaming rather than the media
+type: a streamed `text/html` page, which is where a CSRF token most often sits, or an
+`application/x-ndjson` feed is exposed the same way, and an event stream differs only
+in staying open to be sampled without re-establishing. Where a streamed response
+mixes a secret with reflected input, keep it off this middleware or pass a
+`compressible` that rejects its type.
 
 ## The codec runs both directions
 

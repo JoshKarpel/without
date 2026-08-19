@@ -70,7 +70,13 @@
   `br` is absent by construction. A table that silently left one coding unpadded would promise a
   guarantee it does not keep, and it would be the coding browsers reach for first. Padding raises the
   sample count an attack needs rather than removing the leak, so mount it where secrets and
-  reflections meet and keep `DEFAULT_COMPRESSORS`, with its brotli, everywhere else.
+  reflections meet and keep `DEFAULT_COMPRESSORS`, with its brotli, everywhere else. Neither table
+  covers streaming: a committed stream ends a block per chunk, so each chunk the app produces carries
+  its own observable length, a cleaner oracle than the buffered case, and the single random run a
+  padded container holds sits ahead of all of them. That is what `is_compressible` excludes
+  `text/event-stream` for, and the property is the streaming rather than the media type, so a
+  streamed `text/html` page mixing a secret with reflected input belongs off the middleware or behind
+  a `compressible` that rejects its type.
 - **`without-asgi`**: `Vary: Accept-Encoding` on every response `compress` could have encoded,
   whether or not this client got an encoded body, since candidacy is a property of the resource and a
   shared cache has to key on the header that decides the answer, and on the `304` that revalidates
@@ -83,28 +89,34 @@
   entry it updates is then the encoded variant and
   [RFC 9111 §4.3.4](https://www.rfc-editor.org/rfc/rfc9111#section-4.3.4) has the cache copy the
   `304`'s fields onto it; a strong tag landing there would let a later `If-Range` match under strong
-  comparison and stitch identity range bytes into an encoded body. Bodies below `minimum_size` are
-  left alone, gated on the bytes rather than on `content-length` so the floor holds for a body that
-  arrives whole behind a head that declared no length, and such a body is re-described with an exact
-  `content-length` for its encoded form instead of falling back to chunked. A `206` is never encoded:
-  its `content-range` names offsets into the *identity* representation and nothing here can restate
-  them for an encoded one, so a client reassembling ranges would stitch them at the wrong offsets.
-- **`without-asgi`**: `compress`'s two size gates. `minimum_size` (500 bytes) weighs a body that
-  arrives whole; a body the app *streams* is weighed by `streaming_minimum_size`, which defaults to
-  holding none of it, so the middleware commits on the first non-empty chunk and encodes from there.
-  They are separate because holding costs a streamed body something a buffered one never pays: one
-  threshold for both means keeping bytes the app has already produced until enough of them
-  accumulate to decide, so a feed emitting a line a second delivers nothing for as many seconds as
-  it takes to reach the gate, and how long that is belongs to the app rather than to the middleware.
-  Zero spends the framing bytes instead, which is the trade a response the app chose to stream
-  usually wants; raise it to weigh a stream the way a buffered body is weighed, at that latency.
-  An offloaded body is the one shape that cannot follow a commitment, since
+  comparison and stitch identity range bytes into an encoded body. Which stored `200` a `304` updates
+  is usually unknowable, since §15.4.5's field list omits `content-type` and most `304`s carry none,
+  so the candidate is assumed; a `304` that names a type no coding applies to, or a `content-encoding`
+  the app applied itself, is left exactly as it arrived, because weakening a tag for a re-encoding
+  that never happened breaks every later range request into a full response. A `206` is never
+  encoded: its `content-range` names offsets into the *identity* representation and nothing here can
+  restate them for an encoded one, so a client reassembling ranges would stitch them at the wrong
+  offsets.
+- **`without-asgi`**: `compress`'s one size floor. `minimum_size` (500 bytes) is the whole of it, and
+  what decides how it is answered is what the head said rather than how the body arrives: a declared
+  `content-length` answers it before a body event is read, a body that ends in the events read so far
+  answers it exactly from its own bytes (and is re-described with an exact `content-length` for its
+  encoded form instead of falling back to chunked), and a body still being produced behind a head
+  that declared no length is the one case that cannot be answered without holding bytes the app has
+  already made. `weigh_undeclared_bodies` decides that case, and it is a policy rather than a second
+  floor because the only two honest answers are to hold or not to: holding keeps produced bytes until
+  `minimum_size` of them accumulate, so a feed emitting a line a second delivers nothing for as many
+  seconds as that takes, and how long that is belongs to the app rather than to the middleware. The
+  default does not hold, spending framing bytes bounded by the floor on a body too small to earn
+  them, which is the trade a response the app chose to stream usually wants; an app that wants both
+  declares a `content-length`, which answers the floor for nothing, as `file_response` does. An
+  offloaded body is the one shape that cannot follow a commitment, since
   `http.response.zerocopysend` and `http.response.pathsend` both send bytes the middleware never
   sees and the former carries `more_body` so it can follow body events already sent: arriving before
   any body event an offload passes through unencoded, and arriving after the head has declared
   `content-encoding` it raises `OffloadedBodyAfterEncoding` rather than write a body no decoder can
-  read. Raising `streaming_minimum_size` above the prefix is what lets an app stream one and then
-  offload the rest.
+  read. An app that means to stream a prefix and then offload the rest sends the whole response
+  through the offload.
 - **`without-asgi`**: `StreamingCompressor`, the `Compressor` that can be flushed without being
   ended, and what `compress` needs to encode a response that is still streaming. What a `compress`
   call returns is the codec's choice rather than the caller's: fed the small pieces a streaming body

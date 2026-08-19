@@ -499,6 +499,12 @@ def is_compressible(content_type: bytes | None) -> bool:
     BREACH (see `compress`) with as many samples as it cares to take, on a
     connection it never has to re-establish. A deployment that wants them encoded
     anyway passes its own `compressible` to `compress`.
+
+    That last exclusion is keyed on the media type because a media type is all this
+    predicate sees, while the exposure belongs to *streaming*: a streamed response
+    of a type allowed here carries the same per-chunk length oracle, on a connection
+    that ends rather than one held open. `compress`'s warning says what follows for
+    such a route.
     """
     if content_type is None:
         return False
@@ -579,6 +585,49 @@ def _is_candidate(start: ResponseStart, compressible: Callable[[bytes | None], b
     return compressible(headers.first(start.headers, b"content-type"))
 
 
+def _revalidates_encodable(raw: RawHeaders, compressible: Callable[[bytes | None], bool]) -> bool:
+    """
+    Whether the stored `200` a `304` revalidates is one this middleware would have
+    encoded, and so whether this `304` describes a variant that depends on the
+    client's `accept-encoding`.
+
+    RFC 9110 §15.4.5's field list omits `content-type` and most `304`s arrive
+    without one, so the usual answer is unknowable and the candidate is assumed: a
+    cache keyed on a header the representation does not really vary by shares a
+    little less, while one missing a header it does vary by hands a client an
+    encoding it cannot read.
+
+    A `304` that *does* say what it revalidates settles it, and settling it matters
+    in the direction that costs something. A `video/mp4` or an already-encoded body
+    is never encoded here, so the stored bytes *are* the identity representation and
+    the strong validator the app stated is still true of them; weakening it anyway
+    would break every later `If-Range`, which requires strong comparison, back into
+    a full response, for a re-encoding that never happened.
+    """
+    if headers.first(raw, b"content-encoding") is not None:
+        return False
+    content_type = headers.first(raw, b"content-type")
+    return content_type is None or compressible(content_type)
+
+
+def _declared_length(raw: RawHeaders) -> int | None:
+    """
+    The body size the head states, or `None` when it states none or states one that
+    cannot be read as a count.
+
+    An unreadable length is left to the bytes to answer rather than raised at: this
+    middleware observes a head it did not write, and every decision it makes has an
+    answer that works without one.
+    """
+    length = headers.first(raw, b"content-length")
+    if length is None:
+        return None
+    try:
+        return int(length)
+    except ValueError:
+        return None
+
+
 def _deliverable(compressor: StreamingCompressor, chunk: bytes) -> bytes:
     """
     `chunk` encoded into bytes the client can decode *now*.
@@ -617,11 +666,9 @@ class OffloadedBodyAfterEncoding(Exception):
     truncated response, which every transport already signals as one, in place of a
     complete-looking response that decodes to garbage.
 
-    Two ways out of it, for an app that means to stream a prefix and then offload the
-    rest. Raise `compress`'s `streaming_minimum_size` above the prefix, which leaves
-    the middleware uncommitted while the prefix goes by; or send the whole response
-    through the offload, since an offload arriving before any body event is the case
-    that always passes through.
+    The way out, for an app that means to stream a prefix and then offload the rest,
+    is to send the whole response through the offload instead: an offload arriving
+    before any body event is the case that always passes through.
     """
 
 
@@ -633,7 +680,7 @@ def compress(
     compressors: Mapping[bytes, Callable[[], Compressor]] = DEFAULT_COMPRESSORS,
     *,
     minimum_size: int = 500,
-    streaming_minimum_size: int = 0,
+    weigh_undeclared_bodies: bool = False,
     compressible: Callable[[bytes | None], bool] = is_compressible,
 ) -> HttpMiddleware[object]:
     """
@@ -674,24 +721,27 @@ def compress(
     that revalidates one and inherits the field with the rest of its head.
 
     A body shorter than `minimum_size` is sent unencoded, because gzip's framing
-    costs more than a few hundred bytes of text saves. The gate is applied to the
-    bytes rather than to `content-length`, so it holds for a response that arrives
-    whole behind a head that never declared one.
+    costs more than a few hundred bytes of text saves. It is the *only* floor, and
+    what decides how it is answered is what the head said rather than how the body
+    arrives: a declared `content-length` answers it before a single body event is
+    read, a body that ends in the events read so far answers it exactly from its own
+    bytes, and a body still being produced behind a head that declared no length is
+    the one case that cannot be answered without holding bytes the app has already
+    made.
 
-    A body the app *streams* is weighed by `streaming_minimum_size` instead, which
-    defaults to holding none of it: the middleware commits on the first non-empty
-    chunk and streams the rest through the compressor, ending a block per chunk so
-    each one reaches the client as it is produced rather than accumulating inside
-    the codec until the response finishes. The two gates are separate because
-    holding costs a streamed body something a buffered one never pays. Weighing a
-    stream means keeping bytes the app has already produced until enough of them
-    accumulate to decide, so a feed emitting a line a second delivers nothing for as
-    many seconds as it takes to reach the gate, and how long that is belongs to the
-    app rather than to this middleware. Zero spends the framing bytes instead, which
-    is the trade a response the app chose to stream usually wants. Raise it to weigh
-    a stream the way a buffered body is weighed, at that latency, and to leave the
-    middleware uncommitted for a response that streams a prefix before offloading
-    the rest (see `OffloadedBodyAfterEncoding`).
+    `weigh_undeclared_bodies` decides that case, and it is a policy rather than a
+    second floor because the only two honest answers are to hold or not to. Holding
+    means keeping produced bytes until `minimum_size` of them accumulate, so a feed
+    emitting a line a second delivers nothing for as many seconds as that takes, and
+    how long that is belongs to the app rather than to this middleware. The default
+    does not hold: the middleware commits on the first non-empty chunk and streams
+    the rest through the compressor, ending a block per chunk so each one reaches
+    the client as it is produced rather than accumulating inside the codec until the
+    response finishes. That spends framing bytes on a body too small to earn them,
+    bounded by the floor, which is the trade a response the app chose to stream
+    usually wants. An app that wants both, incremental delivery *and* the floor,
+    declares a `content-length`, which buys the answer for nothing;
+    `file_response` does.
 
     Committing needs a `StreamingCompressor`; a coding whose factory produces a
     plain `Compressor` still encodes responses that arrive whole, and leaves
@@ -721,6 +771,20 @@ def compress(
         coverage is decided by *where* it is mounted, so both answers are
         route-scoped: a router that never reflects input can keep the default
         table and its brotli.
+
+        Streaming is its own exposure and neither answer covers it. A committed
+        stream ends a block per chunk, so each chunk the app produces carries
+        its own observable length: an attacker reads the length of the
+        part holding the secret rather than of the whole response, which is a
+        cleaner oracle than the buffered case, and padding does not blunt it,
+        since a padded container carries one random run for the whole response
+        and none of the chunks behind the first. `is_compressible` excludes
+        `text/event-stream` for this, but the property is the streaming rather
+        than the media type: a streamed `text/html` page or an
+        `application/x-ndjson` feed is exposed the same way, and an event stream
+        differs only in staying open to be sampled without re-establishing. Where
+        a streamed response mixes a secret with reflected input, keep it off this
+        middleware or pass a `compressible` that rejects its type.
     """
     table = {coding.lower(): make_compressor for coding, make_compressor in compressors.items()}
     available = tuple(table)
@@ -738,16 +802,13 @@ def compress(
         if start is None:
             return
 
-        if start.status == _NOT_MODIFIED:
+        if start.status == _NOT_MODIFIED and _revalidates_encodable(start.headers, compressible):
             # A `304` updates the stored `200` it revalidates, and RFC 9110 §15.4.5
             # asks it to carry the header fields that `200` would have, naming
             # `vary` among them because that is how a shared cache picks the stored
-            # variant to update. It is declared here rather than run past
-            # `compressible` first, since the same section's field list omits
-            # `content-type` and a `304` usually arrives without one: a cache keyed
-            # on a header the representation does not really vary by shares a little
-            # less, while one missing a header it does vary by hands a client an
-            # encoding it cannot read.
+            # variant to update. A `304` this middleware could not have encoded takes
+            # neither field and falls through to the pass-through below, since its
+            # status is one no coding applies to.
             revalidated = _varying(start.headers)
             if negotiate_coding(_accept_encoding(scope.headers), available) is not None:
                 # The stored entry this `304` updates is the one its `vary` key
@@ -773,17 +834,25 @@ def compress(
 
         start = replace(start, headers=_varying(start.headers))
         coding = negotiate_coding(_accept_encoding(scope.headers), available)
-        if coding is None:
+        declared = _declared_length(start.headers)
+        if coding is None or (declared is not None and declared < minimum_size):
+            # Nothing to encode with, or a head naming a body too small to be worth
+            # encoding. A declared length answers the floor here, before a byte is
+            # held, which is what carries it to a body the app *streams* behind a
+            # known size: `file_response` stats the file and then yields it chunk by
+            # chunk, and a stylesheet gzip can only grow is weighed all the same.
             yield start
             async for event in outbound:
                 yield event
             return
 
-        # Hold the head until a size gate resolves: committing to a
-        # `content-encoding` before knowing the body is big enough to deserve one is
-        # the one decision that cannot be taken back. Which gate decides is a
-        # property of the body, `minimum_size` for one that ends in the event being
-        # read and `streaming_minimum_size` for one still being produced.
+        # How much of a body still being produced may be held while the floor is
+        # weighed, and the whole of what the streaming case adds: committing to a
+        # `content-encoding` is the one decision that cannot be taken back, so the
+        # head waits here until the floor resolves. A declared length already
+        # resolved it, and an undeclared body is held only when asked to be, never
+        # past the floor, since bytes held beyond it decide nothing.
+        hold = minimum_size if declared is None and weigh_undeclared_bodies else 0
         prefix: list[bytes] = []
         buffered = 0
         async for event in outbound:
@@ -821,10 +890,10 @@ def compress(
                     yield rest
                 return
 
-            if buffered and buffered >= streaming_minimum_size:
-                # Past the gate with more body coming: commit to encoding, release
+            if buffered and buffered >= hold:
+                # Past the floor with more body coming: commit to encoding, release
                 # what was held through the compressor, and stream the rest. An empty
-                # chunk cannot carry the response past a gate of zero, since there is
+                # chunk cannot carry the response past a hold of zero, since there is
                 # nothing yet to encode and nothing to deliver if there were.
                 compressor = table[coding]()
                 if not isinstance(compressor, StreamingCompressor):
