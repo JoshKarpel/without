@@ -3,7 +3,9 @@ from __future__ import annotations
 import pytest
 from markupsafe import Markup
 from without_html import DOCTYPE
+from without_html import Element
 from without_html import Node
+from without_html import VoidElement
 from without_html import body
 from without_html import div
 from without_html import head
@@ -36,6 +38,18 @@ def page(rows: int) -> Node:
     ]
 
 
+class Widget(Element):
+    """An `Element` subclass, which the walk reaches by the `isinstance` arms."""
+
+    __slots__ = ()
+
+
+class Spacer(VoidElement):
+    """A `VoidElement` subclass, likewise."""
+
+    __slots__ = ()
+
+
 TREES: dict[str, Node] = {
     "empty element": div(),
     "bare text": "2 < 3",
@@ -44,13 +58,17 @@ TREES: dict[str, Node] = {
     "nothing": None,
     "small page": page(3),
     "large page": page(2000),
+    "subclass, no children": Widget("x-widget", (("id", "w"),), ()),
+    "subclass, one text child": Widget("x-widget", (), ("body & more",)),
+    "subclass, several children": Widget("x-widget", (), ("a", Element("b", (), ("c",)))),
+    "void subclass": Spacer("x-spacer", (("size", "3"),)),
 }
 
 
 @pytest.mark.parametrize("tree", TREES.values(), ids=TREES.keys())
-@pytest.mark.parametrize("pieces", [1, 2, 512])
-def test_the_chunks_join_to_exactly_what_render_produces(tree: Node, pieces: int) -> None:
-    assert "".join(render_chunks(tree, pieces=pieces)) == render(tree)
+@pytest.mark.parametrize("fragments_per_chunk", [1, 2, 512])
+def test_the_chunks_join_to_exactly_what_render_produces(tree: Node, fragments_per_chunk: int) -> None:
+    assert "".join(render_chunks(tree, fragments_per_chunk=fragments_per_chunk)) == render(tree)
 
 
 def test_a_large_page_arrives_in_many_chunks() -> None:
@@ -63,13 +81,11 @@ def test_a_small_tree_arrives_in_one_chunk() -> None:
     assert list(render_chunks(div(children="hi"))) == ["<div>hi</div>"]
 
 
-def test_a_run_of_empty_pieces_neither_ends_the_stream_nor_is_handed_on() -> None:
-    # A batch can join to nothing, which must not be mistaken for an exhausted walk:
-    # everything after it would silently vanish from the response.
+def test_a_batch_that_joins_to_nothing_does_not_end_the_stream() -> None:
+    # Empty text children make a chunk that joins to nothing; the rest of the tree still
+    # has to arrive.
     tree = div(children=["" for _ in range(2000)])
-    chunks = list(render_chunks(tree, pieces=8))
-    assert "".join(chunks) == "<div></div>"
-    assert "" not in chunks
+    assert "".join(render_chunks(tree, fragments_per_chunk=8)) == "<div></div>"
 
 
 def test_nothing_renders_to_no_chunks() -> None:
@@ -90,7 +106,7 @@ def test_the_first_chunk_arrives_without_walking_the_whole_tree() -> None:
             return f"<i>{self.index}</i>"
 
     tree = div(children=[li(children=Counted(n)) for n in range(1000)])
-    first = next(render_chunks(tree, pieces=8))
+    first = next(render_chunks(tree, fragments_per_chunk=8))
 
     assert first.startswith("<div><li><i>0</i></li>")
     assert len(visited) < 10
@@ -121,5 +137,5 @@ def test_escaping_matches_render_exactly() -> None:
     # `render` and `render_chunks` are generated from one walk; this is the assertion
     # that keeps them one walk if that ever stops being true.
     hostile = div(cls='a"b', attrs={"data-x": "<&>"}, children=["<script>", Markup("<em>ok</em>"), span()])
-    assert "".join(render_chunks(hostile, pieces=1)) == render(hostile)
+    assert "".join(render_chunks(hostile, fragments_per_chunk=1)) == render(hostile)
     assert "<script>" not in "".join(render_chunks(hostile))

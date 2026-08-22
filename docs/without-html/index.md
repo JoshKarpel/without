@@ -187,7 +187,7 @@ for chunk in render_chunks(page):
 
 A chunk is a fixed number of fragments joined rather than a byte budget, so chunks come
 out roughly even in size but not exactly, and a single large `Markup` child goes out whole
-in whatever chunk it lands in. Streaming costs about 10% over `render` for the same tree,
+in whatever chunk it lands in. Streaming costs about 20% over `render` for the same tree,
 which buys a first chunk before the tree is finished and a process that never holds the
 whole page.
 
@@ -233,23 +233,28 @@ will not be yours; the ratios travel better than the absolutes.
 | | 1,000-row table | 200-card page | ns per element |
 |---|---|---|---|
 | hand-written f-strings | 0.91 ms | 0.15 ms | ~185 |
-| Jinja2 | 1.75 ms | 0.27 ms | ~340 |
-| `without-html` | 4.96 ms | 0.96 ms | ~900-1,200 |
-| htpy | 19.1 ms | 5.65 ms | ~3,800-7,000 |
+| Jinja2 | 1.73 ms | 0.27 ms | ~340 |
+| `without-html` | 3.91 ms | 0.85 ms | ~720-1,050 |
+| htpy | 18.6 ms | 5.49 ms | ~3,600-6,800 |
 
-So a node tree costs roughly five times what writing the string by hand does, and about
-three times a compiled template. What that buys is the tree: escaping that cannot be
+So a node tree costs about four times what writing the string by hand does on table-shaped
+markup and five and a half on an attribute-heavy page, and two to three times a compiled
+template. What that buys is the tree: escaping that cannot be
 forgotten, components that compose, and a value a fragment can be rendered from. Whether
 that is a good trade depends on the page, and for a console page rendered in single-digit
 milliseconds against a database query and a network round trip, it disappears.
 
 Two properties worth knowing when the page gets large:
 
-- **Building the tree costs about as much as rendering it**, close to a 55/45 split. An
-  element that is built once and rendered many times pays the larger half once.
-- **Cost is linear in elements, and the collector is what bends it.** Per-element cost is
-  flat from 100 to 30,000 rows with the collector off, and climbs about 35% across that
-  range with it on, because a growing live tree is a growing thing to scan.
+- **Building the tree costs more than rendering it**, about a 63/37 split. An element that
+  is built once and rendered many times pays the larger half once, which is what makes
+  caching at a component boundary worth more than caching a rendered subtree.
+- **Cost is linear in elements, and the collector is what bends it.** Across the sweep
+  `just bench-render --scaling` runs, per-element cost climbs about 30% from 100 to 10,000
+  rows, and about half that with `--gc-off`, because a growing live tree is a growing thing
+  to scan. A long-running server is the workload the default thresholds suit least, so we
+  recommend tuning the collector at startup with
+  [`gc.set_threshold`](https://docs.python.org/3/library/gc.html#gc.set_threshold).
 - **Attributes are the expensive part.** An element with two attributes costs roughly
   twice one with none, because each attribute is a name check and an escape scan. Both
   are already about as cheap as Python allows: the name check is one set membership for

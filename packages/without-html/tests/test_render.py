@@ -4,6 +4,8 @@ import pytest
 import without_html
 from markupsafe import Markup
 from without_html import DOCTYPE
+from without_html import Element
+from without_html import VoidElement
 from without_html import br
 from without_html import div
 from without_html import element
@@ -128,6 +130,34 @@ def test_a_markup_subclass_still_renders_verbatim() -> None:
         __slots__ = ()
 
     assert render(p(children=Fragment("<em>x</em>"))) == "<p><em>x</em></p>"
+
+
+class Widget(Element):
+    """An `Element` subclass, which the walk reaches by the `isinstance` arms."""
+
+    __slots__ = ()
+
+
+@pytest.mark.parametrize(
+    ("children", "expected"),
+    [
+        ((), '<x-widget id="w"></x-widget>'),
+        (("body & more",), '<x-widget id="w">body &amp; more</x-widget>'),
+        (("a", Element("b", (), ("c",))), '<x-widget id="w">a<b>c</b></x-widget>'),
+    ],
+    ids=["no children", "one text child", "several children"],
+)
+def test_an_element_subclass_renders_as_its_element(children: tuple[object, ...], expected: str) -> None:
+    # Each shape closes by a different route (in place, in place after its text, or from
+    # the stack), so a subclass has to be checked through all three rather than one.
+    assert render(Widget("x-widget", (("id", "w"),), children)) == expected  # type: ignore[arg-type]
+
+
+def test_a_void_element_subclass_renders_as_its_element() -> None:
+    class Spacer(VoidElement):
+        __slots__ = ()
+
+    assert render(Spacer("x-spacer", (("size", "3"),))) == '<x-spacer size="3">'
 
 
 def test_a_value_that_cannot_render_is_rejected() -> None:

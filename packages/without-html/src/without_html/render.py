@@ -24,11 +24,11 @@ type TagMarkup = tuple[str, Markup]
 # unused string per process and saves every other element a second lookup.
 TAG_MARKUP: dict[str, TagMarkup] = {}
 
-# How many pieces `render_chunks` accumulates before emitting one. Fine enough that a
-# large page leaves in many chunks, coarse enough that the batching is a rounding error
-# against the walk: measured on a 177 KB page, chunking costs about 8% over `fragments`
-# alone, while checking a byte budget on every piece costs over 30%.
-CHUNK_PIECES = 512
+# How many fragments `render_chunks` accumulates before emitting one chunk. Fine enough
+# that a large page leaves in many chunks, coarse enough that the batching is a rounding
+# error against the walk: measured on a 177 KB page, chunking costs about 8% over
+# `fragments` alone, while checking a byte budget on every fragment costs over 30%.
+FRAGMENTS_PER_CHUNK = 512
 
 
 def tag_markup(tag: str) -> TagMarkup:
@@ -48,7 +48,7 @@ def unrenderable(item: object) -> str:
 
 # `render` and `fragments` are one walk, generated into two functions from
 # `tools/walk.py` so that the escaping ladder has a single source and neither pays a
-# function call or a generator resumption per piece to share it.
+# function call or a generator resumption per fragment to share it.
 
 
 # [[[cog import cog; from walk import emit; cog.outl(emit()) ]]]
@@ -60,8 +60,8 @@ def render(node: Node) -> str:
     the result reaches a client. Pair it with `without_asgi.html_content` to answer a
     request, or write it to a file, or compare it in a test.
 
-    Pieces are collected and joined once, so each byte is copied a single time. For a
-    body that should leave the process as it is produced, `render_chunks` walks the
+    Fragments are collected and joined once, so each byte is copied a single time. For
+    a body that should leave the process as it is produced, `render_chunks` walks the
     same tree without holding the whole string.
     """
     out: list[str] = []
@@ -69,22 +69,48 @@ def render(node: Node) -> str:
     stack.reverse()
     while stack:
         item = stack.pop()
-        if isinstance(item, Element):
+        if type(item) is Element:
             opening, closing = tag_markup(item.tag)
             out.append(opening)
             for name, value in item.attributes:
                 out.append(f" {name}" if value is None else f' {name}="{value}"')
             out.append(">")
-            stack.append(closing)
-            stack.extend(reversed(item.children))
+            children = item.children
+            if not children:
+                out.append(closing)
+            elif len(children) == 1 and type(only := children[0]) is str:
+                out.append(escape_text(only))
+                out.append(closing)
+            else:
+                stack.append(closing)
+                stack.extend(reversed(children))
         elif type(item) is Markup:
-            # Every element pushes its closing tag back onto the stack as a `Markup`, so
-            # this arm runs once per element and is worth reaching by pointer comparison
-            # rather than by the `isinstance` pair it would otherwise take to tell an
-            # already-safe string from one that still needs escaping.
+            # A closing tag pushed by the arm above, or markup the caller supplied.
             out.append(item)
         elif type(item) is str:
             out.append(escape_text(item))
+        elif type(item) is VoidElement:
+            out.append(tag_markup(item.tag)[0])
+            for name, value in item.attributes:
+                out.append(f" {name}" if value is None else f' {name}="{value}"')
+            out.append(">")
+        elif item is None:
+            continue
+        elif isinstance(item, Element):
+            opening, closing = tag_markup(item.tag)
+            out.append(opening)
+            for name, value in item.attributes:
+                out.append(f" {name}" if value is None else f' {name}="{value}"')
+            out.append(">")
+            children = item.children
+            if not children:
+                out.append(closing)
+            elif len(children) == 1 and type(only := children[0]) is str:
+                out.append(escape_text(only))
+                out.append(closing)
+            else:
+                stack.append(closing)
+                stack.extend(reversed(children))
         elif isinstance(item, str):
             out.append(item if isinstance(item, Markup) else escape_text(item))
         elif isinstance(item, VoidElement):
@@ -92,8 +118,6 @@ def render(node: Node) -> str:
             for name, value in item.attributes:
                 out.append(f" {name}" if value is None else f' {name}="{value}"')
             out.append(">")
-        elif item is None:
-            continue
         elif isinstance(item, SupportsHtml):
             out.append(item.__html__())
         else:
@@ -103,32 +127,58 @@ def render(node: Node) -> str:
 
 def fragments(node: Node) -> Iterator[str]:
     """
-    Yield the tree's markup one piece at a time: a tag, an attribute, a run of text.
+    Yield the tree's markup one fragment at a time: a tag, an attribute, a run of text.
 
     The granularity the walk itself produces, which is far finer than anything should
-    be written or sent at: a page is tens of thousands of pieces. `render` joins them
+    be written or sent at: a page is tens of thousands of fragments. `render` joins them
     and `render_chunks` batches them; this is the shared walk both are built on.
     """
     stack: list[Child] = list(children_of(node))
     stack.reverse()
     while stack:
         item = stack.pop()
-        if isinstance(item, Element):
+        if type(item) is Element:
             opening, closing = tag_markup(item.tag)
             yield opening
             for name, value in item.attributes:
                 yield f" {name}" if value is None else f' {name}="{value}"'
             yield ">"
-            stack.append(closing)
-            stack.extend(reversed(item.children))
+            children = item.children
+            if not children:
+                yield closing
+            elif len(children) == 1 and type(only := children[0]) is str:
+                yield escape_text(only)
+                yield closing
+            else:
+                stack.append(closing)
+                stack.extend(reversed(children))
         elif type(item) is Markup:
-            # Every element pushes its closing tag back onto the stack as a `Markup`, so
-            # this arm runs once per element and is worth reaching by pointer comparison
-            # rather than by the `isinstance` pair it would otherwise take to tell an
-            # already-safe string from one that still needs escaping.
+            # A closing tag pushed by the arm above, or markup the caller supplied.
             yield item
         elif type(item) is str:
             yield escape_text(item)
+        elif type(item) is VoidElement:
+            yield tag_markup(item.tag)[0]
+            for name, value in item.attributes:
+                yield f" {name}" if value is None else f' {name}="{value}"'
+            yield ">"
+        elif item is None:
+            continue
+        elif isinstance(item, Element):
+            opening, closing = tag_markup(item.tag)
+            yield opening
+            for name, value in item.attributes:
+                yield f" {name}" if value is None else f' {name}="{value}"'
+            yield ">"
+            children = item.children
+            if not children:
+                yield closing
+            elif len(children) == 1 and type(only := children[0]) is str:
+                yield escape_text(only)
+                yield closing
+            else:
+                stack.append(closing)
+                stack.extend(reversed(children))
         elif isinstance(item, str):
             yield item if isinstance(item, Markup) else escape_text(item)
         elif isinstance(item, VoidElement):
@@ -136,8 +186,6 @@ def fragments(node: Node) -> Iterator[str]:
             for name, value in item.attributes:
                 yield f" {name}" if value is None else f' {name}="{value}"'
             yield ">"
-        elif item is None:
-            continue
         elif isinstance(item, SupportsHtml):
             yield item.__html__()
         else:
@@ -147,7 +195,7 @@ def fragments(node: Node) -> Iterator[str]:
 # [[[end]]]
 
 
-def render_chunks(node: Node, *, pieces: int = CHUNK_PIECES) -> Iterator[str]:
+def render_chunks(node: Node, *, fragments_per_chunk: int = FRAGMENTS_PER_CHUNK) -> Iterator[str]:
     """
     Render a node tree to markup a chunk at a time.
 
@@ -156,19 +204,17 @@ def render_chunks(node: Node, *, pieces: int = CHUNK_PIECES) -> Iterator[str]:
     while the rest of it is still being built and the process never holds the finished
     string. `"".join(render_chunks(node))` is `render(node)`.
 
-    A chunk is `pieces` fragments joined, not a byte budget: counting bytes on every
-    fragment costs several times what batching them does, and the point of the knob is
-    to bound how often a consumer is called, not to hand it uniform buffers. Chunks are
-    therefore roughly even in size but not exactly, and a single large `Markup` child
-    goes out whole in whatever chunk it lands in.
+    A chunk is `fragments_per_chunk` fragments joined, not a byte budget: counting bytes
+    on every fragment costs several times what batching them does, and the point of the
+    knob is to bound how often a consumer is called, not to hand it uniform buffers.
+    Chunks are therefore roughly even in size but not exactly, and a single large
+    `Markup` child goes out whole in whatever chunk it lands in.
 
     What streaming costs is worth choosing deliberately rather than defaulting into: the
-    length is not known in advance, so a response is framed as `transfer-encoding:
-    chunked`, and once the first chunk is gone the status line is gone with it, so a
-    failure partway through a tree can no longer become a 500.
+    total length is not known until the walk ends, and once the first chunk has been
+    handed on there is no taking it back, so a failure partway through a tree can no
+    longer be turned into something else.
     """
     remaining = fragments(node)
-    while batch := list(islice(remaining, pieces)):
-        chunk = "".join(batch)
-        if chunk:
-            yield chunk
+    while batch := list(islice(remaining, fragments_per_chunk)):
+        yield "".join(batch)
