@@ -20,6 +20,17 @@ render(menu(["tea", "toast"]))
 # '<div class="menu"><h1>Menu</h1><ul><li>tea</li><li>toast</li></ul></div>'
 ```
 
+Markup here is built rather than written, which is the axis this sits on against a template
+engine. A component is an ordinary Python function of its arguments returning a value, and
+pages compose by calling functions; a template is text in a file of its own, and composition
+there needs machinery of its own (`{% extends %}`, `{% block %}`, `{% include %}`,
+`{% macro %}`) to do what `def` and a call already do.
+
+The resemblance to React is the shape of a component and stops there: a pure function from
+data to a tree. There is no state, no hooks, no lifecycle, and no reconciliation. What the
+tree does share with a virtual DOM is being the kind of thing those could be built on, which
+is the reason it is the interface.
+
 ## The tree is the interface, not the string
 
 A constructor returns a value, and `render` is a separate pure function over it. That
@@ -204,25 +215,64 @@ tuple caches its own hash, so hashing a tree costs one traversal and every hash 
 is a pointer chase.
 
 That makes a render cache easy to reach for, and mostly the wrong tool. Building a tree
-costs slightly more than rendering it, so memoizing the render half is the smaller half,
+costs more than rendering it, so memoizing the render half is memoizing the smaller half,
 and a dict hit on a rebuilt-but-equal subtree still pays a full recursive `==` to confirm
-the key. Cache the thing that skips both instead:
+the key. Cache at the component boundary instead, where the key is the arguments: a small
+tuple that hashes in nanoseconds rather than a tree that hashes in hundreds of microseconds.
 
 ```python
 @cache
-def sidebar(tier: str) -> Markup:
-    return Markup(render(nav(cls="sidebar", children=[...])))
+def sidebar(tier: str) -> Element:
+    return nav(cls="sidebar", children=[...])
 ```
 
-A `Markup` renders verbatim, so the result drops into any tree as an ordinary child. The
-key is a small argument tuple that hashes in nanoseconds rather than a tree that hashes in
-hundreds of microseconds, and a hit skips construction as well as rendering: measured on a
-177 KB page, re-rendering a cached subtree is a few hundred nanoseconds against the
-hundreds of microseconds to rebuild and re-render it.
+What the component hands back is then a second choice, and a real trade:
+
+- **Return the `Element`** and a hit skips construction, the larger half, while the result
+  stays a value anything can still walk, hash, transform, or render more than once. This is
+  the option that keeps what the tree is for.
+- **Return `Markup`** (`Markup(render(...))`) and a hit skips rendering too, so a cached
+  subtree costs a few hundred nanoseconds against the hundreds of microseconds to rebuild
+  and re-render it. The price is that the result is opaque: it drops into a tree as an
+  ordinary child, and nothing can look inside it again.
+
+Take the second only where nothing downstream needs the structure. Either way the cached
+value is safe to share across requests and render repeatedly, because an element is
+immutable and a `Markup` is a string; there is no defensive copy to make and no way for one
+caller's page to disturb another's.
 
 Use an unbounded `@cache` only where the key space is bounded. Where it is not, reach for
 a bounded cache, and note that eviction bookkeeping is several times a plain dict lookup,
 so keep it at component boundaries rather than at every node.
+
+Nothing about this is limited to static markup. A row rendered from the database, identical
+for every viewer over a window shorter than the data changes in, is the same shape with a
+time bound on it:
+
+```python
+@dataclass(frozen=True)
+class Run:
+    id: str
+    status: str
+
+
+@ttl_cache(maxsize=1_000, ttl=30)
+def run_row(run: Run) -> Element:
+    return tr(attrs={"id": run.id}, children=[td(children=run.id), td(children=run.status)])
+```
+
+`Run` is frozen, so it hashes, so it *is* the key: two requests that fetched the same row
+share the subtree built from it, and a row whose data changed misses on its own.
+
+The axis that decides where a cache goes is not static against dynamic. It is whether the
+key can be named *before* the tree is built. A component is a function of its arguments, so
+the answer is almost always yes, and then caching on those arguments dominates caching on
+the tree: the key is small, and a hit skips the construction a tree-keyed cache would have
+to do first in order to have a key at all.
+
+Caching on the arguments also leaves the granularity with you. When a row is mostly stable
+around one volatile field, decompose it and cache the stable part; a cache keyed on nodes
+would take the whole row as it found it.
 
 ## What it costs
 
@@ -239,16 +289,60 @@ will not be yours; the ratios travel better than the absolutes.
 
 So a node tree costs about four times what writing the string by hand does on table-shaped
 markup and five and a half on an attribute-heavy page, and two to three times a compiled
-template. What that buys is the tree: escaping that cannot be
-forgotten, components that compose, and a value a fragment can be rendered from. Whether
-that is a good trade depends on the page, and for a console page rendered in single-digit
-milliseconds against a database query and a network round trip, it disappears.
+template. For a console page rendered in single-digit milliseconds against a database query
+and a network round trip, that disappears. But it is worth being exact about where the cost
+goes and what it is for, because the obvious answer is wrong.
 
-Two properties worth knowing when the page gets large:
+### The cost is the tree, not the walk
 
-- **Building the tree costs more than rendering it**, about a 63/37 split. An element that
-  is built once and rendered many times pays the larger half once, which is what makes
-  caching at a component boundary worth more than caching a rendered subtree.
+Split the work and the comparison inverts: rendering an already-built tree is *faster* than
+a compiled Jinja template rendering the same table. All of the difference, and more, is in
+building the tree.
+
+| | 1,000-row table |
+|---|---|
+| `without-html`, build the tree | 2.58 ms |
+| `without-html`, render the built tree | 1.48 ms |
+| Jinja2, render a compiled template | 1.72 ms |
+
+From `just bench-render --phases`, which times the halves separately, so they do not sum to
+the table above.
+
+Jinja is not faster because compiled code beats a tree walk. It is faster because its
+compiler already did the structural work: a template collapses to constants like
+`yield '</td><td>'`, where a closing tag, an opening tag and both tag names have been
+folded into one string at compile time. That happens once per process. We rediscover the
+same boundary on every request, by allocating an element and walking it.
+
+Which means the lever is building less often rather than walking faster. Hoisting a static
+subtree to module scope, or memoizing a component to `Markup`, is the same constant-folding
+Jinja's compiler does, by hand and under your control. It is why the caching section above
+matters more than any change to the renderer.
+
+### What the cost buys
+
+Not speed. And not, by itself, the split at the top of this page: rendering a component
+whole or on its own as a fragment, and two components composing without either knowing it,
+follow from a component being a function that returns a value. A function returning `Markup`
+is also a function returning a value, and would buy all of that with no tree and no build
+cost, settling escaping at construction just as well.
+
+What the tree buys is everything that needs the markup to still be *structured* after the
+component has returned: holding a cached subtree that can still be composed into a larger
+page rather than only pasted into one, walking a document to add a nonce to every
+`<script>`, asserting on shape rather than on text in a test, or rendering the same tree to
+something that is not HTML. It is the difference between a layer that hands you an answer
+and one that hands you something you can still ask questions of.
+
+That is optionality, and it is worth being plain that this layer stops at handing it over:
+the diffing, transforming, and asserting are things you do with a tree, above, not things
+done for you here. The build cost is the premium on the option. If you will never open the
+box, a function returning `Markup` is the cheaper design and nothing here will beat it; the
+bet is that having somewhere to stand is worth more, over the life of an application, than
+the milliseconds it costs to stand there.
+
+### Properties worth knowing when the page gets large
+
 - **Cost is linear in elements, and the collector is what bends it.** Across the sweep
   `just bench-render --scaling` runs, per-element cost climbs about 30% from 100 to 10,000
   rows, and about half that with `--gc-off`, because a growing live tree is a growing thing
@@ -273,8 +367,8 @@ Two properties worth knowing when the page gets large:
   subtree, and this layer does not: the cheaper form of the same idea belongs in the
   application, at the component boundary, where a hit skips building the tree as well as
   rendering it.
-- **No diffing, patching, or client runtime.** The tree would support all of it, which
-  is why the interface is the tree; none of it exists.
+- **No diffing, patching, or client runtime.** The tree is what they would be built on,
+  and that is a layer above this one.
 - **No CSS, no widgets, no layout.** The browser has those. `cls` takes complete class
   names, which is also what a scanner like Tailwind's needs in order to see them: build
   class names as whole strings rather than assembling them from fragments, since
