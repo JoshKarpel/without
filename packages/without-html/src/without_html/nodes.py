@@ -156,6 +156,24 @@ def raw_text_of(tag: str, children: Node) -> tuple[Node, ...]:
     return (children,)
 
 
+# `frozen=True, slots=True` on both element types, which is the expensive combination and
+# is kept deliberately. Construction is where a tree renderer spends about half its time,
+# and `frozen` roughly triples it (79 ns unfrozen against 245 frozen for three fields),
+# because the generated `__init__` routes every field through `object.__setattr__` rather
+# than a plain store. The workarounds were measured and none of them help here:
+#
+# - Caching `object.__setattr__` in a default argument, a closure, or a module global, the
+#   way attrs does for slotted classes, is *slower* than the stdlib's generated `__init__`
+#   (291-301 ns), because the extra parameter costs more at the call than the saved lookup
+#   returns. attrs' own documentation says the same of its version.
+# - attrs' genuinely fast path, writing straight into `self.__dict__`, needs a dict class
+#   and so gives up `slots`. It does win on construction (168 ns), but an element then
+#   costs 247 bytes instead of 142, and since collection is what bends this package's
+#   scaling curve, the trade inverts exactly where it matters: measured per element on a
+#   table build, 508 ns against 579 at 1,000 rows, but 1,225 against 721 at 30,000.
+#
+# So the choice is binary: pay for immutability at runtime, or drop `frozen` and rely on
+# the type checker. It stays on, because these are values.
 @dataclass(frozen=True, slots=True)
 class VoidElement:
     """
