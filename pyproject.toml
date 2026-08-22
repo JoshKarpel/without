@@ -15,6 +15,7 @@ dependencies = [
     "without-asgi",
     "without-http",
     "without-web",
+    "without-html",
     "without-dag",
     "without-durability",
     "without-durability-redis",
@@ -37,6 +38,7 @@ without-configmap = { workspace = true }
 without-asgi = { workspace = true }
 without-http = { workspace = true }
 without-web = { workspace = true }
+without-html = { workspace = true }
 without-dag = { workspace = true }
 without-durability = { workspace = true }
 without-durability-redis = { workspace = true }

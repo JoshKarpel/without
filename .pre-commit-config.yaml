@@ -51,6 +51,11 @@ repos:
         language: system
         entry: packages/without-dag/tools/regenerate.sh
         files: ^packages/without-dag/src/without_dag/graph\.py$
+      - id: generate-elements
+        name: regenerate without-html element constructors (cog + ruff)
+        language: system
+        entry: packages/without-html/tools/regenerate.sh
+        files: ^packages/without-html/src/without_html/(elements|__init__)\.py$
       - id: format-justfile
         name: format justfile
         language: system

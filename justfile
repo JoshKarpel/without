@@ -203,6 +203,10 @@ bench framework *args:
 
 alias b := bench
 
+[doc('Benchmark HTML rendering against htpy, Jinja, and hand-written f-strings')]
+bench-render *args:
+    uv run python -m benchmarks.render.bench {{ args }}
+
 [doc('Plot latency + throughput vs rate from the vegeta results in results/')]
 plot *args:
     mise exec -- uv run python -m benchmarks.plot {{ args }}

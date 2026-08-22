@@ -216,6 +216,26 @@ def form_content(fields: Mapping[str, str] | Iterable[tuple[str, str]]) -> Conte
     return Content(urlencode(list(pairs)).encode(), ((b"content-type", FORM_MEDIA_TYPE),))
 
 
+HTML_MEDIA_TYPE = b"text/html; charset=utf-8"
+
+
+def html_content(markup: str) -> Content:
+    """
+    Encode already-rendered `markup` as an HTML `Content`: UTF-8 bytes plus `content-type: text/html`.
+
+    Takes a string rather than any kind of node or template, because how the markup was
+    produced is the application's business and none of this layer's: a `without-html`
+    tree passed through `render`, a template engine's output, or a literal all arrive
+    here identically. That is what lets this package name the content type without
+    taking on a renderer, and what leaves the choice of renderer with the app.
+
+    The charset is stated rather than left to the recipient's guess, since a bare
+    `text/html` sends a browser to its sniffing and locale-default rules for a document
+    this side already knows is UTF-8.
+    """
+    return Content(markup.encode(), ((b"content-type", HTML_MEDIA_TYPE),))
+
+
 @dataclass(frozen=True, slots=True)
 class FilePart:
     """

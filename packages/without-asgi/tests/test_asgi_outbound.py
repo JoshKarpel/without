@@ -36,6 +36,7 @@ from without_asgi import encode_outbound
 from without_asgi import encode_response
 from without_asgi import encode_websocket_outbound
 from without_asgi import form_content
+from without_asgi import html_content
 from without_asgi import json_content
 from without_asgi import multipart_content
 from without_asgi import parse_lifespan_reply
@@ -124,6 +125,18 @@ def test_form_content_percent_encodes_utf8() -> None:
     content = form_content({"name": "café"})
 
     assert content.body == b"name=caf%C3%A9"
+
+
+def test_html_content_pairs_the_markup_with_the_content_type() -> None:
+    content = html_content("<p>hello</p>")
+
+    assert content == Content(b"<p>hello</p>", ((b"content-type", b"text/html; charset=utf-8"),))
+
+
+def test_html_content_encodes_as_utf8() -> None:
+    content = html_content("<p>café</p>")
+
+    assert content.body == "<p>café</p>".encode()
 
 
 async def test_multipart_content_frames_fields_and_files_with_the_boundary() -> None:

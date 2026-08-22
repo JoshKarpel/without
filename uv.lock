@@ -23,6 +23,7 @@ members = [
     "without-durability-redis",
     "without-durability-sqlite",
     "without-env",
+    "without-html",
     "without-http",
     "without-logging",
     "without-web",
@@ -152,7 +153,9 @@ source = { editable = "packages/benchmarks" }
 dependencies = [
     { name = "austin-python" },
     { name = "fastapi" },
+    { name = "htpy" },
     { name = "integration" },
+    { name = "jinja2" },
     { name = "matplotlib" },
     { name = "psutil" },
     { name = "uvicorn", extra = ["standard"] },
@@ -165,7 +168,9 @@ dependencies = [
 requires-dist = [
     { name = "austin-python", specifier = ">=1.7" },
     { name = "fastapi", specifier = ">=0.141.1" },
+    { name = "htpy", specifier = ">=26.5.1" },
     { name = "integration", editable = "packages/integration" },
+    { name = "jinja2", specifier = ">=3.1.6" },
     { name = "matplotlib", specifier = ">=3.9" },
     { name = "psutil", specifier = ">=5.9" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34" },
@@ -563,6 +568,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/2c/48/71de9ed269fdae9c8057e5a4c0aa7402e8bb16f2c6e90b3aa53327b113f8/hpack-4.1.0.tar.gz", hash = "sha256:ec5eca154f7056aa06f196a557655c5b009b382873ac8d1e66e79e87535f1dca", size = 51276, upload-time = "2025-01-22T21:44:58.347Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/07/c6/80c95b1b2b94682a72cbdbfb85b81ae2daffa4291fbfa1b1464502ede10d/hpack-4.1.0-py3-none-any.whl", hash = "sha256:157ac792668d995c657d93111f46b4535ed114f0c9c8d672271bbec7eae1b496", size = 34357, upload-time = "2025-01-22T21:44:56.92Z" },
+]
+
+[[package]]
+name = "htpy"
+version = "26.5.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "markupsafe" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d3/18/48b0fe5f7b23c8bb0b45b09c306f511417fee74afc49a0765178d6dcbac2/htpy-26.5.1.tar.gz", hash = "sha256:43a365c1fc670094da781b923883019339cec031397d61d5fe5f8e2f2278b63e", size = 292049, upload-time = "2026-05-22T08:31:31.387Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e7/68/ad12d6519ccc48852ebb1effbe5a160ff21d7b48c484d0dae6fd173f6d22/htpy-26.5.1-py3-none-any.whl", hash = "sha256:148566db9d720c897baa5832e2a496954ce317ab06ef49a103b44f8a15322c3b", size = 21428, upload-time = "2026-05-22T08:31:30.153Z" },
 ]
 
 [[package]]
@@ -2166,6 +2183,17 @@ requires-dist = [
 ]
 
 [[package]]
+name = "without-html"
+version = "0.0.0"
+source = { editable = "packages/without-html" }
+dependencies = [
+    { name = "markupsafe" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "markupsafe", specifier = ">=3" }]
+
+[[package]]
 name = "without-http"
 version = "0.0.0"
 source = { editable = "packages/without-http" }
@@ -2230,6 +2258,7 @@ dependencies = [
     { name = "without-durability-redis" },
     { name = "without-durability-sqlite" },
     { name = "without-env" },
+    { name = "without-html" },
     { name = "without-http" },
     { name = "without-logging" },
     { name = "without-web" },
@@ -2275,6 +2304,7 @@ requires-dist = [
     { name = "without-durability-redis", editable = "packages/without-durability-redis" },
     { name = "without-durability-sqlite", editable = "packages/without-durability-sqlite" },
     { name = "without-env", editable = "packages/without-env" },
+    { name = "without-html", editable = "packages/without-html" },
     { name = "without-http", editable = "packages/without-http" },
     { name = "without-logging", editable = "packages/without-logging" },
     { name = "without-web", editable = "packages/without-web" },

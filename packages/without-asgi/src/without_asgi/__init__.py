@@ -53,6 +53,7 @@ from without_asgi.outbound import encode_outbound
 from without_asgi.outbound import encode_response
 from without_asgi.outbound import encode_websocket_outbound
 from without_asgi.outbound import form_content
+from without_asgi.outbound import html_content
 from without_asgi.outbound import json_content
 from without_asgi.outbound import multipart_content
 from without_asgi.outbound import parse_lifespan_reply
@@ -162,6 +163,7 @@ __all__ = [
     "extension",
     "file_response",
     "form_content",
+    "html_content",
     "http_inbound",
     "http_outbound",
     "json_content",

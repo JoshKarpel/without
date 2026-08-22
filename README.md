@@ -45,6 +45,9 @@ packages). Each package is its own top-level import.
   on the sans-IO `h11`/`h2`/`wsproto` state machines: `serving(app)` owns the socket
   and the wire protocol (HTTP/1.1, HTTP/2, and WebSockets) and drives any ASGI app.
   Imported as `without_http`.
+- `packages/without-html` — HTML as immutable Python values: element constructors
+  that carry HTML's own constraints in their signatures, and a pure `render`. Depends
+  on nothing else in the workspace. Imported as `without_html`.
 - `packages/without-dag` — bounded-concurrency execution of DAG-shaped async
   workflows: a `Graph` builder threads value types through the wiring, and a
   single-input graph is an async callable that `from_map` lifts straight into a

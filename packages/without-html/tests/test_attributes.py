@@ -1,0 +1,80 @@
+from __future__ import annotations
+
+import pytest
+from without_html import AttributeValue
+from without_html import div
+from without_html import input_
+from without_html import render
+
+
+def test_attributes_render_in_the_order_they_were_given() -> None:
+    assert render(div(attrs={"id": "runs", "data-page": "3"})) == '<div id="runs" data-page="3"></div>'
+
+
+def test_a_class_string_renders_as_the_class_attribute() -> None:
+    assert render(div(cls="card")) == '<div class="card"></div>'
+
+
+def test_several_classes_are_joined_with_spaces() -> None:
+    assert render(div(cls=["card", "card-wide"])) == '<div class="card card-wide"></div>'
+
+
+def test_a_class_generator_is_accepted() -> None:
+    assert render(div(cls=(name for name in ("a", "b")))) == '<div class="a b"></div>'
+
+
+def test_an_empty_class_list_renders_no_attribute() -> None:
+    assert render(div(cls=[])) == "<div></div>"
+
+
+def test_the_class_attribute_comes_first() -> None:
+    assert render(div(cls="card", attrs={"id": "x"})) == '<div class="card" id="x"></div>'
+
+
+def test_class_as_an_attribute_is_rejected() -> None:
+    # Classes have one channel, not two kept in sync, so this fails the first time it is
+    # written rather than when someone later adds `cls` beside it.
+    with pytest.raises(ValueError, match="set classes with `cls`"):
+        div(attrs={"class": "card"})
+
+
+def test_class_as_an_attribute_is_rejected_alongside_cls() -> None:
+    with pytest.raises(ValueError, match="set classes with `cls`"):
+        div(cls="card", attrs={"class": "other"})
+
+
+def test_a_true_value_renders_a_bare_attribute() -> None:
+    assert render(input_(attrs={"disabled": True})) == "<input disabled>"
+
+
+@pytest.mark.parametrize("value", [False, None])
+def test_a_false_or_missing_value_drops_the_attribute(value: AttributeValue) -> None:
+    assert render(input_(attrs={"readonly": value, "name": "q"})) == '<input name="q">'
+
+
+def test_an_integer_value_renders_as_digits() -> None:
+    assert render(div(attrs={"tabindex": 2})) == '<div tabindex="2"></div>'
+
+
+def test_attribute_names_pass_through_verbatim() -> None:
+    # No underscore mangling: the names arrive in a mapping, so hyphenated and
+    # camelCase names (`hx-get`, `viewBox`) need no escape hatch.
+    markup = render(div(attrs={"hx-get": "/runs", "hx-trigger": "every 5s", "viewBox": "0 0 1 1"}))
+    assert markup == '<div hx-get="/runs" hx-trigger="every 5s" viewBox="0 0 1 1"></div>'
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        'onclick="steal()" x',
+        "with space",
+        "quote'd",
+        "sla/sh",
+        "eq=uals",
+        "close>",
+        "",
+    ],
+)
+def test_an_attribute_name_that_could_break_out_is_rejected(name: str) -> None:
+    with pytest.raises(ValueError, match="invalid attribute name"):
+        div(attrs={name: "x"})
