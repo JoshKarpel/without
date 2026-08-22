@@ -23,6 +23,7 @@ from datetime import datetime
 from datetime import timedelta
 from email.utils import parsedate_to_datetime
 from importlib import metadata
+from types import MappingProxyType
 from typing import NamedTuple
 from typing import Protocol
 from typing import Self
@@ -45,6 +46,12 @@ from without import stack
 from without_asgi import Content
 from without_asgi import RawHeaders
 from without_asgi import StreamingContent
+from without_asgi.compression import GZIP_CONTAINER
+from without_asgi.compression import Compressor
+from without_asgi.compression import StreamingCompressor
+from without_asgi.compression import brotli_compressor
+from without_asgi.compression import gzip_compressor
+from without_asgi.compression import zstd_compressor
 from without_asgi.headers import merge
 
 from without_http.h2_wire import request_headers
@@ -1615,26 +1622,28 @@ def follow_redirects(max_hops: int = 5) -> ClientMiddleware:
 
 
 _REQUEST_FRAMING_HEADERS = frozenset({b"content-length", b"transfer-encoding"})
-_GZIP_CONTAINER = zlib.MAX_WBITS | 16  # the wbits offset that selects the gzip wrapper around DEFLATE
-
-
-class Compressor(Protocol):
-    """
-    The incremental compressor shape `compressing` drives: feed chunks through
-    `compress`, then `flush` ends the stream. `zlib.compressobj` and
-    `zstd.ZstdCompressor` satisfy it as-is; a third-party codec plugs in with
-    whatever thin adapter its own surface needs.
-    """
-
-    def compress(self, data: bytes, /) -> bytes: ...
-    def flush(self) -> bytes: ...
 
 
 async def _compressed(body: Stream[bytes], compressor: Compressor) -> AsyncIterator[bytes]:
+    # A codec decides for itself what any one `compress` call returns, and fed the
+    # pieces a streamed body arrives in it usually returns nothing, holding the whole
+    # upload until the stream ends. Ending a block per chunk is what releases it; a
+    # codec with no way to do that (a plain `Compressor`) has to hold it, since unlike
+    # a negotiated response there is no unencoded answer available to a caller who
+    # asked for this coding by name.
+    flush_block: Callable[[], bytes] = (
+        compressor.flush_block if isinstance(compressor, StreamingCompressor) else lambda: b""
+    )
+    # One chunk of lookahead, so the last one is known to be last and rides out on the
+    # flush that ends the stream rather than paying for a block of its own. A body that
+    # arrives whole is one chunk, so it still encodes to exactly the bytes it would
+    # have without any of this.
+    held: bytes | None = None
     async for chunk in body:
-        if compressed := compressor.compress(chunk):
+        if held and (compressed := compressor.compress(held) + flush_block()):
             yield compressed
-    yield compressor.flush()
+        held = chunk
+    yield compressor.compress(held or b"") + compressor.flush()
 
 
 def compressing(coding: bytes, make_compressor: Callable[[], Compressor]) -> ClientMiddleware:
@@ -1648,11 +1657,21 @@ def compressing(coding: bytes, make_compressor: Callable[[], Compressor]) -> Cli
     reimplemented.
 
     That rest: the lazy body `Stream[bytes]` is wrapped in the incremental compressor,
-    so a streamed upload compresses chunk by chunk and nothing buffers; and the
-    framing follows the rewrite, `content-length` no longer describes the body, so it
-    is dropped and the compressed stream goes out `transfer-encoding: chunked` (over
-    HTTP/2 the framing header is dropped with the other hop-by-hop headers and the
-    body rides DATA frames as usual).
+    so a streamed upload compresses chunk by chunk and holds no more than one of them;
+    and the framing follows the rewrite, `content-length` no longer describes the body,
+    so it is dropped and the compressed stream goes out `transfer-encoding: chunked`
+    (over HTTP/2 the framing header is dropped with the other hop-by-hop headers and
+    the body rides DATA frames as usual).
+
+    Holding no more than a chunk is a demand on the codec, not just on the loop: what
+    `compress` returns is the codec's choice, and fed a chunk at a time zlib and zstd
+    return almost nothing until the stream ends, which would buffer the whole upload
+    inside the codec while looking like it streamed. `make_compressor` should therefore
+    produce a `StreamingCompressor`, as `gzip_compressor`, `zstd_compressor`, and
+    `brotli_compressor` all do; a plain `Compressor` still encodes correctly and still
+    buffers, because a coding named by the caller has no unencoded answer to fall back
+    on the way a negotiated response does. A body that arrives whole is one chunk
+    either way, and encodes to the same bytes under both.
 
     Two kinds of request pass through untouched: one already carrying a
     `content-encoding` (the body is already encoded; re-compressing would corrupt it),
@@ -1694,7 +1713,7 @@ def gzip_compress(level: int = zlib.Z_DEFAULT_COMPRESSION) -> ClientMiddleware:
     codings, and `compressing` is the shared mechanism for any coding beyond those;
     the response-side counterpart to all of them is `decompress`.
     """
-    return compressing(b"gzip", lambda: zlib.compressobj(level, zlib.DEFLATED, _GZIP_CONTAINER))
+    return compressing(b"gzip", lambda: gzip_compressor(level))
 
 
 def zstd_compress(level: int | None = None) -> ClientMiddleware:
@@ -1708,33 +1727,7 @@ def zstd_compress(level: int | None = None) -> ClientMiddleware:
 
     `level` is zstd's compression level, defaulting to the library's own default.
     """
-    return compressing(b"zstd", lambda: zstd.ZstdCompressor(level))
-
-
-class _RawBrotliCompressor(Protocol):
-    """The slice of `brotli.Compressor` the adapter drives (the bindings ship no types)."""
-
-    def process(self, data: bytes, /) -> bytes: ...
-    def finish(self) -> bytes: ...
-
-
-@dataclass(slots=True, eq=False)
-class _BrotliCompressor:
-    """
-    Adapt `brotli.Compressor` to the `Compressor` shape.
-
-    Brotli's bindings spell the incremental surface `process`/`finish` (their `flush`
-    is a mid-stream flush that keeps the stream open), so the adapter maps `compress`
-    to `process` and `flush` to `finish`.
-    """
-
-    _raw: _RawBrotliCompressor
-
-    def compress(self, data: bytes, /) -> bytes:
-        return self._raw.process(data)
-
-    def flush(self) -> bytes:
-        return self._raw.finish()
+    return compressing(b"zstd", lambda: zstd_compressor(level))
 
 
 def brotli_compress(quality: int = 11) -> ClientMiddleware:
@@ -1744,9 +1737,12 @@ def brotli_compress(quality: int = 11) -> ClientMiddleware:
     `gzip_compress`'s sibling over brotli ([Google's own bindings](https://github.com/google/brotli),
     a bundled dependency since the stdlib has no brotli): everything there holds here,
     and only the coding differs. `quality` is brotli's compression quality (0-11),
-    defaulting to the library's own default (11, the maximum).
+    defaulting to the bindings' own default of 11, the maximum, because a client
+    compressing an upload it holds whole is the case that ratio is worth paying for.
+    The server-side `compress` table defaults lower, since it encodes per response;
+    see `without_asgi.compression.brotli_compressor`, the shared codec behind both.
     """
-    return compressing(b"br", lambda: _BrotliCompressor(brotli.Compressor(quality=quality)))
+    return compressing(b"br", lambda: brotli_compressor(quality))
 
 
 class Decompressor(Protocol):
@@ -1767,7 +1763,7 @@ class Decompressor(Protocol):
 
 
 def _gzip_decompressor() -> Decompressor:
-    return zlib.decompressobj(wbits=_GZIP_CONTAINER)
+    return zlib.decompressobj(wbits=GZIP_CONTAINER)
 
 
 class _RawBrotliDecompressor(Protocol):
@@ -1802,12 +1798,16 @@ def _brotli_decompressor() -> Decompressor:
 
 
 # The codings decoded out of the box: gzip and zstd from the stdlib, brotli from the
-# bundled bindings. `decompress`'s default table.
-DEFAULT_DECOMPRESSORS: Mapping[bytes, Callable[[], Decompressor]] = {
-    b"br": _brotli_decompressor,
-    b"gzip": _gzip_decompressor,
-    b"zstd": zstd.ZstdDecompressor,
-}
+# bundled bindings. `decompress`'s default table, and the mirror of the server-side
+# `DEFAULT_COMPRESSORS`, a proxy for the same two reasons: nothing can mutate the table
+# every other caller starts from, and `|` extends it into a fresh `dict`.
+DEFAULT_DECOMPRESSORS: MappingProxyType[bytes, Callable[[], Decompressor]] = MappingProxyType(
+    {
+        b"br": _brotli_decompressor,
+        b"gzip": _gzip_decompressor,
+        b"zstd": zstd.ZstdDecompressor,
+    }
+)
 
 _CONTENT_CODING_HEADERS = frozenset({b"content-encoding", b"content-length"})
 
@@ -1859,7 +1859,7 @@ def decompress(
     the bundled bindings). The offer is *derived from its keys*, so what is
     advertised and what is decoded cannot disagree; register a coding this package
     does not ship by extending the table
-    (`decompress({**DEFAULT_DECOMPRESSORS, b"lzma": make_lzma})`) with any factory
+    (`decompress(DEFAULT_DECOMPRESSORS | {b"lzma": make_lzma})`) with any factory
     whose product satisfies `Decompressor`. The mapping is snapshotted, keys
     lowercased, when the middleware is built.
 

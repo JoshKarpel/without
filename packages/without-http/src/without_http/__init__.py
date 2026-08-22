@@ -1,4 +1,5 @@
 from without_http.client import DEFAULT_DECOMPRESSORS
+from without_http.client import GZIP_CONTAINER
 from without_http.client import USER_AGENT
 from without_http.client import Client
 from without_http.client import ClientMiddleware
@@ -13,10 +14,12 @@ from without_http.client import Resolve
 from without_http.client import ResponseBody
 from without_http.client import ResponseHead
 from without_http.client import ResponseTrailers
+from without_http.client import StreamingCompressor
 from without_http.client import add_headers
 from without_http.client import basic_auth
 from without_http.client import bearer_auth
 from without_http.client import brotli_compress
+from without_http.client import brotli_compressor
 from without_http.client import compressing
 from without_http.client import cookies
 from without_http.client import deadline
@@ -24,12 +27,14 @@ from without_http.client import decompress
 from without_http.client import default_headers
 from without_http.client import follow_redirects
 from without_http.client import gzip_compress
+from without_http.client import gzip_compressor
 from without_http.client import request
 from without_http.client import stack
 from without_http.client import tcp_connect
 from without_http.client import user_agent
 from without_http.client import wrap
 from without_http.client import zstd_compress
+from without_http.client import zstd_compressor
 from without_http.h2_wire import early_hint_headers
 from without_http.h2_wire import request_headers
 from without_http.h2_wire import response_headers
@@ -64,6 +69,7 @@ from without_http.ws_wire import ws_events_from_outbound
 __all__ = [
     "ALPN_PROTOCOLS",
     "DEFAULT_DECOMPRESSORS",
+    "GZIP_CONTAINER",
     "USER_AGENT",
     "Client",
     "ClientMiddleware",
@@ -85,12 +91,14 @@ __all__ = [
     "ResponseTrailers",
     "Server",
     "SocketOptions",
+    "StreamingCompressor",
     "Timeout",
     "WriteTimeout",
     "add_headers",
     "basic_auth",
     "bearer_auth",
     "brotli_compress",
+    "brotli_compressor",
     "compressing",
     "cookies",
     "deadline",
@@ -101,6 +109,7 @@ __all__ = [
     "extensions_with_tls",
     "follow_redirects",
     "gzip_compress",
+    "gzip_compressor",
     "h11_events_from_outbound",
     "inbound_from_event",
     "is_websocket_upgrade",
@@ -124,4 +133,5 @@ __all__ = [
     "wrap",
     "ws_events_from_outbound",
     "zstd_compress",
+    "zstd_compressor",
 ]

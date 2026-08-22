@@ -34,6 +34,7 @@ from without_asgi import WebsocketText
 from without_asgi import encode_response
 from without_asgi import headers
 from without_asgi import make_asgi_app
+from without_asgi.compression import compress
 from without_asgi.routing import HttpMiddleware
 from without_asgi.routing import stack
 from without_asgi.routing import wrap
@@ -321,8 +322,14 @@ todos_router: Router[TodoList] = Router(
     ),
     fallback=fallback,
     # `catching` is innermost (last in the stack), so the exception-mapped response
-    # still flows out through `powered_by` and gets stamped like any other.
-    middleware=stack(powered_by, catching(_recover)),
+    # still flows out through `powered_by` and gets stamped like any other, and
+    # `compress` is outermost, so it encodes every response the stack can produce
+    # rather than only the ones a handler returned normally. Both are plain
+    # `without-asgi` middleware attached to a `without-web` router, and `compress`
+    # covers the two body shapes at once: `GET /todos` arrives whole and comes back
+    # with an exact `content-length` for its encoded body, while `POST /todos/import`
+    # is still streaming when it crosses the size gate and is encoded chunk by chunk.
+    middleware=stack(compress(), powered_by, catching(_recover)),
 )
 
 

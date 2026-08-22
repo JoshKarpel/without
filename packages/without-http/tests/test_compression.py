@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import bz2
 import gzip
+import zlib
 from collections.abc import AsyncGenerator
 from collections.abc import AsyncIterator
+from collections.abc import Callable
+from collections.abc import Sequence
 from compression import zstd
 from datetime import timedelta
 
@@ -15,20 +18,26 @@ from without_asgi import Receive
 from without_asgi import Send
 from without_asgi import parse_http_scope
 from without_http import DEFAULT_DECOMPRESSORS
+from without_http import GZIP_CONTAINER
 from without_http import ClientRequest
 from without_http import ClientResponse
+from without_http import Compressor
 from without_http import ConnectionPool
 from without_http import ResponseBody
 from without_http import ResponseHead
 from without_http import ResponseTrailers
 from without_http import Timeout
 from without_http import brotli_compress
+from without_http import brotli_compressor
 from without_http import compressing
 from without_http import decompress
 from without_http import gzip_compress
+from without_http import gzip_compressor
 from without_http import request
 from without_http import serving
 from without_http import zstd_compress
+from without_http import zstd_compressor
+from without_http.client import _compressed
 from without_http.testing import mock_client
 
 
@@ -166,10 +175,73 @@ async def test_compressing_composes_a_coding_the_package_does_not_ship() -> None
             assert await body.read() == b"encoding=bzip2 length=absent accept=absent type=absent body=brought our own"
 
 
+# A decoder fed one encoded piece at a time, which is what makes "left the codec as it
+# was produced" checkable: a codec holding its output leaves these returning nothing
+# until the upload ends.
+INCREMENTAL_DECODERS: dict[bytes, Callable[[], Callable[[bytes], bytes]]] = {
+    b"gzip": lambda: zlib.decompressobj(GZIP_CONTAINER).decompress,
+    b"zstd": lambda: zstd.ZstdDecompressor().decompress,
+    b"br": lambda: brotli.Decompressor().process,
+}
+STREAMING_FACTORIES: dict[bytes, Callable[[], Compressor]] = {
+    b"gzip": gzip_compressor,
+    b"zstd": zstd_compressor,
+    b"br": brotli_compressor,
+}
+
+
+async def _encoded_pieces(chunks: Sequence[bytes], compressor: Compressor) -> list[bytes]:
+    async def body() -> AsyncIterator[bytes]:
+        for chunk in chunks:
+            yield chunk
+
+    return [piece async for piece in _compressed(body(), compressor)]
+
+
+@pytest.mark.parametrize("coding", [b"gzip", b"zstd", b"br"])
+async def test_compressing_lets_each_chunk_out_of_the_codec_as_it_arrives(coding: bytes) -> None:
+    """
+    What "nothing buffers" has to mean. Left to decide for itself a codec returns
+    almost nothing per `compress` call and holds the rest until the stream ends, so a
+    streamed upload would sit whole inside it while the code around it looked like it
+    streamed. Decoding piece by piece is what tells the two apart.
+    """
+    chunks = [b"first part, ", b"second part, ", b"third part"]
+    pieces = await _encoded_pieces(chunks, STREAMING_FACTORIES[coding]())
+    decode = INCREMENTAL_DECODERS[coding]()
+    assert [decode(piece) for piece in pieces] == chunks
+
+
+@pytest.mark.parametrize("coding", [b"gzip", b"zstd", b"br"])
+async def test_compressing_encodes_a_whole_body_to_the_bytes_it_always_did(coding: bytes) -> None:
+    """
+    Why the chunk of lookahead is worth its keep: a body that arrives whole is one
+    chunk, known to be the last, so it rides out on the flush that ends the stream and
+    never pays for a mid-stream block it had no use for.
+    """
+    payload = b"squeeze me " * 50
+    pieces = await _encoded_pieces([payload], STREAMING_FACTORIES[coding]())
+    unflushed = STREAMING_FACTORIES[coding]()
+    assert b"".join(pieces) == unflushed.compress(payload) + unflushed.flush()
+
+
+async def test_compressing_holds_a_stream_for_a_codec_that_cannot_flush() -> None:
+    """
+    `bz2.BZ2Compressor` is a plain `Compressor`, so it has no way to release a chunk
+    before the end and the body accumulates inside it. That is the whole price: unlike
+    a negotiated response there is no unencoded answer to fall back on for a caller who
+    named this coding, so the upload still arrives, in one piece at the end.
+    """
+    chunks = [b"first part, ", b"second part, ", b"third part"]
+    pieces = await _encoded_pieces(chunks, bz2.BZ2Compressor())
+    assert len(pieces) == 1
+    assert bz2.decompress(pieces[0]) == b"".join(chunks)
+
+
 async def test_decompress_decodes_a_coding_from_a_caller_extended_table() -> None:
     payload = b"weird stuff " * 40
     async with serving(encoded_app(b"bzip2", (bz2.compress(payload),))) as server, ConnectionPool() as pool:
-        client = decompress({**DEFAULT_DECOMPRESSORS, b"bzip2": bz2.BZ2Decompressor})(pool)
+        client = decompress(DEFAULT_DECOMPRESSORS | {b"bzip2": bz2.BZ2Decompressor})(pool)
         async with request(client, "GET", f"http://{server.host}:{server.port}/zipped") as (head, body):
             assert not any(name == b"content-encoding" for name, _ in head.headers)
             assert await body.read() == payload
@@ -177,7 +249,7 @@ async def test_decompress_decodes_a_coding_from_a_caller_extended_table() -> Non
 
 async def test_decompress_derives_its_offer_from_the_table_with_keys_lowercased() -> None:
     async with serving(report_app) as server, ConnectionPool() as pool:
-        client = decompress({**DEFAULT_DECOMPRESSORS, b"BZIP2": bz2.BZ2Decompressor})(pool)
+        client = decompress(DEFAULT_DECOMPRESSORS | {b"BZIP2": bz2.BZ2Decompressor})(pool)
         async with request(client, "GET", f"http://{server.host}:{server.port}/items") as (_head, body):
             assert await body.read() == b"encoding=absent length=absent accept=br, bzip2, gzip, zstd type=absent body="
 

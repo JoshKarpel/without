@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 from collections import deque
 from collections.abc import AsyncIterator
+from compression import zstd
 from contextlib import asynccontextmanager
 from contextlib import suppress
 from dataclasses import dataclass
@@ -23,8 +25,11 @@ from without_asgi import Outbound
 from without_asgi import file_response
 from without_asgi import headers
 from without_asgi import make_asgi_app
+from without_asgi.compression import DEFAULT_COMPRESSORS
+from without_http import DEFAULT_DECOMPRESSORS
 from without_http import Client
 from without_http import add_headers
+from without_http import decompress
 from without_http import request
 from without_http import serving
 from without_http.testing import loopback_client
@@ -168,6 +173,136 @@ async def test_client_middleware_supplies_the_admin_authorization_header() -> No
 
     assert unauthorized == 401
     assert authorized_status == 200
+
+
+def _many_todos(count: int = 40) -> TodoList:
+    """A list whose rendered JSON clears `compress`'s default size gate."""
+    return TodoList(
+        {index: Todo(id=index, title=f"todo number {index}", done=index % 2 == 0) for index in range(count)}
+    )
+
+
+def test_the_default_coding_tables_cover_the_same_codings() -> None:
+    """
+    The server's `DEFAULT_COMPRESSORS` and the client's `DEFAULT_DECOMPRESSORS` are
+    deliberately two tables and not one: they share no factory, the encode side
+    carries parameters (a level, a quality) the decode side has none of, and the two
+    directions are free to diverge where that is right (`deflate` is worth decoding
+    from peers that send it and not worth ever emitting).
+
+    What must not diverge *by accident* is the coding set, since a coding added to
+    one side alone means this stack no longer round-trips against itself. Nothing
+    structural enforces that, so it is asserted here, from the only package that
+    imports both.
+    """
+    assert set(DEFAULT_COMPRESSORS) == set(DEFAULT_DECOMPRESSORS)
+
+
+async def test_the_server_compresses_a_body_the_client_negotiated_for() -> None:
+    """
+    The two halves of the content-coding story meeting over the wire: the server's
+    `compress` middleware picks a coding out of the request's `accept-encoding`, and
+    the client's `decompress` middleware is what put that header there and what
+    decodes the answer. Neither knows about the other.
+    """
+    async with loopback_client(todos_app(_many_todos())) as plain:
+        decoding = decompress()(plain)
+        async with request(decoding, "GET", "http://testserver/todos") as (head, body):
+            payload = json.loads(await body.read())
+            decoded = head
+
+    assert decoded.status == 200
+    assert len(payload["todos"]) == 40
+    # The decoded head no longer claims an encoding, since the bytes it described are
+    # gone; `vary` survives because it describes the resource, not the encoding.
+    assert headers.first(decoded.headers, b"content-encoding") is None
+    assert headers.get_all(decoded.headers, b"vary") == (b"accept-encoding",)
+
+
+async def test_the_compressed_body_really_is_compressed_on_the_wire() -> None:
+    """The undecorated client sees what the server actually sent, which is the claim above."""
+    async with loopback_client(todos_app(_many_todos())) as client:
+        async with request(client, "GET", "http://testserver/todos", headers=((b"accept-encoding", b"gzip"),)) as (
+            head,
+            body,
+        ):
+            wire = await body.read()
+
+    assert headers.first(head.headers, b"content-encoding") == b"gzip"
+    unencoded = gzip.decompress(wire)
+    assert len(wire) < len(unencoded)
+    assert len(json.loads(unencoded)["todos"]) == 40
+    # A body held whole is re-described exactly rather than falling back to chunked.
+    assert headers.first(head.headers, b"content-length") == str(len(wire)).encode()
+
+
+async def test_the_server_prefers_zstd_when_the_client_takes_either() -> None:
+    async with loopback_client(todos_app(_many_todos())) as client:
+        async with request(
+            client, "GET", "http://testserver/todos", headers=((b"accept-encoding", b"gzip, zstd"),)
+        ) as (head, body):
+            wire = await body.read()
+
+    assert headers.first(head.headers, b"content-encoding") == b"zstd"
+    assert len(json.loads(zstd.decompress(wire))["todos"]) == 40
+
+
+async def test_an_unnegotiated_response_goes_out_unencoded() -> None:
+    async with loopback_client(todos_app(_many_todos())) as client:
+        async with request(client, "GET", "http://testserver/todos") as (head, body):
+            wire = await body.read()
+
+    assert headers.first(head.headers, b"content-encoding") is None
+    assert len(json.loads(wire)["todos"]) == 40
+    # Still declared, so a shared cache keys on the header that would have changed it.
+    assert headers.get_all(head.headers, b"vary") == (b"accept-encoding",)
+
+
+async def test_a_streaming_response_is_encoded_as_it_streams() -> None:
+    """
+    `POST /todos/import` commits its `200` before the upload finishes, so the head
+    goes out while the body is still being produced: the encoded path that cannot
+    state a `content-length` and is framed by the transport instead.
+    """
+    upload = b"".join(json.dumps({"title": f"imported {index}"}).encode() + b"\n" for index in range(60))
+
+    async with loopback_client(todos_app(_todos())) as plain:
+        # The undecorated client first, so the encoding is a fact about the wire and
+        # not something the decoder could have papered over.
+        async with request(
+            plain, "POST", "http://testserver/todos/import", body=upload, headers=((b"accept-encoding", b"gzip"),)
+        ) as (encoded_head, encoded_body):
+            wire = await encoded_body.read()
+        decoding = decompress()(plain)
+        async with request(decoding, "POST", "http://testserver/todos/import", body=upload) as (head, body):
+            lines = [line for line in (await body.read()).split(b"\n") if line]
+
+    assert headers.first(encoded_head.headers, b"content-encoding") == b"gzip"
+    # No `content-length` to state: the head committed before the body existed, so the
+    # encoded stream is framed by the transport.
+    assert headers.first(encoded_head.headers, b"content-length") is None
+    assert len(wire) < len(gzip.decompress(wire))
+
+    assert head.status == 200
+    assert len(lines) == 60
+    assert all(json.loads(line)["ok"] is True for line in lines)
+
+
+async def test_httpx_decodes_what_the_server_encoded() -> None:
+    """
+    The interop claim: an ordinary third-party client, sending its own default
+    `accept-encoding` over a real socket, gets a body it can read. httpx offers
+    brotli when its bindings are importable, which is the server's first preference,
+    so this exercises the whole default table rather than its fallback.
+    """
+    async with serving(todos_app(_many_todos())) as server:
+        async with httpx.AsyncClient(base_url=f"http://{server.host}:{server.port}") as client:
+            response = await client.get("/todos")
+
+    assert response.status_code == 200
+    assert response.headers["content-encoding"] == "br"
+    assert response.headers["vary"] == "accept-encoding"
+    assert len(response.json()["todos"]) == 40
 
 
 async def test_websocket_session_route_over_without_http() -> None:

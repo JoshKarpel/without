@@ -12,7 +12,7 @@
   (`DEFAULT_DECOMPRESSORS`, gzip and zstd from the stdlib and brotli from the bundled bindings), and
   the `accept-encoding` offer is *derived from its keys*, so what is advertised and what can be
   decoded cannot disagree; registering a coding this package does not ship is one entry
-  (`decompress({**DEFAULT_DECOMPRESSORS, b"lzma": make_lzma})`) rather than a fork. The decoded
+  (`decompress(DEFAULT_DECOMPRESSORS | {b"lzma": make_lzma})`) rather than a fork. The decoded
   response is self-consistent: `content-encoding` and `content-length` described the *encoded* body,
   so both leave the head instead of contradicting the bytes the stream now yields, an unknown or
   stacked coding passes through whole, a body that concatenates streams (multi-member gzip,
@@ -25,7 +25,122 @@
   is the middleware over any coding and a `Compressor` factory, with `gzip_compress`,
   `zstd_compress`, and `brotli_compress` as the three that ship. Bodies compress as they stream, so
   a large upload is never buffered whole, and per-call composition means one client can send
-  compressed to a peer that wants it and plain to one that does not.
+  compressed to a peer that wants it and plain to one that does not. Streaming that way is a demand
+  on the codec rather than only on the loop, so the three shipped codings are built from
+  `StreamingCompressor` factories (`gzip_compressor`, `zstd_compressor`, `brotli_compressor`); a
+  factory producing a plain `Compressor` encodes correctly but holds the body to the end, since a
+  coding the caller named has no unencoded answer to fall back on the way a negotiated response does.
+- **`without-asgi`**: negotiated response compression, closing the exchange the two above open.
+  `without_asgi.compression.compress()` is an `HttpMiddleware` that reads a request's
+  `accept-encoding` and encodes the response body with the coding it picks. It is middleware rather
+  than server behavior because the decision needs the response's media type and the request's
+  headers rather than anything about the socket, which is also why no ASGI server implements one; it
+  therefore applies under any transport and any router, and its coverage is decided by where it is
+  mounted. The coding table is the argument (`DEFAULT_COMPRESSORS`: brotli, zstd, and gzip) and what
+  is negotiated is derived from its keys, with the *order* of those keys serving as the server's own
+  preference between codings a client weighted equally, best ratio first. The `Compressor` protocols
+  and the `gzip_compressor` / `zstd_compressor` / `brotli_compressor` factories now live here rather
+  than in `without-http`, which re-exports them, so one codec serves a coding in both directions.
+  `brotli_compressor` defaults to
+  `DYNAMIC_BROTLI_QUALITY` (5) rather than the bindings' 11, since a table entry encodes a response
+  per request; the request-side `brotli_compress` keeps 11, where a client compressing one upload
+  makes the ratio worth its cost. This adds `brotli` to `without-asgi`'s dependencies, which
+  `PHILOSOPHY.md` now states the test for: a dependency that makes no choice for anyone (no stdlib
+  brotli, one implementation) is taken so it just works, where one with live alternatives (a JSON
+  encoder) stays an argument.
+- **`without-asgi`**: `negotiate_coding(accept_encoding, available)`, the negotiation as a pure
+  function, implementing [RFC 9110 §12.5.3](https://www.rfc-editor.org/rfc/rfc9110#section-12.5.3)
+  whole. Weights are the part the ecosystem skips, and skipping them inverts requests: matching on
+  substrings reads `gzip;q=0`, which *refuses* gzip, as asking for it. Here `q=0` excludes, the
+  highest non-zero weight wins, `*` matches every coding not named, and identity outranking the
+  alternatives means no coding. Two answers are choices rather than requirements, both documented on
+  the function: a request with no `accept-encoding` is answered unencoded although rule 1 would
+  permit any coding, and one that refuses identity while accepting nothing available still gets
+  identity rather than a `406`.
+- **`without-asgi`**: `PADDED_COMPRESSORS`, a coding table that mitigates BREACH, for the routes whose
+  responses mix a secret with attacker-influenced text. It implements
+  [Heal The Breach](https://ieeexplore.ieee.org/document/9754554) (Palacios et al., IEEE Access 2022),
+  the mitigation Django adopted in 4.2: each response carries a random-length run of up to
+  `MAX_RANDOM_BYTES` (100) in a part of the container the decoder must ignore, so the response length
+  stops being a function of the content alone and a length oracle has to average the noise away
+  first. It is a table rather than a flag because the padding is per *container*: gzip has the
+  optional filename field after its fixed header (RFC 1952 §2.3.1) and zstd has skippable frames
+  (RFC 8878 §3.1.2), placed after the data rather than before it since a decoder may stop at the end
+  of the frame it just read, while brotli's bindings expose no metadata block and reject concatenation, so
+  `br` is absent by construction. A table that silently left one coding unpadded would promise a
+  guarantee it does not keep, and it would be the coding browsers reach for first. Padding raises the
+  sample count an attack needs rather than removing the leak, so mount it where secrets and
+  reflections meet and keep `DEFAULT_COMPRESSORS`, with its brotli, everywhere else. Neither table
+  covers streaming: a committed stream ends a block per chunk, so each chunk the app produces carries
+  its own observable length, a cleaner oracle than the buffered case, and the single random run a
+  padded container holds sits ahead of all of them. That is what `is_compressible` excludes
+  `text/event-stream` for, and the property is the streaming rather than the media type, so a
+  streamed `text/html` page mixing a secret with reflected input belongs off the middleware or behind
+  a `compressible` that rejects its type.
+- **`without-asgi`**: `Vary: Accept-Encoding` on every response `compress` could have encoded,
+  whether or not this client got an encoded body, since candidacy is a property of the resource and a
+  shared cache has to key on the header that decides the answer, and on the `304` that revalidates
+  one, which [RFC 9110 §15.4.5](https://www.rfc-editor.org/rfc/rfc9110#section-15.4.5) asks to carry
+  the fields its `200` would have and names `Vary` among them because that is how a shared cache
+  picks the stored variant to update. A strong `etag` is weakened to `W/`
+  when the body is encoded, per [RFC 9110 §8.8.1](https://www.rfc-editor.org/rfc/rfc9110#section-8.8.1):
+  weak comparison still matches the two representations, `Range` correctly stops matching. The `304`
+  inherits that weakening for a client whose `accept-encoding` negotiates a coding, since the stored
+  entry it updates is then the encoded variant and
+  [RFC 9111 §4.3.4](https://www.rfc-editor.org/rfc/rfc9111#section-4.3.4) has the cache copy the
+  `304`'s fields onto it; a strong tag landing there would let a later `If-Range` match under strong
+  comparison and stitch identity range bytes into an encoded body. Which stored `200` a `304` updates
+  is usually unknowable, since §15.4.5's field list omits `content-type` and most `304`s carry none,
+  so the candidate is assumed; a `304` that names a type no coding applies to, or a `content-encoding`
+  the app applied itself, is left exactly as it arrived, because weakening a tag for a re-encoding
+  that never happened breaks every later range request into a full response. The size a `304` may
+  state is not read as the same evidence, since a body streamed behind a head that declared no length
+  is encoded however short it turns out to be. Where the tag is weakened the `304`'s `content-length`
+  goes with it, since [§8.6](https://www.rfc-editor.org/rfc/rfc9110#section-8.6) permits one only
+  where it equals what a `200` to the same request would have carried, which for that client is the
+  encoded variant. A `206` is never
+  encoded: its `content-range` names offsets into the *identity* representation and nothing here can
+  restate them for an encoded one, so a client reassembling ranges would stitch them at the wrong
+  offsets.
+- **`without-asgi`**: `compress`'s one size floor. `minimum_size` (500 bytes) is the whole of it, and
+  what decides how it is answered is what the head said rather than how the body arrives: a declared
+  `content-length` answers it before a body event is read, a body that ends in the events read so far
+  answers it exactly from its own bytes (and is re-described with an exact `content-length` for its
+  encoded form instead of falling back to chunked, unless its head announced trailers over HTTP/1.x,
+  which carries them only in the chunked coding; HTTP/2 and HTTP/3 send trailers as a second HEADERS
+  frame that sits beside a length, so the exact length stands there), and a body still being produced behind a head
+  that declared no length is the one case that cannot be answered without holding bytes the app has
+  already made. An empty body is left alone however low the floor, since encoding nothing produces
+  pure framing and the head would then state *that* length, which is how a `HEAD` response comes to
+  answer with the size of an empty encoded stream in place of the size of the body a `GET` would
+  carry. `weigh_undeclared_bodies` decides that case, and it is a policy rather than a second
+  floor because the only two honest answers are to hold or not to: holding keeps produced bytes until
+  `minimum_size` of them accumulate, so a feed emitting a line a second delivers nothing for as many
+  seconds as that takes, and how long that is belongs to the app rather than to the middleware. The
+  default does not hold, spending framing bytes bounded by the floor on a body too small to earn
+  them, which is the trade a response the app chose to stream usually wants; an app that wants both
+  declares a `content-length`, which answers the floor for nothing, as `file_response` does. An
+  offloaded body is the one shape that cannot follow a commitment, since
+  `http.response.zerocopysend` and `http.response.pathsend` both send bytes the middleware never
+  sees and the former carries `more_body` so it can follow body events already sent: arriving before
+  any body event an offload passes through unencoded, and arriving after the head has declared
+  `content-encoding` it raises `OffloadedBodyAfterEncoding` rather than write a body no decoder can
+  read. An app that means to stream a prefix and then offload the rest sends the whole response
+  through the offload.
+- **`without-asgi`**: `StreamingCompressor`, the `Compressor` that can be flushed without being
+  ended, and what `compress` needs to encode a response that is still streaming. What a `compress`
+  call returns is the codec's choice rather than the caller's: fed the small pieces a streaming body
+  arrives in, zlib emits its header and then nothing until the stream ends and zstd emits nothing at
+  all, so encoding a stream without ending a block per chunk holds the whole body inside the codec
+  and delivers it as one burst at the end. That round-trips perfectly, which is why it reads as a
+  working feature while having removed the incremental delivery the response was streamed for. The
+  three shipped codings satisfy the protocol (zlib and zstd through a flush mode, brotli through its
+  own `flush`); a coding whose factory produces a plain `Compressor` still encodes responses that
+  arrive whole, and its streaming ones go out unencoded, which costs bytes rather than delivery.
+  `gzip_compressor` and `zstd_compressor` are public alongside `brotli_compressor` for the same
+  reason: `zlib.compressobj` and `zstd.ZstdCompressor` spell a block flush as a mode argument rather
+  than a method, so a table built from them directly satisfies `Compressor` alone and would take the
+  buffered path for every stream.
 - **`without-http`**: `default_headers(*headers)`, the counterpart to `add_headers` for a field
   RFC 9110 allows only once. `add_headers` copies its headers onto every request whatever it already
   carries, which is right for a field that may repeat and wrong for `authorization` or `user-agent`,
