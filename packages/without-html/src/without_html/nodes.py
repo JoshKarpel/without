@@ -21,8 +21,16 @@ type AttributeValue = str | int | bool | None
 # Attribute names as written, mapped to their values. Names pass through verbatim.
 type Attributes = Mapping[str, AttributeValue]
 
-# One class string, or several to be joined with spaces.
-type ClassNames = str | Iterable[str] | None
+# One class string, or several to be joined with spaces. An entry may itself hold several
+# names, so `("card", size_classes)` needs no thought about which form a part is in, and an
+# entry may be `None` or empty, so `("card", "card-active" if active else None)` needs no
+# filtering around it.
+#
+# Not narrowed to a tuple the way `Node` is: what makes an iterable in a child position a
+# problem is that the element goes on holding it, and this one never survives the call.
+# It is joined into a string before the element exists, so a caller's list cannot be
+# mutated afterwards and a generator cannot be left half-consumed.
+type ClassNames = str | Iterable[str | None] | None
 
 # One rendered attribute: an escaped value, or `None` for a bare attribute.
 type Attribute = tuple[str, str | None]
@@ -30,11 +38,22 @@ type Attribute = tuple[str, str | None]
 # Either kind of element, for code that walks a tree without caring which.
 type AnyElement = Element | VoidElement
 
-# Anything that can appear in a child position. A `str` renders escaped; a `Markup` (or
-# any `SupportsHtml`) renders verbatim; `None` renders nothing, so
-# `paragraph if visible else None` needs no branch around it; and any other iterable
-# flattens, so a generator expression over rows is a child like any other.
-type Node = Element | VoidElement | str | SupportsHtml | Iterable[Node] | None
+# One thing in a child position. A `str` renders escaped; a `Markup` (or any
+# `SupportsHtml`) renders verbatim; and `None` renders nothing, so
+# `paragraph if visible else None` needs no branch around it.
+type Child = Element | VoidElement | str | SupportsHtml | None
+
+# What a child slot accepts: one child, or an iterable of them, so a generator expression
+# over rows is a child like any other.
+#
+# Deliberately one level and not recursive. A recursive type would buy only the ability to
+# nest iterables without unpacking them, and would charge for it three times over: an
+# element holding a list is not hashable, so nothing above can key a cache on a subtree; a
+# nested generator survives construction and is consumed by the *renderer*, so the element
+# renders once and then renders empty; and an element holding a caller's list is not a
+# value, since the caller can still mutate it. Flattening a level here is exactly the `*`
+# the caller can write, so it is written where it is visible: `children=[header, *rows]`.
+type Node = Child | Iterable[Child]
 
 # Elements with no children and no closing tag. Read at build time to decide which
 # constructors produce a `VoidElement`, and to reject the generic `element` factory for a
@@ -59,9 +78,12 @@ CHECKED_ATTRIBUTE_NAMES: set[str] = set()
 FORBIDDEN_IN_NAME = frozenset(" \t\n\r\f\v\"'>/=")
 
 
-def checked_name(name: str) -> str:
+def admit_name(name: str) -> None:
     """
-    The attribute name, having proven it cannot break out of the attribute list.
+    Prove `name` cannot break out of the attribute list, and admit it to the cache.
+
+    The slow path, reached once per distinct name per process: the caller holds the
+    membership test, so a name already proven never gets here at all.
 
     A name is normally a literal the application author wrote, so a bad one is a bug
     in code they own and fails loudly here. It is checked at all because a name
@@ -70,17 +92,14 @@ def checked_name(name: str) -> str:
 
     `class` is rejected outright rather than merged with `cls`, so classes have one
     source and not two kept in sync. Costing nothing extra falls out of the cache: it
-    is never admitted to it, so every occurrence takes the slow path and raises, while
-    every other name is a single set lookup.
+    is never admitted, so every occurrence takes this path and raises, while every
+    other name is a single set lookup and never returns here.
     """
-    if name in CHECKED_ATTRIBUTE_NAMES:
-        return name
     if name == "class":
         raise ValueError("set classes with `cls`, not as an attribute")
     if not name or not FORBIDDEN_IN_NAME.isdisjoint(name):
         raise ValueError(f"invalid attribute name: {name!r}")
     CHECKED_ATTRIBUTE_NAMES.add(name)
-    return name
 
 
 def attributes_of(cls: ClassNames, attrs: Attributes | None) -> tuple[Attribute, ...]:
@@ -89,57 +108,74 @@ def attributes_of(cls: ClassNames, attrs: Attributes | None) -> tuple[Attribute,
 
     Escaping happens here rather than at render so that an element is a value that has
     already been proven safe to emit, and so one built once and rendered many times
-    pays for it once.
+    pays for it once. That is also why there is no way to hand this function attributes
+    that are already rendered: the conversion it does is the escaping, so requiring the
+    parsed form from a caller would be requiring the caller to escape.
+
+    Empty and `None` class entries are dropped rather than joined, which is what lets a
+    conditional class be written inline. `filter` does it in one C-level pass, where a
+    comprehension would be a Python-level loop on the hottest path in the package.
+
+    The name check is the cache lookup, with `admit_name` reached only by a name not yet
+    proven, so a repeated name costs one set membership rather than that plus a call.
     """
     if cls is None and not attrs:
         return ()
     rendered: list[Attribute] = []
     if cls is not None:
-        names = cls if isinstance(cls, str) else " ".join(cls)
+        names = cls if isinstance(cls, str) else " ".join(filter(None, cls))
         if names:
             rendered.append(("class", escape_attribute(names)))
     if attrs:
         for name, value in attrs.items():
             if value is None or value is False:
                 continue
+            if name not in CHECKED_ATTRIBUTE_NAMES:
+                admit_name(name)
             if value is True:
-                rendered.append((checked_name(name), None))
+                rendered.append((name, None))
             else:
-                rendered.append((checked_name(name), escape_attribute(value if type(value) is str else str(value))))
+                rendered.append((name, escape_attribute(value if type(value) is str else str(value))))
     return tuple(rendered)
 
 
-def children_of(children: Node) -> tuple[Node, ...]:
+def children_of(children: Node) -> tuple[Child, ...]:
     """
-    Normalize a child argument into a tuple of nodes.
+    Normalize a child argument into a tuple of children.
 
     A caller's list is copied rather than held, so an element cannot change after it is
     built: what arrives as a place becomes a value at the edge. A generator is consumed
-    here for the same reason, which also means an element can be rendered more than once.
+    here for the same reason, which is what makes an element renderable more than once.
+
+    One level, matching `Node`: what this returns holds no iterables, so every element in
+    the tree is a hashable value and the renderer never has to walk one.
 
     Dispatch is a ladder of exact-type identity checks before any `isinstance`, ordered by
-    how often each shape actually appears. The `isinstance` checks behind them still decide
-    every case the ladder does not, subclasses included; they are just no longer on the
-    common path, where the `Iterable` ABC check in particular costs several times a pointer
-    comparison. Their type tuples are bound once rather than rebuilt on every call.
+    how often each shape actually appears. `type()` rather than `__class__` because it is
+    both faster (CPython specializes the one-argument call) and honest: an object can set
+    `__class__` to whatever it likes, and here that would decide whether text is escaped.
+    The `isinstance` checks behind the ladder still decide every case it does not,
+    subclasses included; they are just no longer on the common path, where the `Iterable`
+    ABC check in particular costs several times a pointer comparison. Their type tuples are
+    bound once rather than rebuilt on every call.
     """
-    kind = children.__class__
+    kind = type(children)
     if kind is str or kind is Markup:
-        return (children,)
+        return (children,)  # type: ignore[return-value]
     if kind is Element or kind is VoidElement:
-        return (children,)
+        return (children,)  # type: ignore[return-value]
     if children is None:
         return ()
     if isinstance(children, FLATTENED_TYPES):
         return tuple(children)
-    if isinstance(children, SINGLE_NODE_TYPES):
+    if isinstance(children, SINGLE_CHILD_TYPES):
         return (children,)
     if isinstance(children, Iterable):
         return tuple(children)
     return (children,)
 
 
-def raw_text_of(tag: str, children: Node) -> tuple[Node, ...]:
+def raw_text_of(tag: str, children: Markup | None) -> tuple[Child, ...]:
     """
     Normalize the content of a raw-text element, which must already be `Markup`.
 
@@ -200,12 +236,12 @@ class Element:
 
     tag: str
     attributes: tuple[Attribute, ...] = ()
-    children: tuple[Node, ...] = ()
+    children: tuple[Child, ...] = ()
 
 
 # The `isinstance` arguments `children_of` uses, bound once instead of built into a fresh
 # tuple on every call. They live here because they name the element classes above.
-SINGLE_NODE_TYPES = (str, Element, VoidElement)
+SINGLE_CHILD_TYPES = (str, Element, VoidElement)
 FLATTENED_TYPES = (list, tuple, GeneratorType)
 
 

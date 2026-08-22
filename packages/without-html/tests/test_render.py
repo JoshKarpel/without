@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import without_html
 from markupsafe import Markup
 from without_html import DOCTYPE
 from without_html import br
@@ -45,10 +46,19 @@ def test_a_generator_of_children_is_flattened() -> None:
     assert render(ul(children=(li(children=str(n)) for n in (7, 8)))) == "<ul><li>7</li><li>8</li></ul>"
 
 
-def test_a_nested_iterable_of_children_is_flattened_in_order() -> None:
-    assert render(div(children=[span(children="a"), [span(children="b"), span(children="c")]])) == (
+def test_an_unpacked_iterable_of_children_renders_in_order() -> None:
+    rest = [span(children="b"), span(children="c")]
+    assert render(div(children=[span(children="a"), *rest])) == (
         "<div><span>a</span><span>b</span><span>c</span></div>"
     )
+
+
+def test_a_nested_iterable_is_rejected_with_the_unpacking_it_needs() -> None:
+    # Flattening one level is what `children_of` does; flattening further would mean an
+    # element could hold a list, which is neither hashable nor safe from the caller.
+    nested = div(children=[span(children="a"), [span(children="b")]])  # type: ignore[list-item]
+    with pytest.raises(TypeError, match=r"unpack it with `\*`"):
+        render(nested)
 
 
 def test_an_element_built_from_a_generator_renders_the_same_twice() -> None:
@@ -123,3 +133,21 @@ def test_a_markup_subclass_still_renders_verbatim() -> None:
 def test_a_value_that_cannot_render_is_rejected() -> None:
     with pytest.raises(TypeError, match="not renderable"):
         render(div(children=[object()]))  # type: ignore[list-item]
+
+
+GENERATED = {
+    name: constructor
+    for name in without_html.__all__
+    if getattr(constructor := getattr(without_html, name), "__module__", None) == "without_html.elements"
+}
+
+
+@pytest.mark.parametrize("name", GENERATED, ids=GENERATED)
+def test_every_generated_constructor_builds_its_own_tag(name: str) -> None:
+    # The constructors are generated from one tag list, so what is worth pinning is that
+    # each one carries the tag it is named for: a slip in the generator would otherwise
+    # produce a whole vocabulary of elements that render as something else.
+    tag = name.removesuffix("_")
+    empty = GENERATED[name]()
+    assert empty.tag == tag
+    assert render(empty) in (f"<{tag}>", f"<{tag}></{tag}>")

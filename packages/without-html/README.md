@@ -29,10 +29,15 @@ Response.from_content(200, html_content(render(runs_table(runs))))
 ```
 
 Escaping is a type rather than a setting: text is escaped on the way in, and
-`Safe` (MarkupSafe's `Markup`, so anything Jinja or tdom produced is already one)
-is the only thing that renders verbatim. The element constructors carry HTML's own
-constraints in their signatures, so a void element with children and an unescaped
-`<script>` body are type errors rather than runtime surprises.
+`Markup` (MarkupSafe's own, kept under its own name, so anything Jinja or tdom
+produced is already one) is the only thing that renders verbatim. The element
+constructors carry HTML's own constraints in their signatures, so a void element
+with children and an unescaped `<script>` body are type errors rather than runtime
+surprises.
+
+`render` returns the whole string; `render_chunks` walks the same tree and yields
+the same bytes a chunk at a time, so a large page starts reaching a client while
+the rest of it is still being built.
 
 The tree is the interface, not the string: a component can be rendered whole for a
 page or on its own for a fragment, and syntax sugar can be layered on later without

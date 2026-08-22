@@ -27,6 +27,26 @@ def test_an_empty_class_list_renders_no_attribute() -> None:
     assert render(div(cls=[])) == "<div></div>"
 
 
+def test_a_none_class_entry_is_dropped() -> None:
+    # What makes a conditional class writable inline, the same way `None` in a child
+    # position is: no filtering, no branch, no stray separator where the entry was.
+    active = False
+    assert render(div(cls=("card", "card-active" if active else None))) == '<div class="card"></div>'
+
+
+def test_an_empty_class_entry_is_dropped_rather_than_doubling_the_separator() -> None:
+    assert render(div(cls=("card", "", "wide"))) == '<div class="card wide"></div>'
+
+
+def test_a_class_entry_may_itself_hold_several_names() -> None:
+    # So a caller never has to know which form a part arrived in.
+    assert render(div(cls=("card", "p-2 m-2"))) == '<div class="card p-2 m-2"></div>'
+
+
+def test_all_class_entries_being_dropped_renders_no_attribute() -> None:
+    assert render(div(cls=(None, None))) == "<div></div>"
+
+
 def test_the_class_attribute_comes_first() -> None:
     assert render(div(cls="card", attrs={"id": "x"})) == '<div class="card" id="x"></div>'
 

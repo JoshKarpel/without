@@ -6,6 +6,7 @@ from without_html.markup import SupportsHtml
 from without_html.nodes import AnyElement
 from without_html.nodes import Attributes
 from without_html.nodes import AttributeValue
+from without_html.nodes import Child
 from without_html.nodes import ClassNames
 from without_html.nodes import Element
 from without_html.nodes import ElementConstructor
@@ -17,6 +18,7 @@ from without_html.nodes import element
 from without_html.nodes import element_type
 from without_html.nodes import void_element_type
 from without_html.render import render
+from without_html.render import render_chunks
 
 # The element constructors are re-exported here so that `from without_html import div`
 # works; the block is generated, and isort is held off it so that the generator and the
@@ -144,17 +146,18 @@ __all__ = [
     # import cog
     # from tags import emit_names
     # cog.outl(emit_names([
-    #     "DOCTYPE", "AttributeValue", "Attributes", "ClassNames", "Element", "Node",
-    #     "Markup", "SupportsHtml", "AnyElement", "VoidElement", "ElementConstructor",
-    #     "RawTextElementConstructor", "VoidElementConstructor",
+    #     "DOCTYPE", "AttributeValue", "Attributes", "Child", "ClassNames", "Element",
+    #     "Node", "Markup", "SupportsHtml", "AnyElement", "VoidElement",
+    #     "ElementConstructor", "RawTextElementConstructor", "VoidElementConstructor",
     #     "element", "element_type", "void_element_type",
-    #     "escape", "render",
+    #     "escape", "render", "render_chunks",
     # ]))
     # ]]]
     "DOCTYPE",
     "AnyElement",
     "AttributeValue",
     "Attributes",
+    "Child",
     "ClassNames",
     "Element",
     "ElementConstructor",
@@ -245,6 +248,7 @@ __all__ = [
     "progress",
     "q",
     "render",
+    "render_chunks",
     "rp",
     "rt",
     "ruby",

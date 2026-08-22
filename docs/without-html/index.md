@@ -39,7 +39,10 @@ Every constructor takes the same three arguments, all keyword-only.
 p(cls=["lead", "muted"], attrs={"id": "intro", "hx-get": "/more"}, children=["text ", em(children="here")])
 ```
 
-- **`cls`** is one class string or several to be joined. It is separate from `attrs`
+- **`cls`** is one class string or several to be joined. An entry may itself hold several
+  names and an entry may be `None` or empty, both dropped rather than joined, so
+  `cls=("card", "card-active" if active else None)` needs no filtering around it and a
+  caller never has to know which form a part arrived in. It is separate from `attrs`
   because it is the one attribute routinely built up from parts, and it is the *only*
   way to set classes: `attrs={"class": ...}` raises. Two channels into one attribute
   would be two sources to keep in sync, and forbidding the second one means the mistake
@@ -51,9 +54,9 @@ p(cls=["lead", "muted"], attrs={"id": "intro", "hx-get": "/more"}, children=["te
   underscore-to-hyphen convention to remember. A value of `True` renders the attribute
   bare (`disabled`), `False` and `None` drop it entirely, and an `int` renders as
   digits, since the attributes that take numbers are machine-read.
-- **`children`** is any `Node`: another element, a string, `None`, or any iterable of
-  those, nested freely. `None` rendering as nothing is what lets `card if visible else
-  None` sit inline with no branch around it, and iterables flattening is what lets a
+- **`children`** is any `Node`: one `Child` (another element, a string, `None`) or an
+  iterable of them. `None` rendering as nothing is what lets `card if visible else None`
+  sit inline with no branch around it, and an iterable flattening is what lets a
   generator expression over rows be a child like any other.
 
 A number in a *child* position is deliberately not accepted. How a number reads to a
@@ -62,6 +65,25 @@ would be deciding for the layer above.
 
 Children are copied when the element is built, so a generator is consumed once and the
 element stays a value that renders the same every time.
+
+## One level of flattening
+
+An iterable in a child position is flattened once, so unpacking goes at the call site,
+where it is visible:
+
+```python
+div(children=[header, *rows])
+```
+
+An element's children are therefore always flat, which is what makes every element a
+hashable value: the hash of a subtree is the hash of its strings and its children's
+hashes, so a tree is content-addressed and anything above can key on one. It is also why
+rendering never mutates anything, since a generator is consumed when the element is built
+rather than while it is being rendered. A nested iterable raises, and says what to write
+instead.
+
+`cls` is the exception, taking any iterable, because it is joined into a string before the
+element exists: nothing survives the call for anyone to mutate or exhaust.
 
 ## Escaping is a type
 
@@ -153,6 +175,55 @@ For a whole document, `DOCTYPE` is a `Markup` constant to put in front of the ro
 render([DOCTYPE, html(children=[head(children=title(children="runs")), body(children=page)])])
 ```
 
+## Streaming is the same walk
+
+`render_chunks` walks the tree `render` walks and produces the same bytes in the same
+order, handing them back as they are made rather than holding the finished string.
+
+```python
+for chunk in render_chunks(page):
+    ...  # `"".join(render_chunks(page))` is `render(page)`
+```
+
+A chunk is a fixed number of fragments joined rather than a byte budget, so chunks come
+out roughly even in size but not exactly, and a single large `Markup` child goes out whole
+in whatever chunk it lands in. Streaming costs about 10% over `render` for the same tree,
+which buys a first chunk before the tree is finished and a process that never holds the
+whole page.
+
+What it gives up is worth choosing rather than defaulting into: the total length is not
+known until the walk ends, and once the first chunk has been handed on there is no taking
+it back, so a failure partway through a tree can no longer be turned into something else.
+`render` stays the default for that reason.
+
+## Caching is yours, not this layer's
+
+Every element is a hashable value, and the hash of a subtree is the hash of its strings
+and its children's hashes, so a tree is content-addressed for free. On CPython 3.14 a
+tuple caches its own hash, so hashing a tree costs one traversal and every hash after that
+is a pointer chase.
+
+That makes a render cache easy to reach for, and mostly the wrong tool. Building a tree
+costs slightly more than rendering it, so memoizing the render half is the smaller half,
+and a dict hit on a rebuilt-but-equal subtree still pays a full recursive `==` to confirm
+the key. Cache the thing that skips both instead:
+
+```python
+@cache
+def sidebar(tier: str) -> Markup:
+    return Markup(render(nav(cls="sidebar", children=[...])))
+```
+
+A `Markup` renders verbatim, so the result drops into any tree as an ordinary child. The
+key is a small argument tuple that hashes in nanoseconds rather than a tree that hashes in
+hundreds of microseconds, and a hit skips construction as well as rendering: measured on a
+177 KB page, re-rendering a cached subtree is a few hundred nanoseconds against the
+hundreds of microseconds to rebuild and re-render it.
+
+Use an unbounded `@cache` only where the key space is bounded. Where it is not, reach for
+a bounded cache, and note that eviction bookkeeping is several times a plain dict lookup,
+so keep it at component boundaries rather than at every node.
+
 ## What it costs
 
 Measured by `just bench-render`, which times every renderer over the same workloads and
@@ -178,9 +249,12 @@ Two properties worth knowing when the page gets large:
   element that is built once and rendered many times pays the larger half once.
 - **Cost is linear in elements, and the collector is what bends it.** Per-element cost is
   flat from 100 to 30,000 rows with the collector off, and climbs about 35% across that
-  range with it on, because a growing live tree is a growing thing to scan. A page big
-  enough for that to matter is a page that wants a streaming renderer, which is why
-  keeping the tree as the interface matters more than the current numbers do.
+  range with it on, because a growing live tree is a growing thing to scan.
+- **Attributes are the expensive part.** An element with two attributes costs roughly
+  twice one with none, because each attribute is a name check and an escape scan. Both
+  are already about as cheap as Python allows: the name check is one set membership for
+  a name seen before, and the escape is a guarded containment scan, which beats both
+  `str.translate` and a regex pre-guard by several times on real values.
 
 ## What this deliberately does not do
 
@@ -190,9 +264,10 @@ Two properties worth knowing when the page gets large:
   HTML.
 - **No components with lifecycle, state, or hooks.** A component is a function of its
   arguments. Anything stateful belongs above this layer.
-- **No streaming render.** A page is built whole and joined once. Nothing here prevents
-  a chunk-at-a-time renderer over the same tree, but a page large enough to need one has
-  not turned up.
+- **No render cache.** Elements are hashable values, so one could key a cache on any
+  subtree, and this layer does not: the cheaper form of the same idea belongs in the
+  application, at the component boundary, where a hit skips building the tree as well as
+  rendering it.
 - **No diffing, patching, or client runtime.** The tree would support all of it, which
   is why the interface is the tree; none of it exists.
 - **No CSS, no widgets, no layout.** The browser has those. `cls` takes complete class
