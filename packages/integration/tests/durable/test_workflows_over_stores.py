@@ -10,12 +10,6 @@ from datetime import timedelta
 from uuid import uuid4
 
 import pytest
-from gateways import Gateway
-from gateways import as_object
-from gateways import get_json
-from gateways import paying
-from gateways import post_json
-from gateways import until
 from integration.durable import Order
 from integration.durable import Payments
 from integration.durable import Reached
@@ -24,7 +18,6 @@ from integration.durable import pay_out
 from integration.durable import payments_app
 from integration.durable import submitting
 from integration.durable import unwinding
-from stores import durable  # noqa: F401 - the parametrized fixture every test here takes
 from without_dag import CompiledGraph
 from without_durability import Checkpointer
 from without_durability import Completed
@@ -38,6 +31,14 @@ from without_durability import resume
 from without_durability import run_durably
 from without_durability import work
 from without_http.testing import loopback_client
+
+from .gateways import Gateway
+from .gateways import as_object
+from .gateways import get_json
+from .gateways import paying
+from .gateways import post_json
+from .gateways import until
+from .stores import durable  # noqa: F401 - the parametrized fixture every test here takes
 
 # The same workflows over every store, which is the claim the `Checkpointer` and `Scheduler`
 # interfaces exist to support and the thing no single-store suite can show. The stores' own

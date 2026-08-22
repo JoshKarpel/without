@@ -44,18 +44,24 @@ repos:
       - id: generate-ladders
         name: regenerate overload ladders (cog + ruff)
         language: system
-        entry: packages/without-web/tools/regenerate.sh
-        files: ^packages/without-web/src/without_web/(handlers|extractors)\.py$
+        entry: packages/without_web/tools/regenerate.sh
+        files: ^packages/without_web/src/without_web/(handlers|extractors)\.py$
       - id: generate-dag-ladders
         name: regenerate without-dag overload ladder (cog + ruff)
         language: system
-        entry: packages/without-dag/tools/regenerate.sh
-        files: ^packages/without-dag/src/without_dag/graph\.py$
+        entry: packages/without_dag/tools/regenerate.sh
+        files: ^packages/without_dag/src/without_dag/graph\.py$
       - id: generate-elements
         name: regenerate without-html element constructors and renderers (cog + ruff)
         language: system
-        entry: packages/without-html/tools/regenerate.sh
-        files: ^packages/without-html/src/without_html/(elements|render|__init__)\.py$
+        entry: packages/without_html/tools/regenerate.sh
+        files: ^packages/without_html/src/without_html/(elements|render|__init__)\.py$
+      - id: generate-package-bases
+        name: regenerate the mypy package bases (cog)
+        language: system
+        entry: uv run cog -r -I scripts pyproject.toml
+        files: ^(pyproject\.toml|scripts/package_bases\.py|packages/[^/]+/pyproject\.toml)$
+        pass_filenames: false
       - id: format-justfile
         name: format justfile
         language: system

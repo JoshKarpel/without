@@ -6,9 +6,6 @@ from datetime import timedelta
 from typing import Never
 
 import pytest
-from gateways import BASE
-from gateways import get_json as get
-from gateways import post_json as post
 from integration.durable.api import MAX_WORKFLOW_ID
 from integration.durable.api import Payments
 from integration.durable.api import payments_app
@@ -21,6 +18,10 @@ from without_durability import SplitDurable
 from without_http import Client
 from without_http import request
 from without_http.testing import loopback_client
+
+from .gateways import BASE
+from .gateways import get_json as get
+from .gateways import post_json as post
 
 # The API driven over the real HTTP wire but no socket (`loopback_client`), against
 # in-memory stores: what these prove is the *endpoints*, so neither a bound port nor a

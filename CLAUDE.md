@@ -41,6 +41,10 @@ derived package dependency graph are published as a documentation site (see
 [`mkdocs.yml`](mkdocs.yml) and the hand-written [`docs/hooks.py`](docs/hooks.py));
 build it locally with `just docs` (serve) or `just docs-build` (strict build).
 
+For why each package directory is underscored (`packages/without_html`) and carries
+`__init__.py` markers, where a `conftest.py` may live, and what a new package has to
+add, see [`docs/contributing/workspace-layout.md`](docs/contributing/workspace-layout.md).
+
 For how the packages are versioned and shipped (lockstep versioning, the
 `without-core` distribution name, build-time dependency pinning, and the trusted-
 publishing setup), see [`docs/contributing/releasing.md`](docs/contributing/releasing.md).

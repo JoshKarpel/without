@@ -108,7 +108,11 @@ alias td := durations
 mutate pkg *args='run':
     #!/usr/bin/env bash
     set -euo pipefail
-    cd packages/{{ pkg }}
+    # Take the distribution name (`without-html`) or the directory name (`without_html`):
+    # the directories are underscored so that each package's `tests` is a distinct module
+    # to pytest and mypy, but the hyphenated name is what everything else calls a package.
+    pkg="{{ pkg }}"
+    cd "packages/${pkg//-/_}"
     trap 'rm -f setup.cfg' EXIT
     # -n0 overrides the workspace's `-n auto`: pytest-xdist would re-exec its workers in
     # subprocesses that never see mutmut's in-process sys.path insert, so they would import
