@@ -6,8 +6,6 @@ from collections.abc import AsyncIterator
 import pytest
 from without import Stream
 from without import stream_from_iterable
-from without_asgi import Asgi
-from without_asgi import HttpHandler
 from without_asgi import HttpScope
 from without_asgi import Inbound
 from without_asgi import Outbound
@@ -41,36 +39,15 @@ from without_web import ws
 from without_web import ws_route
 from without_web.handlers import _extract_all
 
+from .helpers import a_request_body
+from .helpers import a_scope
+from .helpers import a_websocket_scope
+from .helpers import drive_json
 from .helpers import json_response
 
 
 def _scope(*, query: bytes = b"") -> HttpScope:
-    return HttpScope(
-        asgi=Asgi(version="3.0", spec_version="2.0"),
-        http_version="1.1",
-        method="POST",
-        scheme="http",
-        path="/things/7",
-        raw_path=None,
-        query_string=query,
-        root_path="",
-        headers=(),
-        client=None,
-        server=None,
-        extensions=None,
-    )
-
-
-async def _inbound(payload: bytes) -> AsyncIterator[Inbound]:
-    yield RequestBody(body=payload, more_body=False)
-
-
-async def _run(handler: HttpHandler, payload: bytes = b"") -> tuple[int, object]:
-    events = [event async for event in handler(_inbound(payload))]
-    start = events[0]
-    assert isinstance(start, ResponseStart)
-    raw = b"".join(event.body for event in events if isinstance(event, ResponseBody))
-    return start.status, json.loads(raw)
+    return a_scope(method="POST", path="/things/7", query=query)
 
 
 async def test_handle_calls_the_function_with_the_typed_extracted_values() -> None:
@@ -82,7 +59,7 @@ async def test_handle_calls_the_function_with_the_typed_extracted_values() -> No
 
     endpoint = handle(path_param("id", INT), body(json.loads, schema={"type": "object"}), fn=make)
     handler = endpoint("tenant", Match(_scope(), {"id": 7}))
-    status, response = await _run(handler, b'{"title": "ship"}')
+    status, response = await drive_json(handler, b'{"title": "ship"}')
 
     assert status == 201
     assert response == {"ok": True}
@@ -99,7 +76,7 @@ async def test_handle_relays_a_streamed_response_without_buffering_the_output() 
         return chunks()
 
     handler = handle(path_param("id", INT), fn=make)("tenant", Match(_scope(), {"id": 5}))
-    events = [event async for event in handler(_inbound(b""))]
+    events = [event async for event in handler(a_request_body(b""))]
     start = events[0]
     assert isinstance(start, ResponseStart)
     assert start.status == 206
@@ -111,7 +88,7 @@ async def test_handle_with_no_extractors_passes_only_the_state() -> None:
         return json_response(200, {"state": state})
 
     handler = handle(fn=make)("tenant", Match(_scope(), {}))
-    assert await _run(handler) == (200, {"state": "tenant"})
+    assert await drive_json(handler) == (200, {"state": "tenant"})
 
 
 def test_handle_recovers_its_openapi_from_the_extractors() -> None:
@@ -168,20 +145,7 @@ def test_handle_rejects_more_than_one_body_extractor() -> None:
 
 
 def _ws_scope(*, query: bytes = b"") -> WebsocketScope:
-    return WebsocketScope(
-        asgi=Asgi(version="3.0", spec_version="2.0"),
-        http_version="1.1",
-        scheme="ws",
-        path="/feed/7",
-        raw_path=None,
-        query_string=query,
-        root_path="",
-        headers=(),
-        client=None,
-        server=None,
-        subprotocols=(),
-        extensions=None,
-    )
+    return a_websocket_scope(path="/feed/7", query=query)
 
 
 def _noop_ws(inputs: Stream[WebsocketInbound]) -> Stream[WebsocketOutbound]:
@@ -276,7 +240,7 @@ async def test_handle_stream_buffers_its_output_when_the_handler_returns_a_respo
         return json_response(201, {"state": state, "received": total})
 
     handler = handle_stream(fn=collect)("tenant", Match(_scope(), {}))
-    assert await _run(handler, b"abcdef") == (201, {"state": "tenant", "received": 6})
+    assert await drive_json(handler, b"abcdef") == (201, {"state": "tenant", "received": 6})
 
 
 def test_handle_stream_recovers_its_openapi_from_the_extractors() -> None:
@@ -321,12 +285,12 @@ async def test_handle_awaits_an_async_handler_that_returns_a_response() -> None:
 
     endpoint = handle(body(json.loads, schema={"type": "object"}), fn=make)
     handler = endpoint("tenant", Match(_scope(), {}))
-    assert await _run(handler, b'{"x": 1}') == (200, {"state": "tenant", "got": {"x": 1}})
+    assert await drive_json(handler, b'{"x": 1}') == (200, {"state": "tenant", "got": {"x": 1}})
 
 
 async def test_handle_runs_a_handler_that_only_reads_the_state() -> None:
     handler = handle(fn=_ok)("tenant", Match(_scope(), {}))
-    assert await _run(handler) == (200, {})
+    assert await drive_json(handler) == (200, {})
 
 
 async def test_handle_stream_relays_a_handler_that_emits_nothing() -> None:

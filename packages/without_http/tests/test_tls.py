@@ -19,8 +19,8 @@ from without_http import serving
 from wsproto.events import AcceptConnection
 from wsproto.events import TextMessage
 
-from .test_server import echo_app
-from .test_websocket import WebSocketClient
+from .helpers import WebSocketClient
+from .helpers import echo_app
 
 
 async def scheme_app(scope: RawScope, receive: Receive, send: Send) -> None:

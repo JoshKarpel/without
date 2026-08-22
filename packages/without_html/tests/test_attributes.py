@@ -67,10 +67,9 @@ def test_class_as_an_attribute_is_rejected_alongside_cls() -> None:
 def test_a_proven_attribute_name_is_admitted_to_the_cache() -> None:
     # The name check is a cache lookup, so a name proven once never reaches the check
     # again. Without the admission every occurrence would take the slow path instead.
-    #
-    # Dropped first because the cache is process-global and outlives the test that fills
-    # it, and a mutation run re-runs the whole suite in one process.
-    CHECKED_ATTRIBUTE_NAMES.discard("data-admitted")
+    # Asserted absent first, because a name already admitted satisfies the check below
+    # without the call under test doing anything.
+    assert "data-admitted" not in CHECKED_ATTRIBUTE_NAMES
     div(attrs={"data-admitted": "1"})
     assert "data-admitted" in CHECKED_ATTRIBUTE_NAMES
 

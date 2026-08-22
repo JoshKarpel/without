@@ -5,7 +5,6 @@ from collections.abc import AsyncIterator
 import pytest
 from without import Stream
 from without import stream_from_iterable
-from without_asgi import Asgi
 from without_asgi import WebsocketAccept
 from without_asgi import WebsocketClose
 from without_asgi import WebsocketInbound
@@ -15,26 +14,15 @@ from without_web import Match
 from without_web import catching_websocket
 from without_web import ws
 
+from .helpers import a_websocket_scope
+
 
 class HandshakeDenied(Exception):
     pass
 
 
 def _ws_scope() -> WebsocketScope:
-    return WebsocketScope(
-        asgi=Asgi(version="3.0", spec_version="2.0"),
-        http_version="1.1",
-        scheme="ws",
-        path="/feed/3",
-        raw_path=None,
-        query_string=b"",
-        root_path="",
-        headers=(),
-        client=None,
-        server=None,
-        subprotocols=(),
-        extensions=None,
-    )
+    return a_websocket_scope(path="/feed/3")
 
 
 class HandshakeThrottled(Exception):

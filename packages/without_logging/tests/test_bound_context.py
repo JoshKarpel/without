@@ -1,13 +1,13 @@
 import asyncio
 import logging
 
-from without import Sink
-from without import from_sink
 from without_logging import Record
 from without_logging import bind
 from without_logging import capture
 from without_logging import merge_context
 from without_logging import parse_record
+
+from .helpers import sink_into
 
 
 def make_log_record(**overrides: object) -> logging.LogRecord:
@@ -24,13 +24,6 @@ def make_log_record(**overrides: object) -> logging.LogRecord:
     for key, value in overrides.items():
         setattr(record, key, value)
     return record
-
-
-def sink_into(collected: list[Record]) -> Sink[Record]:
-    async def append(record: Record) -> None:
-        collected.append(record)
-
-    return from_sink(append)
 
 
 def test_merge_context_stamps_the_bound_fields_onto_the_record() -> None:

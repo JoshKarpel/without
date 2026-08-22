@@ -26,9 +26,9 @@ from without_http import deadline
 from without_http import request
 from without_http import serving
 
-from .conftest import HOST
-from .test_client import _large_upload
-from .test_client import sized_echo_app
+from .helpers import HOST
+from .helpers import large_upload
+from .helpers import sized_echo_app
 
 type Handler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]
 
@@ -127,7 +127,7 @@ async def test_write_timeout_when_the_peer_never_reads_the_request_body() -> Non
                     pool,
                     "POST",
                     f"http://{host}:{port}/upload",
-                    body=_large_upload(),
+                    body=large_upload(),
                     timeout=Timeout(write=timedelta(seconds=0.2)),
                 ) as (
                     _head,
@@ -175,7 +175,7 @@ async def test_write_timeout_after_the_head_surfaces_at_the_body_read() -> None:
 
     async def exchange(client: Client, url: str) -> None:
         bound = Timeout(write=timedelta(seconds=0.2))
-        async with request(client, "POST", url, body=_large_upload(), timeout=bound) as (head, body):
+        async with request(client, "POST", url, body=large_upload(), timeout=bound) as (head, body):
             assert head.status == 200  # the head arrives before the upload stalls out
             await body.read()
 

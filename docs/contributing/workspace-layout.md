@@ -60,6 +60,17 @@ into a `cog` block in `pyproject.toml`, and a pre-commit hook keeps them in sync
   `src` reaches `mypy_path`. Skipping it fails the next type check with `Source file found
   twice under different module names`.
 
-Within a package's tests, import a helper module relatively (`from .helpers import ...`).
-A bare `from helpers import ...` only resolved because pytest put the tests directory on
-`sys.path`, which it no longer does once the directory is a package.
+## Shared test code
+
+A fixture shared by a package's tests goes in that package's `tests/conftest.py`, where
+pytest finds it with no import at all. Anything that is not a fixture (a sample value, a
+double, a small driver that runs one exchange) goes in a `tests/helpers.py` beside it, so
+one test module never imports another: importing `test_client` to reach its `echo_app`
+couples collection of one file to another and hides which of two same-named helpers a
+reader is looking at.
+
+Import that module relatively (`from .helpers import ...`). A bare `from helpers import
+...` only resolved because pytest put the tests directory on `sys.path`, which it no
+longer does once the directory is a package. Relative imports from a *parent* package are
+linted out (`TID252`), so a test in a subdirectory reaching helpers one level up names
+them in full: `from packages.integration.tests.helpers import running`.

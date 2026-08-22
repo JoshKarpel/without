@@ -292,16 +292,18 @@ Patterns that generalize (the `mutation-testing` skill has the full method):
 - **Use distinct non-default values.** A field set to `0`, `""`, or the first enum member can make
   a broken function pass by coincidence; give each field a different, non-default value so an
   argument swap surfaces.
-- **Have a test drop its own key from a process-global memo.** A whole run happens in one process,
+- **Empty a process-global memo before the test that pins it.** A whole run happens in one process,
   so a process-wide memo (`without-html`'s `tag_markup` and `CHECKED_ATTRIBUTE_NAMES`) is already
   warm from the stats pass before the first mutant runs, and the body behind it never executes
   again. Every mutation of that body then survives however wrong it is, because every call reads
-  the warm entry back instead. A test that pins a memo has to empty it first
-  (`tag_markup.cache_clear()`) rather than assume a fresh interpreter, which is the one place in a
-  suite where "the process is reused" is load-bearing. Then assert the built value *and* that a
-  second call returns the same object: the first half kills mutations of the body, the second
-  kills a mutant that rebuilds instead of reading back, whose returned value is correct either
-  way.
+  the warm entry back instead. This is the one place in a suite where "the process is reused" is
+  load-bearing, so the memos are emptied by an autouse fixture in
+  `packages/without_html/tests/conftest.py` rather than by whichever test happens to need it. A
+  test that depends on a cold memo then asserts that it *is* cold (`cache_info().currsize == 0`,
+  the name not yet admitted), so the dependency is visible and the fixture cannot quietly stop
+  mattering. Then assert the built value *and* that a second call returns the same object: the
+  first half kills mutations of the body, the second kills a mutant that rebuilds instead of
+  reading back, whose returned value is correct either way.
 
 ## Considered and rejected: the type-checker filter
 

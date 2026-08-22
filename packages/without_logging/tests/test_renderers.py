@@ -15,6 +15,8 @@ from without_logging import exception_to_text
 from without_logging import render_console
 from without_logging import render_json
 
+from .helpers import a_record
+
 
 def a_simple_traceback() -> TracebackException:
     try:
@@ -36,24 +38,6 @@ def a_traceback_from(exception: Exception) -> TracebackException:
         raise exception
     except Exception as exc:  # noqa: BLE001 - the test wants whatever it was handed, as a traceback
         return TracebackException.from_exception(exc)
-
-
-def a_record(
-    *,
-    message: str = "charge accepted",
-    level: int = logging.INFO,
-    logger: str = "svc.billing",
-    exception: TracebackException | None = None,
-    **fields: object,
-) -> Record:
-    return Record(
-        timestamp=datetime(2026, 7, 5, 14, 56, 9, tzinfo=UTC),
-        level=level,
-        logger=logger,
-        message=message,
-        exception=exception,
-        fields=fields,
-    )
 
 
 def a_chained_traceback() -> TracebackException:

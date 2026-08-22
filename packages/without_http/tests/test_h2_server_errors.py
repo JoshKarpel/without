@@ -19,10 +19,10 @@ from without_asgi import Send
 from without_http.testing import AUTHORITY
 from without_http.testing import served_pipe
 
-from .test_h2_server import h2_client
-from .test_h2_server import request_headers
-from .test_server import echo_app
-from .test_server import receive_after_done_app
+from .helpers import echo_app
+from .helpers import h2_client
+from .helpers import h2_request_headers
+from .helpers import receive_after_done_app
 
 # The server is driven over an in-memory pipe rather than a bound socket: every claim
 # here is about the HTTP/2 codec and the server's own stream handling, which run
@@ -110,7 +110,7 @@ async def _drive(app: ASGIApp, method: str, path: str, *, body: bytes = b"") -> 
         conn = h2_client()
         conn.initiate_connection()
         stream_id = conn.get_next_available_stream_id()
-        conn.send_headers(stream_id, request_headers(method, path), end_stream=not body)
+        conn.send_headers(stream_id, h2_request_headers(method, path), end_stream=not body)
         if body:
             conn.send_data(stream_id, body, end_stream=True)
         writer.write(conn.data_to_send())
@@ -178,7 +178,7 @@ async def test_resetting_a_stream_mid_response_is_contained() -> None:
         conn = h2_client()
         conn.initiate_connection()
         stream_id = conn.get_next_available_stream_id()
-        conn.send_headers(stream_id, request_headers("GET", "/big"), end_stream=True)
+        conn.send_headers(stream_id, h2_request_headers("GET", "/big"), end_stream=True)
         writer.write(conn.data_to_send())
         await writer.drain()
         got_first = False
@@ -203,7 +203,7 @@ async def test_a_settings_update_wakes_an_active_stream() -> None:
         conn = h2_client()
         conn.initiate_connection()
         stream_id = conn.get_next_available_stream_id()
-        conn.send_headers(stream_id, request_headers("POST", "/u"), end_stream=False)
+        conn.send_headers(stream_id, h2_request_headers("POST", "/u"), end_stream=False)
         writer.write(conn.data_to_send())
         await writer.drain()
         await asyncio.sleep(0.05)  # let the server open the stream
@@ -242,7 +242,7 @@ async def test_a_client_goaway_closes_the_connection() -> None:
         conn = h2_client()
         conn.initiate_connection()
         stream_id = conn.get_next_available_stream_id()
-        conn.send_headers(stream_id, request_headers("GET", "/g"), end_stream=True)
+        conn.send_headers(stream_id, h2_request_headers("GET", "/g"), end_stream=True)
         conn.close_connection()  # GOAWAY in the same first packet
         writer.write(conn.data_to_send())
         await writer.drain()
@@ -274,7 +274,7 @@ async def test_resetting_an_in_flight_stream_disconnects_it() -> None:
         conn = h2_client()
         conn.initiate_connection()
         stream_id = conn.get_next_available_stream_id()
-        conn.send_headers(stream_id, request_headers("GET", "/r"), end_stream=True)
+        conn.send_headers(stream_id, h2_request_headers("GET", "/r"), end_stream=True)
         writer.write(conn.data_to_send())
         await writer.drain()
         async with asyncio.timeout(5):
@@ -291,7 +291,7 @@ async def test_an_in_flight_stream_is_cancelled_on_server_shutdown() -> None:
         conn = h2_client()
         conn.initiate_connection()
         stream_id = conn.get_next_available_stream_id()
-        conn.send_headers(stream_id, request_headers("GET", "/slow"), end_stream=True)
+        conn.send_headers(stream_id, h2_request_headers("GET", "/slow"), end_stream=True)
         writer.write(conn.data_to_send())
         await writer.drain()
         async with asyncio.timeout(5):
@@ -323,7 +323,7 @@ async def test_a_client_reset_cancels_the_stream_task() -> None:
         conn = h2_client()
         conn.initiate_connection()
         stream_id = conn.get_next_available_stream_id()
-        conn.send_headers(stream_id, request_headers("GET", "/r"), end_stream=True)
+        conn.send_headers(stream_id, h2_request_headers("GET", "/r"), end_stream=True)
         writer.write(conn.data_to_send())
         await writer.drain()
         async with asyncio.timeout(5):
@@ -380,7 +380,7 @@ async def test_a_reset_flood_closes_the_connection() -> None:
         await writer.drain()
         for _ in range(3):  # three resets exceed the budget of two
             stream_id = conn.get_next_available_stream_id()
-            conn.send_headers(stream_id, request_headers("GET", "/x"), end_stream=True)
+            conn.send_headers(stream_id, h2_request_headers("GET", "/x"), end_stream=True)
             conn.reset_stream(stream_id, error_code=h2.errors.ErrorCodes.CANCEL)
             writer.write(conn.data_to_send())
             await writer.drain()
@@ -488,7 +488,7 @@ async def _drive_full(app: ASGIApp, method: str, path: str, *, body: bytes = b""
         conn = h2_client()
         conn.initiate_connection()
         stream_id = conn.get_next_available_stream_id()
-        conn.send_headers(stream_id, request_headers(method, path), end_stream=not body)
+        conn.send_headers(stream_id, h2_request_headers(method, path), end_stream=not body)
         if body:
             conn.send_data(stream_id, body, end_stream=True)
         writer.write(conn.data_to_send())
@@ -609,13 +609,13 @@ async def test_resets_within_the_budget_leave_the_connection_serving() -> None:
         await writer.drain()
         for _ in range(2):  # exactly the budget of two resets, so the connection survives
             reset_id = conn.get_next_available_stream_id()
-            conn.send_headers(reset_id, request_headers("GET", "/x"), end_stream=True)
+            conn.send_headers(reset_id, h2_request_headers("GET", "/x"), end_stream=True)
             conn.reset_stream(reset_id, error_code=h2.errors.ErrorCodes.CANCEL)
             writer.write(conn.data_to_send())
             await writer.drain()
 
         stream_id = conn.get_next_available_stream_id()
-        conn.send_headers(stream_id, request_headers("GET", "/ok"), end_stream=True)
+        conn.send_headers(stream_id, h2_request_headers("GET", "/ok"), end_stream=True)
         writer.write(conn.data_to_send())
         await writer.drain()
         status = 0
@@ -653,7 +653,7 @@ async def test_a_reset_flood_sends_goaway_enhance_your_calm(caplog: pytest.LogCa
             await writer.drain()
             for _ in range(3):  # three resets exceed the budget of two
                 stream_id = conn.get_next_available_stream_id()
-                conn.send_headers(stream_id, request_headers("GET", "/x"), end_stream=True)
+                conn.send_headers(stream_id, h2_request_headers("GET", "/x"), end_stream=True)
                 conn.reset_stream(stream_id, error_code=h2.errors.ErrorCodes.CANCEL)
                 writer.write(conn.data_to_send())
                 await writer.drain()
@@ -685,7 +685,7 @@ async def test_a_client_reset_logs_and_cancels_the_stream_task(caplog: pytest.Lo
             conn = h2_client()
             conn.initiate_connection()
             stream_id = conn.get_next_available_stream_id()
-            conn.send_headers(stream_id, request_headers("GET", "/r"), end_stream=True)
+            conn.send_headers(stream_id, h2_request_headers("GET", "/r"), end_stream=True)
             writer.write(conn.data_to_send())
             await writer.drain()
             async with asyncio.timeout(5):
@@ -709,7 +709,7 @@ async def test_an_in_flight_stream_task_is_cancelled_on_server_shutdown() -> Non
         conn = h2_client()
         conn.initiate_connection()
         stream_id = conn.get_next_available_stream_id()
-        conn.send_headers(stream_id, request_headers("GET", "/slow"), end_stream=True)
+        conn.send_headers(stream_id, h2_request_headers("GET", "/slow"), end_stream=True)
         writer.write(conn.data_to_send())
         await writer.drain()
         async with asyncio.timeout(5):

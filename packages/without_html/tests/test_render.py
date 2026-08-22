@@ -6,7 +6,6 @@ from markupsafe import Markup
 from without_html import DOCTYPE
 from without_html import Element
 from without_html import RawTextElementConstructor
-from without_html import VoidElement
 from without_html import br
 from without_html import div
 from without_html import element
@@ -24,6 +23,9 @@ from without_html import ul
 from without_html.nodes import RAW_TEXT_TAGS
 from without_html.nodes import VOID_TAGS
 from without_html.render import tag_markup
+
+from .helpers import Spacer
+from .helpers import Widget
 
 
 def test_empty_element_renders_open_and_close_tags() -> None:
@@ -149,12 +151,10 @@ def test_an_unknown_tag_renders_with_a_closing_tag() -> None:
 
 def test_tag_markup_is_built_once_per_tag_and_reused() -> None:
     # The renderer's per-tag constants are memoized, so the first element with a tag
-    # builds them and every later one reads back the same objects.
-    #
-    # The memo is process-global and outlives the test that fills it, and a mutation run
-    # re-runs the whole suite in one process, so this empties it rather than assuming a
-    # fresh interpreter. Left warm, the build being checked never runs.
-    tag_markup.cache_clear()
+    # builds them and every later one reads back the same objects. Asserted cold first,
+    # because a warm memo satisfies the identity check below without ever building
+    # anything.
+    assert tag_markup.cache_info().currsize == 0
     built = tag_markup("x-memo")
     assert built == ("<x-memo", Markup("</x-memo>"))
     assert tag_markup("x-memo") is built
@@ -179,12 +179,6 @@ def test_a_string_subclass_child_is_still_escaped() -> None:
     assert render(p(children=Loud("2 < 3"))) == "<p>2 &lt; 3</p>"
 
 
-class Widget(Element):
-    """An `Element` subclass, which the walk reaches by the `isinstance` arms."""
-
-    __slots__ = ()
-
-
 @pytest.mark.parametrize(
     ("children", "expected"),
     [
@@ -202,9 +196,6 @@ def test_an_element_subclass_renders_as_its_element(children: tuple[object, ...]
 
 
 def test_a_void_element_subclass_renders_as_its_element() -> None:
-    class Spacer(VoidElement):
-        __slots__ = ()
-
     assert render(Spacer("x-spacer", (("size", "3"),))) == '<x-spacer size="3">'
 
 

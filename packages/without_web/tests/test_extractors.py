@@ -4,7 +4,6 @@ import json
 from dataclasses import dataclass
 
 import pytest
-from without_asgi import Asgi
 from without_asgi import HttpScope
 from without_asgi import RawHeaders
 from without_asgi import WebsocketScope
@@ -30,39 +29,16 @@ from without_web import path_param
 from without_web import query_param
 from without_web import websocket_scope
 
+from .helpers import a_scope
+from .helpers import a_websocket_scope
+
 
 def _scope(*, query: bytes = b"", headers: RawHeaders = ()) -> HttpScope:
-    return HttpScope(
-        asgi=Asgi(version="3.0", spec_version="2.0"),
-        http_version="1.1",
-        method="GET",
-        scheme="http",
-        path="/todos/7",
-        raw_path=None,
-        query_string=query,
-        root_path="",
-        headers=headers,
-        client=None,
-        server=None,
-        extensions=None,
-    )
+    return a_scope(method="GET", path="/todos/7", query=query, headers=headers)
 
 
 def _ws_scope(*, query: bytes = b"") -> WebsocketScope:
-    return WebsocketScope(
-        asgi=Asgi(version="3.0", spec_version="2.0"),
-        http_version="1.1",
-        scheme="ws",
-        path="/todos/7/events",
-        raw_path=None,
-        query_string=query,
-        root_path="",
-        headers=(),
-        client=None,
-        server=None,
-        subprotocols=(),
-        extensions=None,
-    )
+    return a_websocket_scope(path="/todos/7/events", query=query)
 
 
 def _request(

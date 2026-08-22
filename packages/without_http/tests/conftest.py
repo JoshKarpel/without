@@ -13,7 +13,7 @@ import pytest
 import trustme
 from without_http import server_ssl_context
 
-HOST = "127.0.0.1"
+from .helpers import HOST
 
 type _Endpoint = tuple[asyncio.StreamReader, asyncio.StreamWriter]
 type _StreamPairFactory = Callable[[], Awaitable[tuple[_Endpoint, _Endpoint]]]

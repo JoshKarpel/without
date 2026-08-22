@@ -43,10 +43,7 @@ from without_asgi import parse_lifespan_reply
 from without_asgi import parse_outbound
 from without_asgi import parse_websocket_outbound
 
-
-class _FileDescriptor:
-    def fileno(self) -> int:
-        return 7  # pragma: no cover - only its presence satisfies the SupportsFileno protocol; never called
+from .helpers import FileDescriptor
 
 
 def test_encode_outbound_renders_a_response_start() -> None:
@@ -238,7 +235,7 @@ def test_encode_outbound_renders_a_server_push() -> None:
 
 
 def test_encode_outbound_renders_a_zero_copy_send_with_offset_and_count() -> None:
-    fd = _FileDescriptor()
+    fd = FileDescriptor()
     event = ZeroCopySend(file=fd, offset=64, count=2048, more_body=True)
 
     assert encode_outbound(event) == {
@@ -251,7 +248,7 @@ def test_encode_outbound_renders_a_zero_copy_send_with_offset_and_count() -> Non
 
 
 def test_encode_outbound_omits_zero_copy_offset_and_count_when_absent() -> None:
-    fd = _FileDescriptor()
+    fd = FileDescriptor()
 
     assert encode_outbound(ZeroCopySend(file=fd, offset=None, count=None, more_body=False)) == {
         "type": "http.response.zerocopysend",
@@ -406,8 +403,8 @@ def test_parse_lifespan_reply_rejects_an_unknown_reply() -> None:
         ResponseBody(body=b"hello", more_body=True),
         ResponseBody(body=b"", more_body=False),
         ServerPush(path="/style.css", headers=((b"accept", b"text/css"),)),
-        ZeroCopySend(file=_FileDescriptor(), offset=64, count=2048, more_body=True),
-        ZeroCopySend(file=_FileDescriptor(), offset=None, count=None, more_body=False),
+        ZeroCopySend(file=FileDescriptor(), offset=64, count=2048, more_body=True),
+        ZeroCopySend(file=FileDescriptor(), offset=None, count=None, more_body=False),
         PathSend(path="/var/www/big.iso"),
         EarlyHint(links=(b"</style.css>; rel=preload",)),
         ResponseTrailers(headers=((b"digest", b"sha-256=abc"),), more_trailers=False),
@@ -469,7 +466,7 @@ def test_parse_outbound_defaults_response_body_to_empty_bytes() -> None:
 
 
 def test_parse_outbound_defaults_zerocopysend_more_body_to_false() -> None:
-    fd = _FileDescriptor()
+    fd = FileDescriptor()
 
     assert parse_outbound({"type": "http.response.zerocopysend", "file": fd}) == ZeroCopySend(
         file=fd, offset=None, count=None, more_body=False

@@ -34,6 +34,8 @@ from without_durability import run_durably
 from without_durability.graph import survives
 from without_durability.graph import written
 
+from .helpers import ParkedWrites
+
 
 class Unwound(Exception):
     """A workflow that was compensated, and so must not be run again under its own id."""
@@ -653,19 +655,6 @@ async def test_a_node_record_cancelled_in_flight_still_lands() -> None:
         await recording
 
     assert await checkpointer.load("wf-held") == {"shipped": "tr-1"}, "the effect happened, so its record has to land"
-
-
-@dataclass(frozen=True, slots=True)
-class ParkedWrites(MemoryCheckpointer):
-    """The double, with a `record` that parks mid-write so a cancellation can land in it."""
-
-    writing: asyncio.Event = field(default_factory=asyncio.Event)
-    proceed: asyncio.Event = field(default_factory=asyncio.Event)
-
-    async def record(self, holder: Pass, key: str, value: object) -> Recorded:
-        self.writing.set()
-        await self.proceed.wait()
-        return await super().record(holder, key, value)
 
 
 async def test_a_compensated_workflow_is_not_resumed_under_its_own_id() -> None:

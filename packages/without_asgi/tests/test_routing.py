@@ -9,7 +9,6 @@ from dataclasses import replace
 import pytest
 from without import Stream
 from without import stream_from_iterable
-from without_asgi import Asgi
 from without_asgi import Disconnect
 from without_asgi import HttpHandler
 from without_asgi import HttpScope
@@ -23,6 +22,8 @@ from without_asgi.outbound import encode_response
 from without_asgi.routing import _BodyTooLarge
 from without_asgi.routing import limit_concurrent_requests
 from without_asgi.routing import limit_request_body
+
+from .helpers import a_scope
 
 
 @dataclass(slots=True)
@@ -44,20 +45,7 @@ def _holding_handler(gate: _Gate) -> HttpHandler:
 
 
 def _scope() -> HttpScope:
-    return HttpScope(
-        asgi=Asgi(version="3.0", spec_version="2.4"),
-        http_version="2",
-        method="GET",
-        scheme="http",
-        path="/items",
-        raw_path=b"/items",
-        query_string=b"",
-        root_path="",
-        headers=(),
-        client=None,
-        server=None,
-        extensions=None,
-    )
+    return a_scope(path="/items", http_version="2")
 
 
 async def _collect(handler: HttpHandler) -> list[Outbound]:

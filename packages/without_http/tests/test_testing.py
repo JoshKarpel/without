@@ -31,7 +31,7 @@ from without_http.testing import respond
 from without_http.testing import scope_from_client_request
 from without_http.testing import served_pipe
 
-from .test_client import echo_app
+from .helpers import tagged_echo_app
 
 
 async def test_mock_client_answers_from_its_handler_without_a_server() -> None:
@@ -130,7 +130,7 @@ async def test_asgi_client_drives_an_app_with_no_socket(monkeypatch: pytest.Monk
         raise AssertionError("the in-memory client must not open a connection")  # pragma: no cover
 
     monkeypatch.setattr(asyncio, "open_connection", refuse)
-    async with asgi_client(echo_app) as client:
+    async with asgi_client(tagged_echo_app) as client:
         async with request(client, "GET", "http://testserver/items") as (head, body):
             assert head.status == 200
             assert head.headers == ((b"content-type", b"text/plain"),)
@@ -140,7 +140,7 @@ async def test_asgi_client_drives_an_app_with_no_socket(monkeypatch: pytest.Monk
 async def test_asgi_client_drops_the_body_of_a_head_response() -> None:
     # HEAD is the one method whose response carries no body however much the app sends,
     # which is the transport's job here as much as it is the wire server's.
-    async with asgi_client(echo_app) as client:
+    async with asgi_client(tagged_echo_app) as client:
         async with request(client, "HEAD", "http://testserver/items") as (head, body):
             assert head.status == 200
             assert await body.read() == b""
@@ -159,13 +159,13 @@ async def test_asgi_client_mounts_the_app_under_a_root_path() -> None:
 
 
 async def test_asgi_client_sends_a_request_body() -> None:
-    async with asgi_client(echo_app) as client:
+    async with asgi_client(tagged_echo_app) as client:
         async with request(client, "POST", "http://testserver/submit", body=b"payload") as (_head, body):
             assert await body.read() == b"POST /submit test= body=payload"
 
 
 async def test_asgi_client_composes_with_client_middleware() -> None:
-    async with asgi_client(echo_app) as pool_free:
+    async with asgi_client(tagged_echo_app) as pool_free:
         client = stack(base_url("http://testserver"))(pool_free)
         async with request(client, "GET", "/items") as (_head, body):
             assert await body.read() == b"GET /items test= body="
@@ -435,7 +435,7 @@ async def test_loopback_client_round_trips_over_the_real_wire_without_a_socket(
         raise AssertionError("the loopback client must not open a connection")  # pragma: no cover
 
     monkeypatch.setattr(asyncio, "open_connection", refuse)
-    async with loopback_client(echo_app) as client:
+    async with loopback_client(tagged_echo_app) as client:
         async with request(client, "GET", "http://testserver/items") as (head, body):
             assert head.status == 200
             assert await body.read() == b"GET /items test= body="
@@ -471,7 +471,7 @@ async def test_the_no_socket_probe_can_fail() -> None:
 
     with pytest.MonkeyPatch.context() as patched:
         patched.setattr(asyncio, "open_connection", refuse)
-        async with serving(echo_app) as server, ConnectionPool() as pool:
+        async with serving(tagged_echo_app) as server, ConnectionPool() as pool:
             with pytest.raises(AssertionError, match="must not open a connection"):  # pragma: no branch
                 async with request(pool, "GET", f"http://{server.host}:{server.port}/items") as _response:
                     pass  # pragma: no cover
@@ -482,7 +482,7 @@ async def test_loopback_client_posts_a_streamed_body_and_reuses_the_connection()
         yield b"ab"
         yield b"cd"
 
-    async with loopback_client(echo_app) as client:
+    async with loopback_client(tagged_echo_app) as client:
         async with request(client, "POST", "http://testserver/up", body=upload()) as (_head, body):
             assert await body.read() == b"POST /up test= body=abcd"
         async with request(client, "GET", "http://testserver/again") as (_head, body):
@@ -493,7 +493,7 @@ async def test_loopback_client_posts_a_streamed_body_and_reuses_the_connection()
 
 
 async def test_loopback_client_runs_the_same_exchange_over_http2() -> None:
-    async with loopback_client(echo_app, http2=True) as client:
+    async with loopback_client(tagged_echo_app, http2=True) as client:
         async with request(client, "GET", "http://testserver/items") as (head, body):
             assert head.status == 200
             assert await body.read() == b"GET /items test= body="
@@ -516,7 +516,7 @@ async def test_loopback_client_turns_a_crashing_handler_into_a_500() -> None:
 
 
 async def test_loopback_client_refuses_an_https_url() -> None:
-    async with loopback_client(echo_app) as client:
+    async with loopback_client(tagged_echo_app) as client:
         with pytest.raises(ValueError, match="no TLS"):
             async with request(client, "GET", "https://testserver/items") as _response:
                 pass  # pragma: no cover
@@ -600,7 +600,7 @@ async def test_pipe_drops_a_write_to_a_peer_that_already_closed() -> None:
 
 
 async def test_served_pipe_answers_a_request_written_as_bytes() -> None:
-    async with served_pipe(echo_app) as (reader, writer):
+    async with served_pipe(tagged_echo_app) as (reader, writer):
         writer.write(b"GET /items HTTP/1.1\r\nhost: testserver\r\n\r\n")
         await writer.drain()
         head = await reader.readuntil(b"\r\n\r\n")
@@ -671,7 +671,7 @@ async def test_served_pipe_closes_the_endpoints_when_the_connection_task_crashed
     mocker.patch("without_http.testing._serve_connection", crash)
 
     with pytest.raises(RuntimeError, match="a server bug"):
-        async with served_pipe(echo_app) as (_reader, writer):
+        async with served_pipe(tagged_echo_app) as (_reader, writer):
             await yield_once()  # lets the connection task run far enough to crash
 
     assert writer.is_closing()

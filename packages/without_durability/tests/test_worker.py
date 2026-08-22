@@ -5,7 +5,6 @@ from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
 from time import monotonic
@@ -28,10 +27,13 @@ from without_durability.worker import ready
 from without_durability.worker import waking
 from without_durability.worker import work
 
+from .helpers import STARTED_AT
+from .helpers import Clock
+from .helpers import as_text
+
 SMALL = {"widget": 1200, "gizmo": 800}
 LARGE = {"piano": 90_000}
 WORKFLOW = "wf-payout-1"
-STARTED_AT = datetime(2026, 3, 14, 9, 30, tzinfo=UTC)
 BRIEF = timedelta(milliseconds=10)
 # Short enough that a test waits it out for real rather than mocking a clock.
 SETTLING = timedelta(milliseconds=20)
@@ -70,14 +72,6 @@ async def as_total(items: dict[str, int]) -> int:
 # The parsers this body's four durable reads take. They are written out rather than
 # reached for because parsing what a checkpoint holds is the *application's* job, and a
 # test standing in for an application does it too.
-def as_text(recorded: object) -> str:
-    if not isinstance(
-        recorded, str
-    ):  # pragma: no cover - the arm that makes this a parser rather than a cast; no test feeds it a bad value
-        raise TypeError(f"{recorded!r} is not the text this step recorded")
-    return recorded
-
-
 def as_whole(recorded: object) -> int:
     if not isinstance(
         recorded, int
@@ -99,17 +93,6 @@ async def paid(workflow: str, total: int) -> str:
 
 
 BODY = settling_body()
-
-
-@dataclass(slots=True)
-class Clock:
-    at: datetime = STARTED_AT
-
-    def __call__(self) -> datetime:
-        return self.at
-
-    def advance(self, by: timedelta) -> None:
-        self.at += by
 
 
 async def as_stream(*workflows: str) -> AsyncIterator[Delivery]:

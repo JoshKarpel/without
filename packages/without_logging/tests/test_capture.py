@@ -1,13 +1,9 @@
 import asyncio
 import logging
-from datetime import UTC
-from datetime import datetime
 
 from pytest_mock import MockerFixture
-from without import Sink
 from without import compose
 from without import from_selector
-from without import from_sink
 from without import tee
 from without_logging import Level
 from without_logging import Record
@@ -17,23 +13,8 @@ from without_logging import capture
 from without_logging import parse_record
 from without_logging.capture import CaptureHandler
 
-
-def sink_into(collected: list[Record]) -> Sink[Record]:
-    async def append(record: Record) -> None:
-        collected.append(record)
-
-    return from_sink(append)
-
-
-def a_record(message: str) -> Record:
-    return Record(
-        timestamp=datetime.fromtimestamp(1_700_000_000.0, tz=UTC),
-        level=logging.INFO,
-        logger="svc.test",
-        message=message,
-        exception=None,
-        fields={},
-    )
+from .helpers import a_record
+from .helpers import sink_into
 
 
 async def test_capture_delivers_logged_records_to_the_sink() -> None:
@@ -142,10 +123,10 @@ async def test_offer_counts_a_record_dropped_when_the_queue_is_full() -> None:
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[Record] = asyncio.Queue(1)
     handler = CaptureHandler(loop, queue, parse_record)
-    retained = a_record("retained")
+    retained = a_record(message="retained")
     queue.put_nowait(retained)
 
-    handler._offer(a_record("overflow"))
+    handler._offer(a_record(message="overflow"))
 
     assert handler.dropped == 1
     assert queue.get_nowait() is retained
@@ -157,7 +138,7 @@ async def test_offer_counts_a_record_dropped_after_the_queue_is_shut_down() -> N
     handler = CaptureHandler(loop, queue, parse_record)
     queue.shutdown()
 
-    handler._offer(a_record("too late"))
+    handler._offer(a_record(message="too late"))
 
     assert handler.dropped == 1
 
@@ -166,10 +147,10 @@ async def test_offer_counts_each_dropped_record_separately() -> None:
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[Record] = asyncio.Queue(1)
     handler = CaptureHandler(loop, queue, parse_record)
-    queue.put_nowait(a_record("kept"))
+    queue.put_nowait(a_record(message="kept"))
 
-    handler._offer(a_record("first overflow"))
-    handler._offer(a_record("second overflow"))
+    handler._offer(a_record(message="first overflow"))
+    handler._offer(a_record(message="second overflow"))
 
     assert handler.dropped == 2
 

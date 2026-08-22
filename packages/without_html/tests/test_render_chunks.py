@@ -5,7 +5,6 @@ from markupsafe import Markup
 from without_html import DOCTYPE
 from without_html import Element
 from without_html import Node
-from without_html import VoidElement
 from without_html import body
 from without_html import div
 from without_html import head
@@ -18,6 +17,9 @@ from without_html import render_chunks
 from without_html import span
 from without_html import title
 from without_html import ul
+
+from .helpers import Spacer
+from .helpers import Widget
 
 
 def page(rows: int) -> Node:
@@ -36,18 +38,6 @@ def page(rows: int) -> Node:
             ]
         ),
     ]
-
-
-class Widget(Element):
-    """An `Element` subclass, which the walk reaches by the `isinstance` arms."""
-
-    __slots__ = ()
-
-
-class Spacer(VoidElement):
-    """A `VoidElement` subclass, likewise."""
-
-    __slots__ = ()
 
 
 TREES: dict[str, Node] = {

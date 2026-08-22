@@ -24,13 +24,9 @@ import pytest
 from pytest_mock import MockerFixture
 from without import cancel_futures
 from without_asgi import ASGIApp
-from without_asgi import HttpScope
 from without_asgi import RawMessage
 from without_asgi import Receive
-from without_asgi import Response
 from without_asgi import Send
-from without_asgi import make_asgi_app
-from without_asgi.routing import buffered
 from without_http import serving
 from without_http.server import _DEFAULT_LIMITS
 from without_http.server import _MID_ACCEPT_FLUSH_TICKS
@@ -50,6 +46,11 @@ from wsproto import WSConnection
 from wsproto.events import Request as WsRequest
 from wsproto.events import TextMessage
 
+from .helpers import configured_app
+from .helpers import crash_app
+from .helpers import echo_app
+from .helpers import receive_after_done_app
+
 type _Endpoint = tuple[asyncio.StreamReader, asyncio.StreamWriter]
 type _StreamPairFactory = Callable[[], Awaitable[tuple[_Endpoint, _Endpoint]]]
 
@@ -60,27 +61,6 @@ type _StreamPairFactory = Callable[[], Awaitable[tuple[_Endpoint, _Endpoint]]]
 # needs a real socket), anything with a TLS context, and anything reading `Server`'s own
 # accept-loop metrics.
 _SERVER_HOST, _SERVER_PORT = SERVER_ADDRESS
-
-
-async def echo_app(scope: RawMessage, receive: Receive, send: Send) -> None:
-    """A raw ASGI app that echoes the request line and body. Has no lifespan support."""
-    if scope["type"] != "http":
-        raise RuntimeError("this app serves only http")
-    body = b""
-    more = True
-    while more:
-        message = await receive()
-        if message["type"] == "http.disconnect":  # pragma: no cover - clients here never disconnect mid-body
-            return
-        chunk = message.get("body", b"")
-        assert isinstance(chunk, bytes)
-        body += chunk
-        more = bool(message.get("more_body", False))
-    method = str(scope["method"])
-    path = str(scope["path"])
-    payload = f"{method} {path} {body.decode()}".encode()
-    await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
-    await send({"type": "http.response.body", "body": payload})
 
 
 _UNREAD_BODY = b"answered without reading"
@@ -96,28 +76,6 @@ async def unread_app(scope: RawMessage, receive: Receive, send: Send) -> None:
         }
     )
     await send({"type": "http.response.body", "body": _UNREAD_BODY})
-
-
-def configured_app() -> ASGIApp:
-    @asynccontextmanager
-    async def lifespan() -> AsyncIterator[str]:
-        yield "configured-state"
-
-    def handle(state: str, head: HttpScope, body: bytes) -> Response:
-        return Response(status=200, headers=((b"content-type", b"text/plain"),), body=f"{state}:{head.path}".encode())
-
-    return make_asgi_app(lifespan, http=buffered(handle))
-
-
-def crash_app() -> ASGIApp:
-    @asynccontextmanager
-    async def lifespan() -> AsyncIterator[None]:
-        yield None
-
-    def handle(state: None, head: HttpScope, body: bytes) -> Response:
-        raise RuntimeError("handler exploded")
-
-    return make_asgi_app(lifespan, http=buffered(handle))
 
 
 @asynccontextmanager
@@ -264,22 +222,6 @@ async def test_serves_a_large_post_body_spanning_multiple_socket_reads() -> None
         response = await client.post("/big", content=payload)
 
     assert response.text == "POST /big " + payload.decode()
-
-
-async def receive_after_done_app(scope: RawMessage, receive: Receive, send: Send) -> None:
-    """Read the body to completion, then call `receive` once more to observe the disconnect."""
-    if scope["type"] != "http":
-        raise RuntimeError("this app serves only http")
-    more = True
-    while more:
-        message = await receive()
-        more = bool(message.get("more_body", False))
-    trailing = await receive()
-    trailing_type = trailing["type"]
-    assert isinstance(trailing_type, str)
-    body = trailing_type.encode()
-    await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
-    await send({"type": "http.response.body", "body": body})
 
 
 async def test_receiving_after_the_request_body_is_done_yields_a_disconnect() -> None:
@@ -454,7 +396,7 @@ async def scope_echo_app(scope: RawMessage, receive: Receive, send: Send) -> Non
     await send({"type": "http.response.body", "body": payload})
 
 
-async def sized_echo_app(scope: RawMessage, receive: Receive, send: Send) -> None:
+async def sized_path_app(scope: RawMessage, receive: Receive, send: Send) -> None:
     """Echo the request path in a `content-length`-framed body, so a raw reader can bound it."""
     if scope["type"] != "http":
         raise RuntimeError("this app serves only http")
@@ -495,7 +437,7 @@ async def test_head_keeps_the_connection_alive_after_suppressing_the_body() -> N
     # A HEAD response must skip its body Data (h11 rejects a body on a HEAD response), then
     # finish cleanly so the keep-alive connection is reusable. If the method check or the
     # skip is broken, sending the body raises and the connection dies before the next request.
-    async with served_pipe(sized_echo_app) as (reader, writer):
+    async with served_pipe(sized_path_app) as (reader, writer):
         writer.write(b"HEAD /one HTTP/1.1\r\nhost: test\r\n\r\n")
         await writer.drain()
         head_status, head_body = await _read_one_http_response(reader, read_body=False)

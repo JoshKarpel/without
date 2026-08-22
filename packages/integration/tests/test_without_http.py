@@ -40,6 +40,8 @@ from wsproto.events import Event
 from wsproto.events import Request
 from wsproto.events import TextMessage
 
+from .helpers import a_todo_list
+
 # This is the composition proof: a `without-web` router becomes an ASGI app via
 # `without-asgi`'s `make_asgi_app`, that app is served by `without-http`, and it is
 # driven by `without-http`'s own client. The same app would run unchanged under uvicorn.
@@ -50,10 +52,6 @@ from wsproto.events import TextMessage
 # one: the test whose claim *is* that an ordinary third-party client can talk to this
 # server over a network, and the websocket tests, since the in-memory clients speak HTTP
 # only.
-
-
-def _todos() -> TodoList:
-    return TodoList({1: Todo(id=1, title="write", done=False), 2: Todo(id=2, title="ship", done=True)})
 
 
 @dataclass(slots=True)
@@ -131,7 +129,7 @@ async def test_file_response_streams_a_file_over_without_http(tmp_path: Path) ->
 
 
 async def test_todos_router_served_over_without_http_is_reachable_by_httpx() -> None:
-    async with serving(todos_app(_todos())) as server:
+    async with serving(todos_app(a_todo_list())) as server:
         async with httpx.AsyncClient(base_url=f"http://{server.host}:{server.port}") as client:
             response = await client.get("/todos")
 
@@ -143,7 +141,7 @@ async def test_todos_router_served_over_without_http_is_reachable_by_httpx() -> 
 
 async def test_without_http_client_gets_one_todo() -> None:
     async with (
-        loopback_client(todos_app(_todos())) as client,
+        loopback_client(todos_app(a_todo_list())) as client,
         request(client, "GET", "http://testserver/todos/1") as (head, body),
     ):
         assert head.status == 200
@@ -152,7 +150,7 @@ async def test_without_http_client_gets_one_todo() -> None:
 
 async def test_a_missing_todo_maps_to_404() -> None:
     async with (
-        loopback_client(todos_app(_todos())) as client,
+        loopback_client(todos_app(a_todo_list())) as client,
         request(client, "GET", "http://testserver/todos/999") as (head, _body),
     ):
         assert head.status == 404
@@ -166,7 +164,7 @@ async def _admin_status(client: Client, url: str) -> int:
 async def test_client_middleware_supplies_the_admin_authorization_header() -> None:
     url = "http://testserver/admin/stats"
 
-    async with loopback_client(todos_app(_todos())) as client:
+    async with loopback_client(todos_app(a_todo_list())) as client:
         unauthorized = await _admin_status(client, url)
         authorized = add_headers((b"authorization", b"Bearer let-me-in"))(client)
         authorized_status = await _admin_status(authorized, url)
@@ -266,7 +264,7 @@ async def test_a_streaming_response_is_encoded_as_it_streams() -> None:
     """
     upload = b"".join(json.dumps({"title": f"imported {index}"}).encode() + b"\n" for index in range(60))
 
-    async with loopback_client(todos_app(_todos())) as plain:
+    async with loopback_client(todos_app(a_todo_list())) as plain:
         # The undecorated client first, so the encoding is a fact about the wire and
         # not something the decoder could have papered over.
         async with request(
@@ -306,7 +304,10 @@ async def test_httpx_decodes_what_the_server_encoded() -> None:
 
 
 async def test_websocket_session_route_over_without_http() -> None:
-    async with serving(todos_app(_todos())) as server, _websocket(server.host, server.port, "/todos/session") as socket:
+    async with (
+        serving(todos_app(a_todo_list())) as server,
+        _websocket(server.host, server.port, "/todos/session") as socket,
+    ):
         accept = await socket.next_event()
         assert isinstance(accept, AcceptConnection)
 

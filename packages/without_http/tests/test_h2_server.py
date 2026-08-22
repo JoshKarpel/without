@@ -11,29 +11,17 @@ from without_asgi import ASGIApp
 from without_asgi import RawMessage
 from without_asgi import Receive
 from without_asgi import Send
-from without_http.testing import AUTHORITY
 from without_http.testing import served_pipe
 
-from .test_server import configured_app
-from .test_server import crash_app
-from .test_server import echo_app
+from .helpers import configured_app
+from .helpers import crash_app
+from .helpers import echo_app
+from .helpers import h2_client
+from .helpers import h2_request_headers
 
 # Cleartext HTTP/2 by prior knowledge, driven over an in-memory pipe: the codec and the
 # server's flow-control sender are the subject, and both run identically without a
 # socket. The h2 path reached through ALPN needs a handshake, so it stays on a real one.
-
-
-def h2_client() -> h2.connection.H2Connection:
-    return h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=True, header_encoding=None))
-
-
-def request_headers(method: str, path: str) -> list[tuple[bytes, bytes]]:
-    return [
-        (b":method", method.encode()),
-        (b":path", path.encode()),
-        (b":scheme", b"http"),
-        (b":authority", AUTHORITY),
-    ]
 
 
 def fixed_body_app(size: int) -> ASGIApp:
@@ -80,7 +68,7 @@ async def _roundtrip(app: ASGIApp, method: str, path: str, body: bytes = b"") ->
         conn = h2_client()
         conn.initiate_connection()
         stream_id = conn.get_next_available_stream_id()
-        conn.send_headers(stream_id, request_headers(method, path), end_stream=not body)
+        conn.send_headers(stream_id, h2_request_headers(method, path), end_stream=not body)
         if body:
             conn.send_data(stream_id, body, end_stream=True)
         writer.write(conn.data_to_send())
@@ -202,7 +190,7 @@ async def _drive_blocked_then_bump(
         conn.initiate_connection()
         conn.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: initial_window})
         stream_id = conn.get_next_available_stream_id()
-        conn.send_headers(stream_id, request_headers("GET", "/w"), end_stream=True)
+        conn.send_headers(stream_id, h2_request_headers("GET", "/w"), end_stream=True)
         writer.write(conn.data_to_send())
         await writer.drain()
 
@@ -267,7 +255,7 @@ async def test_a_single_byte_window_still_sends_the_first_byte() -> None:
         conn.initiate_connection()
         conn.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 1})
         stream_id = conn.get_next_available_stream_id()
-        conn.send_headers(stream_id, request_headers("GET", "/one"), end_stream=True)
+        conn.send_headers(stream_id, h2_request_headers("GET", "/one"), end_stream=True)
         writer.write(conn.data_to_send())
         await writer.drain()
 

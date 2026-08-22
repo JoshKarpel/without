@@ -19,7 +19,6 @@ from hypothesis import given
 from hypothesis import strategies as st
 from without import Stream
 from without import stream_from_iterable
-from without_asgi import Asgi
 from without_asgi import EarlyHint
 from without_asgi import HttpHandler
 from without_asgi import HttpScope
@@ -47,35 +46,17 @@ from without_asgi.compression import padded_gzip_compressor
 from without_asgi.compression import padded_zstd_compressor
 from without_asgi.routing import HttpMiddleware
 
+from .helpers import FileDescriptor
+from .helpers import a_scope
+
 # A body long enough to clear the default `minimum_size` floor, and compressible
 # enough that the encoded form is unmistakably shorter than the plain one.
 BODY = b'{"todos":[' + b'{"title":"write the docs","done":false},' * 40 + b"]}"
 SHORT = b'{"ok":true}'
 
 
-@dataclass(frozen=True, slots=True)
-class _FileDescriptor:
-    """The whole of what `ZeroCopySend` asks of a file: something with a descriptor."""
-
-    def fileno(self) -> int:
-        return 7  # pragma: no cover - only its presence satisfies the SupportsFileno protocol; never called
-
-
 def _scope(*, headers: RawHeaders = (), http_version: str = "1.1") -> HttpScope:
-    return HttpScope(
-        asgi=Asgi(version="3.0", spec_version="2.4"),
-        http_version=http_version,
-        method="GET",
-        scheme="http",
-        path="/todos",
-        raw_path=b"/todos",
-        query_string=b"",
-        root_path="",
-        headers=headers,
-        client=None,
-        server=None,
-        extensions=None,
-    )
+    return a_scope(path="/todos", http_version=http_version, headers=headers)
 
 
 def _accepting(offer: bytes, *, http_version: str = "1.1") -> HttpScope:
@@ -838,7 +819,7 @@ class TestOtherEvents:
         "offloaded",
         [
             pytest.param(PathSend(path="/srv/data.json"), id="path-send"),
-            pytest.param(ZeroCopySend(file=_FileDescriptor()), id="zero-copy-send"),
+            pytest.param(ZeroCopySend(file=FileDescriptor()), id="zero-copy-send"),
         ],
     )
     async def test_refuses_to_offload_a_body_it_has_committed_to_encoding(self, offloaded: Outbound) -> None:

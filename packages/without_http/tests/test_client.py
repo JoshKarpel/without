@@ -60,33 +60,14 @@ from without_http.client import _utcnow
 from without_http.client import _with_cookie
 from without_http.client import _with_release
 
+from .helpers import chunks
+from .helpers import large_upload
+from .helpers import read_body
+from .helpers import sized_echo_app
+from .helpers import tagged_echo_app
+
 type _Endpoint = tuple[asyncio.StreamReader, asyncio.StreamWriter]
 type _StreamPairFactory = Callable[[], Awaitable[tuple[_Endpoint, _Endpoint]]]
-
-
-async def _read_body(receive: Receive) -> bytes:
-    body = b""
-    more = True
-    while more:
-        message = await receive()
-        if message["type"] == "http.disconnect":  # pragma: no cover - clients here never disconnect mid-body
-            break
-        chunk = message.get("body", b"")
-        assert isinstance(chunk, bytes)
-        body += chunk
-        more = bool(message.get("more_body", False))
-    return body
-
-
-async def echo_app(scope: RawScope, receive: Receive, send: Send) -> None:
-    if scope["type"] != "http":
-        raise RuntimeError("this app serves only http")
-    head = parse_http_scope(scope)
-    body = await _read_body(receive)
-    marker = next((value for name, value in head.headers if name == b"x-test"), b"")
-    payload = f"{head.method} {head.path} test={marker.decode()} body={body.decode()}".encode()
-    await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
-    await send({"type": "http.response.body", "body": payload})
 
 
 async def redirect_app(scope: RawScope, receive: Receive, send: Send) -> None:
@@ -94,7 +75,7 @@ async def redirect_app(scope: RawScope, receive: Receive, send: Send) -> None:
     if scope["type"] != "http":
         raise RuntimeError("this app serves only http")
     head = parse_http_scope(scope)
-    await _read_body(receive)
+    await read_body(receive)
     if head.path == "/start":
         status = int(head.query_string.removeprefix(b"status="))
         await send(
@@ -111,14 +92,14 @@ async def redirect_app(scope: RawScope, receive: Receive, send: Send) -> None:
 
 
 async def test_pool_gets_a_response() -> None:
-    async with serving(echo_app) as server, ConnectionPool() as pool:
+    async with serving(tagged_echo_app) as server, ConnectionPool() as pool:
         async with request(pool, "GET", f"http://{server.host}:{server.port}/items") as (head, body):
             assert head.status == 200
             assert await body.read() == b"GET /items test= body="
 
 
 async def test_pool_posts_a_body() -> None:
-    async with serving(echo_app) as server, ConnectionPool() as pool:
+    async with serving(tagged_echo_app) as server, ConnectionPool() as pool:
         url = f"http://{server.host}:{server.port}/submit"
         async with request(pool, "POST", url, body=b"payload") as (_head, body):
             assert await body.read() == b"POST /submit test= body=payload"
@@ -126,7 +107,7 @@ async def test_pool_posts_a_body() -> None:
 
 async def test_wrap_request_side_rewrites_the_outgoing_request() -> None:
     inject = wrap(request=lambda request: replace(request, headers=(*request.headers, (b"x-test", b"viawrap"))))
-    async with serving(echo_app) as server, ConnectionPool() as pool:
+    async with serving(tagged_echo_app) as server, ConnectionPool() as pool:
         async with request(inject(pool), "GET", f"http://{server.host}:{server.port}/items") as (_head, body):
             assert await body.read() == b"GET /items test=viawrap body="
 
@@ -141,14 +122,14 @@ async def test_wrap_response_side_transforms_the_returned_body() -> None:
 
         return ClientResponse(response.head, ResponseBody(upper(response.body.events())))
 
-    async with serving(echo_app) as server, ConnectionPool() as pool:
+    async with serving(tagged_echo_app) as server, ConnectionPool() as pool:
         client = wrap(response=shout)(pool)
         async with request(client, "GET", f"http://{server.host}:{server.port}/items") as (_head, body):
             assert await body.read() == b"GET /ITEMS TEST= BODY="
 
 
 async def test_add_headers_middleware_injects_a_header_seen_server_side() -> None:
-    async with serving(echo_app) as server, ConnectionPool() as pool:
+    async with serving(tagged_echo_app) as server, ConnectionPool() as pool:
         client = add_headers((b"x-test", b"injected"))(pool)
         async with request(client, "GET", f"http://{server.host}:{server.port}/items") as (_head, body):
             assert await body.read() == b"GET /items test=injected body="
@@ -316,7 +297,7 @@ async def chain_app(scope: RawScope, receive: Receive, send: Send) -> None:
     if scope["type"] != "http":
         raise RuntimeError("this app serves only http")
     head = parse_http_scope(scope)
-    await _read_body(receive)
+    await read_body(receive)
     remaining = int(head.path.removeprefix("/hop/"))
     if remaining == 0:
         await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
@@ -344,23 +325,6 @@ async def test_follow_redirects_middleware_stops_at_max_hops() -> None:
             # The chain is longer than max_hops, so it stops still on a redirect.
             assert head.status == 302
             assert await body.read() == b""
-
-
-async def sized_echo_app(scope: RawScope, receive: Receive, send: Send) -> None:
-    """Like `echo_app` but sends a `content-length`, so the response is keep-alive framed."""
-    if scope["type"] != "http":
-        raise RuntimeError("this app serves only http")
-    head = parse_http_scope(scope)
-    body = await _read_body(receive)
-    payload = f"{head.method} {head.path} body={body.decode()}".encode()
-    await send(
-        {
-            "type": "http.response.start",
-            "status": 200,
-            "headers": [(b"content-type", b"text/plain"), (b"content-length", str(len(payload)).encode())],
-        }
-    )
-    await send({"type": "http.response.body", "body": payload})
 
 
 def _only_idle(pool: ConnectionPool) -> list[_Http11Connection]:
@@ -391,23 +355,9 @@ async def early_reject_app(scope: RawScope, receive: Receive, send: Send) -> Non
     await send({"type": "http.response.body", "body": b""})
 
 
-async def _large_upload() -> AsyncIterator[bytes]:
-    # To block, the upload must outrun the sender's send buffer *plus* the receiver's
-    # receive buffer, since a peer that never reads still absorbs both. Linux autotunes
-    # each up to `net.ipv4.tcp_wmem`/`tcp_rmem` (~10 MB combined on default kernels, and
-    # more on a tuned host), so a cap sized against one buffer is a race the kernel wins:
-    # the whole body lands in the buffers, nothing blocks, and the test hangs.
-    #
-    # The cap is generous rather than tuned because it costs nothing to raise: the
-    # generator is lazy, so a consumer that blocks (or is cancelled by an early response)
-    # only ever pays for the chunks it actually wrote.
-    for _ in range(512):  # pragma: no branch - the early response cancels this before the loop finishes
-        yield b"x" * 100_000
-
-
 async def test_early_response_to_a_large_upload_does_not_deadlock() -> None:
     async def post_status(pool: ConnectionPool, url: str) -> int:
-        async with request(pool, "POST", url, body=_large_upload()) as (head, body):
+        async with request(pool, "POST", url, body=large_upload()) as (head, body):
             await body.read()
             return head.status
 
@@ -476,7 +426,7 @@ async def _raising_body() -> AsyncIterator[bytes]:
 
 
 async def test_a_request_body_generator_error_surfaces_to_the_caller() -> None:
-    async with serving(echo_app) as server, ConnectionPool(max_connections_per_host=1) as pool:
+    async with serving(tagged_echo_app) as server, ConnectionPool(max_connections_per_host=1) as pool:
         url = f"http://{server.host}:{server.port}/up"
         with pytest.raises(ValueError, match="body generator blew up"):
             # The echo server waits for the whole body, so the head never arrives: the error
@@ -553,7 +503,7 @@ async def test_a_stale_pooled_connection_is_replaced_with_a_fresh_one() -> None:
 
 
 async def test_cleartext_h2c_uses_http_2_by_prior_knowledge() -> None:
-    async with serving(echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
+    async with serving(tagged_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
         async with request(pool, "GET", f"http://{server.host}:{server.port}/items") as (head, body):
             assert head.status == 200
             assert await body.read() == b"GET /items test= body="
@@ -561,16 +511,11 @@ async def test_cleartext_h2c_uses_http_2_by_prior_knowledge() -> None:
         assert pool._h11 == {}
 
 
-async def _chunks(*parts: bytes) -> AsyncIterator[bytes]:
-    for part in parts:
-        yield part
-
-
 async def chunked_response_app(scope: RawScope, receive: Receive, send: Send) -> None:
     """A raw ASGI app that streams its response body across several `more_body` chunks."""
     if scope["type"] != "http":
         raise RuntimeError("this app serves only http")
-    await _read_body(receive)
+    await read_body(receive)
     await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
     for part in (b"one", b"two", b"three"):
         await send({"type": "http.response.body", "body": part, "more_body": True})
@@ -578,8 +523,8 @@ async def chunked_response_app(scope: RawScope, receive: Receive, send: Send) ->
 
 
 async def test_streams_a_request_body_from_an_async_iterator() -> None:
-    async with serving(echo_app) as server, ConnectionPool() as pool:
-        upload = _chunks(b"ab", b"cd", b"ef")
+    async with serving(tagged_echo_app) as server, ConnectionPool() as pool:
+        upload = chunks(b"ab", b"cd", b"ef")
         async with request(pool, "POST", f"http://{server.host}:{server.port}/up", body=upload) as (_head, body):
             assert await body.read() == b"POST /up test= body=abcdef"
 
@@ -599,7 +544,7 @@ async def cookie_app(scope: RawScope, receive: Receive, send: Send) -> None:
     if scope["type"] != "http":
         raise RuntimeError("this app serves only http")
     head = parse_http_scope(scope)
-    await _read_body(receive)
+    await read_body(receive)
     set_cookie = {
         "/set": (b"set-cookie", b"sid=xyz789; Path=/"),
         "/clear": (b"set-cookie", b"sid=; Path=/; Max-Age=0"),
@@ -649,21 +594,16 @@ def test_build_request_keeps_an_explicit_content_length_for_a_buffered_body() ->
 
 
 async def test_build_request_keeps_explicit_framing_for_a_streaming_body() -> None:
-    stream = _chunks(b"ab", b"cd")
+    stream = chunks(b"ab", b"cd")
     outgoing = _build_request("POST", "http://h/x", ((b"transfer-encoding", b"chunked"),), stream, Timeout())
 
     assert outgoing.headers == ((b"transfer-encoding", b"chunked"),)
     assert [chunk async for chunk in outgoing.body] == [b"ab", b"cd"]
 
 
-async def _chunks_with_gaps(*parts: bytes) -> AsyncIterator[bytes]:
-    for part in parts:
-        yield part
-
-
-async def test_streams_an_h11_body_with_an_explicit_host_and_empty_chunks() -> None:
-    async with serving(echo_app) as server, ConnectionPool() as pool:
-        upload = _chunks_with_gaps(b"", b"ab", b"", b"cd")
+async def test_streams_an_h11_body_with_an_explicit_host_and_emptychunks() -> None:
+    async with serving(tagged_echo_app) as server, ConnectionPool() as pool:
+        upload = chunks(b"", b"ab", b"", b"cd")
         url = f"http://{server.host}:{server.port}/up"
         async with request(pool, "POST", url, headers=((b"host", b"override.test"),), body=upload) as (_head, body):
             assert await body.read() == b"POST /up test= body=abcd"
@@ -671,7 +611,7 @@ async def test_streams_an_h11_body_with_an_explicit_host_and_empty_chunks() -> N
 
 async def test_reads_a_large_h11_response_body_across_multiple_socket_reads() -> None:
     payload = b"x" * 200_000
-    async with serving(echo_app) as server, ConnectionPool() as pool:
+    async with serving(tagged_echo_app) as server, ConnectionPool() as pool:
         url = f"http://{server.host}:{server.port}/big"
         async with request(pool, "POST", url, body=payload) as (_head, body):
             assert await body.read() == b"POST /big test= body=" + payload
@@ -681,7 +621,7 @@ async def no_location_redirect_app(scope: RawScope, receive: Receive, send: Send
     """Answer every request with a `302` that carries no `Location` header."""
     if scope["type"] != "http":
         raise RuntimeError("this app serves only http")
-    await _read_body(receive)
+    await read_body(receive)
     await send({"type": "http.response.start", "status": 302, "headers": [(b"content-length", b"0")]})
     await send({"type": "http.response.body", "body": b""})
 
@@ -858,14 +798,14 @@ def test_build_request_adds_content_length_for_a_buffered_body() -> None:
 
 
 async def test_build_request_keeps_content_length_for_a_streaming_body() -> None:
-    stream = _chunks(b"ab", b"cd")
+    stream = chunks(b"ab", b"cd")
     outgoing = _build_request("POST", "http://api.example.test/x", ((b"content-length", b"4"),), stream, Timeout())
 
     assert outgoing.headers == ((b"content-length", b"4"),)  # no chunked framing added over an explicit length
 
 
 async def test_build_request_adds_chunked_transfer_encoding_for_an_unframed_streaming_body() -> None:
-    stream = _chunks(b"payload")
+    stream = chunks(b"payload")
     outgoing = _build_request("POST", "http://api.example.test/x", (), stream, Timeout())
 
     assert outgoing.headers == ((b"transfer-encoding", b"chunked"),)
@@ -886,14 +826,14 @@ def test_build_request_lets_the_caller_override_what_the_content_described() -> 
 
 
 async def test_a_content_body_reaches_the_server_as_bytes_and_a_content_type() -> None:
-    async with serving(echo_app) as server, ConnectionPool() as pool:
+    async with serving(tagged_echo_app) as server, ConnectionPool() as pool:
         url = f"http://{server.host}:{server.port}/submit"
         async with request(pool, "POST", url, body=json_content({"n": 1})) as (_head, body):
             assert await body.read() == b'POST /submit test= body={"n": 1}'
 
 
-async def test_build_request_takes_a_streaming_contents_headers_and_chunks() -> None:
-    content = StreamingContent(_chunks(b"ab", b"cd"), ((b"content-type", b"multipart/form-data; boundary=bb"),))
+async def test_build_request_takes_a_streaming_contents_headers_andchunks() -> None:
+    content = StreamingContent(chunks(b"ab", b"cd"), ((b"content-type", b"multipart/form-data; boundary=bb"),))
 
     outgoing = _build_request("POST", "http://h/x", ((b"x-trace", b"t-1"),), content, Timeout())
 
@@ -906,9 +846,9 @@ async def test_build_request_takes_a_streaming_contents_headers_and_chunks() -> 
 
 
 async def test_a_streaming_content_body_reaches_the_server_with_its_headers() -> None:
-    async with serving(echo_app) as server, ConnectionPool() as pool:
+    async with serving(tagged_echo_app) as server, ConnectionPool() as pool:
         url = f"http://{server.host}:{server.port}/submit"
-        content = StreamingContent(_chunks(b"part one ", b"part two"), ((b"x-test", b"paired"),))
+        content = StreamingContent(chunks(b"part one ", b"part two"), ((b"x-test", b"paired"),))
         async with request(pool, "POST", url, body=content) as (_head, body):
             assert await body.read() == b"POST /submit test=paired body=part one part two"
 
@@ -921,7 +861,7 @@ def test_build_request_carries_the_timeout_onto_the_request() -> None:
 
 
 async def test_open_reports_http_1_1_for_a_cleartext_connection() -> None:
-    async with serving(echo_app) as server:
+    async with serving(tagged_echo_app) as server:
         _reader, writer, protocol = await _open(server.host, server.port, ssl_context=None)
         try:
             assert protocol == "http/1.1"
@@ -933,7 +873,7 @@ async def test_open_reports_http_1_1_for_a_cleartext_connection() -> None:
 
 async def test_tcp_connect_tunes_the_happy_eyeballs_delay() -> None:
     connect = tcp_connect(happy_eyeballs_delay=timedelta(milliseconds=50))
-    async with serving(echo_app) as server, ConnectionPool(connect=connect) as pool:
+    async with serving(tagged_echo_app) as server, ConnectionPool(connect=connect) as pool:
         async with request(pool, "GET", f"http://{server.host}:{server.port}/raced") as (head, body):
             assert head.status == 200
             assert await body.read() == b"GET /raced test= body="
@@ -941,7 +881,7 @@ async def test_tcp_connect_tunes_the_happy_eyeballs_delay() -> None:
 
 async def test_tcp_connect_connects_sequentially_without_a_delay() -> None:
     connect = tcp_connect(happy_eyeballs_delay=None)
-    async with serving(echo_app) as server, ConnectionPool(connect=connect) as pool:
+    async with serving(tagged_echo_app) as server, ConnectionPool(connect=connect) as pool:
         async with request(pool, "GET", f"http://{server.host}:{server.port}/serial") as (head, body):
             assert head.status == 200
             assert await body.read() == b"GET /serial test= body="
@@ -950,7 +890,7 @@ async def test_tcp_connect_connects_sequentially_without_a_delay() -> None:
 async def test_tcp_connect_takes_an_injected_resolver() -> None:
     # The URL names a host no DNS knows; the injected resolver maps it to the live
     # server, proving resolution policy swaps without monkeypatching.
-    async with serving(echo_app) as server:
+    async with serving(tagged_echo_app) as server:
 
         async def canned(host: str, port: int) -> list[tuple[int, int, int, str, tuple[str, int]]]:
             assert (host, port) == ("fake.internal", 80)

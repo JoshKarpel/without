@@ -20,8 +20,9 @@ from without_http import serving
 from without_http.client import _open
 from without_http.client import _origin
 
-from .conftest import HOST
-from .test_client import echo_app
+from .helpers import HOST
+from .helpers import chunks
+from .helpers import tagged_echo_app
 
 
 @pytest.fixture(scope="session")
@@ -37,7 +38,7 @@ def server_context_h11_only(authority: trustme.CA, tmp_path_factory: pytest.Temp
 async def test_open_reports_http_1_1_when_tls_alpn_declines_h2(
     server_context_h11_only: ssl.SSLContext, trusting_client_context_factory: Callable[[], ssl.SSLContext]
 ) -> None:
-    async with serving(echo_app, ssl_context=server_context_h11_only) as server:
+    async with serving(tagged_echo_app, ssl_context=server_context_h11_only) as server:
         context = trusting_client_context_factory()
         context.set_alpn_protocols(["h2", "http/1.1"])
         _reader, writer, protocol = await _open(HOST, server.port, ssl_context=context)
@@ -52,7 +53,7 @@ async def test_open_reports_http_1_1_when_tls_alpn_declines_h2(
 async def test_an_https_request_with_http2_disabled_uses_http_1_1(
     server_context: ssl.SSLContext, trusting_client_context_factory: Callable[[], ssl.SSLContext]
 ) -> None:
-    async with serving(echo_app, ssl_context=server_context) as server:
+    async with serving(tagged_echo_app, ssl_context=server_context) as server:
         async with ConnectionPool(allow_http2=False, ssl_context_factory=trusting_client_context_factory) as pool:
             async with request(pool, "GET", f"https://{HOST}:{server.port}/items") as (head, body):
                 assert head.status == 200
@@ -63,7 +64,7 @@ async def test_an_https_request_with_http2_disabled_uses_http_1_1(
 async def test_alpn_fallback_to_http_1_1_pools_and_reuses_an_h11_connection(
     server_context_h11_only: ssl.SSLContext, trusting_client_context_factory: Callable[[], ssl.SSLContext]
 ) -> None:
-    async with serving(echo_app, ssl_context=server_context_h11_only) as server:
+    async with serving(tagged_echo_app, ssl_context=server_context_h11_only) as server:
         async with ConnectionPool(ssl_context_factory=trusting_client_context_factory) as pool:
             url = f"https://{HOST}:{server.port}/items"
             async with request(pool, "GET", url) as (_head, body):
@@ -78,7 +79,7 @@ async def test_alpn_fallback_to_http_1_1_pools_and_reuses_an_h11_connection(
 async def test_an_unusable_pooled_h2_connection_is_replaced(
     server_context: ssl.SSLContext, trusting_client_context_factory: Callable[[], ssl.SSLContext]
 ) -> None:
-    async with serving(echo_app, ssl_context=server_context) as server:
+    async with serving(tagged_echo_app, ssl_context=server_context) as server:
         async with ConnectionPool(ssl_context_factory=trusting_client_context_factory) as pool:
             url = f"https://{HOST}:{server.port}/items"
             async with request(pool, "GET", url) as (_head, body):
@@ -94,7 +95,7 @@ async def test_an_unusable_pooled_h2_connection_is_replaced(
 async def test_client_round_trips_a_get_over_h2(
     server_context: ssl.SSLContext, trusting_client_context_factory: Callable[[], ssl.SSLContext]
 ) -> None:
-    async with serving(echo_app, ssl_context=server_context) as server:
+    async with serving(tagged_echo_app, ssl_context=server_context) as server:
         async with ConnectionPool(ssl_context_factory=trusting_client_context_factory) as pool:
             async with request(pool, "GET", f"https://{HOST}:{server.port}/items") as (head, body):
                 assert head.status == 200
@@ -105,7 +106,7 @@ async def test_client_round_trips_a_get_over_h2(
 async def test_client_posts_a_body_over_h2(
     server_context: ssl.SSLContext, trusting_client_context_factory: Callable[[], ssl.SSLContext]
 ) -> None:
-    async with serving(echo_app, ssl_context=server_context) as server:
+    async with serving(tagged_echo_app, ssl_context=server_context) as server:
         async with ConnectionPool(ssl_context_factory=trusting_client_context_factory) as pool:
             url = f"https://{HOST}:{server.port}/submit"
             async with request(pool, "POST", url, body=b"payload") as (_head, body):  # pragma: no branch
@@ -119,7 +120,7 @@ async def test_client_multiplexes_concurrent_requests_over_one_h2_connection(
         async with request(pool, "GET", f"https://{HOST}:{port}/n{index}") as (_head, body):
             return await body.read()
 
-    async with serving(echo_app, ssl_context=server_context) as server:
+    async with serving(tagged_echo_app, ssl_context=server_context) as server:
         async with ConnectionPool(ssl_context_factory=trusting_client_context_factory) as pool:
             bodies = await asyncio.gather(*(fetch(pool, server.port, index) for index in range(8)))
             assert len(pool._h2) == 1
@@ -127,17 +128,12 @@ async def test_client_multiplexes_concurrent_requests_over_one_h2_connection(
     assert bodies == [f"GET /n{index} test= body=".encode() for index in range(8)]
 
 
-async def _chunks(*parts: bytes) -> AsyncIterator[bytes]:
-    for part in parts:
-        yield part
-
-
 async def test_client_streams_a_request_body_over_h2(
     server_context: ssl.SSLContext, trusting_client_context_factory: Callable[[], ssl.SSLContext]
 ) -> None:
-    async with serving(echo_app, ssl_context=server_context) as server:
+    async with serving(tagged_echo_app, ssl_context=server_context) as server:
         async with ConnectionPool(ssl_context_factory=trusting_client_context_factory) as pool:
-            upload = _chunks(b"ab", b"cd", b"ef")
+            upload = chunks(b"ab", b"cd", b"ef")
             async with request(pool, "POST", f"https://{HOST}:{server.port}/up", body=upload) as (
                 _head,
                 body,
@@ -149,7 +145,7 @@ async def test_client_round_trips_a_body_larger_than_the_flow_control_window(
     server_context: ssl.SSLContext, trusting_client_context_factory: Callable[[], ssl.SSLContext]
 ) -> None:
     payload = b"z" * 200_000
-    async with serving(echo_app, ssl_context=server_context) as server:
+    async with serving(tagged_echo_app, ssl_context=server_context) as server:
         async with ConnectionPool(ssl_context_factory=trusting_client_context_factory) as pool:
             async with request(pool, "POST", f"https://{HOST}:{server.port}/big", body=payload) as (
                 _head,
@@ -162,7 +158,7 @@ async def test_client_add_headers_middleware_reaches_the_server_over_h2(
     server_context: ssl.SSLContext, trusting_client_context_factory: Callable[[], ssl.SSLContext]
 ) -> None:
     async with (
-        serving(echo_app, ssl_context=server_context) as server,
+        serving(tagged_echo_app, ssl_context=server_context) as server,
         ConnectionPool(ssl_context_factory=trusting_client_context_factory) as pool,
         request(add_headers((b"x-test", b"injected"))(pool), "GET", f"https://{HOST}:{server.port}/items") as (
             _head,
@@ -173,13 +169,13 @@ async def test_client_add_headers_middleware_reaches_the_server_over_h2(
 
 
 async def test_cleartext_stays_http_1_1_even_with_http2_enabled() -> None:
-    async with serving(echo_app) as server, ConnectionPool(allow_http2=True) as pool:
+    async with serving(tagged_echo_app) as server, ConnectionPool(allow_http2=True) as pool:
         async with request(pool, "GET", f"http://{HOST}:{server.port}/items") as (_head, body):
             assert await body.read() == b"GET /items test= body="
         assert pool._h2 == {}
 
 
-async def bidi_echo_app(scope: RawScope, receive: Receive, send: Send) -> None:
+async def bidi_tagged_echo_app(scope: RawScope, receive: Receive, send: Send) -> None:
     """Uppercase each request-body chunk into a response chunk, interleaved (full duplex)."""
     if scope["type"] != "http":
         raise RuntimeError("this app serves only http")
@@ -200,7 +196,7 @@ async def bidi_echo_app(scope: RawScope, receive: Receive, send: Send) -> None:
 
 
 async def test_h2_bidirectional_ping_pong_streams_both_ways() -> None:
-    async with serving(bidi_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
+    async with serving(bidi_tagged_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
         outbound: asyncio.Queue[bytes | None] = asyncio.Queue()
 
         async def request_body() -> AsyncIterator[bytes]:
@@ -221,7 +217,7 @@ async def test_h2_bidirectional_ping_pong_streams_both_ways() -> None:
 
 
 async def test_h2_server_speaks_first_before_the_request_body_is_ready() -> None:
-    async with serving(bidi_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
+    async with serving(bidi_tagged_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
         head_seen = asyncio.Event()
 
         async def request_body() -> AsyncIterator[bytes]:
@@ -238,7 +234,7 @@ async def test_h2_server_speaks_first_before_the_request_body_is_ready() -> None
 
 @pytest.mark.no_mutation  # teardown-timing assertions below are perturbed by mutmut's trampoline; see pyproject
 async def test_h2_abandoning_a_bidi_body_cancels_the_parked_sender() -> None:
-    async with serving(bidi_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
+    async with serving(bidi_tagged_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
         outbound: asyncio.Queue[bytes | None] = asyncio.Queue()
 
         async def request_body() -> AsyncIterator[bytes]:
@@ -280,7 +276,7 @@ async def test_h2_a_request_body_error_after_the_head_resets_the_stream() -> Non
             release.set()
             await body.read()
 
-    async with serving(bidi_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
+    async with serving(bidi_tagged_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
         url = f"http://{server.host}:{server.port}/bidi"
         with pytest.raises(ValueError, match="h2 body blew up"):
             await exchange(pool, url)

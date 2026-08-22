@@ -40,19 +40,7 @@ from without_http import zstd_compressor
 from without_http.client import _compressed
 from without_http.testing import mock_client
 
-
-async def _read_body(receive: Receive) -> bytes:
-    body = b""
-    more = True
-    while more:
-        message = await receive()
-        if message["type"] == "http.disconnect":  # pragma: no cover - clients here never disconnect mid-body
-            break
-        chunk = message.get("body", b"")
-        assert isinstance(chunk, bytes)
-        body += chunk
-        more = bool(message.get("more_body", False))
-    return body
+from .helpers import read_body
 
 
 async def report_app(scope: RawScope, receive: Receive, send: Send) -> None:
@@ -64,7 +52,7 @@ async def report_app(scope: RawScope, receive: Receive, send: Send) -> None:
     def header(name: bytes) -> bytes:
         return next((value for header_name, value in head.headers if header_name == name), b"absent")
 
-    body = await _read_body(receive)
+    body = await read_body(receive)
     if header(b"content-encoding") == b"gzip":
         body = gzip.decompress(body)
     elif header(b"content-encoding") == b"zstd":
@@ -90,7 +78,7 @@ def encoded_app(encoding: bytes, chunks: tuple[bytes, ...]) -> ASGIApp:
     async def app(scope: RawScope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             raise RuntimeError("this app serves only http")
-        await _read_body(receive)
+        await read_body(receive)
         await send({"type": "http.response.start", "status": 200, "headers": [(b"content-encoding", encoding)]})
         for chunk in chunks:
             await send({"type": "http.response.body", "body": chunk, "more_body": True})

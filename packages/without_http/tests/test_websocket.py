@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import ssl
-from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from contextlib import suppress
@@ -22,93 +20,12 @@ from wsproto import WSConnection
 from wsproto.events import AcceptConnection
 from wsproto.events import BytesMessage
 from wsproto.events import CloseConnection
-from wsproto.events import Event
-from wsproto.events import Ping
 from wsproto.events import Pong
 from wsproto.events import RejectConnection
 from wsproto.events import Request
 from wsproto.events import TextMessage
 
-_BUFFER = 65536
-
-
-@dataclass(slots=True)
-class WebSocketClient:
-    """A minimal wsproto-backed WebSocket client for exercising the server."""
-
-    reader: asyncio.StreamReader
-    writer: asyncio.StreamWriter
-    conn: WSConnection
-    pending: deque[Event] = field(default_factory=deque)
-
-    @classmethod
-    async def connect(
-        cls,
-        host: str,
-        port: int,
-        path: str,
-        *,
-        subprotocols: tuple[str, ...] = (),
-        ssl_context: ssl.SSLContext | None = None,
-    ) -> WebSocketClient:
-        reader, writer = await asyncio.open_connection(host, port, ssl=ssl_context)
-        conn = WSConnection(ConnectionType.CLIENT)
-        writer.write(conn.send(Request(host=host, target=path, subprotocols=list(subprotocols))))
-        await writer.drain()
-        return cls(reader=reader, writer=writer, conn=conn)
-
-    async def next_event(self) -> Event:
-        while not self.pending:
-            data = await self.reader.read(_BUFFER)
-            self.conn.receive_data(data)
-            self.pending.extend(self.conn.events())
-            if data == b"":
-                break  # pragma: no cover - tests always read a frame before reaching EOF here
-        return self.pending.popleft()
-
-    async def send_text(self, text: str) -> None:
-        self.writer.write(self.conn.send(TextMessage(data=text)))
-        await self.writer.drain()
-
-    async def send_fragmented_text(self, first: str, rest: str) -> None:
-        self.writer.write(self.conn.send(TextMessage(data=first, message_finished=False)))
-        self.writer.write(self.conn.send(TextMessage(data=rest, message_finished=True)))
-        await self.writer.drain()
-
-    async def send_bytes(self, data: bytes) -> None:
-        self.writer.write(self.conn.send(BytesMessage(data=data)))
-        await self.writer.drain()
-
-    async def send_fragmented_bytes(self, first: bytes, rest: bytes) -> None:
-        self.writer.write(self.conn.send(BytesMessage(data=first, message_finished=False)))
-        self.writer.write(self.conn.send(BytesMessage(data=rest, message_finished=True)))
-        await self.writer.drain()
-
-    async def send_raw(self, raw: bytes) -> None:
-        self.writer.write(raw)
-        await self.writer.drain()
-
-    async def send_close(self, code: int, reason: str) -> None:
-        self.writer.write(self.conn.send(CloseConnection(code=code, reason=reason)))
-        await self.writer.drain()
-
-    async def send_ping(self) -> None:
-        self.writer.write(self.conn.send(Ping()))
-        await self.writer.drain()
-
-    async def send_pong(self) -> None:
-        self.writer.write(self.conn.send(Pong()))
-        await self.writer.drain()
-
-    async def close(self, code: int = 1000) -> None:
-        with suppress(OSError):
-            self.writer.write(self.conn.send(CloseConnection(code=code, reason="")))
-            await self.writer.drain()
-
-    async def aclose(self) -> None:
-        self.writer.close()
-        with suppress(OSError):
-            await self.writer.wait_closed()
+from .helpers import WebSocketClient
 
 
 @asynccontextmanager
