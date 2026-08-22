@@ -6,6 +6,7 @@ from typing import assert_type
 from markupsafe import Markup
 from without_html import Element
 from without_html import ElementConstructor
+from without_html import RawTextElementConstructor
 from without_html import VoidElement
 from without_html import VoidElementConstructor
 from without_html import br
@@ -27,6 +28,14 @@ if TYPE_CHECKING:
     assert_type(element_type("x-chart"), ElementConstructor)
     assert_type(void_element_type("x-spacer"), VoidElementConstructor)
     assert_type(script(children=Markup("f()")), Element)
+
+    # A raw-text constructor takes a narrower `children` than `ElementConstructor`
+    # promises, so it does not satisfy that protocol, which is why there is a second one
+    # naming `Markup | None` itself. The relationship only runs one way: an ordinary
+    # constructor accepts everything a raw-text one must, so `div` satisfies both.
+    ordinary: ElementConstructor = div
+    raw_text: RawTextElementConstructor = script
+    ordinary = script  # type: ignore[assignment]
 
     br(children="text")  # type: ignore[call-arg]
     script(children="alert(1)")  # type: ignore[arg-type]

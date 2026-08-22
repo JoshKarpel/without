@@ -219,6 +219,18 @@ class ElementConstructor(Protocol):
         ...
 
 
+class RawTextElementConstructor(Protocol):
+    """The call signature every raw-text element constructor shares, and its tag identity."""
+
+    __name__: str
+
+    def __call__(
+        self, *, cls: ClassNames = None, attrs: Attributes | None = None, children: Markup | None = None
+    ) -> Element:
+        """Build one element of this kind."""
+        ...
+
+
 class VoidElementConstructor(Protocol):
     """The call signature every named void element constructor shares, and its tag identity."""
 

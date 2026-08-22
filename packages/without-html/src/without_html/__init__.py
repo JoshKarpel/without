@@ -10,6 +10,7 @@ from without_html.nodes import ClassNames
 from without_html.nodes import Element
 from without_html.nodes import ElementConstructor
 from without_html.nodes import Node
+from without_html.nodes import RawTextElementConstructor
 from without_html.nodes import VoidElement
 from without_html.nodes import VoidElementConstructor
 from without_html.nodes import element
@@ -145,7 +146,8 @@ __all__ = [
     # cog.outl(emit_names([
     #     "DOCTYPE", "AttributeValue", "Attributes", "ClassNames", "Element", "Node",
     #     "Markup", "SupportsHtml", "AnyElement", "VoidElement", "ElementConstructor",
-    #     "VoidElementConstructor", "element", "element_type", "void_element_type",
+    #     "RawTextElementConstructor", "VoidElementConstructor",
+    #     "element", "element_type", "void_element_type",
     #     "escape", "render",
     # ]))
     # ]]]
@@ -158,6 +160,7 @@ __all__ = [
     "ElementConstructor",
     "Markup",
     "Node",
+    "RawTextElementConstructor",
     "SupportsHtml",
     "VoidElement",
     "VoidElementConstructor",
