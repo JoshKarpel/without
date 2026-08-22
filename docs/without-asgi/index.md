@@ -374,13 +374,21 @@ encodes hands back identity bytes to stitch into an encoded body. Weakening wher
 nothing was encoded is the same error pointed the other way: a `video/mp4` is stored
 as the identity bytes its strong tag was stated for, so a `W/` copied onto it breaks
 every later range request into a full response for a re-encoding that never happened.
-The [size floor](#how-big-is-big-enough) settles it the same way when the `304` states
-a `content-length`, which
+The size a `304` may also state, which
 [RFC 9110 §8.6](https://www.rfc-editor.org/rfc/rfc9110#section-8.6) allows and reads as
-the size of the selected representation: under the floor the stored body went out
-unencoded whatever the client offered, so its tag stands. A client that negotiates
-nothing holds the identity representation either way, so its validator is left exactly
-as the app stated it.
+the size of the selected representation, is deliberately *not* read as the same kind of
+evidence, though a `200`'s own `content-length` answers the
+[size floor](#how-big-is-big-enough). It would only prove the stored body went out
+unencoded where nothing under `minimum_size` is ever encoded, which is
+`weigh_undeclared_bodies` rather than the default, and what it buys is a strong
+validator on a representation too small for anyone to ask a range of.
+
+Where the tag is weakened, any `content-length` the `304` carried goes with it. §8.6
+permits one only where it equals what a `200` to the same request would have carried,
+and for this client that `200` is the encoded variant, so the identity size the app
+stated is no longer that number. A client that negotiates nothing holds the identity
+representation either way, so both its validator and its stated size are left exactly
+as the app wrote them.
 
 ### How big is big enough
 
@@ -391,10 +399,18 @@ answered is what the head said, not how the body arrives:
 - a declared `content-length` answers it before a single body event is read
 - a body that ends in the events read so far answers it exactly, from its own bytes,
   and is re-described with an exact `content-length` for its encoded form rather than
-  falling back to chunked, unless its head announced trailers, which HTTP/1.1 carries
-  only in the chunked coding, so a length would strand them
+  falling back to chunked, unless its head announced trailers over HTTP/1.x, which
+  carries trailers only in the chunked coding, so a length would strand them (HTTP/2
+  and HTTP/3 send trailers as a second HEADERS frame, which sits beside a length, so
+  announcing them costs nothing there)
 - a body still being produced behind a head that declared no length is the one case
   that cannot be answered without holding bytes the app has already made
+
+An empty body is left alone however low the floor, since encoding nothing produces
+pure framing and the head would then state *that* length. A `HEAD` response is where
+that shows: its head describes the body a `GET` would carry while its own body is
+empty, so the app's `content-length` would be replaced by the size of an empty encoded
+stream.
 
 `weigh_undeclared_bodies` decides that last case, and it is a policy rather than a
 second floor because the only two honest answers are to hold or not to. Holding means

@@ -92,9 +92,13 @@
   comparison and stitch identity range bytes into an encoded body. Which stored `200` a `304` updates
   is usually unknowable, since §15.4.5's field list omits `content-type` and most `304`s carry none,
   so the candidate is assumed; a `304` that names a type no coding applies to, or a `content-encoding`
-  the app applied itself, is left exactly as it arrived, and one stating a `content-length` under
-  `minimum_size` keeps its strong tag as well, because weakening a tag for a re-encoding that never
-  happened breaks every later range request into a full response. A `206` is never
+  the app applied itself, is left exactly as it arrived, because weakening a tag for a re-encoding
+  that never happened breaks every later range request into a full response. The size a `304` may
+  state is not read as the same evidence, since a body streamed behind a head that declared no length
+  is encoded however short it turns out to be. Where the tag is weakened the `304`'s `content-length`
+  goes with it, since [§8.6](https://www.rfc-editor.org/rfc/rfc9110#section-8.6) permits one only
+  where it equals what a `200` to the same request would have carried, which for that client is the
+  encoded variant. A `206` is never
   encoded: its `content-range` names offsets into the *identity* representation and nothing here can
   restate them for an encoded one, so a client reassembling ranges would stitch them at the wrong
   offsets.
@@ -102,9 +106,14 @@
   what decides how it is answered is what the head said rather than how the body arrives: a declared
   `content-length` answers it before a body event is read, a body that ends in the events read so far
   answers it exactly from its own bytes (and is re-described with an exact `content-length` for its
-  encoded form instead of falling back to chunked), and a body still being produced behind a head
+  encoded form instead of falling back to chunked, unless its head announced trailers over HTTP/1.x,
+  which carries them only in the chunked coding; HTTP/2 and HTTP/3 send trailers as a second HEADERS
+  frame that sits beside a length, so the exact length stands there), and a body still being produced behind a head
   that declared no length is the one case that cannot be answered without holding bytes the app has
-  already made. `weigh_undeclared_bodies` decides that case, and it is a policy rather than a second
+  already made. An empty body is left alone however low the floor, since encoding nothing produces
+  pure framing and the head would then state *that* length, which is how a `HEAD` response comes to
+  answer with the size of an empty encoded stream in place of the size of the body a `GET` would
+  carry. `weigh_undeclared_bodies` decides that case, and it is a policy rather than a second
   floor because the only two honest answers are to hold or not to: holding keeps produced bytes until
   `minimum_size` of them accumulate, so a feed emitting a line a second delivers nothing for as many
   seconds as that takes, and how long that is belongs to the app rather than to the middleware. The

@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from compression import zstd
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
 from typing import cast
 
 import brotli
@@ -60,10 +61,10 @@ class _FileDescriptor:
         return 7  # pragma: no cover - only its presence satisfies the SupportsFileno protocol; never called
 
 
-def _scope(*, headers: RawHeaders = ()) -> HttpScope:
+def _scope(*, headers: RawHeaders = (), http_version: str = "1.1") -> HttpScope:
     return HttpScope(
         asgi=Asgi(version="3.0", spec_version="2.4"),
-        http_version="1.1",
+        http_version=http_version,
         method="GET",
         scheme="http",
         path="/todos",
@@ -77,8 +78,8 @@ def _scope(*, headers: RawHeaders = ()) -> HttpScope:
     )
 
 
-def _accepting(offer: bytes) -> HttpScope:
-    return _scope(headers=((b"accept-encoding", offer),))
+def _accepting(offer: bytes, *, http_version: str = "1.1") -> HttpScope:
+    return _scope(headers=((b"accept-encoding", offer),), http_version=http_version)
 
 
 def _handler(events: Iterable[Outbound]) -> HttpHandler:
@@ -120,6 +121,19 @@ def _json_response(body: bytes = BODY, *, headers: RawHeaders = ()) -> tuple[Out
             headers=((b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()), *headers),
         ),
         ResponseBody(body=body, more_body=False),
+    )
+
+
+def _announcing_trailers() -> tuple[Outbound, ...]:
+    """A buffered response whose head declares both a length and trailers to follow."""
+    return (
+        ResponseStart(
+            status=200,
+            headers=((b"content-type", b"application/json"), (b"content-length", str(len(BODY)).encode())),
+            trailers=True,
+        ),
+        ResponseBody(body=BODY, more_body=False),
+        ResponseTrailers(headers=((b"digest", b"sha-256=abc"),)),
     )
 
 
@@ -243,6 +257,27 @@ class TestBufferedResponses:
         events = await _run(compress(minimum_size=1), _accepting(b"gzip"), _json_response(SHORT))
         assert _one(_head(events), b"content-encoding") == b"gzip"
         assert gzip.decompress(_body(events)) == SHORT
+
+    async def test_leaves_an_empty_body_alone_under_a_floor_of_zero(self) -> None:
+        """
+        Encoding nothing produces pure framing, and the head would then state *that*
+        length. A `HEAD` response is where it shows: its head describes the body a
+        `GET` would carry while its own body is empty, so the app's `content-length`
+        would be replaced by the size of an empty encoded stream.
+        """
+        source = (
+            ResponseStart(
+                status=200,
+                headers=((b"content-type", b"application/json"), (b"content-length", str(len(BODY)).encode())),
+            ),
+            ResponseBody(body=b"", more_body=False),
+        )
+        head_request = replace(_accepting(b"gzip"), method="HEAD")
+        events = await _run(compress(minimum_size=0), head_request, source)
+        head = _head(events)
+        assert _one(head, b"content-encoding") is None
+        assert _one(head, b"content-length") == str(len(BODY)).encode()
+        assert _body(events) == b""
 
     async def test_reads_an_accept_encoding_split_across_header_lines(self) -> None:
         """Reading only the first line would miss `gzip` and answer unencoded."""
@@ -432,29 +467,41 @@ class TestEtag:
         assert _one(head, b"etag") == b'"v1"'
         assert _values(head, b"vary") == []
 
-    async def test_leaves_a_revalidated_validator_alone_for_a_body_under_the_floor(self) -> None:
+    @pytest.mark.parametrize("size", [b"300", b"900"])
+    async def test_weakens_a_revalidated_validator_whatever_size_it_states(self, size: bytes) -> None:
         """
-        The floor settles what the stored `200` is just as its media type does. A `304`
-        may state the size of the representation it revalidates (RFC 9110 §8.6), and
-        under `minimum_size` that body went out unencoded whatever this client offered,
-        so the strong tag is still true of the bytes the client holds.
+        A `304` may state the size of the representation it revalidates (RFC 9110
+        §8.6), and it is not read as evidence the way a `200`'s own `content-length`
+        answers the floor. Under the default a body streamed behind a head that
+        declared no length commits to a coding on its first chunk however short it
+        turns out to be, so a size under `minimum_size` proves nothing about the
+        stored bytes.
         """
-        described = ((b"content-type", b"text/html"), (b"content-length", b"300"), (b"etag", b'"v1"'))
+        described = ((b"content-type", b"text/html"), (b"content-length", size), (b"etag", b'"v1"'))
         events = await _run(
             compress(minimum_size=500), _accepting(b"gzip"), (ResponseStart(status=304, headers=described),)
         )
         head = _head(events)
-        assert _one(head, b"etag") == b'"v1"'
-        # The variance is still declared: candidacy is a property of the resource, and
-        # a `200` of this type below the floor carries `vary` too.
+        assert _one(head, b"etag") == b'W/"v1"'
         assert _values(head, b"vary") == [b"accept-encoding"]
 
-    async def test_weakens_a_revalidated_validator_for_a_body_over_the_floor(self) -> None:
+    async def test_drops_a_revalidated_length_that_describes_the_unencoded_body(self) -> None:
+        """
+        RFC 9110 §8.6 permits a `content-length` on a `304` only where it equals what
+        a `200` to the same request would have carried. Once the validator is weakened
+        that `200` is the encoded variant, so the identity size the app stated is not
+        that number and goes rather than contradicting it.
+        """
         described = ((b"content-type", b"text/html"), (b"content-length", b"900"), (b"etag", b'"v1"'))
         events = await _run(
             compress(minimum_size=500), _accepting(b"gzip"), (ResponseStart(status=304, headers=described),)
         )
-        assert _one(_head(events), b"etag") == b'W/"v1"'
+        assert _one(_head(events), b"content-length") is None
+
+    async def test_keeps_a_revalidated_length_for_a_client_holding_identity_bytes(self) -> None:
+        described = ((b"content-type", b"text/html"), (b"content-length", b"900"), (b"etag", b'"v1"'))
+        events = await _run(compress(minimum_size=500), _scope(), (ResponseStart(status=304, headers=described),))
+        assert _one(_head(events), b"content-length") == b"900"
 
 
 # A decoder fed one encoded event at a time, which is what makes "delivered as it is
@@ -696,26 +743,32 @@ class TestOtherEvents:
         assert events[-1] == trailers
         assert _body(events) == SHORT
 
-    async def test_states_no_length_for_a_head_that_announced_trailers(self) -> None:
+    @pytest.mark.parametrize("http_version", ["1.0", "1.1"])
+    async def test_states_no_length_for_a_head_that_announced_trailers_over_http1(self, http_version: str) -> None:
         """
         HTTP/1.1 carries trailers only in the chunked coding, so the exact length this
         response could otherwise state would frame the body by length and strand the
         trailers behind it.
         """
-        source = (
-            ResponseStart(
-                status=200,
-                headers=((b"content-type", b"application/json"), (b"content-length", str(len(BODY)).encode())),
-                trailers=True,
-            ),
-            ResponseBody(body=BODY, more_body=False),
-            ResponseTrailers(headers=((b"digest", b"sha-256=abc"),)),
-        )
-        events = await _run(compress(), _accepting(b"gzip"), source)
+        events = await _run(compress(), _accepting(b"gzip", http_version=http_version), _announcing_trailers())
         head = _head(events)
         assert head.trailers
         assert _one(head, b"content-encoding") == b"gzip"
         assert _one(head, b"content-length") is None
+        assert gzip.decompress(_body(events)) == BODY
+
+    @pytest.mark.parametrize("http_version", ["2", "3"])
+    async def test_states_a_length_for_a_head_that_announced_trailers_over_http2(self, http_version: str) -> None:
+        """
+        HTTP/2 and HTTP/3 send trailers as a second HEADERS frame, which sits beside a
+        `content-length` rather than displacing it, so announcing trailers costs the
+        exact length nothing there.
+        """
+        events = await _run(compress(), _accepting(b"gzip", http_version=http_version), _announcing_trailers())
+        head = _head(events)
+        assert head.trailers
+        assert _one(head, b"content-encoding") == b"gzip"
+        assert _one(head, b"content-length") == str(len(_body(events))).encode()
         assert gzip.decompress(_body(events)) == BODY
 
     async def test_encodes_a_body_behind_a_push_the_app_sent_first(self) -> None:

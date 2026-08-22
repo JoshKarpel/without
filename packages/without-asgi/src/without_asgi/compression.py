@@ -605,6 +605,13 @@ def _revalidates_encodable(raw: RawHeaders, compressible: Callable[[bytes | None
     the strong validator the app stated is still true of them; weakening it anyway
     would break every later `If-Range`, which requires strong comparison, back into
     a full response, for a re-encoding that never happened.
+
+    The size a `304` may also state (RFC 9110 §8.6) is deliberately not read as the
+    same kind of evidence, though a `200`'s own `content-length` answers the floor.
+    It would only prove the stored body went out unencoded where nothing under
+    `minimum_size` is ever encoded, which is `weigh_undeclared_bodies` rather than the
+    default, and what it buys is a strong validator on a representation too small for
+    anyone to ask a range of.
     """
     if headers.first(raw, b"content-encoding") is not None:
         return False
@@ -628,6 +635,22 @@ def _declared_length(raw: RawHeaders) -> int | None:
         return int(length)
     except ValueError:
         return None
+
+
+def _trailers_need_chunking(http_version: str) -> bool:
+    """
+    Whether this HTTP version carries trailers only in the chunked coding, so a
+    response announcing them cannot also state an exact `content-length`.
+
+    HTTP/1.1 does, and a length there would frame the body by length and strand what
+    follows. HTTP/2 and HTTP/3 send trailers as a second HEADERS frame, which sits
+    beside a `content-length` rather than displacing it, so a response announcing
+    trailers keeps the exact length it could otherwise state. `1.0` is weighed with
+    the rest of the 1.x family rather than read as its own case: it carries no
+    trailers at all, so the only response the choice touches there is one announcing
+    trailers it cannot send.
+    """
+    return http_version.startswith("1.")
 
 
 def _deliverable(compressor: StreamingCompressor, chunk: bytes) -> bytes:
@@ -741,7 +764,10 @@ def compress(
     read, a body that ends in the events read so far answers it exactly from its own
     bytes, and a body still being produced behind a head that declared no length is
     the one case that cannot be answered without holding bytes the app has already
-    made.
+    made. An empty body is left alone however low the floor: encoding nothing
+    produces pure framing, and a head stating *its* length is how a `HEAD` response,
+    whose own body is empty while its head describes the body a `GET` would carry,
+    comes to answer with the wrong size.
 
     `weigh_undeclared_bodies` decides that case, and it is a policy rather than a
     second floor because the only two honest answers are to hold or not to. Holding
@@ -760,9 +786,10 @@ def compress(
     Committing needs a `StreamingCompressor`; a coding whose factory produces a
     plain `Compressor` still encodes responses that arrive whole, and leaves
     streaming ones unencoded rather than stalling them. A response that arrives
-    whole gets an exact `content-length` for its encoded body; a streamed one loses
-    `content-length` and is framed by the transport, as any streaming body is. A
-    strong `etag` is weakened when the body is encoded (see `_weakened`).
+    whole gets an exact `content-length` for its encoded body, unless it announced
+    trailers over HTTP/1.x, which carries them only in the chunked coding; a streamed
+    one loses `content-length` and is framed by the transport, as any streaming body
+    is. A strong `etag` is weakened when the body is encoded (see `_weakened`).
 
     !!! warning "Compression and secrets"
 
@@ -824,14 +851,7 @@ def compress(
             # neither field and falls through to the pass-through below, since its
             # status is one no coding applies to.
             revalidated = _varying(start.headers)
-            # A `304` that states the size of what it revalidates (RFC 9110 §8.6
-            # allows one, describing the selected representation) settles the floor
-            # the same way a `200`'s own `content-length` does: below it the stored
-            # body went out unencoded whatever the client offered, so its validator
-            # is still true of the bytes that client holds.
-            revalidated_length = _declared_length(start.headers)
-            below_floor = revalidated_length is not None and revalidated_length < minimum_size
-            if not below_floor and negotiate_coding(_accept_encoding(scope.headers), available) is not None:
+            if negotiate_coding(_accept_encoding(scope.headers), available) is not None:
                 # The stored entry this `304` updates is the one its `vary` key
                 # selects, so for a client that negotiates a coding it is the encoded
                 # variant, and RFC 9111 §4.3.4 has the cache copy these fields onto
@@ -841,7 +861,11 @@ def compress(
                 # middleware never encodes returns identity bytes to stitch into an
                 # encoded body. A client that negotiates nothing holds the identity
                 # representation, so its validator is left as the app stated it.
-                revalidated = _weakened(revalidated)
+                # Any `content-length` goes with the strong tag: §8.6 permits one on
+                # a `304` only where it equals what a `200` to this request would
+                # have carried, and that `200` is the encoded variant, so the size
+                # the app stated for the identity body is no longer that number.
+                revalidated = headers.remove(_weakened(revalidated), b"content-length")
             yield replace(start, headers=revalidated)
             async for event in outbound:
                 yield event
@@ -881,8 +905,9 @@ def compress(
             if isinstance(event, _OFFLOADED_BODY):
                 # An offloaded body (a path send, a zero-copy send) is bytes this
                 # middleware never sees, so there is nothing to encode. Release the
-                # prefix only if there was one: an empty body event before an offload
-                # is a message the app never sent.
+                # prefix only if any body event arrived: an offload that arrives
+                # first has none, and an empty body event conjured ahead of it is a
+                # message the app never sent.
                 for held in _released(start, interleaved):
                     yield held
                 if prefix:
@@ -899,7 +924,14 @@ def compress(
 
             if not event.more_body:
                 body = b"".join(prefix)
-                if buffered < minimum_size:
+                if not buffered or buffered < minimum_size:
+                    # Nothing to encode, or too little to be worth encoding. The empty
+                    # body is the first case however low the floor, matching the
+                    # streaming path below, which will not commit on nothing either.
+                    # Encoding it would produce pure framing and then state *its*
+                    # length, which is how a `HEAD` response, whose head describes the
+                    # body a `GET` would carry and whose own body is empty, comes to
+                    # answer with the size of an empty encoded stream.
                     for held in _released(start, interleaved):
                         yield held
                     yield ResponseBody(body=body, more_body=False)
@@ -908,11 +940,10 @@ def compress(
                     return
                 compressor = table[coding]()
                 encoded = compressor.compress(body) + compressor.flush()
-                # A head that announced trailers has to stay chunked to carry them,
-                # since HTTP/1.1 sends trailers only in the chunked coding, so the
-                # exact length this response could otherwise state goes unstated
-                # rather than framing the body by length and stranding what follows.
-                length = None if start.trailers else len(encoded)
+                # A head that announced trailers gives up the exact length this
+                # response could otherwise state, but only where carrying them means
+                # staying chunked (see `_trailers_need_chunking`).
+                length = None if start.trailers and _trailers_need_chunking(scope.http_version) else len(encoded)
                 for held in _released(replace(start, headers=_encoded(start.headers, coding, length)), interleaved):
                     yield held
                 yield ResponseBody(body=encoded, more_body=False)
