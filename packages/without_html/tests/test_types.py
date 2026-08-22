@@ -42,3 +42,18 @@ if TYPE_CHECKING:
     div(children=object())  # type: ignore[arg-type]
     div(cls=3)  # type: ignore[arg-type]
     div(attrs={"colspan": 1.5})  # type: ignore[dict-item]
+
+    # `ClassNames` and `Node` name `Sequence` and `Iterator` rather than `Iterable`, so the
+    # two iterables that mean something other than what these positions mean cannot be
+    # written. A `set` renders in an order that varies between processes. A `Mapping`
+    # renders its keys, which for `cls` means `{"card": True, "active": False}`, the shape
+    # `classnames` and `clsx` made the idiom in JavaScript, renders *both* names; the
+    # spelling here is `("card", "card-active" if active else None)`.
+    div(cls={"card", "active"})  # type: ignore[arg-type]
+    div(cls={"card": True, "active": False})  # type: ignore[arg-type]
+
+    # What naming those two costs: an iterable that is neither, which unpacks at the call
+    # site like anything else this one-level flattening asks to be unpacked.
+    classes: dict[str, str] = {}
+    div(cls=classes.values())  # type: ignore[arg-type]
+    div(cls=[*classes.values()])

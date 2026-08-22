@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from collections.abc import Iterator
 from collections.abc import Mapping
+from collections.abc import Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
+from string import ascii_letters
 from types import GeneratorType
 from typing import Protocol
 
@@ -27,11 +30,21 @@ type Attributes = Mapping[str, AttributeValue]
 # entry may be `None` or empty, so `("card", "card-active" if active else None)` needs no
 # filtering around it.
 #
-# Not narrowed to a tuple the way `Node` is: what makes an iterable in a child position a
-# problem is that the element goes on holding it, and this one never survives the call.
-# It is joined into a string before the element exists, so a caller's list cannot be
-# mutated afterwards and a generator cannot be left half-consumed.
-type ClassNames = str | Iterable[str | None] | None
+# Looser than `Node` about *lifetime*, and for a reason that does not extend past it: what
+# makes an iterable in a child position a problem is that the element goes on holding it,
+# and this one never survives the call. It is joined into a string before the element
+# exists, so a caller's list cannot be mutated afterwards and a generator cannot be left
+# half-consumed.
+#
+# `Sequence | Iterator` all the same, because order and meaning are not lifetime. A `set`
+# joins in an order that varies between processes, so the same tree renders differently
+# each run; a `Mapping` joins its keys, so `{"card": True, "active": False}`, the shape
+# `classnames` and `clsx` made the idiom for this job in JavaScript, renders *both* names.
+# The `filter` below drops falsy class names, not falsy values, and it cannot do otherwise:
+# the conditional spelling this type is built around is
+# `("card", "card-active" if active else None)`, and a second one meaning the same thing
+# would be two channels into one attribute, which is what `attrs` rejects `class` for.
+type ClassNames = str | Sequence[str | None] | Iterator[str | None] | None
 
 # One rendered attribute: an escaped value, or `None` for a bare attribute.
 type Attribute = tuple[str, str | None]
@@ -44,8 +57,8 @@ type AnyElement = Element | VoidElement
 # `paragraph if visible else None` needs no branch around it.
 type Child = Element | VoidElement | str | SupportsHtml | None
 
-# What a child slot accepts: one child, or an iterable of them, so a generator expression
-# over rows is a child like any other.
+# What a child slot accepts: one child, or a sequence or iterator of them, so a generator
+# expression over rows is a child like any other.
 #
 # Deliberately one level and not recursive. A recursive type would buy only the ability to
 # nest iterables without unpacking them, and would charge for it three times over: an
@@ -54,7 +67,15 @@ type Child = Element | VoidElement | str | SupportsHtml | None
 # renders once and then renders empty; and an element holding a caller's list is not a
 # value, since the caller can still mutate it. Flattening a level here is exactly the `*`
 # the caller can write, so it is written where it is visible: `children=[header, *rows]`.
-type Node = Child | Iterable[Child]
+#
+# `Sequence | Iterator` rather than `Iterable`, which would say the same thing about what
+# is flattened while also admitting the two shapes `REFUSED_ITERABLES` exists to turn away:
+# a `Mapping` and a `set` are both `Iterable[Child]` structurally, so under `Iterable` the
+# checker passes `children={"label": value}` and the refusal can only arrive at runtime.
+# Neither is a `Sequence` or an `Iterator`, so naming those makes the shape unwritable
+# instead. What it costs is an iterable that is neither, such as `rows.values()` or a class
+# defining only `__iter__`; those unpack with the same `*` this type already asks for.
+type Node = Child | Sequence[Child] | Iterator[Child]
 
 # Elements with no children and no closing tag. Read at build time to decide which
 # constructors produce a `VoidElement`, and to reject the generic `element` factory for a
@@ -88,6 +109,14 @@ CHECKED_NAME_CAPACITY = 4096
 # the name where it stands and starts something else: whitespace and `/` begin the next
 # attribute, `=` and the quotes begin a value, and `<` and `>` open or close a tag.
 FORBIDDEN_IN_NAME = frozenset(" \t\n\r\f\v\"'<>/=")
+
+# What a tag name may begin with, which is what HTML's own tag-name grammar allows there.
+# The check is separate from `FORBIDDEN_IN_NAME` because the characters it excludes do not
+# end the name where they stand; they change what the `<` before them opened. `<!` opens a
+# comment, which runs until `-->` rather than until the `>` that follows, so a tag
+# beginning `!--` swallows the rest of the document and resumes markup wherever the content
+# happens to hold `-->`. `<?` opens a bogus comment, which drops the element in silence.
+TAG_NAME_START = frozenset(ascii_letters)
 
 
 def admit_name(name: str) -> None:
@@ -266,12 +295,14 @@ class Element:
 SINGLE_CHILD_TYPES = (str, Element, VoidElement)
 FLATTENED_TYPES = (list, tuple, GeneratorType)
 
-# Iterables that satisfy `Iterable[Child]` structurally, and so type-check in a child
-# position, while meaning something other than what a child position means. A `Mapping`
+# Iterables that mean something other than what a child position means. A `Mapping`
 # iterates its keys, so `children={"label": value}` renders `label` and silently drops the
 # rest; a `set` iterates in an order that varies between processes, so the same tree
-# renders differently each run. Neither is a tree anyone meant to write, and the type
-# checker cannot say so, which leaves here.
+# renders differently each run. Neither is a tree anyone meant to write.
+#
+# `Node` names `Sequence` and `Iterator` so that a caller under a type checker cannot write
+# either one, which leaves this for the caller who is not: nothing narrower than `object`
+# can be assumed about what actually arrives at runtime.
 REFUSED_ITERABLES = (Mapping, set, frozenset)
 
 
@@ -320,7 +351,9 @@ def refuse_invalid_tag(tag: str) -> None:
 
     The tag half of `admit_name`, and it exists for the same reason: a tag is written into
     `<...>` verbatim, so a space or a `>` in one assembled from outside input opens markup
-    of the supplier's choosing, and no amount of escaping in the *values* closes that.
+    of the supplier's choosing, and no amount of escaping in the *values* closes that. What
+    a tag may *begin* with is checked as well as what it may contain, because a leading `!`
+    or `?` turns the whole element into a comment rather than ending the name early.
 
     Raw-text tags are refused here rather than beside the void check, so that a tag
     declared void reaches it too: a `<script>` with no closing tag leaves the rest of the
@@ -331,7 +364,7 @@ def refuse_invalid_tag(tag: str) -> None:
     constructor is defined, and `element` is the one-shot form, which already pays a
     frozenset lookup per call and is the form to move off when a tag repeats.
     """
-    if not tag or not FORBIDDEN_IN_NAME.isdisjoint(tag):
+    if not tag or tag[0] not in TAG_NAME_START or not FORBIDDEN_IN_NAME.isdisjoint(tag):
         raise ValueError(f"invalid tag name: {tag!r}")
     if tag in RAW_TEXT_TAGS:
         raise ValueError(f"<{tag}> content is not parsed as markup; use the `{tag}` constructor")

@@ -66,6 +66,14 @@ TAGS_THAT_COULD_BREAK_OUT = [
     "x><script>alert(1)</script><x",
     "open<",
     "",
+    # `<!--` opens a comment that runs to the next `-->`, not to the `>` that ends the tag,
+    # so this one swallows the document from here on and resumes markup at an offset its
+    # supplier chooses. `<?` opens a bogus comment, which drops the element without a word.
+    "!--x",
+    "!doctype html",
+    "?x",
+    "-x",
+    "1x",
 ]
 
 

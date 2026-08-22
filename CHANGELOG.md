@@ -21,16 +21,22 @@
   have the `cls` argument and two channels into one attribute would be two sources to keep in
   sync. Tag and attribute *names* are checked rather than escaped, since a name is written into
   the markup verbatim and one assembled from outside input is an injection point that escaping
-  the values around it cannot reach. Custom elements are first class: `element_type(tag)`
-  and `void_element_type(tag)` define constructors equal in standing to the built-in ones, with
-  the tag check paid once at definition rather than on every call, which is the seam for
-  anything the browser must do itself. `render_chunks(node)` walks the same tree and produces
+  the values around it cannot reach. A tag must also begin with an ASCII letter, all HTML's own
+  tag-name grammar allows there, which is what keeps a leading `!` from opening a comment that
+  runs past the element rather than ending the name. Custom elements are first class:
+  `element_type(tag)` and `void_element_type(tag)` define constructors equal in standing to the
+  built-in ones, with the tag check paid once at definition rather than on every call, which is
+  the seam for anything the browser must do itself. `render_chunks(node)` walks the same tree and produces
   the same bytes a chunk at a time, for a body that should start reaching a client before the
-  tree is finished. An iterable in a child position flattens one level, so unpacking goes at the
-  call site (`[header, *rows]`), which is what makes every element a hashable value with flat
-  children and keeps rendering from consuming anything. `cls` is the exception, taking any
-  iterable since it is joined before the element exists, and dropping `None` and empty entries so
-  `cls=("card", "card-active" if active else None)` needs no filtering around it.
+  tree is finished. A sequence or iterator in a child position flattens one level, so unpacking
+  goes at the call site (`[header, *rows]`), which is what makes every element a hashable value
+  with flat children and keeps rendering from consuming anything. Naming those two rather than
+  `Iterable` is what keeps a `Mapping` (which would render only its keys) and a `set` (which
+  would render in an order that varies between processes) from type-checking there. `cls` names
+  the same two, and drops `None` and empty entries so `cls=("card", "card-active" if active else
+  None)` needs no filtering around it. That spelling is the only one: a `Mapping` joins its keys,
+  so `cls={"card": True, "active": False}`, the shape `classnames` and `clsx` made the idiom in
+  JavaScript, would render *both* names, and it does not type-check for that reason.
 - **`benchmarks`**: `benchmarks.render` (`just bench-render`), an in-process comparison of
   `without-html` against htpy, Jinja2, and hand-written f-strings over four workloads (a wide
   table, an htmx-sized fragment, an attribute-heavy page, and a deep nest). It shares none of

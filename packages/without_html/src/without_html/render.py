@@ -9,11 +9,13 @@ from markupsafe import Markup
 
 from without_html.markup import SupportsHtml
 from without_html.markup import escape_text
+from without_html.nodes import REFUSED_ITERABLES
 from without_html.nodes import Child
 from without_html.nodes import Element
 from without_html.nodes import Node
 from without_html.nodes import VoidElement
 from without_html.nodes import children_of
+from without_html.nodes import refused_iterable
 
 # A tag's opening prefix (`<div`) and its closing tag (`</div>`).
 type TagMarkup = tuple[str, Markup]
@@ -46,7 +48,17 @@ def tag_markup(tag: str) -> TagMarkup:
 
 
 def unrenderable(item: object) -> str:
-    """Why `item` cannot be rendered, reached only once a walk has already failed."""
+    """
+    Why `item` cannot be rendered, reached only once a walk has already failed.
+
+    A mapping or a set is sent to `refused_iterable` rather than told to unpack itself.
+    `children_of` refuses those two shapes where they arrive as the child argument, but one
+    nested in a list flattens past it and fails here instead, and the advice the other arm
+    gives is exactly the fix that must not be taken: `[*{"label": value}]` renders the keys
+    and drops the values, which is what refusing the mapping was for.
+    """
+    if isinstance(item, REFUSED_ITERABLES):
+        return refused_iterable(item)
     if isinstance(item, Iterable):
         return f"an iterable in a child position is not flattened; unpack it with `*`: {item!r}"
     return f"not renderable: {item!r}"

@@ -65,10 +65,10 @@ p(cls=["lead", "muted"], attrs={"id": "intro", "hx-get": "/more"}, children=["te
   underscore-to-hyphen convention to remember. A value of `True` renders the attribute
   bare (`disabled`), `False` and `None` drop it entirely, and an `int` renders as
   digits, since the attributes that take numbers are machine-read.
-- **`children`** is any `Node`: one `Child` (another element, a string, `None`) or an
-  iterable of them. `None` rendering as nothing is what lets `card if visible else None`
-  sit inline with no branch around it, and an iterable flattening is what lets a
-  generator expression over rows be a child like any other.
+- **`children`** is any `Node`: one `Child` (another element, a string, `None`) or a
+  sequence or iterator of them. `None` rendering as nothing is what lets
+  `card if visible else None` sit inline with no branch around it, and flattening is what
+  lets a generator expression over rows be a child like any other.
 
 A number in a *child* position is deliberately not accepted. How a number reads to a
 person is a formatting decision, and this layer picking one (`1000`? `1,000`? `1_000`?)
@@ -93,8 +93,27 @@ rendering never mutates anything, since a generator is consumed when the element
 rather than while it is being rendered. A nested iterable raises, and says what to write
 instead.
 
-`cls` is the exception, taking any iterable, because it is joined into a string before the
-element exists: nothing survives the call for anyone to mutate or exhaust.
+What a child slot takes is a `Sequence` or an `Iterator`, not any `Iterable`. A `Mapping`
+and a `set` are both `Iterable[Child]` structurally, so naming `Iterable` would type-check
+`children={"label": value}`, which renders the keys and drops the values, and
+`children={"a", "b"}`, which renders in an order that varies between processes. Both raise
+either way, and naming the two narrower types is what moves the refusal from runtime to
+the type checker. The cost is an iterable that is neither, such as `rows.values()`, which
+unpacks with the same `*` as anything else: `children=[*rows.values()]`.
+
+`cls` is looser about *lifetime*, since it is joined into a string before the element
+exists, so nothing survives the call for anyone to mutate or exhaust. It names the same two
+types all the same, because order and meaning are not lifetime. A `set` of class names
+joins in an order that varies between processes. A `Mapping` joins its *keys*, so
+`cls={"card": True, "active": False}` would render both names: the shape
+[classnames](https://github.com/JedWatson/classnames) and
+[clsx](https://github.com/lukeed/clsx) made the idiom for this job in JavaScript is the one
+spelling that means the opposite of what it says here. The spelling that works is the one
+`cls` is built around, where `None` and empty entries drop out:
+
+```python
+div(cls=("card", "card-active" if active else None))
+```
 
 ## Escaping is a type
 
@@ -122,7 +141,11 @@ rendered many times pays for it once.
 *Names* are checked rather than escaped: attribute names once per distinct name per
 process, and tag names wherever a tag enters, so `element`, `element_type`, and
 `void_element_type` all reject one carrying whitespace, quotes, `/`, `=`, `<`, or `>`. A
-name is normally a literal, so a bad one is a bug in code you own and fails loudly. It is
+tag must also begin with an ASCII letter, which is all HTML's own tag-name grammar allows
+there: a leading `!` or `?` does not end the name early but changes what the `<` in front
+of it opened, and `<!--` runs to the next `-->` rather than to the `>` that follows, so
+everything after such a tag would be swallowed as comment content. A name is normally a
+literal, so a bad one is a bug in code you own and fails loudly. It is
 checked at all because a name goes into the markup verbatim, which is exactly what
 escaping the values around it cannot reach: a name assembled from outside input would be
 an injection point no amount of value escaping closes.

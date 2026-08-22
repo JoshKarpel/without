@@ -203,15 +203,32 @@ def test_a_string_subclass_that_knows_its_own_markup_renders_verbatim() -> None:
 
 
 def test_a_mapping_in_a_child_position_is_rejected_rather_than_rendering_its_keys() -> None:
-    # A `Mapping` satisfies `Iterable[Child]`, so the type checker passes it and the
-    # flattening arm would render its keys and silently drop everything else.
+    # The flattening arm would render its keys and silently drop everything else. Every
+    # ignore below is an assertion of its own: `Node` names `Sequence` and `Iterator`
+    # rather than `Iterable` precisely so a mapping and a set are unwritable here, and if
+    # one of them ever type-checks again the unused ignore fails the build. What is left to
+    # test at runtime is the caller who is not under a type checker at all.
     with pytest.raises(TypeError, match="renders only its keys"):
-        render(div(children={"label": "value"}))
+        render(div(children={"label": "value"}))  # type: ignore[arg-type]
 
 
 def test_a_set_in_a_child_position_is_rejected_rather_than_rendering_in_any_order() -> None:
     with pytest.raises(TypeError, match="varies between runs"):
-        render(div(children={"a", "b"}))
+        render(div(children={"a", "b"}))  # type: ignore[arg-type]
+
+
+def test_a_mapping_nested_in_a_list_is_refused_in_its_own_terms() -> None:
+    # A list is how children are usually assembled, and one nested there flattens past the
+    # check on the child argument, so the failure arrives at the walk instead. It must not
+    # arrive as the generic advice to unpack the iterable: following that renders the keys
+    # and drops the values, which is the failure the refusal exists to prevent.
+    with pytest.raises(TypeError, match="renders only its keys"):
+        render(div(children=[{"label": "value"}]))  # type: ignore[list-item]
+
+
+def test_a_set_nested_in_a_list_is_refused_in_its_own_terms() -> None:
+    with pytest.raises(TypeError, match="varies between runs"):
+        render(div(children=["a", {"b", "c"}]))  # type: ignore[list-item]
 
 
 @pytest.mark.parametrize(
