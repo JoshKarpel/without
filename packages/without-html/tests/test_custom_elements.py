@@ -27,7 +27,7 @@ def test_a_defined_element_takes_the_tag_as_its_name() -> None:
 
 def test_a_defined_void_element_has_no_closing_tag() -> None:
     spacer = void_element_type("x-spacer")
-    assert render(spacer(attrs={"size": "8"})) == '<x-spacer size="8">'
+    assert render(spacer(cls="wide", attrs={"size": "8"})) == '<x-spacer class="wide" size="8">'
 
 
 @pytest.mark.parametrize("tag", ["br", "img", "input"])

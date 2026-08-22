@@ -5,6 +5,7 @@ from without_html import AttributeValue
 from without_html import div
 from without_html import input_
 from without_html import render
+from without_html.nodes import CHECKED_ATTRIBUTE_NAMES
 
 
 def test_attributes_render_in_the_order_they_were_given() -> None:
@@ -54,13 +55,24 @@ def test_the_class_attribute_comes_first() -> None:
 def test_class_as_an_attribute_is_rejected() -> None:
     # Classes have one channel, not two kept in sync, so this fails the first time it is
     # written rather than when someone later adds `cls` beside it.
-    with pytest.raises(ValueError, match="set classes with `cls`"):
+    with pytest.raises(ValueError, match=r"^set classes with `cls`, not as an attribute$"):
         div(attrs={"class": "card"})
 
 
 def test_class_as_an_attribute_is_rejected_alongside_cls() -> None:
-    with pytest.raises(ValueError, match="set classes with `cls`"):
+    with pytest.raises(ValueError, match=r"^set classes with `cls`, not as an attribute$"):
         div(cls="card", attrs={"class": "other"})
+
+
+def test_a_proven_attribute_name_is_admitted_to_the_cache() -> None:
+    # The name check is a cache lookup, so a name proven once never reaches the check
+    # again. Without the admission every occurrence would take the slow path instead.
+    #
+    # Dropped first because the cache is process-global and outlives the test that fills
+    # it, and a mutation run re-runs the whole suite in one process.
+    CHECKED_ATTRIBUTE_NAMES.discard("data-admitted")
+    div(attrs={"data-admitted": "1"})
+    assert "data-admitted" in CHECKED_ATTRIBUTE_NAMES
 
 
 def test_a_true_value_renders_a_bare_attribute() -> None:

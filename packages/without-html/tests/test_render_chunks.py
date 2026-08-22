@@ -58,8 +58,10 @@ TREES: dict[str, Node] = {
     "nothing": None,
     "small page": page(3),
     "large page": page(2000),
+    "text then element": div(children=["2 < 3", span(children="x")]),
     "subclass, no children": Widget("x-widget", (("id", "w"),), ()),
     "subclass, one text child": Widget("x-widget", (), ("body & more",)),
+    "subclass, one element child": Widget("x-widget", (), (Element("b", (), ("c",)),)),
     "subclass, several children": Widget("x-widget", (), ("a", Element("b", (), ("c",)))),
     "void subclass": Spacer("x-spacer", (("size", "3"),)),
 }
@@ -124,6 +126,13 @@ def test_a_markup_subclass_still_streams_verbatim() -> None:
     assert "".join(render_chunks(p(children=Fragment("<em>x</em>")))) == "<p><em>x</em></p>"
 
 
+def test_a_string_subclass_is_still_escaped_while_streaming() -> None:
+    class Loud(str):
+        __slots__ = ()
+
+    assert "".join(render_chunks(p(children=Loud("2 < 3")))) == "<p>2 &lt; 3</p>"
+
+
 def test_none_between_children_streams_as_nothing() -> None:
     assert "".join(render_chunks(div(children=[None, p(children="kept"), None]))) == "<div><p>kept</p></div>"
 
@@ -131,6 +140,14 @@ def test_none_between_children_streams_as_nothing() -> None:
 def test_a_value_that_cannot_stream_is_rejected() -> None:
     with pytest.raises(TypeError, match="not renderable"):
         list(render_chunks(div(children=[object()])))  # type: ignore[list-item]
+
+
+def test_a_nested_iterable_is_rejected_with_the_unpacking_it_needs() -> None:
+    # The same rejection `render` gives, naming the same way out: the two walks are
+    # generated from one source, and the diagnostic is part of what has to stay one.
+    nested = div(children=[span(children="a"), [span(children="b")]])  # type: ignore[list-item]
+    with pytest.raises(TypeError, match=r"unpack it with `\*`"):
+        list(render_chunks(nested))
 
 
 def test_escaping_matches_render_exactly() -> None:

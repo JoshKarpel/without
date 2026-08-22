@@ -5,6 +5,7 @@ import without_html
 from markupsafe import Markup
 from without_html import DOCTYPE
 from without_html import Element
+from without_html import RawTextElementConstructor
 from without_html import VoidElement
 from without_html import br
 from without_html import div
@@ -20,6 +21,9 @@ from without_html import span
 from without_html import style
 from without_html import title
 from without_html import ul
+from without_html.nodes import RAW_TEXT_TAGS
+from without_html.nodes import VOID_TAGS
+from without_html.render import tag_markup
 
 
 def test_empty_element_renders_open_and_close_tags() -> None:
@@ -36,6 +40,12 @@ def test_children_render_in_order() -> None:
     )
 
 
+def test_text_followed_by_an_element_renders_both() -> None:
+    # A lone text child closes its element in place; a second child sends the whole run
+    # back through the stack, so the two-child case is what pins where that line falls.
+    assert render(div(children=["2 < 3", span(children="x")])) == "<div>2 &lt; 3<span>x</span></div>"
+
+
 def test_nested_elements_render_depth_first() -> None:
     assert render(div(children=p(children=span(children="deep")))) == "<div><p><span>deep</span></p></div>"
 
@@ -46,6 +56,13 @@ def test_none_children_render_nothing() -> None:
 
 def test_a_generator_of_children_is_flattened() -> None:
     assert render(ul(children=(li(children=str(n)) for n in (7, 8)))) == "<ul><li>7</li><li>8</li></ul>"
+
+
+def test_an_iterator_that_is_not_a_generator_is_still_flattened() -> None:
+    # Lists, tuples, and generators are the shapes `children_of` names outright; anything
+    # else iterable arrives through the `Iterable` check behind them.
+    rows = reversed([li(children="7"), li(children="8")])
+    assert render(ul(children=rows)) == "<ul><li>8</li><li>7</li></ul>"
 
 
 def test_an_unpacked_iterable_of_children_renders_in_order() -> None:
@@ -103,9 +120,15 @@ def test_raw_text_content_is_not_escaped() -> None:
     assert render(script(children=Markup("if (a < b && c) f();"))) == "<script>if (a < b && c) f();</script>"
 
 
-def test_a_raw_text_element_rejects_unmarked_content() -> None:
-    with pytest.raises(ValueError, match="must be `Markup`"):
-        script(children="alert(1)")  # type: ignore[arg-type]
+@pytest.mark.parametrize(
+    ("construct", "tag"),
+    [(script, "script"), (style, "style")],
+    ids=["script", "style"],
+)
+def test_a_raw_text_element_rejects_unmarked_content(construct: RawTextElementConstructor, tag: str) -> None:
+    message = rf"^<{tag}> content is not parsed as markup, so it must be `Markup`$"
+    with pytest.raises(ValueError, match=message):
+        construct(children="alert(1)")  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("tag", ["script", "style"])
@@ -119,7 +142,22 @@ def test_a_style_element_takes_markup_content() -> None:
 
 
 def test_an_unknown_tag_renders_with_a_closing_tag() -> None:
-    assert render(element("x-chart", attrs={"data-series": "[1,2]"})) == '<x-chart data-series="[1,2]"></x-chart>'
+    assert render(element("x-chart", cls="wide", attrs={"data-series": "[1,2]"}, children="fallback")) == (
+        '<x-chart class="wide" data-series="[1,2]">fallback</x-chart>'
+    )
+
+
+def test_tag_markup_is_built_once_per_tag_and_reused() -> None:
+    # The renderer's per-tag constants are memoized, so the first element with a tag
+    # builds them and every later one reads back the same objects.
+    #
+    # The memo is process-global and outlives the test that fills it, and a mutation run
+    # re-runs the whole suite in one process, so this empties it rather than assuming a
+    # fresh interpreter. Left warm, the build being checked never runs.
+    tag_markup.cache_clear()
+    built = tag_markup("x-memo")
+    assert built == ("<x-memo", Markup("</x-memo>"))
+    assert tag_markup("x-memo") is built
 
 
 def test_a_markup_subclass_still_renders_verbatim() -> None:
@@ -130,6 +168,15 @@ def test_a_markup_subclass_still_renders_verbatim() -> None:
         __slots__ = ()
 
     assert render(p(children=Fragment("<em>x</em>"))) == "<p><em>x</em></p>"
+
+
+def test_a_string_subclass_child_is_still_escaped() -> None:
+    # The other side of the same dispatch: a `str` subclass that is not `Markup` carries
+    # no promise about its content, so it goes through the escape like any other text.
+    class Loud(str):
+        __slots__ = ()
+
+    assert render(p(children=Loud("2 < 3"))) == "<p>2 &lt; 3</p>"
 
 
 class Widget(Element):
@@ -143,13 +190,14 @@ class Widget(Element):
     [
         ((), '<x-widget id="w"></x-widget>'),
         (("body & more",), '<x-widget id="w">body &amp; more</x-widget>'),
+        ((Element("b", (), ("c",)),), '<x-widget id="w"><b>c</b></x-widget>'),
         (("a", Element("b", (), ("c",))), '<x-widget id="w">a<b>c</b></x-widget>'),
     ],
-    ids=["no children", "one text child", "several children"],
+    ids=["no children", "one text child", "one element child", "several children"],
 )
 def test_an_element_subclass_renders_as_its_element(children: tuple[object, ...], expected: str) -> None:
-    # Each shape closes by a different route (in place, in place after its text, or from
-    # the stack), so a subclass has to be checked through all three rather than one.
+    # A lone text child closes in place; anything else goes back through the stack, and
+    # which side of that a single non-text child falls on is the part worth pinning.
     assert render(Widget("x-widget", (("id", "w"),), children)) == expected  # type: ignore[arg-type]
 
 
@@ -181,3 +229,18 @@ def test_every_generated_constructor_builds_its_own_tag(name: str) -> None:
     empty = GENERATED[name]()
     assert empty.tag == tag
     assert render(empty) in (f"<{tag}>", f"<{tag}></{tag}>")
+
+
+@pytest.mark.parametrize("name", GENERATED, ids=GENERATED)
+def test_every_generated_constructor_carries_its_arguments_into_its_element(name: str) -> None:
+    # The other half of what the generator can get wrong: a constructor that renders the
+    # right tag but drops an argument produces a plausible element with no classes, no
+    # attributes, or no content, which nothing downstream can tell from an empty one.
+    tag = name.removesuffix("_")
+    opening = f'<{tag} class="card" data-k="v"'
+    if tag in VOID_TAGS:
+        assert render(GENERATED[name](cls="card", attrs={"data-k": "v"})) == f"{opening}>"
+        return
+    content = Markup("<em>x</em>") if tag in RAW_TEXT_TAGS else span(children="x")
+    built = GENERATED[name](cls="card", attrs={"data-k": "v"}, children=content)
+    assert render(built) == f"{opening}>{render(content)}</{tag}>"

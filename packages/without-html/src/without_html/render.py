@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from collections.abc import Iterator
+from functools import cache
 from itertools import islice
 
 from markupsafe import Markup
@@ -17,13 +18,6 @@ from without_html.nodes import children_of
 # A tag's opening prefix (`<div`) and its closing tag (`</div>`).
 type TagMarkup = tuple[str, Markup]
 
-# Per-tag constant markup, memoized on first use. A tag's surrounding text never varies,
-# so building it once per distinct tag turns two string formats per element into one
-# dictionary lookup. The closing tag is held as a `Markup` so that pushing it onto the
-# render stack allocates nothing, and it is built for void tags too, where it costs one
-# unused string per process and saves every other element a second lookup.
-TAG_MARKUP: dict[str, TagMarkup] = {}
-
 # How many fragments `render_chunks` accumulates before emitting one chunk. Fine enough
 # that a large page leaves in many chunks, coarse enough that the batching is a rounding
 # error against the walk: measured on a 177 KB page, chunking costs about 8% over
@@ -31,12 +25,15 @@ TAG_MARKUP: dict[str, TagMarkup] = {}
 FRAGMENTS_PER_CHUNK = 512
 
 
+# Per-tag constant markup, memoized on first use. A tag's surrounding text never varies,
+# so building it once per distinct tag turns two string formats per element into one cache
+# hit. The closing tag is held as a `Markup` so that pushing it onto the render stack
+# allocates nothing, and it is built for void tags too, where it costs one unused string
+# per process and saves every other element a second lookup.
+@cache
 def tag_markup(tag: str) -> TagMarkup:
     """The memoized opening and closing markup for `tag`."""
-    markup = TAG_MARKUP.get(tag)
-    if markup is None:
-        markup = TAG_MARKUP[tag] = (f"<{tag}", Markup(f"</{tag}>"))
-    return markup
+    return (f"<{tag}", Markup(f"</{tag}>"))
 
 
 def unrenderable(item: object) -> str:
