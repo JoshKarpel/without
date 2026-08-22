@@ -468,13 +468,14 @@ _COMPRESSIBLE_TYPES = frozenset(
     {
         b"application/javascript",
         b"application/json",
+        b"application/json-seq",
         b"application/wasm",
         b"application/x-javascript",
         b"application/x-ndjson",
         b"application/xml",
     }
 )
-_COMPRESSIBLE_SUFFIXES = (b"+json", b"+text", b"+xml")
+_COMPRESSIBLE_SUFFIXES = (b"+json", b"+json-seq", b"+xml", b"+yaml")
 
 
 def is_compressible(content_type: bytes | None) -> bool:
@@ -483,11 +484,12 @@ def is_compressible(content_type: bytes | None) -> bool:
     default policy, replaceable through its `compressible` argument.
 
     An allowlist, the shape nginx's `gzip_types` takes, rather than a list of
-    exclusions: `text/*`, the structured suffixes (`+json`, `+xml`, `+text`, which
-    is how `application/problem+json` and every other vendor type arrives), and a
-    short list of the remaining types worth the CPU. A type nobody listed is left
-    alone, so the failure mode of an unrecognized type is a larger response rather
-    than cycles burnt re-compressing a JPEG.
+    exclusions: `text/*`, the registered structured syntax suffixes worth encoding
+    (`+json`, `+json-seq`, `+xml`, `+yaml`, which is how `application/problem+json`
+    and every other vendor type arrives), and a short list of the remaining types
+    worth the CPU. A type nobody listed is left alone, so the failure mode of an
+    unrecognized type is a larger response rather than cycles burnt re-compressing
+    a JPEG.
 
     Two exceptions to the shape. A response with no `content-type` is not
     compressed, since compression here is driven by the declared media type and
@@ -676,6 +678,18 @@ def _offloaded_after(coding: bytes) -> str:
     return f"a body already committed to content-encoding {coding!r} cannot be offloaded"
 
 
+def _released(start: ResponseStart, interleaved: Sequence[Outbound]) -> tuple[Outbound, ...]:
+    """
+    The head as it goes out, followed by whatever arrived behind it while it was held.
+
+    A server push may be sent any time after the head and before the final body event,
+    so one can land while the floor is still being weighed. It decides nothing about
+    the encoding and cannot go out ahead of the head it must follow, so it waits with
+    the prefix and is released in the order the app sent it.
+    """
+    return (start, *interleaved)
+
+
 def compress(
     compressors: Mapping[bytes, Callable[[], Compressor]] = DEFAULT_COMPRESSORS,
     *,
@@ -810,7 +824,14 @@ def compress(
             # neither field and falls through to the pass-through below, since its
             # status is one no coding applies to.
             revalidated = _varying(start.headers)
-            if negotiate_coding(_accept_encoding(scope.headers), available) is not None:
+            # A `304` that states the size of what it revalidates (RFC 9110 §8.6
+            # allows one, describing the selected representation) settles the floor
+            # the same way a `200`'s own `content-length` does: below it the stored
+            # body went out unencoded whatever the client offered, so its validator
+            # is still true of the bytes that client holds.
+            revalidated_length = _declared_length(start.headers)
+            below_floor = revalidated_length is not None and revalidated_length < minimum_size
+            if not below_floor and negotiate_coding(_accept_encoding(scope.headers), available) is not None:
                 # The stored entry this `304` updates is the one its `vary` key
                 # selects, so for a client that negotiates a coding it is the encoded
                 # variant, and RFC 9111 §4.3.4 has the cache copy these fields onto
@@ -854,34 +875,46 @@ def compress(
         # past the floor, since bytes held beyond it decide nothing.
         hold = minimum_size if declared is None and weigh_undeclared_bodies else 0
         prefix: list[bytes] = []
+        interleaved: list[Outbound] = []
         buffered = 0
         async for event in outbound:
-            if not isinstance(event, ResponseBody):
+            if isinstance(event, _OFFLOADED_BODY):
                 # An offloaded body (a path send, a zero-copy send) is bytes this
                 # middleware never sees, so there is nothing to encode. Release the
                 # prefix only if there was one: an empty body event before an offload
                 # is a message the app never sent.
-                yield start
+                for held in _released(start, interleaved):
+                    yield held
                 if prefix:
                     yield ResponseBody(body=b"".join(prefix), more_body=True)
                 yield event
                 async for rest in outbound:
                     yield rest
                 return
+            if not isinstance(event, ResponseBody):
+                interleaved.append(event)
+                continue
             prefix.append(event.body)
             buffered += len(event.body)
 
             if not event.more_body:
                 body = b"".join(prefix)
                 if buffered < minimum_size:
-                    yield start
+                    for held in _released(start, interleaved):
+                        yield held
                     yield ResponseBody(body=body, more_body=False)
                     async for rest in outbound:
                         yield rest
                     return
                 compressor = table[coding]()
                 encoded = compressor.compress(body) + compressor.flush()
-                yield replace(start, headers=_encoded(start.headers, coding, len(encoded)))
+                # A head that announced trailers has to stay chunked to carry them,
+                # since HTTP/1.1 sends trailers only in the chunked coding, so the
+                # exact length this response could otherwise state goes unstated
+                # rather than framing the body by length and stranding what follows.
+                length = None if start.trailers else len(encoded)
+                for held in _released(replace(start, headers=_encoded(start.headers, coding, length)), interleaved):
+                    yield held
                 yield ResponseBody(body=encoded, more_body=False)
                 # Trailers may still follow a finished body.
                 async for rest in outbound:
@@ -902,12 +935,14 @@ def compress(
                     # and deliver the response in one burst at the end. Unencoded
                     # instead, which costs bytes rather than the incremental
                     # delivery the app asked for by streaming.
-                    yield start
+                    for held in _released(start, interleaved):
+                        yield held
                     yield ResponseBody(body=b"".join(prefix), more_body=True)
                     async for rest in outbound:
                         yield rest
                     return
-                yield replace(start, headers=_encoded(start.headers, coding, None))
+                for held in _released(replace(start, headers=_encoded(start.headers, coding, None)), interleaved):
+                    yield held
                 yield ResponseBody(body=_deliverable(compressor, b"".join(prefix)), more_body=True)
                 async for rest in outbound:
                     if isinstance(rest, _OFFLOADED_BODY):
@@ -925,7 +960,8 @@ def compress(
 
         # The stream ended without a final body event: the response is already
         # truncated, so release what was held rather than inventing an ending.
-        yield start
+        for held in _released(start, interleaved):
+            yield held
         if prefix:
             yield ResponseBody(body=b"".join(prefix), more_body=True)
 

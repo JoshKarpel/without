@@ -318,7 +318,8 @@ Three properties of the *response* decide candidacy, before any client preferenc
 is consulted: the status has to be one a coding can apply to, a response already
 carrying `content-encoding` is already encoded, and the media type has to be worth
 the CPU. That last is `is_compressible`, an allowlist (`text/*`, the `+json` /
-`+xml` / `+text` structured suffixes, and a short list of the rest) in the shape
+`+json-seq` / `+xml` / `+yaml` structured syntax suffixes, and a short list of the
+rest) in the shape
 nginx's `gzip_types` takes, so an unrecognized type yields a larger response rather
 than cycles spent re-compressing a JPEG. `text/event-stream` is excluded despite
 being `text/`, for a reason about the connection rather than the bytes: an event
@@ -373,8 +374,13 @@ encodes hands back identity bytes to stitch into an encoded body. Weakening wher
 nothing was encoded is the same error pointed the other way: a `video/mp4` is stored
 as the identity bytes its strong tag was stated for, so a `W/` copied onto it breaks
 every later range request into a full response for a re-encoding that never happened.
-A client that negotiates nothing holds the identity representation either way, so its
-validator is left exactly as the app stated it.
+The [size floor](#how-big-is-big-enough) settles it the same way when the `304` states
+a `content-length`, which
+[RFC 9110 §8.6](https://www.rfc-editor.org/rfc/rfc9110#section-8.6) allows and reads as
+the size of the selected representation: under the floor the stored body went out
+unencoded whatever the client offered, so its tag stands. A client that negotiates
+nothing holds the identity representation either way, so its validator is left exactly
+as the app stated it.
 
 ### How big is big enough
 
@@ -385,7 +391,8 @@ answered is what the head said, not how the body arrives:
 - a declared `content-length` answers it before a single body event is read
 - a body that ends in the events read so far answers it exactly, from its own bytes,
   and is re-described with an exact `content-length` for its encoded form rather than
-  falling back to chunked
+  falling back to chunked, unless its head announced trailers, which HTTP/1.1 carries
+  only in the chunked coding, so a length would strand them
 - a body still being produced behind a head that declared no length is the one case
   that cannot be answered without holding bytes the app has already made
 
@@ -432,6 +439,12 @@ body no decoder can read. `compress` raises `OffloadedBodyAfterEncoding` rather 
 writing it, so what reaches the client is a truncated response, which every transport
 already signals as one. An app that means to stream a prefix and then offload the
 rest sends the whole response through the offload instead.
+
+A server push is the other event that can land mid-body, and it decides nothing about
+the encoding: `http.response.push` may be sent any time after the head and before the
+final body event, so one can arrive while the floor is still being weighed. It waits
+with the held head rather than going out ahead of it, and is released in the order the
+app sent it, whichever way the floor resolves.
 
 ### Compression and secrets
 

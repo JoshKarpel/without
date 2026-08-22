@@ -92,8 +92,9 @@
   comparison and stitch identity range bytes into an encoded body. Which stored `200` a `304` updates
   is usually unknowable, since §15.4.5's field list omits `content-type` and most `304`s carry none,
   so the candidate is assumed; a `304` that names a type no coding applies to, or a `content-encoding`
-  the app applied itself, is left exactly as it arrived, because weakening a tag for a re-encoding
-  that never happened breaks every later range request into a full response. A `206` is never
+  the app applied itself, is left exactly as it arrived, and one stating a `content-length` under
+  `minimum_size` keeps its strong tag as well, because weakening a tag for a re-encoding that never
+  happened breaks every later range request into a full response. A `206` is never
   encoded: its `content-range` names offsets into the *identity* representation and nothing here can
   restate them for an encoded one, so a client reassembling ranges would stitch them at the wrong
   offsets.

@@ -5,6 +5,7 @@ import zlib
 from collections.abc import AsyncIterator
 from collections.abc import Callable
 from collections.abc import Iterable
+from collections.abc import Mapping
 from collections.abc import Sequence
 from compression import zstd
 from dataclasses import dataclass
@@ -13,6 +14,8 @@ from typing import cast
 
 import brotli
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 from without import Stream
 from without import stream_from_iterable
 from without_asgi import Asgi
@@ -26,6 +29,7 @@ from without_asgi import RawHeaders
 from without_asgi import ResponseBody
 from without_asgi import ResponseStart
 from without_asgi import ResponseTrailers
+from without_asgi import ServerPush
 from without_asgi import ZeroCopySend
 from without_asgi.compression import DEFAULT_COMPRESSORS
 from without_asgi.compression import GZIP_CONTAINER
@@ -169,7 +173,10 @@ class TestIsCompressible:
             pytest.param(b"application/json", True, id="json-compresses"),
             pytest.param(b"application/problem+json", True, id="the-json-suffix-covers-vendor-types"),
             pytest.param(b"image/svg+xml", True, id="the-xml-suffix-reaches-svg"),
+            pytest.param(b"application/vnd.oai.openapi+yaml", True, id="the-yaml-suffix-reaches-an-openapi-document"),
+            pytest.param(b"application/geo+json-seq", True, id="the-json-seq-suffix-is-its-own-registration"),
             pytest.param(b"application/x-ndjson", True, id="ndjson-compresses"),
+            pytest.param(b"application/json-seq", True, id="json-text-sequences-compress-like-ndjson"),
             pytest.param(b"image/png", False, id="already-compressed-images-are-left-alone"),
             pytest.param(b"video/mp4", False, id="video-is-left-alone"),
             pytest.param(b"application/octet-stream", False, id="unknown-bytes-are-left-alone"),
@@ -425,6 +432,30 @@ class TestEtag:
         assert _one(head, b"etag") == b'"v1"'
         assert _values(head, b"vary") == []
 
+    async def test_leaves_a_revalidated_validator_alone_for_a_body_under_the_floor(self) -> None:
+        """
+        The floor settles what the stored `200` is just as its media type does. A `304`
+        may state the size of the representation it revalidates (RFC 9110 §8.6), and
+        under `minimum_size` that body went out unencoded whatever this client offered,
+        so the strong tag is still true of the bytes the client holds.
+        """
+        described = ((b"content-type", b"text/html"), (b"content-length", b"300"), (b"etag", b'"v1"'))
+        events = await _run(
+            compress(minimum_size=500), _accepting(b"gzip"), (ResponseStart(status=304, headers=described),)
+        )
+        head = _head(events)
+        assert _one(head, b"etag") == b'"v1"'
+        # The variance is still declared: candidacy is a property of the resource, and
+        # a `200` of this type below the floor carries `vary` too.
+        assert _values(head, b"vary") == [b"accept-encoding"]
+
+    async def test_weakens_a_revalidated_validator_for_a_body_over_the_floor(self) -> None:
+        described = ((b"content-type", b"text/html"), (b"content-length", b"900"), (b"etag", b'"v1"'))
+        events = await _run(
+            compress(minimum_size=500), _accepting(b"gzip"), (ResponseStart(status=304, headers=described),)
+        )
+        assert _one(_head(events), b"etag") == b'W/"v1"'
+
 
 # A decoder fed one encoded event at a time, which is what makes "delivered as it is
 # produced" checkable: a codec buffering its output leaves these returning nothing
@@ -663,6 +694,65 @@ class TestOtherEvents:
         )
         events = await _run(compress(), _accepting(b"gzip"), source)
         assert events[-1] == trailers
+        assert _body(events) == SHORT
+
+    async def test_states_no_length_for_a_head_that_announced_trailers(self) -> None:
+        """
+        HTTP/1.1 carries trailers only in the chunked coding, so the exact length this
+        response could otherwise state would frame the body by length and strand the
+        trailers behind it.
+        """
+        source = (
+            ResponseStart(
+                status=200,
+                headers=((b"content-type", b"application/json"), (b"content-length", str(len(BODY)).encode())),
+                trailers=True,
+            ),
+            ResponseBody(body=BODY, more_body=False),
+            ResponseTrailers(headers=((b"digest", b"sha-256=abc"),)),
+        )
+        events = await _run(compress(), _accepting(b"gzip"), source)
+        head = _head(events)
+        assert head.trailers
+        assert _one(head, b"content-encoding") == b"gzip"
+        assert _one(head, b"content-length") is None
+        assert gzip.decompress(_body(events)) == BODY
+
+    async def test_encodes_a_body_behind_a_push_the_app_sent_first(self) -> None:
+        """
+        `http.response.push` may be sent any time after the head and before the final
+        body event, so one can arrive while the floor is still being weighed. It says
+        nothing about the encoding, and it cannot go out ahead of the head it follows.
+        """
+        push = ServerPush(path="/app.css", headers=((b"accept", b"text/css"),))
+        source = (
+            ResponseStart(status=200, headers=((b"content-type", b"application/json"),)),
+            push,
+            ResponseBody(body=BODY, more_body=False),
+        )
+        events = await _run(compress(), _accepting(b"gzip"), source)
+        assert _one(_head(events), b"content-encoding") == b"gzip"
+        assert events[1] == push
+        assert gzip.decompress(_body(events)) == BODY
+
+    async def test_releases_a_push_held_behind_a_committed_stream(self) -> None:
+        head, *bodies = _streamed([BODY[:600], BODY[600:]])
+        push = ServerPush(path="/app.css", headers=((b"accept", b"text/css"),))
+        events = await _run(compress(), _accepting(b"gzip"), (head, push, *bodies))
+        assert _one(_head(events), b"content-encoding") == b"gzip"
+        assert events[1] == push
+        assert gzip.decompress(_body(events)) == BODY
+
+    async def test_releases_a_push_held_behind_a_body_under_the_floor(self) -> None:
+        push = ServerPush(path="/app.css", headers=((b"accept", b"text/css"),))
+        source = (
+            ResponseStart(status=200, headers=((b"content-type", b"application/json"),)),
+            push,
+            ResponseBody(body=SHORT, more_body=False),
+        )
+        events = await _run(compress(), _accepting(b"gzip"), source)
+        assert _one(_head(events), b"content-encoding") is None
+        assert events[1] == push
         assert _body(events) == SHORT
 
     async def test_leaves_an_offloaded_body_unencoded(self) -> None:
@@ -983,3 +1073,62 @@ class TestPaddedCompressors:
         pieces = (BODY[start : start + 7] for start in range(0, len(BODY), 7))
         encoded = b"".join(padded.compress(piece) + padded.flush_block() for piece in pieces)
         assert gzip.decompress(encoded + padded.flush()) == BODY
+
+
+# Every coding the shipped tables can produce, with the decoder that reads it back. A
+# padded coding decodes with the plain one: the random run it carries lives in a part
+# of the container the decoder is required to ignore.
+DECODED_BY: dict[bytes, Callable[[bytes], bytes]] = {
+    b"gzip": gzip.decompress,
+    b"zstd": zstd.decompress,
+    b"br": brotli.decompress,
+}
+
+
+@given(
+    chunks=st.lists(st.binary(max_size=400), min_size=1, max_size=6),
+    minimum_size=st.integers(min_value=0, max_value=800),
+    offer=st.sampled_from([b"gzip", b"zstd", b"br", b"br, zstd, gzip", b"gzip;q=0.5, zstd", b"identity"]),
+    declares_length=st.booleans(),
+    weighs_undeclared=st.booleans(),
+    table=st.sampled_from([DEFAULT_COMPRESSORS, PADDED_COMPRESSORS]),
+)
+async def test_a_response_of_any_shape_describes_the_bytes_it_carries(
+    chunks: list[bytes],
+    minimum_size: int,
+    offer: bytes,
+    declares_length: bool,
+    weighs_undeclared: bool,
+    table: Mapping[bytes, Callable[[], Compressor]],
+) -> None:
+    """
+    The invariant every path through the middleware owes the client, over the shapes a
+    response comes in: how the body is split, whether the head declared a length,
+    whether the floor is above or below it, which coding was negotiated, and whether
+    the coding pads. Whatever comes out decodes back to exactly what went in, and a
+    `content-length` is stated only when it counts the bytes on the wire, since a head
+    describing a body it does not have is the one failure a decoder cannot recover
+    from.
+    """
+    body = b"".join(chunks)
+    declared = ((b"content-length", str(len(body)).encode()),) if declares_length else ()
+    source: tuple[Outbound, ...] = (
+        ResponseStart(status=200, headers=((b"content-type", b"application/json"), *declared)),
+        *(ResponseBody(body=chunk, more_body=index < len(chunks) - 1) for index, chunk in enumerate(chunks)),
+    )
+    middleware = compress(table, minimum_size=minimum_size, weigh_undeclared_bodies=weighs_undeclared)
+
+    events = await _run(middleware, _accepting(offer), source)
+
+    head = _head(events)
+    carried = _body(events)
+    coding = _one(head, b"content-encoding")
+    assert coding is None or coding in table
+    assert (DECODED_BY[coding](carried) if coding is not None else carried) == body
+    length = _one(head, b"content-length")
+    assert length is None or int(length) == len(carried)
+    # The body is complete: the client is told where it ends rather than left holding a
+    # stream the decoder would still be waiting on.
+    bodies = [event for event in events if isinstance(event, ResponseBody)]
+    assert bodies
+    assert not bodies[-1].more_body
