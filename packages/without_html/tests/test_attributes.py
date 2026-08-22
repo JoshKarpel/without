@@ -6,6 +6,7 @@ from without_html import div
 from without_html import input_
 from without_html import render
 from without_html.nodes import CHECKED_ATTRIBUTE_NAMES
+from without_html.nodes import CHECKED_NAME_CAPACITY
 
 
 def test_attributes_render_in_the_order_they_were_given() -> None:
@@ -72,6 +73,16 @@ def test_a_proven_attribute_name_is_admitted_to_the_cache() -> None:
     assert "data-admitted" not in CHECKED_ATTRIBUTE_NAMES
     div(attrs={"data-admitted": "1"})
     assert "data-admitted" in CHECKED_ATTRIBUTE_NAMES
+
+
+def test_the_name_memo_stops_admitting_at_its_capacity() -> None:
+    # A name built from outside input would otherwise grow the memo for the life of the
+    # process. Past the cap a name is checked on every use rather than once, so it still
+    # renders; only the memo stops growing.
+    for n in range(CHECKED_NAME_CAPACITY * 2):
+        div(attrs={f"data-{n}": "1"})
+    assert len(CHECKED_ATTRIBUTE_NAMES) == CHECKED_NAME_CAPACITY
+    assert render(div(attrs={"data-beyond-the-cap": "1"})) == '<div data-beyond-the-cap="1"></div>'
 
 
 def test_a_true_value_renders_a_bare_attribute() -> None:

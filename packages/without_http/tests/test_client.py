@@ -601,7 +601,7 @@ async def test_build_request_keeps_explicit_framing_for_a_streaming_body() -> No
     assert [chunk async for chunk in outgoing.body] == [b"ab", b"cd"]
 
 
-async def test_streams_an_h11_body_with_an_explicit_host_and_emptychunks() -> None:
+async def test_streams_an_h11_body_with_an_explicit_host_and_empty_chunks() -> None:
     async with serving(tagged_echo_app) as server, ConnectionPool() as pool:
         upload = chunks(b"", b"ab", b"", b"cd")
         url = f"http://{server.host}:{server.port}/up"
@@ -832,7 +832,7 @@ async def test_a_content_body_reaches_the_server_as_bytes_and_a_content_type() -
             assert await body.read() == b'POST /submit test= body={"n": 1}'
 
 
-async def test_build_request_takes_a_streaming_contents_headers_andchunks() -> None:
+async def test_build_request_takes_a_streaming_contents_headers_and_chunks() -> None:
     content = StreamingContent(chunks(b"ab", b"cd"), ((b"content-type", b"multipart/form-data; boundary=bb"),))
 
     outgoing = _build_request("POST", "http://h/x", ((b"x-trace", b"t-1"),), content, Timeout())

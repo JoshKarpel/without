@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from collections.abc import Iterator
-from functools import cache
+from functools import lru_cache
 from itertools import islice
 
 from markupsafe import Markup
@@ -25,12 +25,21 @@ type TagMarkup = tuple[str, Markup]
 FRAGMENTS_PER_CHUNK = 512
 
 
+# How many tags' markup is held. Sized well above HTML's own vocabulary plus any custom
+# elements a program defines, so nothing reached by writing tags evicts anything. It is
+# bounded rather than unbounded because the key is a tag, and a tag can be built from
+# outside input; an unbounded memo would then grow for the life of the process. Bounding
+# it costs nothing measurable, since `lru_cache` at a fixed size and `cache` are within
+# noise of each other on a hit.
+TAG_MARKUP_CAPACITY = 4096
+
+
 # Per-tag constant markup, memoized on first use. A tag's surrounding text never varies,
 # so building it once per distinct tag turns two string formats per element into one cache
 # hit. The closing tag is held as a `Markup` so that pushing it onto the render stack
 # allocates nothing, and it is built for void tags too, where it costs one unused string
 # per process and saves every other element a second lookup.
-@cache
+@lru_cache(maxsize=TAG_MARKUP_CAPACITY)
 def tag_markup(tag: str) -> TagMarkup:
     """The memoized opening and closing markup for `tag`."""
     return (f"<{tag}", Markup(f"</{tag}>"))
@@ -109,7 +118,7 @@ def render(node: Node) -> str:
                 stack.append(closing)
                 stack.extend(reversed(children))
         elif isinstance(item, str):
-            out.append(item if isinstance(item, Markup) else escape_text(item))
+            out.append(item.__html__() if isinstance(item, SupportsHtml) else escape_text(item))
         elif isinstance(item, VoidElement):
             out.append(tag_markup(item.tag)[0])
             for name, value in item.attributes:
@@ -177,7 +186,7 @@ def fragments(node: Node) -> Iterator[str]:
                 stack.append(closing)
                 stack.extend(reversed(children))
         elif isinstance(item, str):
-            yield item if isinstance(item, Markup) else escape_text(item)
+            yield item.__html__() if isinstance(item, SupportsHtml) else escape_text(item)
         elif isinstance(item, VoidElement):
             yield tag_markup(item.tag)[0]
             for name, value in item.attributes:
@@ -212,6 +221,19 @@ def render_chunks(node: Node, *, fragments_per_chunk: int = FRAGMENTS_PER_CHUNK)
     handed on there is no taking it back, so a failure partway through a tree can no
     longer be turned into something else.
     """
-    remaining = fragments(node)
-    while batch := list(islice(remaining, fragments_per_chunk)):
+    if fragments_per_chunk < 1:
+        raise ValueError(f"a chunk holds at least one fragment, not {fragments_per_chunk}")
+    return joined(fragments(node), fragments_per_chunk)
+
+
+def joined(remaining: Iterator[str], per_chunk: int) -> Iterator[str]:
+    """
+    Join `remaining` into chunks of `per_chunk` fragments each.
+
+    Separate from `render_chunks` so that the size check there runs when it is called.
+    A generator function runs none of its body until the first value is drawn out, so
+    holding the check in one would turn a caller's bad argument into an error raised
+    somewhere down the line from where it was written.
+    """
+    while batch := list(islice(remaining, per_chunk)):
         yield "".join(batch)

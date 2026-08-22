@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 from without_html import div
+from without_html import element
 from without_html import element_type
 from without_html import render
 from without_html import void_element_type
@@ -45,3 +46,44 @@ def test_defining_a_raw_text_html_tag_is_rejected(tag: str) -> None:
 def test_a_defined_element_escapes_its_content_like_any_other() -> None:
     chart = element_type("x-chart")
     assert render(chart(children="<script>")) == "<x-chart>&lt;script&gt;</x-chart>"
+
+
+@pytest.mark.parametrize("tag", ["script", "style"])
+def test_defining_a_raw_text_html_tag_as_a_void_element_is_rejected(tag: str) -> None:
+    # A raw-text tag declared void renders with no closing tag, which leaves everything
+    # after it in script or stylesheet context however carefully it was escaped.
+    with pytest.raises(ValueError, match="not parsed as markup"):
+        void_element_type(tag)
+
+
+TAGS_THAT_COULD_BREAK_OUT = [
+    'div onclick="steal()"',
+    "with space",
+    "quote'd",
+    "sla/sh",
+    "eq=uals",
+    "close>",
+    "x><script>alert(1)</script><x",
+    "open<",
+    "",
+]
+
+
+@pytest.mark.parametrize("tag", TAGS_THAT_COULD_BREAK_OUT)
+def test_defining_an_element_with_a_tag_that_could_break_out_is_rejected(tag: str) -> None:
+    # A tag is written into `<...>` verbatim, so one assembled from outside input is an
+    # injection point that escaping the *values* does nothing about.
+    with pytest.raises(ValueError, match="invalid tag name"):
+        element_type(tag)
+
+
+@pytest.mark.parametrize("tag", TAGS_THAT_COULD_BREAK_OUT)
+def test_defining_a_void_element_with_a_tag_that_could_break_out_is_rejected(tag: str) -> None:
+    with pytest.raises(ValueError, match="invalid tag name"):
+        void_element_type(tag)
+
+
+@pytest.mark.parametrize("tag", TAGS_THAT_COULD_BREAK_OUT)
+def test_the_generic_factory_rejects_a_tag_that_could_break_out(tag: str) -> None:
+    with pytest.raises(ValueError, match="invalid tag name"):
+        element(tag, children="x")

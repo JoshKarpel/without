@@ -162,8 +162,9 @@ Disabling any of the four exact-type arms (`Element`, `Markup`, `str`, `VoidElem
 both walks) sends the item to the `isinstance` arm below, whose body is either a literal
 duplicate or a superset that resolves to the same thing: `type(item) is Markup` appends the
 item verbatim, and `isinstance(item, str)` reaches
-`item if isinstance(item, Markup) else escape_text(item)`, which for a `Markup` appends the
-item verbatim. The fast arms buy a pointer comparison over an ABC check, not different
+`item.__html__() if isinstance(item, SupportsHtml) else escape_text(item)`, which for a
+`Markup` appends the item verbatim, since its `__html__` returns itself. The fast arms buy
+a pointer comparison over an ABC check, not different
 output, which is why no test can see one go.
 
 `children_of`'s identity ladder has the same shape: `kind is str or kind is Markup` and

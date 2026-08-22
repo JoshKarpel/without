@@ -79,6 +79,12 @@ VOID_BODY = """\
 # for nothing, in the one function where taking the wrong arm means emitting unescaped text.
 # Re-measure before assuming the obvious version is faster.
 #
+# The `str` subclass arm asks for `__html__` rather than for `Markup`, because the two
+# are not the same set and the difference is a double-escape. Django's `SafeString` is a
+# `str` carrying `__html__` and no relation to `Markup`, so a `Markup` test would take it
+# for ordinary text and escape markup its author had already declared safe. Reaching
+# `__html__` covers `Markup` too, whose own returns itself.
+#
 # `Element` is tested before `Markup` because closing in place left `Markup` the rarer of
 # the two: only an element that could not close in place pushes a closing tag, so on an
 # ordinary page most of what reaches this arm is author-supplied. That ordering is worth
@@ -106,7 +112,7 @@ VOID_BODY
         elif isinstance(item, Element):
 ELEMENT_BODY
         elif isinstance(item, str):
-            EMIT(item if isinstance(item, Markup) else escape_text(item))
+            EMIT(item.__html__() if isinstance(item, SupportsHtml) else escape_text(item))
         elif isinstance(item, VoidElement):
 VOID_BODY
         elif isinstance(item, SupportsHtml):

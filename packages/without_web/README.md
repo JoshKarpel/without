@@ -1,7 +1,7 @@
 # without-web
 
 An opinionated HTTP and WebSocket router for
-[`without-asgi`](../without-asgi). `without-asgi` deliberately ships *no* router,
+[`without-asgi`](../without_asgi). `without-asgi` deliberately ships *no* router,
 only the unopinionated boundary and composition tools. `without-web` is the
 opinionated layer on top: t-string patterns with typed parameters, typed request
 extraction, 405-vs-404, mounting, scoped middleware, exception handlers, reverse

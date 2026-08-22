@@ -98,8 +98,7 @@ element exists: nothing survives the call for anyone to mutate or exhaust.
 
 ## Escaping is a type
 
-Text in a child position and every attribute value are escaped. The only thing that
-renders verbatim is
+Text in a child position and every attribute value are escaped. What renders verbatim is
 [`Markup`](https://markupsafe.palletsprojects.com/en/stable/escaping/), MarkupSafe's
 type, used under its own name rather than wrapped in a local one.
 
@@ -110,7 +109,9 @@ p(children=Markup("<em>trusted</em>"))  # renders verbatim
 
 Keeping the name is what makes the interoperation real rather than nominal: a fragment
 rendered by Jinja, Flask, or tdom already *is* one of these, with no adapter, and
-anything carrying `__html__` can sit in a child position. It also carries safety through
+anything carrying `__html__` renders verbatim in a child position whether or not it is a
+`Markup` (Django's `SafeString` is a `str` carrying `__html__` and no relation to
+`Markup`, and renders as its author declared it). `Markup` also carries safety through
 string operations, so `Markup("<b>") + untrusted` escapes the right-hand side and stays
 safe, which is the part a local `str` subclass would get quietly wrong.
 
@@ -118,10 +119,13 @@ Escaping happens when the element is built rather than when it is rendered, so a
 element is a value that has already been proven safe to emit, and one built once and
 rendered many times pays for it once.
 
-Attribute *names* are checked too, once per distinct name per process. A name is
-normally a literal, so a bad one is a bug in code you own and fails loudly; it is
-checked at all because a name assembled from outside input would be an injection point
-that no amount of value escaping closes.
+*Names* are checked rather than escaped: attribute names once per distinct name per
+process, and tag names wherever a tag enters, so `element`, `element_type`, and
+`void_element_type` all reject one carrying whitespace, quotes, `/`, `=`, `<`, or `>`. A
+name is normally a literal, so a bad one is a bug in code you own and fails loudly. It is
+checked at all because a name goes into the markup verbatim, which is exactly what
+escaping the values around it cannot reach: a name assembled from outside input would be
+an injection point no amount of value escaping closes.
 
 ## HTML's own constraints live in the signatures
 
@@ -159,7 +163,8 @@ chart(attrs={"data-series": series}, children=caption(children="Runs per day"))
 Bind it at module scope and use it like `div`. `element(tag, ...)` is the one-shot form
 for a tag that appears once, and `void_element_type` is its void counterpart, for markup
 that is not quite HTML (HTML's own void set is closed, and a custom element is never
-void).
+void). It refuses `script` and `style`, since a raw-text element with no closing tag
+leaves everything after it in script or stylesheet context.
 
 This is the seam for anything the browser has to do itself. A charting library, an
 editor, or a drag-and-drop surface lives behind a custom element: the server owns the

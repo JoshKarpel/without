@@ -22,6 +22,7 @@ from without_html import title
 from without_html import ul
 from without_html.nodes import RAW_TEXT_TAGS
 from without_html.nodes import VOID_TAGS
+from without_html.render import TAG_MARKUP_CAPACITY
 from without_html.render import tag_markup
 
 from .helpers import Spacer
@@ -160,6 +161,14 @@ def test_tag_markup_is_built_once_per_tag_and_reused() -> None:
     assert tag_markup("x-memo") is built
 
 
+def test_the_tag_memo_stops_growing_at_its_capacity() -> None:
+    # Keyed on a tag, and a tag can be built from outside input, so an unbounded memo
+    # would grow for the life of the process on markup an attacker chooses.
+    for n in range(TAG_MARKUP_CAPACITY * 2):
+        tag_markup(f"x-{n}")
+    assert tag_markup.cache_info().currsize == TAG_MARKUP_CAPACITY
+
+
 def test_a_markup_subclass_still_renders_verbatim() -> None:
     # `children_of` dispatches on exact type first for speed, so a subclass has to reach
     # the `isinstance` checks behind that. Without them a `Markup` subclass is a plain
@@ -177,6 +186,32 @@ def test_a_string_subclass_child_is_still_escaped() -> None:
         __slots__ = ()
 
     assert render(p(children=Loud("2 < 3"))) == "<p>2 &lt; 3</p>"
+
+
+def test_a_string_subclass_that_knows_its_own_markup_renders_verbatim() -> None:
+    # Django's `SafeString` is exactly this shape: a `str` carrying `__html__` and no
+    # relation to `Markup`. It reaches the `str` arm before the `SupportsHtml` one, so
+    # a `Markup` test there would take it for ordinary text and escape markup its author
+    # had already declared safe.
+    class SafeText(str):
+        __slots__ = ()
+
+        def __html__(self) -> str:
+            return str(self)
+
+    assert render(p(children=SafeText("<em>x</em>"))) == "<p><em>x</em></p>"
+
+
+def test_a_mapping_in_a_child_position_is_rejected_rather_than_rendering_its_keys() -> None:
+    # A `Mapping` satisfies `Iterable[Child]`, so the type checker passes it and the
+    # flattening arm would render its keys and silently drop everything else.
+    with pytest.raises(TypeError, match="renders only its keys"):
+        render(div(children={"label": "value"}))
+
+
+def test_a_set_in_a_child_position_is_rejected_rather_than_rendering_in_any_order() -> None:
+    with pytest.raises(TypeError, match="varies between runs"):
+        render(div(children={"a", "b"}))
 
 
 @pytest.mark.parametrize(

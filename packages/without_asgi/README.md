@@ -29,14 +29,14 @@ async def app(scope, receive, send):
 the lifespan protocol and wiring each connection's `receive`/`send` around the
 `Processor` a router selects. The same typed vocabulary parses and encodes in
 *both* directions, so a transport that owns the wire (like
-[`without-http`](../without-http)) can talk ASGI to any app in typed values; and
+[`without-http`](../without_http)) can talk ASGI to any app in typed values; and
 the optional `without_asgi.routing` submodule ships the unopinionated
 `Middleware` / `stack` / `wrap` / `buffered` tools you assemble a router from,
 with `without_asgi.compression` holding the negotiated response compression built
 on them.
 
 For a full, opinionated router you don't have to hand-roll, the sibling
-[`without-web`](../without-web) package snaps onto this boundary through nothing
+[`without-web`](../without_web) package snaps onto this boundary through nothing
 but the `HttpRouter` type.
 
 See the

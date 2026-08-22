@@ -4,7 +4,7 @@ HTML as immutable Python values. Build a node tree with plain function calls,
 render it to a string with a pure function. No template language, no loader
 search path, no ambient application object, and no dependency on anything else in
 the workspace: this is a value library that happens to be useful next to
-[`without-web`](../without-web).
+[`without-web`](../without_web).
 
 ```python
 from without_asgi import Response, html_content

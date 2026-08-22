@@ -1,7 +1,7 @@
 # without-http
 
 A sans-IO-backed ASGI **server** and **HTTP client** for `without`. Where
-[`without-asgi`](../without-asgi) is the *app* side of the ASGI boundary (it turns
+[`without-asgi`](../without_asgi) is the *app* side of the ASGI boundary (it turns
 a server's `receive`/`send` into typed streams), `without-http` is the *server*
 side: it owns the socket and the HTTP wire protocol, and drives any ASGI app via
 `app(scope, receive, send)`.

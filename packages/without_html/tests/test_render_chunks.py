@@ -123,8 +123,29 @@ def test_a_string_subclass_is_still_escaped_while_streaming() -> None:
     assert "".join(render_chunks(p(children=Loud("2 < 3")))) == "<p>2 &lt; 3</p>"
 
 
+def test_a_string_subclass_that_knows_its_own_markup_streams_verbatim() -> None:
+    class SafeText(str):
+        __slots__ = ()
+
+        def __html__(self) -> str:
+            return str(self)
+
+    assert "".join(render_chunks(p(children=SafeText("<em>x</em>")))) == "<p><em>x</em></p>"
+
+
 def test_none_between_children_streams_as_nothing() -> None:
     assert "".join(render_chunks(div(children=[None, p(children="kept"), None]))) == "<div><p>kept</p></div>"
+
+
+@pytest.mark.parametrize("fragments_per_chunk", [0, -1])
+def test_a_chunk_size_below_one_is_rejected(fragments_per_chunk: int) -> None:
+    # A zero-fragment chunk is an empty slice on the first pass, so the walk would end
+    # before it started and the whole page would come back as no chunks at all. Raised
+    # from the call rather than from the first chunk drawn out of it, which is what the
+    # missing `list` here pins: a generator function would defer the check to somewhere
+    # down the line from the call that got it wrong.
+    with pytest.raises(ValueError, match="at least one fragment"):
+        render_chunks(div(children="hi"), fragments_per_chunk=fragments_per_chunk)
 
 
 def test_a_value_that_cannot_stream_is_rejected() -> None:

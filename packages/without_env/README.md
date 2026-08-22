@@ -8,7 +8,7 @@ validated [`pydantic-settings`](https://docs.pydantic.dev/latest/concepts/pydant
 model (parse, don't validate), then hands that immutable value to processors via
 `current()`. Because it never changes, a reloading source (a watched file, a
 ConfigMap mount) is a separate plugin; see
-[`without-configmap`](../without-configmap) for the context-updated-by-a-stream
+[`without-configmap`](../without_configmap) for the context-updated-by-a-stream
 case.
 
 ```python

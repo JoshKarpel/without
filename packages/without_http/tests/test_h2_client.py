@@ -175,7 +175,7 @@ async def test_cleartext_stays_http_1_1_even_with_http2_enabled() -> None:
         assert pool._h2 == {}
 
 
-async def bidi_tagged_echo_app(scope: RawScope, receive: Receive, send: Send) -> None:
+async def bidi_echo_app(scope: RawScope, receive: Receive, send: Send) -> None:
     """Uppercase each request-body chunk into a response chunk, interleaved (full duplex)."""
     if scope["type"] != "http":
         raise RuntimeError("this app serves only http")
@@ -196,7 +196,7 @@ async def bidi_tagged_echo_app(scope: RawScope, receive: Receive, send: Send) ->
 
 
 async def test_h2_bidirectional_ping_pong_streams_both_ways() -> None:
-    async with serving(bidi_tagged_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
+    async with serving(bidi_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
         outbound: asyncio.Queue[bytes | None] = asyncio.Queue()
 
         async def request_body() -> AsyncIterator[bytes]:
@@ -217,7 +217,7 @@ async def test_h2_bidirectional_ping_pong_streams_both_ways() -> None:
 
 
 async def test_h2_server_speaks_first_before_the_request_body_is_ready() -> None:
-    async with serving(bidi_tagged_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
+    async with serving(bidi_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
         head_seen = asyncio.Event()
 
         async def request_body() -> AsyncIterator[bytes]:
@@ -234,7 +234,7 @@ async def test_h2_server_speaks_first_before_the_request_body_is_ready() -> None
 
 @pytest.mark.no_mutation  # teardown-timing assertions below are perturbed by mutmut's trampoline; see pyproject
 async def test_h2_abandoning_a_bidi_body_cancels_the_parked_sender() -> None:
-    async with serving(bidi_tagged_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
+    async with serving(bidi_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
         outbound: asyncio.Queue[bytes | None] = asyncio.Queue()
 
         async def request_body() -> AsyncIterator[bytes]:
@@ -276,7 +276,7 @@ async def test_h2_a_request_body_error_after_the_head_resets_the_stream() -> Non
             release.set()
             await body.read()
 
-    async with serving(bidi_tagged_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
+    async with serving(bidi_echo_app) as server, ConnectionPool(force_http2_cleartext=True) as pool:
         url = f"http://{server.host}:{server.port}/bidi"
         with pytest.raises(ValueError, match="h2 body blew up"):
             await exchange(pool, url)

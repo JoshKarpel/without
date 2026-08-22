@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from collections.abc import Mapping
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from types import GeneratorType
 from typing import Protocol
@@ -75,7 +76,18 @@ RAW_TEXT_TAGS = frozenset({"script", "style"})
 # a per-attribute check into a per-vocabulary one.
 CHECKED_ATTRIBUTE_NAMES: set[str] = set()
 
-FORBIDDEN_IN_NAME = frozenset(" \t\n\r\f\v\"'>/=")
+# How many proven names the memo above holds. A vocabulary an application author writes is
+# orders of magnitude smaller than this, so the cap is not a limit anyone reaches by
+# writing names; it is there for the case the vocabulary is not closed after all, where a
+# name built from outside input would otherwise grow the memo for the life of the process.
+# Past the cap the memo stops admitting rather than growing, so a further name is checked
+# on every use instead of once, which is slower but bounded.
+CHECKED_NAME_CAPACITY = 4096
+
+# Characters that must not appear in a tag or attribute name, because each of them ends
+# the name where it stands and starts something else: whitespace and `/` begin the next
+# attribute, `=` and the quotes begin a value, and `<` and `>` open or close a tag.
+FORBIDDEN_IN_NAME = frozenset(" \t\n\r\f\v\"'<>/=")
 
 
 def admit_name(name: str) -> None:
@@ -99,7 +111,8 @@ def admit_name(name: str) -> None:
         raise ValueError("set classes with `cls`, not as an attribute")
     if not name or not FORBIDDEN_IN_NAME.isdisjoint(name):
         raise ValueError(f"invalid attribute name: {name!r}")
-    CHECKED_ATTRIBUTE_NAMES.add(name)
+    if len(CHECKED_ATTRIBUTE_NAMES) < CHECKED_NAME_CAPACITY:
+        CHECKED_ATTRIBUTE_NAMES.add(name)
 
 
 def attributes_of(cls: ClassNames, attrs: Attributes | None) -> tuple[Attribute, ...]:
@@ -170,9 +183,18 @@ def children_of(children: Node) -> tuple[Child, ...]:
         return tuple(children)
     if isinstance(children, SINGLE_CHILD_TYPES):
         return (children,)
+    if isinstance(children, REFUSED_ITERABLES):
+        raise TypeError(refused_iterable(children))
     if isinstance(children, Iterable):
         return tuple(children)
     return (children,)
+
+
+def refused_iterable(children: Mapping[object, object] | AbstractSet[object]) -> str:
+    """Why `children` is not a child, reached only once a child position has already failed."""
+    if isinstance(children, Mapping):
+        return f"a mapping in a child position renders only its keys; pass what you meant: {children!r}"
+    return f"a set in a child position renders in an order that varies between runs; pass a list: {children!r}"
 
 
 def raw_text_of(tag: str, children: Markup | None) -> tuple[Child, ...]:
@@ -244,6 +266,14 @@ class Element:
 SINGLE_CHILD_TYPES = (str, Element, VoidElement)
 FLATTENED_TYPES = (list, tuple, GeneratorType)
 
+# Iterables that satisfy `Iterable[Child]` structurally, and so type-check in a child
+# position, while meaning something other than what a child position means. A `Mapping`
+# iterates its keys, so `children={"label": value}` renders `label` and silently drops the
+# rest; a `set` iterates in an order that varies between processes, so the same tree
+# renders differently each run. Neither is a tree anyone meant to write, and the type
+# checker cannot say so, which leaves here.
+REFUSED_ITERABLES = (Mapping, set, frozenset)
+
 
 class ElementConstructor(Protocol):
     """The call signature every named element constructor shares, and its tag identity."""
@@ -284,12 +314,34 @@ def named(construct: object, tag: str) -> None:
     construct.__doc__ = f"The `<{tag}>` element."
 
 
+def refuse_invalid_tag(tag: str) -> None:
+    """
+    Reject a tag that could break out of the markup it names.
+
+    The tag half of `admit_name`, and it exists for the same reason: a tag is written into
+    `<...>` verbatim, so a space or a `>` in one assembled from outside input opens markup
+    of the supplier's choosing, and no amount of escaping in the *values* closes that.
+
+    Raw-text tags are refused here rather than beside the void check, so that a tag
+    declared void reaches it too: a `<script>` with no closing tag leaves the rest of the
+    document in script context.
+
+    Unlike `admit_name` there is no cache behind this, because there is nothing a cache
+    would save. `element_type` and `void_element_type` settle a tag once when the
+    constructor is defined, and `element` is the one-shot form, which already pays a
+    frozenset lookup per call and is the form to move off when a tag repeats.
+    """
+    if not tag or not FORBIDDEN_IN_NAME.isdisjoint(tag):
+        raise ValueError(f"invalid tag name: {tag!r}")
+    if tag in RAW_TEXT_TAGS:
+        raise ValueError(f"<{tag}> content is not parsed as markup; use the `{tag}` constructor")
+
+
 def refuse_named_tag(tag: str) -> None:
     """Reject a tag whose element carries a constraint the generic form cannot express."""
     if tag in VOID_TAGS:
         raise ValueError(f"<{tag}> is a void element; use the `{tag}` constructor or `void_element_type`")
-    if tag in RAW_TEXT_TAGS:
-        raise ValueError(f"<{tag}> content is not parsed as markup; use the `{tag}` constructor")
+    refuse_invalid_tag(tag)
 
 
 def element_type(tag: str) -> ElementConstructor:
@@ -327,6 +379,7 @@ def void_element_type(tag: str) -> VoidElementConstructor:
     markup that is not quite HTML: an XML-ish document, or a foreign vocabulary rendered
     through the same tree.
     """
+    refuse_invalid_tag(tag)
 
     def construct(*, cls: ClassNames = None, attrs: Attributes | None = None) -> VoidElement:
         return VoidElement(tag, attributes_of(cls, attrs))

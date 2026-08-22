@@ -13,12 +13,15 @@
   `VoidElement` type with no children field at all, and a raw-text element (`script`, `style`)
   takes `Markup | None`, since escaping its content would corrupt the script while not escaping
   it would be an injection hole. Escaping is a type, not a setting: text and attribute values
-  are escaped when the element is built, and MarkupSafe's `Markup` is the one thing that
-  renders verbatim, kept under its own name so a fragment from Jinja or tdom already *is* one.
+  are escaped when the element is built, and MarkupSafe's `Markup` is what renders verbatim,
+  kept under its own name so a fragment from Jinja or tdom already *is* one, alongside anything
+  else carrying `__html__` (Django's `SafeString` included).
   Attribute names pass through a mapping verbatim, so `hx-get`, `data-*`, `aria-*`, and SVG's
   `viewBox` need no mangling convention; `class` is the one name `attrs` rejects, since classes
   have the `cls` argument and two channels into one attribute would be two sources to keep in
-  sync. Custom elements are first class: `element_type(tag)`
+  sync. Tag and attribute *names* are checked rather than escaped, since a name is written into
+  the markup verbatim and one assembled from outside input is an injection point that escaping
+  the values around it cannot reach. Custom elements are first class: `element_type(tag)`
   and `void_element_type(tag)` define constructors equal in standing to the built-in ones, with
   the tag check paid once at definition rather than on every call, which is the seam for
   anything the browser must do itself. `render_chunks(node)` walks the same tree and produces
