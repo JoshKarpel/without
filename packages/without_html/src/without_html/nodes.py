@@ -90,7 +90,18 @@ VOID_TAGS = frozenset(
 # not escaping arbitrary text would be an injection hole. The way out is to accept neither
 # decision on the caller's behalf: content for these elements must arrive already
 # `Markup`, so the author states that the text is theirs rather than a visitor's.
-RAW_TEXT_TAGS = frozenset({"script", "style"})
+#
+# The set is HTML's, not a shortlist of the ones that matter: every tag the tokenizer puts
+# into RAWTEXT is here, because the property is the parser's and a tag left out is one
+# whose entities render literally. Every one of them has a constructor, so the refusal
+# `refuse_invalid_tag` raises can name the thing to use instead.
+#
+# `noscript` is not one, which is worth stating so it does not get added. It is RAWTEXT
+# only where scripting is *enabled*, and that is exactly where its content is never
+# displayed; where the content is shown, the parser reads it as markup and escaping it is
+# correct. `textarea` and `title` are RCDATA rather than RAWTEXT: tags do not open inside
+# them but entities are still decoded, so escaping is correct there too.
+RAW_TEXT_TAGS = frozenset({"script", "style", "iframe", "noembed", "noframes", "xmp"})
 
 # Attribute names already checked, so each distinct name is validated once per process.
 # Names are overwhelmingly literals repeated across every row of a table, so caching turns
@@ -135,8 +146,14 @@ def admit_name(name: str) -> None:
     source and not two kept in sync. Costing nothing extra falls out of the cache: it
     is never admitted, so every occurrence takes this path and raises, while every
     other name is a single set lookup and never returns here.
+
+    The `class` test lowercases first, because attribute names are case-insensitive to
+    a parser: an exact-match test would let `Class` through, and the browser would then
+    see two `class` attributes on one element and silently drop the second. That is the
+    same two-sources-in-sync problem the rejection exists to prevent, arriving in the
+    one form where it fails quietly instead of loudly.
     """
-    if name == "class":
+    if name.lower() == "class":
         raise ValueError("set classes with `cls`, not as an attribute")
     if not name or not FORBIDDEN_IN_NAME.isdisjoint(name):
         raise ValueError(f"invalid attribute name: {name!r}")
@@ -153,6 +170,12 @@ def attributes_of(cls: ClassNames, attrs: Attributes | None) -> tuple[Attribute,
     pays for it once. That is also why there is no way to hand this function attributes
     that are already rendered: the conversion it does is the escaping, so requiring the
     parsed form from a caller would be requiring the caller to escape.
+
+    Which is also why an element is never built from an attribute tuple written by
+    hand. `Element.with_attributes` is the way to change one, and it comes back through
+    here; assembling `(("nonce", nonce),)` at the call site type-checks and renders, and
+    puts an unescaped value straight into the attribute list, where a quote in it opens
+    an attribute of the supplier's choosing.
 
     Empty and `None` class entries are dropped rather than joined, which is what lets a
     conditional class be written inline. `filter` does it in one C-level pass, where a
@@ -181,6 +204,47 @@ def attributes_of(cls: ClassNames, attrs: Attributes | None) -> tuple[Attribute,
     return tuple(rendered)
 
 
+def merged_attributes(
+    existing: tuple[Attribute, ...], cls: ClassNames, attrs: Attributes | None
+) -> tuple[Attribute, ...]:
+    """
+    Lay `cls` and `attrs` over `existing`, replacing what they name and keeping the rest.
+
+    A name already on the element is replaced *where it is* rather than appended, because
+    HTML's own rule for a duplicate attribute is that the first occurrence wins and the
+    rest are dropped. Appending would therefore be a no-op on exactly the elements a
+    transform is trying to change, and a silent one: the markup carries both spellings
+    and the browser reads the old value.
+
+    Names are matched case-insensitively, for the same reason `admit_name` rejects
+    `Class`: a parser sees `data-id` and `Data-Id` as one attribute, so treating them as
+    two here would produce the duplicate this exists to avoid. A replacement keeps the
+    old attribute's *position* and takes the new one's *spelling*, so the markup says
+    what the caller asked for and the browser reads it where it always was.
+
+    An `attrs` entry set to `None` or `False` removes the attribute, which falls out of
+    `attributes_of` dropping those values: the name was mentioned and nothing was
+    rendered for it. `cls` replaces the element's classes when given, and leaves them
+    alone at its `None` default, so there is no spelling of `with_attributes` that
+    changes classes by accident.
+    """
+    pending = {name.lower(): (name, value) for name, value in attributes_of(cls, attrs)}
+    mentioned = set(pending)
+    if attrs:
+        mentioned.update(name.lower() for name in attrs)
+    if cls is not None:
+        mentioned.add("class")
+    merged: list[Attribute] = []
+    for name, value in existing:
+        key = name.lower()
+        if key not in mentioned:
+            merged.append((name, value))
+        elif key in pending:
+            merged.append(pending.pop(key))
+    merged.extend(pending.values())
+    return tuple(merged)
+
+
 def children_of(children: Node) -> tuple[Child, ...]:
     """
     Normalize a child argument into a tuple of children.
@@ -189,8 +253,18 @@ def children_of(children: Node) -> tuple[Child, ...]:
     built: what arrives as a place becomes a value at the edge. A generator is consumed
     here for the same reason, which is what makes an element renderable more than once.
 
-    One level, matching `Node`: what this returns holds no iterables, so every element in
-    the tree is a hashable value and the renderer never has to walk one.
+    One level, matching `Node`. What that buys is an element holding no iterables, so it
+    is a hashable value a cache can be keyed on and the renderer never has to walk one.
+
+    It is not *proven* here, and deliberately: what this refuses is the shape that would
+    otherwise render something plausible and wrong, not every shape that is not a child.
+    A mapping renders its keys and a set renders in an order that varies between runs, so
+    both have to be caught where they were written or they are never caught at all. An
+    unflattened `[rows]` is the other kind: it has no rendering, so it raises out of the
+    walk, naming the mistake and the `*` that fixes it. Proving the rest here as well
+    would put a second ladder over child kinds beside the renderer's, which is the one
+    place that has to look at every child anyway, and it is the drift between two such
+    ladders that would be the security bug. So there is one, and this is not it.
 
     Dispatch is a ladder of exact-type identity checks before any `isinstance`, ordered by
     how often each shape actually appears. `type()` rather than `__class__` because it is
@@ -226,21 +300,31 @@ def refused_iterable(children: Mapping[object, object] | AbstractSet[object]) ->
     return f"a set in a child position renders in an order that varies between runs; pass a list: {children!r}"
 
 
-def raw_text_of(tag: str, children: Markup | None) -> tuple[Child, ...]:
+def raw_text_of(tag: str, children: Node) -> tuple[Child, ...]:
     """
     Normalize the content of a raw-text element, which must already be `Markup`.
 
-    The type of every raw-text constructor's `children` says the same thing, so a
-    caller under a type checker never reaches this. It is still checked because the
-    alternative failure is silent: a plain string would be escaped, and a stylesheet
-    or script that arrives entity-encoded is broken in a way that points nowhere near
-    the code that caused it.
+    Every raw-text constructor's `children` is typed `Markup | None`, so a caller under
+    a type checker reaches the refusal only through `Element.with_children`, where the
+    element's tag is not known statically and the wider type is the honest one. It is
+    checked because the alternative failure is silent: a plain string would be escaped,
+    and a stylesheet or script that arrives entity-encoded is broken in a way that points
+    nowhere near the code that caused it.
+
+    The wider shapes are accepted and not only refused, because a walk hands every element
+    its children back the way it found them, as a sequence. Requiring a bare `Markup` here
+    would make a raw-text element the one node a generic transform could not rebuild. The
+    exact-type test comes first so the constructors, which do pass a bare `Markup`, still
+    reach the answer in one pointer comparison.
     """
     if children is None:
         return ()
-    if not isinstance(children, Markup):
+    if type(children) is Markup:
+        return (children,)
+    content = children_of(children)
+    if not all(isinstance(child, Markup) for child in content):
         raise ValueError(f"<{tag}> content is not parsed as markup, so it must be `Markup`")
-    return (children,)
+    return content
 
 
 # `frozen=True, slots=True` on both element types, which is the expensive combination and
@@ -274,6 +358,15 @@ class VoidElement:
     tag: str
     attributes: tuple[Attribute, ...] = ()
 
+    def with_attributes(self, *, cls: ClassNames = None, attrs: Attributes | None = None) -> VoidElement:
+        """
+        A new element with `cls` and `attrs` laid over this one's attributes.
+
+        `Element.with_attributes`, for an element with no content; the semantics are
+        described there.
+        """
+        return VoidElement(self.tag, merged_attributes(self.attributes, cls, attrs))
+
 
 @dataclass(frozen=True, slots=True)
 class Element:
@@ -281,13 +374,51 @@ class Element:
     An element with content: a tag, its rendered attributes, and its children.
 
     Build these through a named constructor in `without_html.elements`, or `element`
-    for a tag HTML does not define. The fields here are the already-parsed form, with
-    attributes escaped and children flattened to a tuple.
+    for a tag HTML does not define, and change one with `with_attributes` and
+    `with_children`. The fields here are the already-parsed form, with attributes
+    escaped and children flattened to a tuple, so writing them directly is writing the
+    output of a parse that never ran: an attribute value assembled at the call site
+    reaches the markup unescaped.
     """
 
     tag: str
     attributes: tuple[Attribute, ...] = ()
     children: tuple[Child, ...] = ()
+
+    def with_attributes(self, *, cls: ClassNames = None, attrs: Attributes | None = None) -> Element:
+        """
+        A new element with `cls` and `attrs` laid over this one's attributes.
+
+        The transform half of the constructors, taking its arguments in the same shape
+        they do, so that changing an element during a walk is spelled the way building
+        one is and goes through the same escaping:
+
+        ```python
+        el.with_attributes(attrs={"nonce": nonce}) if el.tag == "script" else el
+        ```
+
+        A name already on the element is replaced where it stands, an `attrs` entry set
+        to `None` removes it, and `cls` replaces the classes when given. See
+        `merged_attributes` for why replacing in place is the only correct arm of that.
+        """
+        return Element(self.tag, merged_attributes(self.attributes, cls, attrs), self.children)
+
+    def with_children(self, children: Node) -> Element:
+        """
+        A new element with `children` in place of this one's.
+
+        Wholesale rather than an insert or an append, because the children are already a
+        value: `el.with_children([*el.children, footer])` adds one and reads as what it
+        does, and nothing here has to grow a second way to say it.
+
+        A raw-text element (`<script>`, `<style>`) keeps its own rule about content, which
+        is why this exists rather than `dataclasses.replace`: replace would put an escaped
+        string inside a `<script>`, where nothing escapes and the entities are the
+        program.
+        """
+        if self.tag in RAW_TEXT_TAGS:
+            return Element(self.tag, self.attributes, raw_text_of(self.tag, children))
+        return Element(self.tag, self.attributes, children_of(children))
 
 
 # The `isinstance` arguments `children_of` uses, bound once instead of built into a fresh

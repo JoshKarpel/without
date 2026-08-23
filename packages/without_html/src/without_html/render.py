@@ -51,6 +51,12 @@ def unrenderable(item: object) -> str:
     """
     Why `item` cannot be rendered, reached only once a walk has already failed.
 
+    This is where a child that is not one is caught, and the only place: `children_of`
+    turns away the two shapes that would otherwise render something plausible and wrong,
+    and leaves everything else to the walk, which has to look at every child regardless.
+    So the message has to carry the whole diagnosis, including for a mistake made a long
+    way from here.
+
     A mapping or a set is sent to `refused_iterable` rather than told to unpack itself.
     `children_of` refuses those two shapes where they arrive as the child argument, but one
     nested in a list flattens past it and fails here instead, and the advice the other arm

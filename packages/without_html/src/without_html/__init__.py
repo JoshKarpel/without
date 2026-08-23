@@ -91,6 +91,8 @@ from without_html.elements import menu
 from without_html.elements import meta
 from without_html.elements import meter
 from without_html.elements import nav
+from without_html.elements import noembed
+from without_html.elements import noframes
 from without_html.elements import noscript
 from without_html.elements import object_
 from without_html.elements import ol
@@ -138,6 +140,7 @@ from without_html.elements import ul
 from without_html.elements import var
 from without_html.elements import video
 from without_html.elements import wbr
+from without_html.elements import xmp
 # [[[end]]]
 # isort: on
 
@@ -236,6 +239,8 @@ __all__ = [
     "meta",
     "meter",
     "nav",
+    "noembed",
+    "noframes",
     "noscript",
     "object_",
     "ol",
@@ -286,5 +291,6 @@ __all__ = [
     "video",
     "void_element_type",
     "wbr",
+    "xmp",
     # [[[end]]]
 ]

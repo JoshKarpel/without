@@ -204,6 +204,11 @@ def pre(*, cls: ClassNames = None, attrs: Attributes | None = None, children: No
     return Element("pre", attributes_of(cls, attrs), children_of(children))
 
 
+def xmp(*, cls: ClassNames = None, attrs: Attributes | None = None, children: Markup | None = None) -> Element:
+    """The `<xmp>` element."""
+    return Element("xmp", attributes_of(cls, attrs), raw_text_of("xmp", children))
+
+
 def ul(*, cls: ClassNames = None, attrs: Attributes | None = None, children: Node = None) -> Element:
     """The `<ul>` element."""
     return Element("ul", attributes_of(cls, attrs), children_of(children))
@@ -389,9 +394,19 @@ def embed(*, cls: ClassNames = None, attrs: Attributes | None = None) -> VoidEle
     return VoidElement("embed", attributes_of(cls, attrs))
 
 
-def iframe(*, cls: ClassNames = None, attrs: Attributes | None = None, children: Node = None) -> Element:
+def noembed(*, cls: ClassNames = None, attrs: Attributes | None = None, children: Markup | None = None) -> Element:
+    """The `<noembed>` element."""
+    return Element("noembed", attributes_of(cls, attrs), raw_text_of("noembed", children))
+
+
+def iframe(*, cls: ClassNames = None, attrs: Attributes | None = None, children: Markup | None = None) -> Element:
     """The `<iframe>` element."""
-    return Element("iframe", attributes_of(cls, attrs), children_of(children))
+    return Element("iframe", attributes_of(cls, attrs), raw_text_of("iframe", children))
+
+
+def noframes(*, cls: ClassNames = None, attrs: Attributes | None = None, children: Markup | None = None) -> Element:
+    """The `<noframes>` element."""
+    return Element("noframes", attributes_of(cls, attrs), raw_text_of("noframes", children))
 
 
 def object_(*, cls: ClassNames = None, attrs: Attributes | None = None, children: Node = None) -> Element:

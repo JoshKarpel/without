@@ -41,21 +41,28 @@ repos:
         language: pygrep
         entry: 'PLC0415'
         types: [python]
+      # Each of these fires on its generated outputs *and* on the generator behind them,
+      # so that editing the source of a shape regenerates it. The scripts name their own
+      # outputs and take `pass_filenames: false`, because pre-commit hands a hook only the
+      # files that changed, and a generator edit does not change its outputs until it runs.
       - id: generate-ladders
         name: regenerate overload ladders (cog + ruff)
         language: system
         entry: packages/without_web/tools/regenerate.sh
-        files: ^packages/without_web/src/without_web/(handlers|extractors)\.py$
+        files: ^packages/without_web/(src/without_web/(handlers|extractors)\.py|tools/(ladders\.py|regenerate\.sh))$
+        pass_filenames: false
       - id: generate-dag-ladders
         name: regenerate without-dag overload ladder (cog + ruff)
         language: system
         entry: packages/without_dag/tools/regenerate.sh
-        files: ^packages/without_dag/src/without_dag/graph\.py$
+        files: ^packages/without_dag/(src/without_dag/graph\.py|tools/(dag_ladders\.py|regenerate\.sh))$
+        pass_filenames: false
       - id: generate-elements
         name: regenerate without-html element constructors and renderers (cog + ruff)
         language: system
         entry: packages/without_html/tools/regenerate.sh
-        files: ^packages/without_html/src/without_html/(elements|render|__init__)\.py$
+        files: ^packages/without_html/(src/without_html/(elements|render|__init__)\.py|tools/(tags|walk)\.py|tools/regenerate\.sh)$
+        pass_filenames: false
       - id: generate-package-bases
         name: regenerate the mypy package bases (cog)
         language: system

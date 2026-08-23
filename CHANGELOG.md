@@ -10,16 +10,25 @@
   framework, and the interface is the *tree* rather than the string, which is what leaves room
   for rendering a component alone as a fragment. HTML's own constraints live in the
   signatures rather than in checks that can be forgotten: a void element is a separate
-  `VoidElement` type with no children field at all, and a raw-text element (`script`, `style`)
-  takes `Markup | None`, since escaping its content would corrupt the script while not escaping
-  it would be an injection hole. Escaping is a type, not a setting: text and attribute values
+  `VoidElement` type with no children field at all, and a raw-text element takes
+  `Markup | None`, since escaping its content would corrupt the script while not escaping
+  it would be an injection hole. That set is HTML's own rather than a shortlist (`script`,
+  `style`, `iframe`, `noembed`, `noframes`, `xmp`), since a tag left out is one whose content
+  renders entity-encoded; `noscript` is deliberately not one, being raw text only where its
+  content is never displayed. Escaping is a type, not a setting: text and attribute values
   are escaped when the element is built, and MarkupSafe's `Markup` is what renders verbatim,
   kept under its own name so a fragment from Jinja or tdom already *is* one, alongside anything
   else carrying `__html__` (Django's `SafeString` included).
   Attribute names pass through a mapping verbatim, so `hx-get`, `data-*`, `aria-*`, and SVG's
   `viewBox` need no mangling convention; `class` is the one name `attrs` rejects, since classes
   have the `cls` argument and two channels into one attribute would be two sources to keep in
-  sync. Tag and attribute *names* are checked rather than escaped, since a name is written into
+  sync, and it rejects the name however it is capitalized, since a parser reads `Class` and
+  `class` as one attribute. An element is changed with `with_attributes` and `with_children`,
+  which take the arguments the constructors take, so a transform goes through the same
+  escaping the tree was built with; `dataclasses.replace` on the fields would write the output
+  of a parse that never ran. Replacing an attribute puts the new value where the old one stood,
+  because HTML keeps the first of a duplicated attribute and an appended one would be silently
+  inert. Tag and attribute *names* are checked rather than escaped, since a name is written into
   the markup verbatim and one assembled from outside input is an injection point that escaping
   the values around it cannot reach. A tag must also begin with an ASCII letter, all HTML's own
   tag-name grammar allows there, which is what keeps a leading `!` from opening a comment that

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import pytest
+import without_html
+from markupsafe import Markup
 from without_html import div
 from without_html import element
 from without_html import element_type
 from without_html import render
 from without_html import void_element_type
+from without_html.nodes import RAW_TEXT_TAGS
 
 
 def test_a_defined_element_renders_like_a_named_one() -> None:
@@ -37,10 +40,43 @@ def test_defining_a_void_html_tag_as_an_element_is_rejected(tag: str) -> None:
         element_type(tag)
 
 
-@pytest.mark.parametrize("tag", ["script", "style"])
+def test_the_raw_text_tags_are_the_ones_a_parser_treats_that_way() -> None:
+    # Pinned as a literal because every other test here is parametrized over the set
+    # itself, so a tag dropped from it would take its own coverage with it and the suite
+    # would stay green while the content of that element started rendering entity-encoded.
+    #
+    # The membership is HTML's, checked against a conforming parser rather than reasoned
+    # about: feeding `a &amp; b` to html5lib comes back as those five characters for each
+    # of these and as `a & b` for everything else. `noscript` is the near miss and is
+    # deliberately absent: it is raw text only where scripting is on, which is exactly
+    # where its content is never shown. `textarea` and `title` are RCDATA, so entities
+    # are decoded in them and escaping is right.
+    assert {"script", "style", "iframe", "noembed", "noframes", "xmp"} == RAW_TEXT_TAGS
+
+
+@pytest.mark.parametrize("tag", sorted(RAW_TEXT_TAGS))
 def test_defining_a_raw_text_html_tag_is_rejected(tag: str) -> None:
     with pytest.raises(ValueError, match="not parsed as markup"):
         element_type(tag)
+
+
+@pytest.mark.parametrize("tag", sorted(RAW_TEXT_TAGS))
+def test_every_raw_text_tag_has_the_constructor_its_refusal_names(tag: str) -> None:
+    # The refusal above tells the caller to use `<tag>`'s own constructor, so a raw-text
+    # tag with no constructor would make that message name something that does not exist,
+    # leaving no way at all to build the element. None of HTML's raw-text tags is a Python
+    # keyword, so the constructor is named for the tag with no suffix.
+    construct = getattr(without_html, tag)
+    assert render(construct(children=Markup("a && b"))) == f"<{tag}>a && b</{tag}>"
+
+
+@pytest.mark.parametrize("tag", sorted(RAW_TEXT_TAGS))
+def test_a_raw_text_element_refuses_content_that_would_have_been_escaped(tag: str) -> None:
+    # Entities are not decoded inside these, so escaped text renders as the entity itself
+    # and the content is wrong in a way that points nowhere near the code that caused it.
+    construct = getattr(without_html, tag)
+    with pytest.raises(ValueError, match="not parsed as markup"):
+        construct(children="a && b")
 
 
 def test_a_defined_element_escapes_its_content_like_any_other() -> None:
@@ -48,7 +84,7 @@ def test_a_defined_element_escapes_its_content_like_any_other() -> None:
     assert render(chart(children="<script>")) == "<x-chart>&lt;script&gt;</x-chart>"
 
 
-@pytest.mark.parametrize("tag", ["script", "style"])
+@pytest.mark.parametrize("tag", sorted(RAW_TEXT_TAGS))
 def test_defining_a_raw_text_html_tag_as_a_void_element_is_rejected(tag: str) -> None:
     # A raw-text tag declared void renders with no closing tag, which leaves everything
     # after it in script or stylesheet context however carefully it was escaped.

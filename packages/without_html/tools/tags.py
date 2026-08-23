@@ -25,6 +25,11 @@ from without_html.nodes import VOID_TAGS
 
 # Every element this package names, in the order the reference page should read:
 # document structure outward to leaves, then tables, then forms.
+#
+# `xmp`, `noembed`, and `noframes` are obsolete and nothing should reach for them; they are
+# named anyway because they are raw-text elements, and `RAW_TEXT_TAGS` refuses a raw-text
+# tag to the generic factory by telling the caller to use its constructor. Leaving them out
+# would make that message name something that does not exist.
 TAGS = (
     "html",
     "head",
@@ -63,6 +68,7 @@ TAGS = (
     "ol",
     "p",
     "pre",
+    "xmp",
     "ul",
     "a",
     "abbr",
@@ -100,7 +106,9 @@ TAGS = (
     "track",
     "video",
     "embed",
+    "noembed",
     "iframe",
+    "noframes",
     "object",
     "picture",
     "source",

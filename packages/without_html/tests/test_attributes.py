@@ -65,6 +65,15 @@ def test_class_as_an_attribute_is_rejected_alongside_cls() -> None:
         div(cls="card", attrs={"class": "other"})
 
 
+@pytest.mark.parametrize("name", ["Class", "CLASS", "cLaSs"])
+def test_class_as_an_attribute_is_rejected_however_it_is_spelled(name: str) -> None:
+    # Attribute names are case-insensitive to a parser, so a spelling that got past the
+    # rejection would not get past the browser: it would see two `class` attributes on one
+    # element, keep the first, and drop the other without a word.
+    with pytest.raises(ValueError, match=r"^set classes with `cls`, not as an attribute$"):
+        div(cls="card", attrs={name: "other"})
+
+
 def test_a_proven_attribute_name_is_admitted_to_the_cache() -> None:
     # The name check is a cache lookup, so a name proven once never reaches the check
     # again. Without the admission every occurrence would take the slow path instead.

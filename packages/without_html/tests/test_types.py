@@ -37,6 +37,13 @@ if TYPE_CHECKING:
     raw_text: RawTextElementConstructor = script
     ordinary = script  # type: ignore[assignment]
 
+    # A transform preserves which kind of element it started from, so a void element
+    # cannot acquire children by going through one.
+    assert_type(div().with_attributes(attrs={"id": "x"}), Element)
+    assert_type(div().with_children("text"), Element)
+    assert_type(br().with_attributes(attrs={"id": "x"}), VoidElement)
+    br().with_children("text")  # type: ignore[attr-defined]
+
     br(children="text")  # type: ignore[call-arg]
     script(children="alert(1)")  # type: ignore[arg-type]
     div(children=object())  # type: ignore[arg-type]

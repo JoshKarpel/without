@@ -90,8 +90,17 @@ An element's children are therefore always flat, which is what makes every eleme
 hashable value: the hash of a subtree is the hash of its strings and its children's
 hashes, so a tree is content-addressed and anything above can key on one. It is also why
 rendering never mutates anything, since a generator is consumed when the element is built
-rather than while it is being rendered. A nested iterable raises, and says what to write
-instead.
+rather than while it is being rendered.
+
+A nested iterable is a static error, and if it gets past the type checker anyway it has no
+rendering, so it raises out of the walk naming the `*` that fixes it. It is not refused at
+construction, and that is the line: what construction turns away is the shape that would
+otherwise render something plausible and *wrong*, a `Mapping` (its keys) or a `set` (an
+order that varies between processes), because those have to be caught where they were
+written or they are never caught at all. Proving the rest at construction would mean a
+second ladder over child kinds beside the renderer's, which is the one place that looks at
+every child anyway, and drift between two such ladders is how escaping bugs happen. So
+there is one.
 
 What a child slot takes is a `Sequence` or an `Iterator`, not any `Iterable`. A `Mapping`
 and a `set` are both `Iterable[Child]` structurally, so naming `Iterable` would type-check
@@ -159,10 +168,19 @@ than in a runtime check you can forget.
 field at all. Giving one children is not a mistake to be caught but a thing that cannot
 be written.
 
-**Raw-text elements** (`script`, `style`) take `Markup | None`. Their content is not
-parsed as markup, so escaping it would corrupt the script (`a && b` becoming
-`a &amp;&amp; b`) while not escaping it would be an injection hole. Requiring `Markup`
-takes neither decision on your behalf.
+**Raw-text elements** take `Markup | None`. Their content is not parsed as markup, so
+escaping it would corrupt the script (`a && b` becoming `a &amp;&amp; b`) while not
+escaping it would be an injection hole. Requiring `Markup` takes neither decision on your
+behalf. The set is HTML's own and not a shortlist of the ones that matter: `script`,
+`style`, `iframe`, `noembed`, `noframes`, and `xmp`. The last four are obsolete and
+nothing should reach for them, but a parser still reads their content as raw text, so a
+tag left out would be one whose entities render as themselves.
+
+`noscript` is the near miss and is deliberately not one. It is raw text only where
+scripting is enabled, which is exactly where its content is never shown; where the
+content is displayed, the parser reads it as markup and escaping it is right. `textarea`
+and `title` are RCDATA, so tags do not open inside them but entities are still decoded,
+and escaping is right there too.
 
 **Everything else** takes any `Node`.
 
@@ -186,13 +204,42 @@ chart(attrs={"data-series": series}, children=caption(children="Runs per day"))
 Bind it at module scope and use it like `div`. `element(tag, ...)` is the one-shot form
 for a tag that appears once, and `void_element_type` is its void counterpart, for markup
 that is not quite HTML (HTML's own void set is closed, and a custom element is never
-void). It refuses `script` and `style`, since a raw-text element with no closing tag
-leaves everything after it in script or stylesheet context.
+void). It refuses the raw-text tags, since one declared void renders with no closing tag
+and leaves everything after it in script or stylesheet context.
 
 This is the seam for anything the browser has to do itself. A charting library, an
 editor, or a drag-and-drop surface lives behind a custom element: the server owns the
 element's attributes, the library owns everything inside it, and neither has to know
 about the other.
+
+## Changing an element you already have
+
+An element is a value, so nothing changes one; `with_attributes` and `with_children`
+return a new element with the change applied. They take their arguments in the shape the
+constructors do, so a transform reads like the code that built the tree:
+
+```python
+el.with_attributes(attrs={"nonce": nonce})  # add, or replace what is there
+el.with_attributes(attrs={"id": None})  # remove
+el.with_attributes(cls=("card", "active"))  # replace the classes
+el.with_children([*el.children, footer])  # append, by naming what was there
+```
+
+These exist rather than `dataclasses.replace` because the fields are the *already-parsed*
+form. `attributes` holds values that have been escaped and children have been flattened,
+so writing either directly is writing the output of a parse that never ran: a nonce
+assembled at the call site would reach the markup unescaped, and `replace` would put an
+escaped string inside a `<script>`, where nothing is escaped and the entities are the
+program.
+
+Replacing an attribute puts the new value where the old one stood rather than appending
+it. HTML's own rule for a duplicated attribute is that the first occurrence wins, so
+appending would be a no-op on exactly the elements a transform is trying to change, and
+a silent one. Names match case-insensitively for the same reason: `data-id` and `Data-Id`
+are one attribute to a parser.
+
+`cls` at its default means "not mentioned", so no change to attributes can drop an
+element's classes by omission; `cls=""` is how you remove them.
 
 ## Answering a request
 
@@ -357,8 +404,8 @@ cost, settling escaping at construction just as well.
 
 What the tree buys is everything that needs the markup to still be *structured* after the
 component has returned: holding a cached subtree that can still be composed into a larger
-page rather than only pasted into one, walking a document to add a nonce to every
-`<script>`, asserting on shape rather than on text in a test, or rendering the same tree to
+page rather than only pasted into one, walking a document with `with_attributes` to add a
+nonce to every `<script>`, asserting on shape rather than on text in a test, or rendering the same tree to
 something that is not HTML. It is the difference between a layer that hands you an answer
 and one that hands you something you can still ask questions of.
 
