@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.5
 
 ### Added
 
@@ -57,45 +57,15 @@
   `json_content`, `form_content`, and `multipart_content`. It takes a `str`, so how the markup
   was produced stays the application's business and this package names the content type without
   taking on a renderer.
-
-## 0.0.4
-
-### Added
-
-- **`without-http`**: response decompression as opt-in middleware. `decompress()` offers
-  `accept-encoding` outbound and wraps the response body in an incremental decoder inbound, so a
-  streamed body decodes chunk by chunk and trailers pass through untouched. It is middleware rather
-  than pool behavior because the transport must never silently rewrite bytes: a caller that wants
-  the wire encoding reads the undecorated client. The coding table is the argument
-  (`DEFAULT_DECOMPRESSORS`, gzip and zstd from the stdlib and brotli from the bundled bindings), and
-  the `accept-encoding` offer is *derived from its keys*, so what is advertised and what can be
-  decoded cannot disagree; registering a coding this package does not ship is one entry
-  (`decompress(DEFAULT_DECOMPRESSORS | {b"lzma": make_lzma})`) rather than a fork. The decoded
-  response is self-consistent: `content-encoding` and `content-length` described the *encoded* body,
-  so both leave the head instead of contradicting the bytes the stream now yields, an unknown or
-  stacked coding passes through whole, a body that concatenates streams (multi-member gzip,
-  back-to-back zstd frames) decodes whole rather than stopping at the first, and a truncated
-  compressed stream raises `ConnectionError` rather than passing a prefix off as the whole body.
-  This is also how the no-unbidden-headers
-  position holds rather than bends: composing the middleware is how a client opts into offering
-  `accept-encoding` at all.
-- **`without-http`**: request compression, the same mechanism pointed the other way. `compressing`
-  is the middleware over any coding and a `Compressor` factory, with `gzip_compress`,
-  `zstd_compress`, and `brotli_compress` as the three that ship. Bodies compress as they stream, so
-  a large upload is never buffered whole, and per-call composition means one client can send
-  compressed to a peer that wants it and plain to one that does not. Streaming that way is a demand
-  on the codec rather than only on the loop, so the three shipped codings are built from
-  `StreamingCompressor` factories (`gzip_compressor`, `zstd_compressor`, `brotli_compressor`); a
-  factory producing a plain `Compressor` encodes correctly but holds the body to the end, since a
-  coding the caller named has no unencoded answer to fall back on the way a negotiated response does.
-- **`without-asgi`**: negotiated response compression, closing the exchange the two above open.
-  `without_asgi.compression.compress()` is an `HttpMiddleware` that reads a request's
-  `accept-encoding` and encodes the response body with the coding it picks. It is middleware rather
-  than server behavior because the decision needs the response's media type and the request's
-  headers rather than anything about the socket, which is also why no ASGI server implements one; it
-  therefore applies under any transport and any router, and its coverage is decided by where it is
-  mounted. The coding table is the argument (`DEFAULT_COMPRESSORS`: brotli, zstd, and gzip) and what
-  is negotiated is derived from its keys, with the *order* of those keys serving as the server's own
+- **`without-asgi`**: negotiated response compression, closing the exchange 0.0.4's client-side
+  `decompress` and `compressing` opened. `without_asgi.compression.compress()` is an
+  `HttpMiddleware` that reads a request's `accept-encoding` and encodes the response body with the
+  coding it picks. It is middleware rather than server behavior because the decision needs the
+  response's media type and the request's headers rather than anything about the socket, which is
+  also why no ASGI server implements one; it therefore applies under any transport and any router,
+  and its coverage is decided by where it is mounted. The coding table is the argument
+  (`DEFAULT_COMPRESSORS`: brotli, zstd, and gzip) and what is negotiated is derived from its keys,
+  with the *order* of those keys serving as the server's own
   preference between codings a client weighted equally, best ratio first. The `Compressor` protocols
   and the `gzip_compressor` / `zstd_compressor` / `brotli_compressor` factories now live here rather
   than in `without-http`, which re-exports them, so one codec serves a coding in both directions.
@@ -199,6 +169,48 @@
   reason: `zlib.compressobj` and `zstd.ZstdCompressor` spell a block flush as a mode argument rather
   than a method, so a table built from them directly satisfies `Compressor` alone and would take the
   buffered path for every stream.
+
+### Fixed
+
+- **`without-http`**: `compressing` no longer holds a streamed upload inside the codec. Each chunk
+  was fed to the compressor and whatever came back was yielded, which is the shape of streaming
+  without the property: zlib returns its header and then nothing until the stream ends and zstd
+  returns nothing at all, so a large upload accumulated inside the codec and went out as one burst
+  on the final flush. Ending a block per chunk is what releases it, so the three shipped codings are
+  now built from `without-asgi`'s `StreamingCompressor` factories (`gzip_compressor`,
+  `zstd_compressor`, `brotli_compressor`) and `compressing` flushes a block per chunk, with one
+  chunk of lookahead so the last one rides out on the flush that ends the stream rather than paying
+  for a block of its own. A body that arrives whole is one chunk either way, so it encodes to
+  exactly the bytes it did before. A `make_compressor` producing a plain `Compressor` still encodes
+  correctly and still buffers, since a coding the caller named by hand has no unencoded answer to
+  fall back on the way a negotiated response does.
+
+## 0.0.4
+
+### Added
+
+- **`without-http`**: response decompression as opt-in middleware. `decompress()` offers
+  `accept-encoding` outbound and wraps the response body in an incremental decoder inbound, so a
+  streamed body decodes chunk by chunk and trailers pass through untouched. It is middleware rather
+  than pool behavior because the transport must never silently rewrite bytes: a caller that wants
+  the wire encoding reads the undecorated client. The coding table is the argument
+  (`DEFAULT_DECOMPRESSORS`, gzip and zstd from the stdlib and brotli from the bundled bindings), and
+  the `accept-encoding` offer is *derived from its keys*, so what is advertised and what can be
+  decoded cannot disagree; registering a coding this package does not ship is one entry
+  (`decompress(DEFAULT_DECOMPRESSORS | {b"lzma": make_lzma})`) rather than a fork. The decoded
+  response is self-consistent: `content-encoding` and `content-length` described the *encoded* body,
+  so both leave the head instead of contradicting the bytes the stream now yields, an unknown or
+  stacked coding passes through whole, a body that concatenates streams (multi-member gzip,
+  back-to-back zstd frames) decodes whole rather than stopping at the first, and a truncated
+  compressed stream raises `ConnectionError` rather than passing a prefix off as the whole body.
+  This is also how the no-unbidden-headers
+  position holds rather than bends: composing the middleware is how a client opts into offering
+  `accept-encoding` at all.
+- **`without-http`**: request compression, the same mechanism pointed the other way. `compressing`
+  is the middleware over any coding and a `Compressor` factory, with `gzip_compress`,
+  `zstd_compress`, and `brotli_compress` as the three that ship. Bodies compress as they stream, so
+  a large upload is never buffered whole, and per-call composition means one client can send
+  compressed to a peer that wants it and plain to one that does not.
 - **`without-http`**: `default_headers(*headers)`, the counterpart to `add_headers` for a field
   RFC 9110 allows only once. `add_headers` copies its headers onto every request whatever it already
   carries, which is right for a field that may repeat and wrong for `authorization` or `user-agent`,
