@@ -17,6 +17,7 @@ from without_asgi.outbound import Outbound
 from without_asgi.outbound import ResponseBody
 from without_asgi.outbound import ResponseStart
 from without_asgi.scope import HttpScope
+from without_asgi.selection import Head
 from without_asgi.selection import NotModified
 from without_asgi.selection import Selection
 from without_asgi.selection import Span
@@ -33,6 +34,7 @@ DEFAULT_CHUNK_SIZE = 65536
 
 _OCTET_STREAM = "application/octet-stream"
 _CONTENT_TYPE = b"content-type"
+_CONTENT_ENCODING = b"content-encoding"
 _CONTENT_LENGTH = b"content-length"
 _CONTENT_RANGE = b"content-range"
 _ACCEPT_RANGES = b"accept-ranges"
@@ -93,12 +95,13 @@ async def file_response(
     closes an abandoned outbound stream, e.g. on a client disconnect mid-download).
     """
     stat = await asyncio.to_thread(path.stat)
-    resolved = content_type or mimetypes.guess_file_type(path)[0] or _OCTET_STREAM
+    resolved, encoding = _declared(path, content_type)
     start = ResponseStart(
         status=status,
         headers=(
             *headers,
-            (_CONTENT_TYPE, resolved.encode(_LATIN1)),
+            (_CONTENT_TYPE, resolved),
+            *encoding,
             (_CONTENT_LENGTH, str(stat.st_size).encode(_ASCII)),
         ),
     )
@@ -144,12 +147,13 @@ async def serve_file(
         # Refusing here keeps the failure ahead of the `ResponseStart`, where the old
         # code would have committed a `200` and then raised mid-body.
         raise OSError(EINVAL, "not a regular file", str(path))
-    guessed = content_type or mimetypes.guess_file_type(path)[0] or _OCTET_STREAM
+    guessed, encoding = _declared(path, content_type)
     modified = datetime.fromtimestamp(stat.st_mtime, UTC)
     validator = etag if etag is not None else _derived_etag(stat.st_size, stat.st_mtime_ns)
     described = (
         *headers,
-        (_CONTENT_TYPE, guessed.encode(_LATIN1)),
+        (_CONTENT_TYPE, guessed),
+        *encoding,
         (_ETAG, validator),
         (_LAST_MODIFIED, http_date(modified)),
         (_ACCEPT_RANGES, _BYTES),
@@ -157,6 +161,7 @@ async def serve_file(
     )
     revalidation = (
         *headers,
+        *encoding,
         (_ETAG, validator),
         (_LAST_MODIFIED, http_date(modified)),
         *_cache_control(cache_control),
@@ -169,6 +174,31 @@ async def serve_file(
         last_modified=modified,
     )
     return stream_selection(path, selection, stat.st_size, described, revalidation, chunk_size)
+
+
+def _declared(path: Path, override: str | None) -> tuple[bytes, RawHeaders]:
+    """
+    The media type the file's suffixes name, and the content coding its bytes are
+    already in.
+
+    `guess_file_type` reports both, and dropping the second is how `logo.svgz` goes out
+    as `image/svg+xml` with no `content-encoding`, i.e. gzip bytes a browser renders as
+    SVG. The coding is only claimed alongside a media type: a bare `archive.gz` guesses
+    `(None, "gzip")`, which names an opaque archive rather than a gzip-encoded
+    something, and declaring a coding for it would have the client silently unwrap the
+    file it asked to download.
+
+    An explicit `content_type` suppresses the coding entirely. A caller naming the type
+    is describing the bytes as they are, so a `.gz` served as `application/gzip` is a
+    body to hand over whole, not one to unwrap.
+    """
+    if override is not None:
+        return override.encode(_LATIN1), ()
+    guessed, coding = mimetypes.guess_file_type(path)
+    if guessed is None:
+        return _OCTET_STREAM.encode(_LATIN1), ()
+    encoding: RawHeaders = () if coding is None else ((_CONTENT_ENCODING, coding.encode(_LATIN1)),)
+    return guessed.encode(_LATIN1), encoding
 
 
 def _derived_etag(size: int, mtime_ns: int) -> bytes:
@@ -192,12 +222,16 @@ def start_for(
     Turn a `Selection` into the `ResponseStart` that announces it.
 
     `described` carries what a `200` says about the representation (content type,
-    validators, `Accept-Ranges`); `revalidation` carries only what RFC 9110 §15.4.5
-    requires a `304` to repeat, so a bodyless answer does not describe content it is
+    validators, `Accept-Ranges`); `revalidation` carries what its caller decided a `304`
+    should repeat, which is RFC 9110 §15.4.5's required fields and whatever else
+    identifies the stored variant, so a bodyless answer does not describe content it is
     not sending.
+
+    `Head` announces exactly what `Whole` does, including the `content-length` of the
+    body a `GET` would carry (§9.3.2), and differs only in that no body follows.
     """
     match selection:
-        case Whole():
+        case Whole() | Head():
             return ResponseStart(status=200, headers=(*described, (_CONTENT_LENGTH, b"%d" % size)))
         case Span(first, last):
             return ResponseStart(
@@ -240,14 +274,14 @@ def stream_selection(
             return _stream_file(path, start, chunk_size)
         case Span(first, last):
             return _stream_span(path, start, chunk_size, first, last - first + 1)
-        case NotModified() | Unsatisfiable():
+        case Head() | NotModified() | Unsatisfiable():
             return no_body(start)
         case _ as unreachable:
             assert_never(unreachable)
 
 
 async def no_body(start: ResponseStart) -> AsyncIterator[Outbound]:
-    """The event stream for an answer that carries no content: a `304` or a `416`."""
+    """The event stream for an answer that carries no content: a `HEAD`, a `304`, or a `416`."""
     yield start
     yield ResponseBody(body=b"", more_body=False)  # pragma: no mutate - values equal the field defaults
 

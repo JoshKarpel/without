@@ -16,6 +16,7 @@ from without_asgi.types import RawHeaders
 # memory, and the whole matrix tests as a table.
 
 __all__ = [
+    "Head",
     "NotModified",
     "Selection",
     "Span",
@@ -38,6 +39,18 @@ _LATIN1 = "latin-1"
 @dataclass(frozen=True, slots=True)
 class Whole:
     """The entire representation: a `200`."""
+
+
+@dataclass(frozen=True, slots=True)
+class Head:
+    """
+    The head a `200` would carry, and no body: the answer to a `HEAD`.
+
+    Distinct from `Whole` so the bytes are never produced. A `HEAD` answered as `Whole`
+    reads the entire representation off disk and streams it only for the transport to
+    drop each frame, which makes `curl -I` and every uptime check cost a full read of
+    the largest file they name.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,11 +80,12 @@ class Unsatisfiable:
     """The requested range lies outside the representation: a `416`."""
 
 
-type Selection = Whole | Span | NotModified | Unsatisfiable
+type Selection = Whole | Head | Span | NotModified | Unsatisfiable
 
-# The three field-less answers are values, not identities, so one instance of each is
-# handed through rather than allocated per request.
+# The field-less answers are values, not identities, so one instance of each is handed
+# through rather than allocated per request.
 _WHOLE = Whole()
+_HEAD = Head()
 _NOT_MODIFIED = NotModified()
 _UNSATISFIABLE = Unsatisfiable()
 
@@ -108,6 +122,10 @@ def selection_for(
     """
     Decide what to send for a representation of `size` bytes carrying these validators.
 
+    A `HEAD` that is not answered `304` selects `Head`, which announces exactly what a
+    `200` would and sends no body, so nothing reads the representation to produce bytes
+    the transport is required to discard.
+
     The precedence is RFC 9110 §13.2.2's, not one invented here: `If-None-Match` is
     evaluated before `If-Modified-Since` and *suppresses* it entirely when present, and
     `If-Range` gates whether a `Range` is honored at all. `etag` is the final header
@@ -132,7 +150,7 @@ def selection_for(
         return _NOT_MODIFIED
     # §14.2: GET is the only method for which range handling is defined.
     if method != "GET":
-        return _WHOLE
+        return _HEAD
     spec = headers.first(request_headers, b"range")
     if spec is None or not _range_allowed(request_headers, etag, last_modified):
         return _WHOLE
@@ -140,10 +158,15 @@ def selection_for(
 
 
 def _is_current(raw: RawHeaders, etag: bytes | None, last_modified: datetime | None) -> bool:
-    candidates = _entity_tags(headers.get_all(raw, b"if-none-match"))
-    if candidates:
-        # §13.1.2: when `If-None-Match` is present, `If-Modified-Since` is not
-        # evaluated at all, whether or not the tags matched.
+    conditions = headers.get_all(raw, b"if-none-match")
+    if conditions:
+        # §13.1.2: when `If-None-Match` is *present*, `If-Modified-Since` is not
+        # evaluated at all, whether or not the tags matched and whether or not the field
+        # parsed. Gating on the parse instead would let a malformed tag fall through to
+        # a date the client did not intend to be decisive: wherever the tag is derived
+        # from the bytes and the date is not, a rewrite that preserves the timestamp
+        # would answer `304` with content the tag comparison was there to refuse.
+        candidates = _entity_tags(conditions)
         if b"*" in candidates:
             return True
         return etag is not None and any(_weakly_matches(candidate, etag) for candidate in candidates)

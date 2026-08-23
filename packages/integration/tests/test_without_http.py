@@ -138,14 +138,14 @@ async def test_file_response_streams_a_file_over_without_http(tmp_path: Path) ->
 _STYLESHEET = ("body { color: rebeccapurple; }\n" * 200).encode()  # ~6 KB, several chunks
 
 
-def _assets_app(root: Path) -> ASGIApp:
+def _assets_app(root: Path, *, index: str | None = None) -> ASGIApp:
     """A `without-web` router serving an inventory, the whole stack in one app."""
 
     @asynccontextmanager
     async def lifespan() -> AsyncIterator[None]:
         yield None
 
-    assets = inventory(root, cache_control=b"public, max-age=31536000, immutable")
+    assets = inventory(root, index=index, cache_control=b"public, max-age=31536000, immutable")
     router: Router[None] = Router(routes=(static_files("/static", assets),), fallback=_no_route)
     return make_asgi_app(lifespan, http=router.dispatch)
 
@@ -214,6 +214,31 @@ async def test_a_pre_compressed_variant_is_negotiated_over_the_wire(tmp_path: Pa
             assert headers.first(head.headers, b"content-encoding") == b"gzip"
             assert headers.first(head.headers, b"vary") == b"accept-encoding"
             assert gzip.decompress(await body.read()) == _STYLESHEET
+
+
+async def test_a_head_over_the_wire_describes_the_get_and_sends_nothing(tmp_path: Path) -> None:
+    async with _assets(tmp_path) as client:
+        async with request(client, "HEAD", "http://testserver/static/app.css") as (head, body):
+            assert head.status == 200
+            # RFC 9110 §9.3.2: the head describes the body a GET would carry.
+            assert headers.first(head.headers, b"content-length") == b"%d" % len(_STYLESHEET)
+            assert await body.read() == b""
+
+
+async def test_an_index_reached_without_its_slash_is_redirected_over_the_wire(tmp_path: Path) -> None:
+    # Served at the slash-less URL, every relative link in the page would resolve against
+    # /static/ instead of /static/guide/.
+    (tmp_path / "guide").mkdir()
+    (tmp_path / "guide" / "index.html").write_bytes(b"<p>guide</p>\n")
+    async with loopback_client(_assets_app(tmp_path, index="index.html")) as client:
+        async with request(client, "GET", "http://testserver/static/guide") as (head, body):
+            assert head.status == 302
+            assert headers.first(head.headers, b"location") == b"guide/"
+            assert await body.read() == b""
+
+        async with request(client, "GET", "http://testserver/static/guide/") as (head, body):
+            assert head.status == 200
+            assert await body.read() == b"<p>guide</p>\n"
 
 
 async def test_a_path_outside_the_mount_reaches_the_router_fallback(tmp_path: Path) -> None:

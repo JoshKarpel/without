@@ -36,6 +36,9 @@ from .helpers import a_scope
 
 _STYLESHEET = ("body { color: rebeccapurple; }\n" * 40).encode()
 _LOGO = bytes(range(256)) * 12  # not a real PNG, but named one, so it is incompressible by type
+# gzip framing around *stored* bytes: already in a content coding, yet still very
+# compressible, so a build that re-encoded it would visibly produce a smaller variant.
+_STORED_SVGZ = gzip.compress(b"<svg></svg>\n" * 500, compresslevel=0, mtime=0)
 
 
 @pytest.fixture
@@ -60,8 +63,9 @@ async def _answer(
     method: str = "GET",
     not_found: Response | None = None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
+    path: str | None = None,
 ) -> tuple[ResponseStart, bytes]:
-    scope = a_scope(path=f"/{key}", headers=headers, method=method)
+    scope = a_scope(path=path if path is not None else f"/{key}", headers=headers, method=method)
     served = (
         await serve_asset(scope, assets, key, chunk_size=chunk_size)
         if not_found is None
@@ -76,6 +80,11 @@ async def _answer(
 
 def _header(start: ResponseStart, name: bytes) -> bytes | None:
     return first(start.headers, name)
+
+
+def _header_of(assets: Inventory, key: str, name: bytes) -> bytes | None:
+    asset = assets.assets[key]
+    return first(asset.identity.described, name)
 
 
 class TestInventoryBuild:
@@ -105,7 +114,11 @@ class TestInventoryBuild:
 
         alias, direct = assets.get("guide"), assets.get("guide/index.html")
         assert alias is not None
-        assert alias is direct
+        assert direct is not None
+        assert alias.path == direct.path
+        assert alias.identity == direct.identity
+        # The alias is reached as a directory, so its canonical URL ends in a slash.
+        assert (alias.directory_index, direct.directory_index) == (True, False)
 
     def test_without_an_index_the_directory_key_stays_absent(self, tree: Path) -> None:
         assert inventory(tree, encodings={}).get("guide") is None
@@ -117,7 +130,10 @@ class TestInventoryBuild:
 
         assets = inventory(tmp_path, index="index.html", encodings={})
 
-        assert assets.get("docs/guide") is assets.get("docs/guide/index.html")
+        alias, direct = assets.get("docs/guide"), assets.get("docs/guide/index.html")
+        assert alias is not None
+        assert direct is not None
+        assert alias.path == direct.path
         assert assets.get("docs") is None
 
     def test_a_file_that_is_not_the_index_does_not_alias_its_directory(self, tree: Path) -> None:
@@ -202,10 +218,87 @@ class TestInventoryBuild:
     def test_no_cache_control_is_emitted_by_default(self, tree: Path) -> None:
         assert _header_of(inventory(tree, encodings={}), "css/app.css", b"cache-control") is None
 
+    def test_an_unreadable_directory_raises_rather_than_going_silently_missing(self, tree: Path) -> None:
+        # `Path.walk` ignores a failed `scandir` by default, which would leave the
+        # inventory short every asset under `locked` and answer 404 for them forever.
+        locked = tree / "locked"
+        locked.mkdir()
+        (locked / "hidden.css").write_bytes(_STYLESHEET)
+        locked.chmod(0o000)
+        try:
+            with pytest.raises(PermissionError):
+                inventory(tree, encodings={})
+        finally:
+            locked.chmod(0o755)
 
-def _header_of(assets: Inventory, key: str, name: bytes) -> bytes | None:
-    asset = assets.assets[key]
-    return first(asset.identity.described, name)
+
+class TestStoredContentCodings:
+    """A file whose suffixes name a coding as well as a media type is already encoded."""
+
+    @pytest.mark.parametrize(
+        ("name", "content_type", "coding"),
+        [
+            pytest.param("logo.svgz", b"image/svg+xml", b"gzip", id="svgz-is-a-gzipped-svg"),
+            pytest.param("bundle.tar.gz", b"application/x-tar", b"gzip", id="tar-gz-is-a-gzipped-tar"),
+            pytest.param("bundle.tgz", b"application/x-tar", b"gzip", id="tgz-is-the-same-thing-abbreviated"),
+        ],
+    )
+    def test_the_coding_the_suffix_names_is_declared(
+        self, tmp_path: Path, name: str, content_type: bytes, coding: bytes
+    ) -> None:
+        # Dropping the coding is how gzip bytes come to be labelled image/svg+xml, which
+        # a browser renders as SVG rather than decompressing.
+        (tmp_path / name).write_bytes(gzip.compress(b"<svg></svg>\n", mtime=0))
+
+        assets = inventory(tmp_path, encodings={})
+
+        assert _header_of(assets, name, b"content-type") == content_type
+        assert _header_of(assets, name, b"content-encoding") == coding
+
+    def test_a_suffix_naming_only_a_coding_is_an_opaque_archive(self, tmp_path: Path) -> None:
+        # `guess_file_type("archive.gz")` is `(None, "gzip")`: no media type came with
+        # the coding, so this is a file to hand over whole, not one to unwrap.
+        (tmp_path / "archive.gz").write_bytes(gzip.compress(b"payload\n", mtime=0))
+
+        assets = inventory(tmp_path, encodings={})
+
+        assert _header_of(assets, "archive.gz", b"content-type") == b"application/octet-stream"
+        assert _header_of(assets, "archive.gz", b"content-encoding") is None
+
+    def test_already_encoded_bytes_are_not_encoded_again(self, tmp_path: Path) -> None:
+        # Stored rather than deflated, so re-encoding *would* shrink it and the
+        # no-smaller check cannot be what keeps the variant out.
+        (tmp_path / "logo.svgz").write_bytes(_STORED_SVGZ)
+
+        assets = inventory(tmp_path)
+
+        assert assets.assets["logo.svgz"].encodings == {}
+
+    def test_a_stored_coding_negotiates_nothing_so_it_does_not_vary(self, tmp_path: Path) -> None:
+        (tmp_path / "logo.svgz").write_bytes(_STORED_SVGZ)
+
+        assets = inventory(tmp_path)
+
+        assert _header_of(assets, "logo.svgz", b"vary") is None
+
+    def test_the_only_representation_keeps_the_bare_entity_tag(self, tmp_path: Path) -> None:
+        # The `-gzip` suffix distinguishes negotiated variants of one asset. A stored
+        # coding is not a variant of anything, so suffixing it would be a lie.
+        (tmp_path / "logo.svgz").write_bytes(gzip.compress(b"<svg></svg>\n", mtime=0))
+
+        etag = inventory(tmp_path, encodings={}).assets["logo.svgz"].identity.etag
+
+        assert not etag.endswith(b'-gzip"')
+
+    async def test_a_304_for_a_stored_coding_repeats_it(self, tmp_path: Path) -> None:
+        (tmp_path / "logo.svgz").write_bytes(gzip.compress(b"<svg></svg>\n", mtime=0))
+        assets = inventory(tmp_path, encodings={})
+        etag = assets.assets["logo.svgz"].identity.etag
+
+        start, body = await _answer(assets, "logo.svgz", headers=((b"if-none-match", etag),))
+
+        assert (start.status, body) == (304, b"")
+        assert _header(start, b"content-encoding") == b"gzip"
 
 
 class TestSymlinks:
@@ -358,6 +451,97 @@ class TestServing:
 
         assert start.status == 200
         assert _header(start, b"content-length") == b"%d" % len(_STYLESHEET)
+
+    async def test_a_head_request_carries_no_body_bytes_at_all(self, tree: Path) -> None:
+        # Answering HEAD as `Whole` reads the whole file and streams it for the
+        # transport to drop, so `curl -I` costs a full read of whatever it names.
+        _start, body = await _answer(inventory(tree, encodings={}), "css/app.css", method="HEAD")
+
+        assert body == b""
+
+    async def test_a_head_request_never_opens_the_file(self, tree: Path, mocker: MockerFixture) -> None:
+        assets = inventory(tree, encodings={})  # the walk reads every file; the request must not
+        opened = mocker.patch.object(Path, "open", autospec=True)
+
+        await _answer(assets, "css/app.css", method="HEAD")
+
+        opened.assert_not_called()
+
+    async def test_a_head_for_an_in_memory_variant_carries_no_body_either(self, tree: Path) -> None:
+        assets = inventory(tree, encodings={b"gzip": gzip_compressor})
+
+        start, body = await _answer(assets, "css/app.css", method="HEAD", headers=((b"accept-encoding", b"gzip"),))
+
+        assert (start.status, body) == (200, b"")
+        assert _header(start, b"content-encoding") == b"gzip"
+        assert _header(start, b"content-length") == b"%d" % assets.assets["css/app.css"].encodings[b"gzip"].size
+
+    async def test_a_304_for_a_negotiated_variant_names_the_coding_it_revalidates(self, tree: Path) -> None:
+        # Without it a downstream `compress()` reads the 304 as one it would itself have
+        # encoded and weakens a validator that is still exactly true of the stored bytes.
+        assets = inventory(tree, encodings={b"gzip": gzip_compressor})
+        etag = assets.assets["css/app.css"].encodings[b"gzip"].etag
+
+        start, body = await _answer(
+            assets,
+            "css/app.css",
+            headers=((b"accept-encoding", b"gzip"), (b"if-none-match", etag)),
+        )
+
+        assert (start.status, body) == (304, b"")
+        assert _header(start, b"content-encoding") == b"gzip"
+
+
+class TestDirectoryIndexes:
+    @pytest.fixture
+    def assets(self, tree: Path) -> Inventory:
+        return inventory(tree, index="index.html", encodings={})
+
+    async def test_the_trailing_slash_form_serves_the_index(self, assets: Inventory) -> None:
+        start, body = await _answer(assets, "guide", path="/guide/")
+
+        assert (start.status, body) == (200, b"<p>guide</p>\n")
+
+    async def test_the_slashless_form_redirects_rather_than_serving_the_document(self, assets: Inventory) -> None:
+        # Served here, every relative link in the document resolves against `/` instead
+        # of `/guide/`, i.e. one level too high. `split_path` has already dropped the
+        # trailing slash, so this is the only place the two URLs are still distinct.
+        start, body = await _answer(assets, "guide", path="/guide")
+
+        assert (start.status, body) == (302, b"")
+        assert _header(start, b"location") == b"guide/"
+
+    async def test_the_redirect_target_is_relative_so_the_mount_prefix_is_irrelevant(self, tmp_path: Path) -> None:
+        nested = tmp_path / "docs" / "guide"
+        nested.mkdir(parents=True)
+        (nested / "index.html").write_bytes(b"<p>nested</p>\n")
+        assets = inventory(tmp_path, index="index.html", encodings={})
+
+        start, _body = await _answer(assets, "docs/guide", path="/assets/docs/guide")
+
+        # Resolved against the request URI (RFC 9110 §10.2.2) this is /assets/docs/guide/.
+        assert _header(start, b"location") == b"guide/"
+
+    async def test_a_directory_whose_name_needs_encoding_is_quoted(self, tmp_path: Path) -> None:
+        nested = tmp_path / "a b:c"
+        nested.mkdir()
+        (nested / "index.html").write_bytes(b"<p>odd</p>\n")
+        assets = inventory(tmp_path, index="index.html", encodings={})
+
+        start, _body = await _answer(assets, "a b:c", path="/a b:c")
+
+        # A bare colon in the first segment of a relative reference reads as a scheme.
+        assert _header(start, b"location") == b"a%20b%3Ac/"
+
+    async def test_naming_the_index_directly_still_serves_it(self, assets: Inventory) -> None:
+        start, body = await _answer(assets, "guide/index.html", path="/guide/index.html")
+
+        assert (start.status, body) == (200, b"<p>guide</p>\n")
+
+    async def test_an_ordinary_asset_is_never_redirected(self, assets: Inventory) -> None:
+        start, body = await _answer(assets, "css/app.css", path="/css/app.css")
+
+        assert (start.status, body) == (200, _STYLESHEET)
 
     async def test_a_custom_not_found_response_is_used(self, tree: Path) -> None:
         teapot = Response(status=418, body=b"nope\n")
@@ -620,6 +804,38 @@ class TestSidecars:
         assets = inventory(tree, encodings={b"gzip": gzip_compressor})
 
         assert "css/app.css.gz" not in assets.assets
+
+    @pytest.mark.security("a sidecar is never published under the media type of the asset it encodes")
+    @pytest.mark.parametrize(
+        "suffix",
+        [
+            pytest.param(".gz", id="gzip"),
+            pytest.param(".br", id="brotli"),
+            pytest.param(".zst", id="zstd"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("label", "encodings"),
+        [
+            pytest.param("none", {}, id="with-no-codings-configured-at-all"),
+            pytest.param("gzip-only", {b"gzip": gzip_compressor}, id="with-only-one-coding-configured"),
+        ],
+    )
+    async def test_a_sidecar_is_dropped_whether_or_not_its_coding_is_configured(
+        self,
+        tree: Path,
+        suffix: str,
+        label: str,
+        encodings: dict[bytes, Callable[[], Compressor]],
+    ) -> None:
+        # Keying suppression on the active table is how `app.css.br` becomes an asset of
+        # its own: brotli bytes labelled `text/css`, with no content-encoding, at a URL
+        # the build system's own naming makes guessable.
+        (tree / "css" / f"app.css{suffix}").write_bytes(b"encoded bytes that are not css")
+
+        assets = inventory(tree, encodings=encodings)
+
+        assert f"css/app.css{suffix}" not in assets.assets
 
     async def test_a_sidecar_with_no_asset_beside_it_is_served_as_itself(self, tree: Path) -> None:
         (tree / "orphan.gz").write_bytes(gzip.compress(b"lonely", mtime=0))

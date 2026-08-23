@@ -65,6 +65,40 @@ async def test_unknown_suffix_falls_back_to_octet_stream(tmp_path: Path) -> None
     assert _headers(events)[b"content-type"] == b"application/octet-stream"
 
 
+async def test_a_suffix_naming_a_coding_declares_it_alongside_the_type(tmp_path: Path) -> None:
+    # Dropping the coding `guess_file_type` reports is how gzip bytes come to be
+    # labelled image/svg+xml, which a browser renders rather than decompressing.
+    path = tmp_path / "logo.svgz"
+    path.write_bytes(b"pretend these are gzip bytes")
+
+    headers = _headers(await _collect(await file_response(path)))
+
+    assert headers[b"content-type"] == b"image/svg+xml"
+    assert headers[b"content-encoding"] == b"gzip"
+
+
+async def test_a_suffix_naming_only_a_coding_is_an_opaque_archive(tmp_path: Path) -> None:
+    path = tmp_path / "archive.gz"
+    path.write_bytes(b"pretend these are gzip bytes")
+
+    headers = _headers(await _collect(await file_response(path)))
+
+    assert headers[b"content-type"] == b"application/octet-stream"
+    assert b"content-encoding" not in headers
+
+
+async def test_a_content_type_override_suppresses_the_coding(tmp_path: Path) -> None:
+    # Naming the type describes the bytes as they are: a body to hand over whole,
+    # not one the client should silently unwrap.
+    path = tmp_path / "logo.svgz"
+    path.write_bytes(b"pretend these are gzip bytes")
+
+    headers = _headers(await _collect(await file_response(path, content_type="application/gzip")))
+
+    assert headers[b"content-type"] == b"application/gzip"
+    assert b"content-encoding" not in headers
+
+
 async def test_content_length_is_the_file_size(tmp_path: Path) -> None:
     path = tmp_path / "note.txt"
     path.write_bytes(b"eleven byte")  # 11 bytes
@@ -238,6 +272,43 @@ class TestServeFile:
         start, body = await _serve(report, headers=((b"if-modified-since", http_date(modified)),))
 
         assert (start.status, body) == (304, b"")
+
+    async def test_a_head_is_described_like_the_get_but_sends_nothing(self, report: Path) -> None:
+        start, body = await _serve(report, method="HEAD")
+
+        assert (start.status, body) == (200, b"")
+        # §9.3.2: the head describes the body a GET would carry.
+        assert dict(start.headers)[b"content-length"] == b"%d" % len(_REPORT)
+
+    async def test_a_head_never_opens_the_file(self, report: Path, mocker: MockerFixture) -> None:
+        # Answered as `Whole`, a HEAD reads the whole file and streams it for the
+        # transport to drop, so every `curl -I` costs a full read.
+        opened = mocker.patch.object(Path, "open", autospec=True)
+
+        await _serve(report, method="HEAD")
+
+        opened.assert_not_called()
+
+    async def test_a_head_still_revalidates(self, report: Path) -> None:
+        etag = dict((await _serve(report))[0].headers)[b"etag"]
+
+        start, _body = await _serve(report, method="HEAD", headers=((b"if-none-match", etag),))
+
+        assert start.status == 304
+
+    async def test_a_stored_coding_is_declared_and_repeated_on_the_304(self, tmp_path: Path) -> None:
+        path = tmp_path / "logo.svgz"
+        path.write_bytes(_REPORT)
+        scope = a_scope(path="/logo.svgz")
+        start = _start(await _collect(await serve_file(scope, path)))
+        etag = dict(start.headers)[b"etag"]
+
+        revalidated = _start(
+            await _collect(await serve_file(a_scope(path="/logo.svgz", headers=((b"if-none-match", etag),)), path))
+        )
+
+        assert dict(start.headers)[b"content-encoding"] == b"gzip"
+        assert (revalidated.status, dict(revalidated.headers)[b"content-encoding"]) == (304, b"gzip")
 
     async def test_a_304_repeats_the_caching_policy(self, report: Path) -> None:
         etag = dict((await _serve(report))[0].headers)[b"etag"]

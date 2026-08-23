@@ -232,7 +232,17 @@ read in `chunk_size` pieces via `asyncio.to_thread`, matching the package's
 `pathlib.Path` + thread-offload file-I/O discipline, and the file is closed when
 the stream ends or is closed early (`make_asgi_app` closes an abandoned outbound
 stream, e.g. on a client disconnect mid-download). A `HEAD` request needs nothing
-special: the transport drops the body chunks on the wire.
+special here: `file_response` always streams, and the transport drops the body
+chunks on the wire.
+
+`guess_file_type` reports a content *coding* alongside the media type, and both
+are used. A `logo.svgz` is gzip-encoded SVG, so it goes out as `image/svg+xml`
+with `Content-Encoding: gzip`; dropping the coding is how gzip bytes come to be
+labelled as an image a browser then tries to render. The coding is claimed only
+where a media type came with it, so a bare `archive.gz` guesses `(None, "gzip")`
+and stays an opaque `application/octet-stream` download. An explicit
+`content_type` suppresses the coding entirely, since a caller naming the type is
+describing the bytes as they are.
 
 `file_response` answers `200` and nothing else, and that is its job rather than a
 gap. It serves content with no cacheable identity: a report just rendered, a
@@ -275,7 +285,7 @@ selection_for(
     request_headers=scope.headers,
     etag=validator,
     last_modified=modified,
-) -> Whole | Span | NotModified | Unsatisfiable
+) -> Whole | Head | Span | NotModified | Unsatisfiable
 ```
 
 Nothing in that signature mentions a file. It takes a size, two validators, and
@@ -289,6 +299,12 @@ filesystem in sight. `serve_file` and `serve_asset` are the shells that do the
 The ordering that makes `file_response` able to answer a clean `404` is what
 makes this work too: the `stat` runs on the `await`, so a `304` and a `416` are
 both decided while nothing is on the wire.
+
+`Head` is why the union has five arms rather than four. A `HEAD` answered as
+`Whole` reads the entire representation and streams it for the transport to
+discard frame by frame, so `curl -I` and every uptime check cost a full read of
+whatever they name. `Head` announces exactly what a `200` would, `Content-Length`
+included (§9.3.2), and sends nothing.
 
 `serve_file(scope, path)` is `file_response`'s request-aware sibling for one
 named file. Its derived validator is _weak_ (`W/"<size>-<mtime>"`), because a
@@ -439,9 +455,26 @@ the loop, is made here once, over a tree the operator assembled. Only regular
 files are admitted. Each entry is resolved and confirmed to be inside the root,
 and one that escapes raises, naming both ends; no flag relaxes that, because
 that flag is precisely aiohttp's CVE. Symlinked directories are not descended
-into, so a cycle cannot hang the walk. A directory has no key at all, which is a
-`404` by omission rather than by check, and there is no directory listing and
+into, so a cycle cannot hang the walk. A directory that cannot be read raises
+too, rather than contributing nothing: `Path.walk` ignores a failed `scandir` by
+default, which would leave the inventory silently short every asset beneath it
+and answer `404` for them in production. A directory has no key at all, which is
+a `404` by omission rather than by check, and there is no directory listing and
 none behind a flag.
+
+### Index files and the trailing slash
+
+`index="index.html"` aliases a directory's key to the index inside it, so
+`/guide/` reaches `guide/index.html`. `without-web`'s `split_path` strips a
+trailing slash, so `/guide` and `/guide/` arrive as the same key and `serve_asset`
+is the only place left that can tell them apart, from `scope.path`. The
+slash-less form gets a `302` to the slashed one rather than the document itself:
+served there, every relative link and asset reference inside the page would
+resolve against `/` instead of `/guide/`, one level too high. The `Location` is
+relative (just the final segment plus a slash), because an inventory does not
+know what prefix it was mounted under, and it is a `302` rather than a `301` for
+the same reason: the URL shape it points at is not the inventory's to make
+permanent. This is WhiteNoise's `redirect` decision, and for the same reasons.
 
 ### The assumption, and how it is checked
 
@@ -490,6 +523,28 @@ send `If-None-Match`, receive a `304`, and go on using bytes that are a
 different representation entirely. `Vary: Accept-Encoding` goes only on assets
 that actually have variants, since stamping it on an already-compressed image
 fragments every downstream cache key for nothing.
+
+A `304` repeats the variant's `Content-Encoding` alongside the validators RFC
+9110 §15.4.5 requires, which is a floor rather than a ceiling. Without it a
+downstream [`compress`](#negotiated-response-compression) cannot tell a `304` for
+an already-encoded
+variant from one it would itself have encoded, so it weakens a validator that is
+still exactly true of the stored bytes, and the client's next `If-Range`, which
+requires strong comparison, refetches the whole asset.
+
+A sidecar is suppressed by a **fixed** suffix set (`.gz`, `.zst`, `.br`), not by
+the codings currently configured. Keying it on the live table would mean a
+coding's absence exposes its sidecars: with only gzip configured an `app.css.br`
+beside `app.css` becomes an asset of its own, brotli bytes labelled `text/css`
+with no `Content-Encoding`, at a URL the build system's own naming makes
+guessable, and with `encodings={}` every sidecar in the tree is published that
+way. This is why WhiteNoise's `is_compressed_variant` tests a literal
+`(".gz", ".br")` rather than anything configurable. A coding outside the table
+still suppresses its own sidecars, so a custom one loses nothing.
+
+A file whose own suffixes name a coding (`logo.svgz`, `bundle.tar.gz`) is already
+encoded: it is served with that `Content-Encoding`, is not encoded again, and
+carries no `Vary`, because it has one representation and negotiates nothing.
 
 Holding the encoded bytes in memory also buys something on-the-fly compression
 cannot offer at all: a `Range` over a compressed asset. The `compress`

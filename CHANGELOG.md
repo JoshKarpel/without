@@ -6,19 +6,26 @@
 
 - **`without-asgi`**: conditional requests, byte ranges, and static assets.
   `selection_for` is the whole of RFC 9110 §13 and §14 as one pure function of a size, two
-  validators, and the request's headers, returning `Whole | Span | NotModified |
+  validators, and the request's headers, returning `Whole | Head | Span | NotModified |
   Unsatisfiable`; nothing in its signature mentions a file, so the matrix tests as a table
-  and the same decision serves bytes from anywhere. `serve_file(scope, path)` is
-  `file_response`'s request-aware sibling for one named file, answering `200`, `206`, `304`,
-  and `416`, with the `stat` still on the `await` so every one of those is decided while
-  nothing is on the wire. Its derived validator is *weak*, because a filesystem's timestamp
+  and the same decision serves bytes from anywhere. `Head` is its own arm so a `HEAD` never
+  reads the representation to produce bytes the transport is required to drop, which is what
+  keeps `curl -I` and an uptime check from costing a full read of whatever they name; it
+  announces exactly what a `200` would, `Content-Length` included. `serve_file(scope, path)`
+  is `file_response`'s request-aware sibling for one named file, answering `200`, `206`,
+  `304`, and `416`, with the `stat` still on the `await` so every one of those is decided
+  while nothing is on the wire. Its derived validator is *weak*, because a filesystem's timestamp
   granularity can be coarser than the gap between two writes, so a resumed download
   correctly restarts rather than splicing two versions; pass `etag` when you hold something
   better. Only single ranges are honored: `multipart/byteranges` is most of the cost for a
   case almost nothing sends, and §14 permits ignoring a `Range`, so the check is a scan for
   a comma rather than a split and a header naming a hundred thousand ranges costs one
   linear pass. `file_response` is unchanged and keeps its job, content with no cacheable
-  identity, where a validator that changes every request buys nothing.
+  identity, where a validator that changes every request buys nothing. Both helpers use the
+  content *coding* `mimetypes.guess_file_type` reports alongside the media type, so a
+  `logo.svgz` goes out as `image/svg+xml` with `Content-Encoding: gzip` rather than as gzip
+  bytes a browser tries to render as an image; a suffix naming only a coding (`archive.gz`)
+  stays an opaque download, and an explicit `content_type` suppresses the coding entirely.
   For a *tree*, `inventory(root)` walks it once at startup into a mapping of key to
   `Asset`, and `serve_asset` answers out of it. This is deliberately not a directory mount:
   a mount derives a filesystem path from request input and then has to prove the derivation
@@ -29,7 +36,11 @@
   request with an attacker in the loop is made once here over a tree the operator
   assembled: regular files only, each resolved and confirmed inside the root (one that
   escapes raises, and no flag relaxes that, because that flag *is* aiohttp's CVE), symlinked
-  directories not descended, and no directory listing at all. The cost is the one in the
+  directories not descended, a directory that cannot be read raising rather than silently
+  contributing nothing, and no directory listing at all. With `index=`, the slash-less
+  `/guide` gets a relative `302` to `/guide/` rather than the document, since serving it
+  there resolves every relative link in the page one level too high, and the router's
+  `split_path` has already made the two URLs indistinguishable by key. The cost is the one in the
   name: nothing may write into the tree while the process runs. That is not enforced by file
   modes, which change and which root ignores, but it is detected, since the `stat` before
   any `ResponseStart` raises `AssetChanged` rather than framing a body whose length and
@@ -46,8 +57,14 @@
   belongs in the build rather than in a cost every replica pays at startup. Each coding
   carries its *own* strong validator, since one tag shared across codings lets a client
   holding the gzip copy revalidate into a `304` and keep bytes from a different
-  representation, and `Vary: Accept-Encoding` goes only on assets that have variants, since
-  stamping it on an image fragments every downstream cache key for nothing. Holding encoded
+  representation, and a `304` repeats that coding so a downstream `compress` can tell a
+  revalidation of an already-encoded variant from one it would have encoded itself.
+  `Vary: Accept-Encoding` goes only on assets that have variants, since
+  stamping it on an image fragments every downstream cache key for nothing. Sidecars are
+  recognized by a fixed suffix set rather than by the configured codings, so an `app.css.br`
+  is never published as an asset of its own (brotli bytes labelled `text/css`) merely because
+  brotli is not among them, and a file already stored in a coding is served with it rather
+  than encoded a second time. Holding encoded
   bytes in memory also makes a `Range` over a compressed asset work, which on-the-fly
   compression cannot do at all, since it has no way to restate a `Content-Range` computed
   over identity bytes.
@@ -55,7 +72,7 @@
   `Inventory`. The catch-all remainder is the inventory key, and the returned `Route` is an
   ordinary value carrying its complete segments, so it reverses through `url_for` with no
   router involved and `mount` rebases it like any other route. The split follows the
-  placement rule: deciding between `200`, `206`, `304`, and `416` needs no routing
+  placement rule: deciding between `200`, `206`, `302`, `304`, and `416` needs no routing
   vocabulary, so it lives a layer down; matching a prefix does, so it lives here. A bare
   prefix does not match, which is correct rather than a gap, since a request for a directory
   is a listing request. A single-page app's entry point is the router's `fallback` instead,

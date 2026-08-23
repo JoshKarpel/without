@@ -236,8 +236,9 @@ nested opaque app is trimmed by its full accumulated path.
 `static_files(prefix, assets)` is a `GET`/`HEAD` `Route` serving an
 [`Inventory`](../without-asgi/index.md#serving-a-tree-of-assets) built by
 `without-asgi`. The split is the placement rule at work: reading a file and
-deciding between `200`, `206`, `304`, and `416` needs no routing vocabulary at
-all, so it lives one layer down; matching a prefix does, so it lives here.
+deciding between `200`, `206`, `302`, `304`, and `416` needs no routing
+vocabulary at all, so it lives one layer down; matching a prefix does, so it
+lives here.
 
 ```python
 from without_asgi import inventory
@@ -261,6 +262,13 @@ router involved, and `mount` rebases it like any other route.
 A catch-all does not match an empty remainder, so the bare `prefix` is itself a
 `404`. That is the right answer rather than a gap: a request for a directory is a
 listing request, and an inventory serves no listings.
+
+Routing here is trailing-slash insensitive, because `split_path` strips the
+slash from targets and pattern literals alike. That is what leaves an inventory
+built with `index=` unable to distinguish `/assets/guide` from `/assets/guide/`
+by key, and why `serve_asset` reaches for `scope.path` and issues the
+[canonicalizing redirect](../without-asgi/index.md#index-files-and-the-trailing-slash)
+itself.
 
 A single-page app's entry point is not a mount either, since it must also answer
 client-side deep links that match no asset at all. That is the router's

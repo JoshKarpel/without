@@ -85,6 +85,7 @@ from without_asgi.scope import parse_http_scope
 from without_asgi.scope import parse_scope
 from without_asgi.scope import parse_tls
 from without_asgi.scope import parse_websocket_scope
+from without_asgi.selection import Head
 from without_asgi.selection import NotModified
 from without_asgi.selection import Selection
 from without_asgi.selection import Span
@@ -124,6 +125,7 @@ __all__ = [
     "Disconnect",
     "EarlyHint",
     "FilePart",
+    "Head",
     "HttpHandler",
     "HttpRouter",
     "HttpScope",

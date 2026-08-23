@@ -10,12 +10,15 @@ from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
 from datetime import UTC
 from datetime import datetime
 from pathlib import Path
 from stat import S_ISREG
 from types import MappingProxyType
+from typing import NoReturn
 from typing import assert_never
+from urllib.parse import quote
 
 from without_asgi import headers
 from without_asgi.compression import DEFAULT_COMPRESSORS
@@ -32,6 +35,7 @@ from without_asgi.outbound import ResponseBody
 from without_asgi.outbound import ResponseStart
 from without_asgi.outbound import encode_response
 from without_asgi.scope import HttpScope
+from without_asgi.selection import Head
 from without_asgi.selection import NotModified
 from without_asgi.selection import Selection
 from without_asgi.selection import Span
@@ -86,6 +90,11 @@ _ETAGC = frozenset(range(0x21, 0x7F)) - {0x22}
 # outside this table falls back to a dot plus its own name.
 _SIDECAR_SUFFIXES: Mapping[bytes, str] = MappingProxyType({b"gzip": ".gz", b"zstd": ".zst", b"br": ".br"})
 _NAMED_IN_WARNING = 5
+_LOCATION = b"location"
+# Neither `301` nor a cached one: the inventory does not know what prefix it is mounted
+# under, so the URL shape it is redirecting *to* is not its own to make permanent. This
+# is why WhiteNoise's `redirect` is a `302` as well.
+_MOVED = 302
 
 # What `serve_asset` answers for a key the inventory does not hold. Public and
 # injectable: the policy is the caller's, and `static_files` passes it straight through
@@ -126,7 +135,16 @@ class Representation:
     described: RawHeaders
     """What a `200` or `206` says about this representation."""
     revalidation: RawHeaders
-    """Only what RFC 9110 §15.4.5 requires a `304` to repeat."""
+    """
+    What a `304` repeats: RFC 9110 §15.4.5's required fields, plus the
+    `content-encoding` naming *which* stored variant is being revalidated.
+
+    §15.4.5 states a floor rather than a ceiling, and the coding earns its place there.
+    Without it a downstream `compress()` cannot tell a `304` for an already-encoded
+    variant from one it would have encoded itself, so it weakens a validator that is
+    still exactly true of the stored bytes, and the client's next `If-Range`, which
+    requires strong comparison, refetches the whole asset.
+    """
     body: bytes | None = None
     """The encoded bytes, held in memory; `None` for the identity form, read from disk."""
 
@@ -139,6 +157,11 @@ class Asset:
     last_modified: datetime
     identity: Representation
     encodings: Mapping[bytes, Representation] = field(default=_NO_ENCODINGS)
+    directory_index: bool = False
+    """
+    Whether this entry is the index *of a directory* rather than the file itself, so
+    its canonical URL ends in a slash. See `_slash_redirect`.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +221,8 @@ def inventory(
 
     - Only regular files are admitted, so a directory, fifo, or device is absent rather
       than a failure discovered mid-response.
+    - A directory that cannot be read **raises**, rather than contributing nothing and
+      leaving the inventory silently short every asset beneath it.
     - Each entry is resolved and confirmed to be inside `root`; one that escapes
       **raises**, naming both ends. No flag relaxes this, because that flag is
       precisely aiohttp's CVE-2024-23334.
@@ -207,8 +232,13 @@ def inventory(
 
     Keys are relative POSIX paths with no leading slash (`"css/app.css"`). `index`
     installs an alias from a directory's key to the index file inside it, so `/guide/`
-    reaches `guide/index.html`; every other directory key is simply absent, which is a
-    `404` by omission. There is no directory listing, and none behind a flag.
+    reaches `guide/index.html`, and the slash-less `/guide` gets a `302` to it rather
+    than the document itself (see `_slash_redirect`); every other directory key is
+    simply absent, which is a `404` by omission. There is no directory listing, and none
+    behind a flag.
+
+    A file whose suffixes name a content coding as well as a media type (`logo.svgz`,
+    `bundle.tar.gz`) is served with that `content-encoding` and is not encoded again.
 
     `etag_for` returns the opaque *token*; the quoting is added here, and a token
     holding characters illegal in an entity-tag is rejected, so a caller cannot emit a
@@ -248,9 +278,18 @@ def inventory(
     return Inventory(assets=_with_index_aliases(assets, index))
 
 
+def _unreadable(error: OSError) -> NoReturn:
+    # `Path.walk` ignores a failed `scandir` by default, so an unreadable directory
+    # yields nothing and says nothing: the inventory is quietly short every asset
+    # beneath it and answers `404` for them in production. The walk raises on a dangling
+    # symlink and on one escaping the root; a directory it cannot open is the same class
+    # of tree problem and gets the same treatment.
+    raise error
+
+
 def _regular_files(base: Path) -> dict[str, tuple[Path, os.stat_result]]:
     found: dict[str, tuple[Path, os.stat_result]] = {}
-    for parent, _directories, names in base.walk():
+    for parent, _directories, names in base.walk(on_error=_unreadable):
         for name in names:
             path = parent / name
             resolved = path.resolve()
@@ -276,10 +315,20 @@ def _without_sidecars(
 ) -> dict[str, tuple[Path, os.stat_result]]:
     """
     Drop `app.css.br` when `app.css` is present: it is that asset's encoded form, not an
-    asset of its own, and indexing it too would serve compressed bytes under a media
-    type guessed from the wrong suffix.
+    asset of its own, and publishing it too would hand the same bytes a second URL,
+    outside negotiation, under a validator unrelated to the asset's.
+
+    The suffixes are a **fixed** set, deliberately not the active `encodings` table. Key
+    the suppression on the table and a coding's absence exposes its sidecars: with
+    `encodings={b"gzip": ...}` an `app.css.br` beside `app.css` becomes an asset in its
+    own right, and with `encodings={}` every sidecar in the tree does. `.zst` is worse
+    still, because `mimetypes` has no entry for it, so `app.css.zst` would go out as
+    `application/zstd` at a URL the build system's naming makes guessable. This is why
+    WhiteNoise's `is_compressed_variant` tests a literal `(".gz", ".br")` rather than
+    anything configurable. A coding outside the table still suppresses its own sidecars,
+    so a custom one loses nothing.
     """
-    suffixes = tuple(_sidecar_suffix(coding) for coding in encodings)
+    suffixes = frozenset(_SIDECAR_SUFFIXES.values()) | {_sidecar_suffix(coding) for coding in encodings}
     return {
         key: entry
         for key, entry in found.items()
@@ -303,21 +352,24 @@ def _asset(
     compressed_here: list[str],
 ) -> Asset:
     token = _valid_token(etag_for(key, path, stat), key)
-    content_type = _content_type(path, charset)
+    content_type, stored = _content_type_and_coding(path, charset)
     modified = datetime.fromtimestamp(stat.st_mtime, UTC)
+    # Bytes already in a content coding are not encoded again: stacking gzip on
+    # `logo.svgz` costs the client two unwraps to reach the same SVG.
     encoded = (
         _encodings(key, path, stat, token, content_type, modified, cache_control, encodings, compressed_here)
-        if compressible(content_type)
+        if stored is None and compressible(content_type)
         else {}
     )
     # Vary only where the body genuinely depends on the request: stamping it on an
     # already-compressed image fragments every downstream cache key for nothing, which
-    # is the bug filed against ngx_brotli as #97.
+    # is the bug filed against ngx_brotli as #97. A file stored in a coding has one
+    # representation and negotiates nothing, so it does not vary either.
     identity = _representation(
         size=stat.st_size,
-        token=token,
+        etag=_etag(token),
         content_type=content_type,
-        coding=None,
+        coding=stored,
         modified=modified,
         cache_control=cache_control,
         varies=bool(encoded),
@@ -361,7 +413,7 @@ def _encodings(
             compressed_here.append(f"{key} ({coding.decode(_ASCII)})")
         built[coding] = _representation(
             size=len(body),
-            token=token,
+            etag=_etag(token, coding),
             content_type=content_type,
             coding=coding,
             modified=modified,
@@ -391,10 +443,21 @@ def _compressed(data: bytes, make: Callable[[], Compressor]) -> bytes:
     return compressor.compress(data) + compressor.flush()
 
 
+def _etag(token: bytes, coding: bytes | None = None) -> bytes:
+    """
+    Quote `token` as an entity-tag, suffixed for a negotiated variant.
+
+    Each coding is its own representation, so it gets its own strong tag rather than
+    sharing the identity one. A file *stored* in a coding is not a variant of anything:
+    it is the only representation there is, so it keeps the bare tag.
+    """
+    return b'"%s"' % token if coding is None else b'"%s-%s"' % (token, coding)
+
+
 def _representation(
     *,
     size: int,
-    token: bytes,
+    etag: bytes,
     content_type: bytes,
     coding: bytes | None,
     modified: datetime,
@@ -402,9 +465,6 @@ def _representation(
     varies: bool,
     body: bytes | None = None,
 ) -> Representation:
-    # Each coding is its own representation, so it gets its own strong tag rather than
-    # sharing the identity one.
-    etag = b'"%s"' % token if coding is None else b'"%s-%s"' % (token, coding)
     caching: RawHeaders = () if cache_control is None else ((_CACHE_CONTROL, cache_control),)
     vary: RawHeaders = ((_VARY, _ACCEPT_ENCODING),) if varies else ()
     encoding: RawHeaders = () if coding is None else ((_CONTENT_ENCODING, coding),)
@@ -413,18 +473,31 @@ def _representation(
         size=size,
         etag=etag,
         described=((_CONTENT_TYPE, content_type), *encoding, *validators, (_ACCEPT_RANGES, _BYTES), *caching, *vary),
-        revalidation=(*validators, *caching, *vary),
+        revalidation=(*encoding, *validators, *caching, *vary),
         body=body,
     )
 
 
-def _content_type(path: Path, charset: str | None) -> bytes:
-    guessed = mimetypes.guess_file_type(path)[0] or _OCTET_STREAM
+def _content_type_and_coding(path: Path, charset: str | None) -> tuple[bytes, bytes | None]:
+    """
+    The media type the file's suffixes name, and the content coding its bytes are
+    already stored in.
+
+    `guess_file_type` reports both, and dropping the second is how `logo.svgz` goes out
+    as `image/svg+xml` with no `content-encoding`, i.e. gzip bytes a browser renders as
+    SVG, and `bundle.tar.gz` as a bare `application/x-tar`. The coding is claimed only
+    alongside a media type: a lone `archive.gz` guesses `(None, "gzip")`, which names an
+    opaque archive rather than a gzip-encoded something, and declaring a coding there
+    would have the client silently unwrap the file it asked to download.
+    """
+    guessed, coding = mimetypes.guess_file_type(path)
+    if guessed is None:
+        return _OCTET_STREAM.encode(_LATIN1), None
     # A textual asset with no charset leaves the encoding to the recipient's guess,
     # which is how a UTF-8 stylesheet ends up rendering as mojibake.
     if charset is not None and guessed.startswith("text/"):
         guessed = f"{guessed}; charset={charset}"
-    return guessed.encode(_LATIN1)
+    return guessed.encode(_LATIN1), None if coding is None else coding.encode(_ASCII)
 
 
 def _valid_token(token: bytes, key: str) -> bytes:
@@ -441,8 +514,28 @@ def _with_index_aliases(assets: dict[str, Asset], index: str | None) -> Mapping[
         # A root-level index has no directory key to alias; it is reached by naming it,
         # which is what a router `fallback` serving a single-page app does.
         if name == index and separator and directory not in assets:
-            assets[directory] = asset
+            assets[directory] = replace(asset, directory_index=True)
     return assets
+
+
+def _slash_redirect(key: str) -> Response:
+    """
+    Send `/assets/guide` to `/assets/guide/`.
+
+    `without-web`'s `split_path` strips a trailing slash, so both URLs arrive here as
+    the same key and only the request path still distinguishes them, which is why the
+    redirect lives at this altitude rather than in the router. Serving the index
+    at the slash-less URL would resolve every relative link and asset reference in that
+    document one level too high, against `/assets/` instead of `/assets/guide/`, which
+    is why static servers redirect rather than answer at both.
+
+    The target is **relative**: an inventory does not know what prefix it was mounted
+    under, so it names the final segment and lets the client resolve it against the
+    request URI (RFC 9110 §10.2.2). The segment is percent-encoded, which also keeps a
+    name containing a colon from being read as a scheme.
+    """
+    _, _, name = key.rpartition("/")
+    return Response(status=_MOVED, headers=((_LOCATION, quote(name, safe="").encode(_ASCII) + b"/"),))
 
 
 def _report(compressed_here: list[str]) -> None:
@@ -468,7 +561,7 @@ async def serve_asset(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
 ) -> AsyncIterator[Outbound]:
     """
-    Answer a request for `key` out of `assets`: `200`, `206`, `304`, `416`, or `404`.
+    Answer a request for `key` out of `assets`: `200`, `206`, `302`, `304`, `416`, or `404`.
 
     `key` is used only to look up an entry, never to build a path, so every traversal
     payload (`..`, a decoded `%2F` or `%00`, an absolute path, a Windows drive letter,
@@ -476,9 +569,10 @@ async def serve_asset(
 
     The content coding is negotiated against the variants the inventory holds, and the
     conditional and range rules are then applied to *that* representation: its size, its
-    own strong validator. A `304` or `416` is decided from the inventory alone and
-    touches no file at all, which is what makes revalidation, the common request for a
-    cached asset, cost a dictionary lookup and a byte comparison.
+    own strong validator. Every answer that owes no bytes (a `302`, a `304`, a `416`,
+    and any `HEAD`) is settled from the inventory alone and touches no file at all,
+    which is what makes revalidation, the common request for a cached asset, cost a
+    dictionary lookup and a byte comparison, and a `curl -I` cost nothing at all.
 
     When identity bytes are owed the `stat` runs before any `ResponseStart`, and its
     size is checked against the inventory's. A disagreement means the tree was written
@@ -489,6 +583,8 @@ async def serve_asset(
     asset = assets.get(key)
     if asset is None:
         return _replay(encode_response(not_found))
+    if asset.directory_index and not scope.path.endswith("/"):
+        return _replay(encode_response(_slash_redirect(key)))
     chosen = _negotiated(asset, scope.headers)
     selection = selection_for(
         size=chosen.size,
@@ -529,7 +625,7 @@ def _from_memory(chosen: Representation, selection: Selection, chunk_size: int) 
             return _stream_bytes(start, body, chunk_size)
         case Span(first, last):
             return _stream_bytes(start, body[first : last + 1], chunk_size)
-        case NotModified() | Unsatisfiable():
+        case Head() | NotModified() | Unsatisfiable():
             return no_body(start)
         case _ as unreachable:
             assert_never(unreachable)

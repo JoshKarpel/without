@@ -4,6 +4,7 @@ from datetime import UTC
 from datetime import datetime
 
 import pytest
+from without_asgi.selection import Head
 from without_asgi.selection import NotModified
 from without_asgi.selection import Selection
 from without_asgi.selection import Span
@@ -67,7 +68,10 @@ class TestMethods:
 
     def test_head_ignores_a_range_because_only_get_defines_range_handling(self) -> None:
         # RFC 9110 §14.2: GET is the only method for which range handling is defined.
-        assert _decide((b"range", b"bytes=10-19"), method="HEAD") == Whole()
+        assert _decide((b"range", b"bytes=10-19"), method="HEAD") == Head()
+
+    def test_head_selects_a_head_so_the_representation_is_never_read(self) -> None:
+        assert _decide(method="HEAD") == Head()
 
     def test_a_plain_get_with_no_conditions_gets_the_whole_representation(self) -> None:
         assert _decide() == Whole()
@@ -174,6 +178,27 @@ class TestConditionalRequests:
         # answered 304 on its own must not be consulted.
         decision = _decide(
             (b"if-none-match", b'"something-else"'),
+            (b"if-modified-since", _MODIFIED_HTTP),
+        )
+
+        assert decision == Whole()
+
+    @pytest.mark.parametrize(
+        "offered",
+        [
+            pytest.param(b"unquoted", id="a-bare-token-is-not-an-entity-tag"),
+            pytest.param(b'"unterminated', id="a-missing-closing-quote"),
+            pytest.param(b'W/unquoted"', id="a-weak-prefix-without-an-opening-quote"),
+            pytest.param(b"", id="an-empty-field-value"),
+        ],
+    )
+    def test_a_malformed_entity_tag_suppresses_the_date_condition_too(self, offered: bytes) -> None:
+        # §13.1.2 turns on If-None-Match being *present*, not on it parsing. Gating on
+        # the parse lets a malformed tag fall through to a date the client never meant
+        # to be decisive: with a content-hash validator, a rebuild that changes bytes but
+        # preserves mtime would then answer 304 with content the tag was there to refuse.
+        decision = _decide(
+            (b"if-none-match", offered),
             (b"if-modified-since", _MODIFIED_HTTP),
         )
 
