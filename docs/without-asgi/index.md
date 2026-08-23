@@ -127,13 +127,18 @@ from without_asgi import Response, json_content
 Response.from_content(201, json_content(todo))
 ```
 
-Three producers ship, each an encoding both sides of the stack kept re-deriving;
+Four producers ship, each an encoding both sides of the stack kept re-deriving;
 a text or msgpack encoder would be another, with equal standing:
 
 - `json_content(payload, *, dumps=...)` encodes JSON.
 - `form_content(fields)` encodes `application/x-www-form-urlencoded`, the shape
   HTML forms POST and OAuth2 token endpoints require. A mapping carries one value
   per name; pass pairs when a name repeats.
+- `html_content(markup)` pairs already-rendered markup with
+  `text/html; charset=utf-8`. It takes a `str`, so how the markup was produced stays
+  the application's business: [`without-html`](../without-html/index.md)'s `render`,
+  a template engine, or a literal all arrive here identically, and this package names
+  the content type without taking on a renderer.
 - `multipart_content(fields, files, *, boundary=None)` encodes
   `multipart/form-data` (RFC 7578), the shape file-upload APIs take: each field a
   text part, each `FilePart(name, filename, body, content_type)` a file part with

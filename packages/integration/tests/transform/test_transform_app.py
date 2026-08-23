@@ -5,7 +5,6 @@ import hashlib
 import json
 import re
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -44,6 +43,9 @@ from without_asgi.scope import parse_websocket_scope
 from without_configmap import read_yaml_file
 from without_configmap import watch_config
 
+from packages.integration.tests.helpers import drive_websocket
+from packages.integration.tests.helpers import running
+
 
 def _write_settings(mount: Path, default_mode: str, max_bytes: int) -> None:
     (mount / "settings.yaml").write_text(
@@ -76,31 +78,6 @@ def _has_header(message: RawMessage, name: bytes, value: bytes) -> bool:
 async def _blocked(mount: Path) -> AsyncIterator[object]:
     await asyncio.Event().wait()
     yield object()  # pragma: no cover - the wait never returns; the yield only makes this a never-signalling change source
-
-
-@asynccontextmanager
-async def _running(app: ASGIApp) -> AsyncIterator[None]:
-    inbox: asyncio.Queue[RawMessage] = asyncio.Queue()
-    outbox: asyncio.Queue[RawMessage] = asyncio.Queue()
-
-    async def receive() -> RawMessage:
-        return await inbox.get()
-
-    async def send(message: RawMessage) -> None:
-        await outbox.put(message)
-
-    async def drive() -> None:
-        await app({"type": "lifespan", "asgi": {"version": "3.0"}}, receive, send)
-
-    lifespan = asyncio.create_task(drive())
-    await inbox.put({"type": "lifespan.startup"})
-    assert await outbox.get() == {"type": "lifespan.startup.complete"}
-    try:
-        yield
-    finally:
-        await inbox.put({"type": "lifespan.shutdown"})
-        assert await outbox.get() == {"type": "lifespan.shutdown.complete"}
-        await lifespan
 
 
 async def _request(
@@ -141,7 +118,7 @@ async def test_transforms_the_body_with_the_config_default(tmp_path: Path) -> No
     source = watch_config(tmp_path, read_yaml_file(Settings, "settings.yaml"), changes=_blocked)
     app = text_transform_app(source)
 
-    async with _running(app):
+    async with running(app):
         start, body = await _request(app, "POST", "/transform", body=b"hello world")
 
     assert _status(start) == 200
@@ -157,7 +134,7 @@ async def test_every_route_carries_the_clacks_overhead_header(method: str, path:
     source = watch_config(tmp_path, read_yaml_file(Settings, "settings.yaml"), changes=_blocked)
     app = text_transform_app(source)
 
-    async with _running(app):
+    async with running(app):
         start, _body = await _request(app, method, path)
 
     assert _has_header(start, b"x-clacks-overhead", b"GNU Terry Pratchett")
@@ -170,7 +147,7 @@ async def test_access_log_middleware_prints_the_request_and_the_response(
     source = watch_config(tmp_path, read_yaml_file(Settings, "settings.yaml"), changes=_blocked)
     app = text_transform_app(source)
 
-    async with _running(app):
+    async with running(app):
         await _request(app, "GET", "/missing")
 
     out = capsys.readouterr().out
@@ -185,7 +162,7 @@ async def test_access_timing_middleware_reports_the_request_duration(
     source = watch_config(tmp_path, read_yaml_file(Settings, "settings.yaml"), changes=_blocked)
     app = text_transform_app(source)
 
-    async with _running(app):
+    async with running(app):
         await _request(app, "GET", "/missing")
 
     out = capsys.readouterr().out
@@ -198,7 +175,7 @@ async def test_request_digest_falls_back_to_a_header_without_the_trailers_extens
     app = text_transform_app(source)
     body = b"the quick brown fox"
 
-    async with _running(app):
+    async with running(app):
         start, _body = await _request(app, "POST", "/transform", body=body)
 
     expected = b"sha-256=" + hashlib.sha256(body).hexdigest().encode()
@@ -212,7 +189,7 @@ async def test_request_digest_uses_a_trailer_when_the_server_advertises_the_exte
     app = text_transform_app(source)
     body = b"the quick brown fox"
 
-    async with _running(app):
+    async with running(app):
         messages = await _request(app, "POST", "/transform", body=body, extensions={"http.response.trailers": {}})
 
     start = messages[0]
@@ -230,7 +207,7 @@ async def test_query_mode_overrides_the_config_default(tmp_path: Path) -> None:
     source = watch_config(tmp_path, read_yaml_file(Settings, "settings.yaml"), changes=_blocked)
     app = text_transform_app(source)
 
-    async with _running(app):
+    async with running(app):
         _start, body = await _request(app, "POST", "/transform", query=b"mode=title", body=b"the quiet part")
 
     assert _body(body) == b"The Quiet Part"
@@ -241,7 +218,7 @@ async def test_unknown_mode_is_a_400(tmp_path: Path) -> None:
     source = watch_config(tmp_path, read_yaml_file(Settings, "settings.yaml"), changes=_blocked)
     app = text_transform_app(source)
 
-    async with _running(app):
+    async with running(app):
         start, body = await _request(app, "POST", "/transform", query=b"mode=shout", body=b"hi")
 
     assert _status(start) == 400
@@ -253,7 +230,7 @@ async def test_body_over_the_configured_limit_is_a_413(tmp_path: Path) -> None:
     source = watch_config(tmp_path, read_yaml_file(Settings, "settings.yaml"), changes=_blocked)
     app = text_transform_app(source)
 
-    async with _running(app):
+    async with running(app):
         start, body = await _request(app, "POST", "/transform", body=b"toolong")
 
     assert _status(start) == 413
@@ -265,7 +242,7 @@ async def test_non_utf8_body_is_a_400(tmp_path: Path) -> None:
     source = watch_config(tmp_path, read_yaml_file(Settings, "settings.yaml"), changes=_blocked)
     app = text_transform_app(source)
 
-    async with _running(app):
+    async with running(app):
         start, body = await _request(app, "POST", "/transform", body=b"\xff\xfe")
 
     assert _status(start) == 400
@@ -277,7 +254,7 @@ async def test_modes_lists_modes_and_the_current_default(tmp_path: Path) -> None
     source = watch_config(tmp_path, read_yaml_file(Settings, "settings.yaml"), changes=_blocked)
     app = text_transform_app(source)
 
-    async with _running(app):
+    async with running(app):
         start, body = await _request(app, "GET", "/modes")
 
     assert _status(start) == 200
@@ -289,7 +266,7 @@ async def test_unknown_route_is_a_404(tmp_path: Path) -> None:
     source = watch_config(tmp_path, read_yaml_file(Settings, "settings.yaml"), changes=_blocked)
     app = text_transform_app(source)
 
-    async with _running(app):
+    async with running(app):
         start, body = await _request(app, "GET", "/nope")
 
     assert _status(start) == 404
@@ -312,7 +289,7 @@ async def test_handlers_pick_up_a_config_reload_mid_lifetime(tmp_path: Path) -> 
     source = watch_config(tmp_path, read_yaml_file(Settings, "settings.yaml"), changes=reloads)
     app = text_transform_app(source)
 
-    async with _running(app):
+    async with running(app):
         _start, before = await _request(app, "POST", "/transform", body=b"Echo")
         assert _body(before) == b"ECHO"
 
@@ -321,22 +298,6 @@ async def test_handlers_pick_up_a_config_reload_mid_lifetime(tmp_path: Path) -> 
 
         _start, after = await _request(app, "POST", "/transform", body=b"Echo")
         assert _body(after) == b"echo"
-
-
-async def _websocket(app: ASGIApp, path: str, incoming: list[RawMessage]) -> list[RawMessage]:
-    scope: RawMessage = {"type": "websocket", "asgi": {"version": "3.0"}, "path": path, "headers": []}
-    events = iter(incoming)
-
-    async def receive() -> RawMessage:
-        return next(events)
-
-    sent: list[RawMessage] = []
-
-    async def send(message: RawMessage) -> None:
-        sent.append(message)
-
-    await app(scope, receive, send)
-    return sent
 
 
 async def test_unrouted_websocket_path_is_closed_without_reading(tmp_path: Path) -> None:
@@ -354,7 +315,7 @@ async def test_unrouted_websocket_path_is_closed_without_reading(tmp_path: Path)
     async def send(message: RawMessage) -> None:
         sent.append(message)
 
-    async with _running(app):
+    async with running(app):
         await app({"type": "websocket", "asgi": {"version": "3.0"}, "path": "/ws", "headers": []}, receive, send)
 
     assert sent == [{"type": "websocket.close", "code": 1000, "reason": ""}]
@@ -365,8 +326,8 @@ async def test_websocket_stream_transforms_each_text_frame_with_the_default_mode
     source = watch_config(tmp_path, read_yaml_file(Settings, "settings.yaml"), changes=_blocked)
     app = text_transform_app(source)
 
-    async with _running(app):
-        sent = await _websocket(
+    async with running(app):
+        sent = await drive_websocket(
             app,
             "/stream",
             [

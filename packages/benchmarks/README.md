@@ -117,6 +117,44 @@ rate coexists rather than overwrites. Each run leaves a `.bin` (raw vegeta) and
 flamegraph. Endpoints: `list` (`GET /todos`), `show` (`GET /todos/2`), `create`
 (`POST /todos`).
 
+## Rendering: a different shape of benchmark
+
+`benchmarks.render` measures `without-html` against its peers, and deliberately
+shares none of the above machinery. The thing under test is a pure function from
+data to a string, so there is no server, no socket, and no load generator: the
+only honest way to time one is to call it many times in a tight loop and take the
+best result. Run it with `just bench-render` (add `--phases`, `--scaling`, or
+`--profile`).
+
+The methodology that matters here is different too:
+
+- **Byte-identical output is checked before timing.** Four renderers that
+  disagree about their output are not comparable at any speed, so the run *fails*
+  rather than reports. This is the same "same core" principle as the load
+  benchmark's shared `integration.todos.core`, enforced on the output rather than
+  the input. It is also the way a render benchmark most often lies: a contender
+  that skips escaping, or emits slightly different markup, is doing less work.
+- **The minimum sample, not the mean.** Noise on a machine that is also doing
+  other things is one-sided, since it can only make a run slower, so the minimum
+  of many batches is the closest estimate of the true cost. The median's distance
+  above it is reported beside each result, so a polluted run is visible rather
+  than silently averaged in.
+- **The collector stays on.** `timeit` disables it, which is right for comparing
+  unrelated snippets and wrong here: building a tree allocates thousands of
+  objects, so collection is part of what the approach costs. `--gc-off` measures
+  the other way, and the gap between the two is a result in itself.
+- **A floor, not just peers.** Hand-written f-strings with `html.escape` have no
+  tree, no dispatch, and no policy, so they are the cost of the string work alone
+  and every other number reads as that plus what the abstraction charges.
+
+The contenders span the design space rather than sampling it: `without-html` and
+[htpy](https://htpy.dev/) are the same idea (an immutable node tree built by
+Python calls, rendered by a walk), Jinja is the incumbent template engine and
+compiles to Python bytecode, and the f-string renderer is the floor. Four
+workloads cover the shapes a console actually renders: a wide `table`, a small
+`fragment` (what an htmx swap returns), an attribute-heavy `page`, and a `deep`
+nest that would cost a stack frame per level under a recursive renderer.
+
 `just plot` reads the *clean* (non-`-prof`) runs and draws latency and throughput
 versus target rate to `results/{endpoint}-latency-throughput.png`, one series per
 cell that has results. `just hotspots` reads the `--profile` runs and prints each

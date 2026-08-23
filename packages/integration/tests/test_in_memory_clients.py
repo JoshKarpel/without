@@ -9,8 +9,6 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from integration.todos.app import todos_app
-from integration.todos.core import Todo
-from integration.todos.core import TodoList
 from starlette.testclient import TestClient
 from without_asgi import ASGIApp
 from without_asgi import json_content
@@ -19,6 +17,8 @@ from without_http import request
 from without_http import run_lifespan
 from without_http.testing import asgi_client
 from without_http.testing import loopback_client
+
+from .helpers import a_todo_list
 
 # The interop proof, in both directions. without-http's in-memory clients speak only
 # ASGI and their own request/response values, so they drive a *foreign* app (FastAPI
@@ -32,10 +32,6 @@ from without_http.testing import loopback_client
 # call here runs, but a callable parameter is contravariant, so neither side's app type
 # is assignable to the other's. Each ignore is pinned to its code, so it fails the build
 # if the ecosystem's annotations ever converge.
-
-
-def _todos() -> TodoList:
-    return TodoList({1: Todo(id=1, title="write", done=False), 2: Todo(id=2, title="ship", done=True)})
 
 
 def _fastapi_app() -> FastAPI:
@@ -89,7 +85,7 @@ async def test_an_in_memory_client_drives_a_fastapi_app(wire: bool) -> None:
 
 @pytest.mark.parametrize("wire", [False, True], ids=["asgi", "loopback"])
 async def test_an_in_memory_client_drives_the_without_todos_app(wire: bool) -> None:
-    async with _in_memory(todos_app(_todos()), wire=wire) as client:
+    async with _in_memory(todos_app(a_todo_list()), wire=wire) as client:
         async with request(client, "GET", "http://testserver/todos/1") as (head, body):
             assert head.status == 200
             assert json.loads(await body.read())["title"] == "write"
@@ -99,7 +95,7 @@ async def test_an_in_memory_client_drives_the_without_todos_app(wire: bool) -> N
 
 
 async def test_httpx_asgi_transport_drives_a_without_app() -> None:
-    app = todos_app(_todos())
+    app = todos_app(a_todo_list())
     transport = httpx.ASGITransport(app=app)  # type: ignore[arg-type]
     # ASGITransport never runs the lifespan protocol, and a `make_asgi_app` app keeps its
     # state there, so the lifespan is driven around it here. That gap is exactly what
@@ -121,7 +117,7 @@ def _through_test_client(app: ASGIApp) -> tuple[int, str]:
 async def test_starlette_test_client_drives_a_without_app() -> None:
     # TestClient is synchronous and runs the app on its own event loop in a portal
     # thread, so it is driven from a worker thread rather than from this one.
-    status, title = await asyncio.to_thread(_through_test_client, todos_app(_todos()))
+    status, title = await asyncio.to_thread(_through_test_client, todos_app(a_todo_list()))
 
     assert status == 200
     assert title == "write"

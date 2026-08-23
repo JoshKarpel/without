@@ -29,35 +29,38 @@ packages). Each package is its own top-level import.
   `with`-scoped background task helper (`without.tasks`). Distributed on PyPI as
   `without-core` (the bare `without` name is unavailable there); imported as
   `without`.
-- `packages/without-env` — first plugin: a static `Context` parsed from
+- `packages/without_env` — first plugin: a static `Context` parsed from
   environment variables (`pydantic-settings`). Imported as `without_env`.
-- `packages/without-configmap` — config from a Kubernetes mount (`watchfiles` +
+- `packages/without_configmap` — config from a Kubernetes mount (`watchfiles` +
   `pydantic`); the context-updated-by-a-stream half of the model. Imported as
   `without_configmap`.
-- `packages/without-asgi` — adapters that turn an ASGI app's `receive`/`send`
+- `packages/without_asgi` — adapters that turn an ASGI app's `receive`/`send`
   into typed event streams and back, in *both* directions (so it serves an app
   adapter and an ASGI server equally). The boundary only, no routing or
   framework. Imported as `without_asgi`.
-- `packages/without-web` — an opinionated HTTP/WebSocket router over
+- `packages/without_web` — an opinionated HTTP/WebSocket router over
   `without-asgi`: trie matching, typed path params, 405-vs-404, mounting, scoped
   middleware, exception handlers, and OpenAPI. Imported as `without_web`.
-- `packages/without-http` — an `asyncio` ASGI **server** (and HTTP client) built
+- `packages/without_http` — an `asyncio` ASGI **server** (and HTTP client) built
   on the sans-IO `h11`/`h2`/`wsproto` state machines: `serving(app)` owns the socket
   and the wire protocol (HTTP/1.1, HTTP/2, and WebSockets) and drives any ASGI app.
   Imported as `without_http`.
-- `packages/without-dag` — bounded-concurrency execution of DAG-shaped async
+- `packages/without_html` — HTML as immutable Python values: element constructors
+  that carry HTML's own constraints in their signatures, and a pure `render`. Depends
+  on nothing else in the workspace. Imported as `without_html`.
+- `packages/without_dag` — bounded-concurrency execution of DAG-shaped async
   workflows: a `Graph` builder threads value types through the wiring, and a
   single-input graph is an async callable that `from_map` lifts straight into a
   `Processor`. Imported as `without_dag`.
-- `packages/without-durability` — durable workflows over `without-dag`: a
+- `packages/without_durability` — durable workflows over `without-dag`: a
   checkpoint any process can read, plus the store interfaces (`Checkpointer`,
   `Scheduler`, `Durable`) that make "one writer at a time" enforceable rather than
   hoped for. Imported as `without_durability`.
-- `packages/without-durability-redis`, `packages/without-durability-postgres`,
-  `packages/without-durability-sqlite` — one store each, so the core pulls no
+- `packages/without_durability_redis`, `packages/without_durability_postgres`,
+  `packages/without_durability_sqlite` — one store each, so the core pulls no
   driver. Redis reaches every guarantee with small Lua scripts, the SQL stores with
   ordinary transactions, and SQLite needs no server at all.
-- `packages/without-logging` — a logging pipeline: stdlib log records parsed into
+- `packages/without_logging` — a logging pipeline: stdlib log records parsed into
   immutable `Record` values at a `capture` boundary, filtered and enriched as
   processors, drained to a sink the app owns. Imported as `without_logging`.
 - `packages/integration` — not a real package (and never published: its name

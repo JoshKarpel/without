@@ -51,6 +51,8 @@ packages. Each is its own top-level import.
   handlers, and OpenAPI.
 - [`without-http`](without-http/index.md): an `asyncio` ASGI server and HTTP
   client built on the sans-IO `h11`/`h2`/`wsproto` state machines.
+- [`without-html`](without-html/index.md): HTML as immutable Python values, with
+  escaping and HTML's own constraints carried in the types.
 - [`without-dag`](without-dag/index.md): bounded-concurrency execution of
   DAG-shaped async workflows, liftable straight into a `Processor`.
 - [`without-durability`](without-durability/index.md): durable workflows over a

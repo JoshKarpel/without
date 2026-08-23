@@ -105,6 +105,9 @@ nav:
       - without-http/testing.md
       - without-http/alternatives.md
       - Reference: without-http/reference.md
+  - without-html:
+      - without-html/index.md
+      - Reference: without-html/reference.md
   - without-dag:
       - without-dag/index.md
       - Reference: without-dag/reference.md
@@ -128,6 +131,7 @@ nav:
   - Architecture:
       - architecture/package-graph.md
   - Contributing:
+      - Workspace layout: contributing/workspace-layout.md
       - Releasing: contributing/releasing.md
       - Mutation testing: contributing/mutation-testing.md
   - Changelog: changelog.md

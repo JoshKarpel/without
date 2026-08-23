@@ -1,43 +1,71 @@
 # Changelog
 
-## 0.0.4
+## 0.0.5
 
 ### Added
 
-- **`without-http`**: response decompression as opt-in middleware. `decompress()` offers
-  `accept-encoding` outbound and wraps the response body in an incremental decoder inbound, so a
-  streamed body decodes chunk by chunk and trailers pass through untouched. It is middleware rather
-  than pool behavior because the transport must never silently rewrite bytes: a caller that wants
-  the wire encoding reads the undecorated client. The coding table is the argument
-  (`DEFAULT_DECOMPRESSORS`, gzip and zstd from the stdlib and brotli from the bundled bindings), and
-  the `accept-encoding` offer is *derived from its keys*, so what is advertised and what can be
-  decoded cannot disagree; registering a coding this package does not ship is one entry
-  (`decompress(DEFAULT_DECOMPRESSORS | {b"lzma": make_lzma})`) rather than a fork. The decoded
-  response is self-consistent: `content-encoding` and `content-length` described the *encoded* body,
-  so both leave the head instead of contradicting the bytes the stream now yields, an unknown or
-  stacked coding passes through whole, a body that concatenates streams (multi-member gzip,
-  back-to-back zstd frames) decodes whole rather than stopping at the first, and a truncated
-  compressed stream raises `ConnectionError` rather than passing a prefix off as the whole body.
-  This is also how the no-unbidden-headers
-  position holds rather than bends: composing the middleware is how a client opts into offering
-  `accept-encoding` at all.
-- **`without-http`**: request compression, the same mechanism pointed the other way. `compressing`
-  is the middleware over any coding and a `Compressor` factory, with `gzip_compress`,
-  `zstd_compress`, and `brotli_compress` as the three that ship. Bodies compress as they stream, so
-  a large upload is never buffered whole, and per-call composition means one client can send
-  compressed to a peer that wants it and plain to one that does not. Streaming that way is a demand
-  on the codec rather than only on the loop, so the three shipped codings are built from
-  `StreamingCompressor` factories (`gzip_compressor`, `zstd_compressor`, `brotli_compressor`); a
-  factory producing a plain `Compressor` encodes correctly but holds the body to the end, since a
-  coding the caller named has no unencoded answer to fall back on the way a negotiated response does.
-- **`without-asgi`**: negotiated response compression, closing the exchange the two above open.
-  `without_asgi.compression.compress()` is an `HttpMiddleware` that reads a request's
-  `accept-encoding` and encodes the response body with the coding it picks. It is middleware rather
-  than server behavior because the decision needs the response's media type and the request's
-  headers rather than anything about the socket, which is also why no ASGI server implements one; it
-  therefore applies under any transport and any router, and its coverage is decided by where it is
-  mounted. The coding table is the argument (`DEFAULT_COMPRESSORS`: brotli, zstd, and gzip) and what
-  is negotiated is derived from its keys, with the *order* of those keys serving as the server's own
+- **`without-html`**: a new package. HTML as immutable Python values: build a node tree with
+  plain constructors (`div(cls=..., attrs=..., children=...)`), render it with a pure
+  `render(node) -> str`. It depends on nothing else in the workspace, so it is usable from any
+  framework, and the interface is the *tree* rather than the string, which is what leaves room
+  for rendering a component alone as a fragment. HTML's own constraints live in the
+  signatures rather than in checks that can be forgotten: a void element is a separate
+  `VoidElement` type with no children field at all, and a raw-text element takes
+  `Markup | None`, since escaping its content would corrupt the script while not escaping
+  it would be an injection hole. That set is HTML's own rather than a shortlist (`script`,
+  `style`, `iframe`, `noembed`, `noframes`, `xmp`), since a tag left out is one whose content
+  renders entity-encoded; `noscript` is deliberately not one, being raw text only where its
+  content is never displayed. Escaping is a type, not a setting: text and attribute values
+  are escaped when the element is built, and MarkupSafe's `Markup` is what renders verbatim,
+  kept under its own name so a fragment from Jinja or tdom already *is* one, alongside anything
+  else carrying `__html__` (Django's `SafeString` included).
+  Attribute names pass through a mapping verbatim, so `hx-get`, `data-*`, `aria-*`, and SVG's
+  `viewBox` need no mangling convention; `class` is the one name `attrs` rejects, since classes
+  have the `cls` argument and two channels into one attribute would be two sources to keep in
+  sync, and it rejects the name however it is capitalized, since a parser reads `Class` and
+  `class` as one attribute. An element is changed with `with_attributes` and `with_children`,
+  which take the arguments the constructors take, so a transform goes through the same
+  escaping the tree was built with; `dataclasses.replace` on the fields would write the output
+  of a parse that never ran. Replacing an attribute puts the new value where the old one stood,
+  because HTML keeps the first of a duplicated attribute and an appended one would be silently
+  inert. Tag and attribute *names* are checked rather than escaped, since a name is written into
+  the markup verbatim and one assembled from outside input is an injection point that escaping
+  the values around it cannot reach. A tag must also begin with an ASCII letter, all HTML's own
+  tag-name grammar allows there, which is what keeps a leading `!` from opening a comment that
+  runs past the element rather than ending the name. Custom elements are first class:
+  `element_type(tag)` and `void_element_type(tag)` define constructors equal in standing to the
+  built-in ones, with the tag check paid once at definition rather than on every call, which is
+  the seam for anything the browser must do itself. `render_chunks(node)` walks the same tree and produces
+  the same bytes a chunk at a time, for a body that should start reaching a client before the
+  tree is finished. A sequence or iterator in a child position flattens one level, so unpacking
+  goes at the call site (`[header, *rows]`), which is what makes every element a hashable value
+  with flat children and keeps rendering from consuming anything. Naming those two rather than
+  `Iterable` is what keeps a `Mapping` (which would render only its keys) and a `set` (which
+  would render in an order that varies between processes) from type-checking there. `cls` names
+  the same two, and drops `None` and empty entries so `cls=("card", "card-active" if active else
+  None)` needs no filtering around it. That spelling is the only one: a `Mapping` joins its keys,
+  so `cls={"card": True, "active": False}`, the shape `classnames` and `clsx` made the idiom in
+  JavaScript, would render *both* names, and it does not type-check for that reason.
+- **`benchmarks`**: `benchmarks.render` (`just bench-render`), an in-process comparison of
+  `without-html` against htpy, Jinja2, and hand-written f-strings over four workloads (a wide
+  table, an htmx-sized fragment, an attribute-heavy page, and a deep nest). It shares none of
+  the load benchmark's machinery, because the thing under test is a pure function rather than a
+  server, and it *fails* unless every renderer produces byte-identical output, which is the way
+  a render benchmark most often lies. It reports the minimum of many batches with the collector
+  left on, since building a tree allocates and collection is part of what the approach costs.
+- **`without-asgi`**: `html_content(markup)`, the fourth `Content` producer alongside
+  `json_content`, `form_content`, and `multipart_content`. It takes a `str`, so how the markup
+  was produced stays the application's business and this package names the content type without
+  taking on a renderer.
+- **`without-asgi`**: negotiated response compression, closing the exchange 0.0.4's client-side
+  `decompress` and `compressing` opened. `without_asgi.compression.compress()` is an
+  `HttpMiddleware` that reads a request's `accept-encoding` and encodes the response body with the
+  coding it picks. It is middleware rather than server behavior because the decision needs the
+  response's media type and the request's headers rather than anything about the socket, which is
+  also why no ASGI server implements one; it therefore applies under any transport and any router,
+  and its coverage is decided by where it is mounted. The coding table is the argument
+  (`DEFAULT_COMPRESSORS`: brotli, zstd, and gzip) and what is negotiated is derived from its keys,
+  with the *order* of those keys serving as the server's own
   preference between codings a client weighted equally, best ratio first. The `Compressor` protocols
   and the `gzip_compressor` / `zstd_compressor` / `brotli_compressor` factories now live here rather
   than in `without-http`, which re-exports them, so one codec serves a coding in both directions.
@@ -141,6 +169,48 @@
   reason: `zlib.compressobj` and `zstd.ZstdCompressor` spell a block flush as a mode argument rather
   than a method, so a table built from them directly satisfies `Compressor` alone and would take the
   buffered path for every stream.
+
+### Fixed
+
+- **`without-http`**: `compressing` no longer holds a streamed upload inside the codec. Each chunk
+  was fed to the compressor and whatever came back was yielded, which is the shape of streaming
+  without the property: zlib returns its header and then nothing until the stream ends and zstd
+  returns nothing at all, so a large upload accumulated inside the codec and went out as one burst
+  on the final flush. Ending a block per chunk is what releases it, so the three shipped codings are
+  now built from `without-asgi`'s `StreamingCompressor` factories (`gzip_compressor`,
+  `zstd_compressor`, `brotli_compressor`) and `compressing` flushes a block per chunk, with one
+  chunk of lookahead so the last one rides out on the flush that ends the stream rather than paying
+  for a block of its own. A body that arrives whole is one chunk either way, so it encodes to
+  exactly the bytes it did before. A `make_compressor` producing a plain `Compressor` still encodes
+  correctly and still buffers, since a coding the caller named by hand has no unencoded answer to
+  fall back on the way a negotiated response does.
+
+## 0.0.4
+
+### Added
+
+- **`without-http`**: response decompression as opt-in middleware. `decompress()` offers
+  `accept-encoding` outbound and wraps the response body in an incremental decoder inbound, so a
+  streamed body decodes chunk by chunk and trailers pass through untouched. It is middleware rather
+  than pool behavior because the transport must never silently rewrite bytes: a caller that wants
+  the wire encoding reads the undecorated client. The coding table is the argument
+  (`DEFAULT_DECOMPRESSORS`, gzip and zstd from the stdlib and brotli from the bundled bindings), and
+  the `accept-encoding` offer is *derived from its keys*, so what is advertised and what can be
+  decoded cannot disagree; registering a coding this package does not ship is one entry
+  (`decompress(DEFAULT_DECOMPRESSORS | {b"lzma": make_lzma})`) rather than a fork. The decoded
+  response is self-consistent: `content-encoding` and `content-length` described the *encoded* body,
+  so both leave the head instead of contradicting the bytes the stream now yields, an unknown or
+  stacked coding passes through whole, a body that concatenates streams (multi-member gzip,
+  back-to-back zstd frames) decodes whole rather than stopping at the first, and a truncated
+  compressed stream raises `ConnectionError` rather than passing a prefix off as the whole body.
+  This is also how the no-unbidden-headers
+  position holds rather than bends: composing the middleware is how a client opts into offering
+  `accept-encoding` at all.
+- **`without-http`**: request compression, the same mechanism pointed the other way. `compressing`
+  is the middleware over any coding and a `Compressor` factory, with `gzip_compress`,
+  `zstd_compress`, and `brotli_compress` as the three that ship. Bodies compress as they stream, so
+  a large upload is never buffered whole, and per-call composition means one client can send
+  compressed to a peer that wants it and plain to one that does not.
 - **`without-http`**: `default_headers(*headers)`, the counterpart to `add_headers` for a field
   RFC 9110 allows only once. `add_headers` copies its headers onto every request whatever it already
   carries, which is right for a field that may repeat and wrong for `authorization` or `user-agent`,

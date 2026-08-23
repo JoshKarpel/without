@@ -24,8 +24,8 @@ from benchmarks.hotspots import self_time
         ("/home/j/without/.venv/lib/python3.14/site-packages/pydantic/type_adapter.py", "pydantic"),
         # First-party packages, classified from the `/src/` marker.
         ("/home/j/without/packages/without/src/without/handlers.py", "without-core"),
-        ("/home/j/without/packages/without-http/src/without_http/server.py", "without-http"),
-        ("/home/j/without/packages/without-asgi/src/without_asgi/h11_wire.py", "without-asgi"),
+        ("/home/j/without/packages/without_http/src/without_http/server.py", "without-http"),
+        ("/home/j/without/packages/without_asgi/src/without_asgi/h11_wire.py", "without-asgi"),
         # Interpreter internals and stdlib, split so the event-loop cost is visible.
         ("/usr/lib/python3.14/asyncio/selector_events.py", "stdlib:asyncio"),
         ("/usr/lib/python3.14/json/encoder.py", "stdlib:json"),

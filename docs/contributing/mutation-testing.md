@@ -144,6 +144,50 @@ identically. They cannot take a `# pragma: no mutate`, because the *other* mutat
 (`False -> True`) is a real behavior change that the pipe tests do kill, and a pragma would blind
 both.
 
+### Fast paths a slower arm already handles
+
+`without-html` dispatches on exact type before falling back to `isinstance`, so the same
+input has two routes through the same code and a mutation that closes the fast one is
+invisible. `render` and `fragments` each check four exact types ahead of an `isinstance`
+ladder that handles every one of them again:
+
+```python
+if type(item) is Element:  # mutant: type(None) is Element, never true
+    ...
+elif isinstance(item, Element):  # the same body, reached by subclasses
+    ...
+```
+
+Disabling any of the four exact-type arms (`Element`, `Markup`, `str`, `VoidElement`, in
+both walks) sends the item to the `isinstance` arm below, whose body is either a literal
+duplicate or a superset that resolves to the same thing: `type(item) is Markup` appends the
+item verbatim, and `isinstance(item, str)` reaches
+`item.__html__() if isinstance(item, SupportsHtml) else escape_text(item)`, which for a
+`Markup` appends the item verbatim, since its `__html__` returns itself. The fast arms buy
+a pointer comparison over an ABC check, not different
+output, which is why no test can see one go.
+
+`children_of`'s identity ladder has the same shape: `kind is str or kind is Markup` and
+`kind is Element or kind is VoidElement` are both shadowed by the
+`isinstance(children, SINGLE_CHILD_TYPES)` check behind them, so `kind = None`,
+`kind = type(None)`, and either `or` turned into an `and` all leave the return value
+unchanged.
+
+Two more optimizations fall in the same class:
+
+- **The lone-text-child shortcut.**
+  `elif len(children) == 1 and type(only := children[0]) is str:` closes an element in place
+  rather than pushing its closing tag onto the stack. Mutating the walrus target to
+  `type(None)` sends a single text child back through the stack, where the `str` arm escapes
+  it and the pushed closing tag follows: the same two fragments in the same order. The
+  `== 1` to `== 2` sibling is *not* equivalent, since it drops the second child of a
+  two-child element, and `test_text_followed_by_an_element_renders_both` kills it.
+- **`attributes_of` skipping a redundant `str()`.** Under the `type(None)` mutant,
+  `value if type(value) is str else str(value)` becomes `str(value)` for everything.
+  CPython's `str(x)` returns `x` itself for an exact `str` (verified empirically), and every
+  other value reaching that line already took the `str(value)` arm, so the escaped result is
+  identical.
+
 ### Codec-name case swaps
 
 The wire codecs are named once per module (`_ASCII = "ascii"`, `_LATIN1 = "latin-1"`) rather than
@@ -249,6 +293,18 @@ Patterns that generalize (the `mutation-testing` skill has the full method):
 - **Use distinct non-default values.** A field set to `0`, `""`, or the first enum member can make
   a broken function pass by coincidence; give each field a different, non-default value so an
   argument swap surfaces.
+- **Empty a process-global memo before the test that pins it.** A whole run happens in one process,
+  so a process-wide memo (`without-html`'s `tag_markup` and `CHECKED_ATTRIBUTE_NAMES`) is already
+  warm from the stats pass before the first mutant runs, and the body behind it never executes
+  again. Every mutation of that body then survives however wrong it is, because every call reads
+  the warm entry back instead. This is the one place in a suite where "the process is reused" is
+  load-bearing, so the memos are emptied by an autouse fixture in
+  `packages/without_html/tests/conftest.py` rather than by whichever test happens to need it. A
+  test that depends on a cold memo then asserts that it *is* cold (`cache_info().currsize == 0`,
+  the name not yet admitted), so the dependency is visible and the fixture cannot quietly stop
+  mattering. Then assert the built value *and* that a second call returns the same object: the
+  first half kills mutations of the body, the second kills a mutant that rebuilds instead of
+  reading back, whose returned value is correct either way.
 
 ## Considered and rejected: the type-checker filter
 

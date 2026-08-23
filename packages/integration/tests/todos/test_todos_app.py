@@ -1,16 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 import json
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 
 from integration.todos.app import _recover
 from integration.todos.app import session
 from integration.todos.app import todos_app
 from integration.todos.app import todos_openapi
-from integration.todos.core import Todo
-from integration.todos.core import TodoList
 from without import collect
 from without import stream_from_iterable
 from without_asgi import ASGIApp
@@ -24,34 +19,9 @@ from without_asgi import WebsocketText
 from without_asgi.scope import parse_websocket_scope
 from without_web import Match
 
-
-def _todos() -> TodoList:
-    return TodoList({1: Todo(id=1, title="write", done=False), 2: Todo(id=2, title="ship", done=True)})
-
-
-@asynccontextmanager
-async def _running(app: ASGIApp) -> AsyncIterator[None]:
-    inbox: asyncio.Queue[RawMessage] = asyncio.Queue()
-    outbox: asyncio.Queue[RawMessage] = asyncio.Queue()
-
-    async def receive() -> RawMessage:
-        return await inbox.get()
-
-    async def send(message: RawMessage) -> None:
-        await outbox.put(message)
-
-    async def drive() -> None:
-        await app({"type": "lifespan", "asgi": {"version": "3.0"}}, receive, send)
-
-    lifespan = asyncio.create_task(drive())
-    await inbox.put({"type": "lifespan.startup"})
-    assert await outbox.get() == {"type": "lifespan.startup.complete"}
-    try:
-        yield
-    finally:
-        await inbox.put({"type": "lifespan.shutdown"})
-        assert await outbox.get() == {"type": "lifespan.shutdown.complete"}
-        await lifespan
+from packages.integration.tests.helpers import a_todo_list
+from packages.integration.tests.helpers import drive_websocket
+from packages.integration.tests.helpers import running
 
 
 async def _request(
@@ -136,8 +106,8 @@ async def _stream_request(app: ASGIApp, method: str, path: str, chunks: list[byt
 
 
 async def test_lists_todos_with_the_powered_by_header() -> None:
-    app = todos_app(_todos())
-    async with _running(app):
+    app = todos_app(a_todo_list())
+    async with running(app):
         status, headers, body = await _request(app, "GET", "/todos")
     assert status == 200
     assert headers["x-powered-by"] == [b"without-web"]
@@ -145,31 +115,31 @@ async def test_lists_todos_with_the_powered_by_header() -> None:
 
 
 async def test_filters_todos_by_the_done_query_parameter() -> None:
-    app = todos_app(_todos())
-    async with _running(app):
+    app = todos_app(a_todo_list())
+    async with running(app):
         _status, _headers, body = await _request(app, "GET", "/todos", query=b"done=true")
     assert body == {"todos": [{"id": 2, "title": "ship", "done": True}]}
 
 
 async def test_shows_one_todo_by_typed_path_parameter() -> None:
-    app = todos_app(_todos())
-    async with _running(app):
+    app = todos_app(a_todo_list())
+    async with running(app):
         status, _headers, body = await _request(app, "GET", "/todos/1")
     assert status == 200
     assert body == {"id": 1, "title": "write", "done": False}
 
 
 async def test_a_missing_todo_is_a_mapped_404() -> None:
-    app = todos_app(_todos())
-    async with _running(app):
+    app = todos_app(a_todo_list())
+    async with running(app):
         status, _headers, body = await _request(app, "GET", "/todos/99")
     assert status == 404
     assert body == {"error": "no todo with id 99", "id": 99}
 
 
 async def test_creating_a_todo_echoes_it_with_its_url_and_idempotency_key() -> None:
-    app = todos_app(_todos())
-    async with _running(app):
+    app = todos_app(a_todo_list())
+    async with running(app):
         status, _headers, body = await _request(
             app, "POST", "/todos", body=b'{"title": "deploy"}', headers=[(b"idempotency-key", b"abc-123")]
         )
@@ -179,8 +149,8 @@ async def test_creating_a_todo_echoes_it_with_its_url_and_idempotency_key() -> N
 
 
 async def test_creating_a_todo_without_the_idempotency_key_is_a_422() -> None:
-    app = todos_app(_todos())
-    async with _running(app):
+    app = todos_app(a_todo_list())
+    async with running(app):
         status, _headers, body = await _request(app, "POST", "/todos", body=b'{"title": "deploy"}')
     assert status == 422
     assert isinstance(body, dict)
@@ -189,8 +159,8 @@ async def test_creating_a_todo_without_the_idempotency_key_is_a_422() -> None:
 
 
 async def test_creating_a_todo_with_a_duplicated_idempotency_key_is_a_422() -> None:
-    app = todos_app(_todos())
-    async with _running(app):
+    app = todos_app(a_todo_list())
+    async with running(app):
         status, _headers, body = await _request(
             app,
             "POST",
@@ -205,8 +175,8 @@ async def test_creating_a_todo_with_a_duplicated_idempotency_key_is_a_422() -> N
 
 
 async def test_import_echoes_each_todo_as_the_ndjson_stream_arrives() -> None:
-    app = todos_app(_todos())
-    async with _running(app):
+    app = todos_app(a_todo_list())
+    async with running(app):
         # The "beta" object straddles the first two chunks, so a correct decode
         # proves the handler reassembles across chunk boundaries as they arrive.
         status, bodies = await _stream_request(
@@ -225,8 +195,8 @@ async def test_import_echoes_each_todo_as_the_ndjson_stream_arrives() -> None:
 
 
 async def test_import_skips_blank_lines_and_imports_a_final_unterminated_line() -> None:
-    app = todos_app(_todos())
-    async with _running(app):
+    app = todos_app(a_todo_list())
+    async with running(app):
         # A blank line between records exercises the skip-empty branch; the final
         # chunk has no trailing newline, so it is imported from the leftover buffer
         # after the stream ends rather than inside the split loop.
@@ -249,8 +219,8 @@ async def test_recover_lets_an_unmapped_exception_propagate() -> None:
 
 
 async def test_an_invalid_body_is_a_mapped_422() -> None:
-    app = todos_app(_todos())
-    async with _running(app):
+    app = todos_app(a_todo_list())
+    async with running(app):
         status, _headers, body = await _request(
             app, "POST", "/todos", body=b"{}", headers=[(b"idempotency-key", b"abc-123")]
         )
@@ -260,32 +230,32 @@ async def test_an_invalid_body_is_a_mapped_422() -> None:
 
 
 async def test_a_known_path_with_the_wrong_method_is_405_with_allow() -> None:
-    app = todos_app(_todos())
-    async with _running(app):
+    app = todos_app(a_todo_list())
+    async with running(app):
         status, headers, _body = await _request(app, "PUT", "/todos")
     assert status == 405
     assert headers["allow"] == [b"GET, POST"]
 
 
 async def test_an_unknown_path_is_the_404_fallback() -> None:
-    app = todos_app(_todos())
-    async with _running(app):
+    app = todos_app(a_todo_list())
+    async with running(app):
         status, _headers, body = await _request(app, "GET", "/nope")
     assert status == 404
     assert body == {"error": "no route for GET /nope"}
 
 
 async def test_the_admin_router_is_grafted_under_its_prefix() -> None:
-    app = todos_app(_todos())
-    async with _running(app):
+    app = todos_app(a_todo_list())
+    async with running(app):
         status, _headers, body = await _request(app, "GET", "/admin/stats", headers=[(b"authorization", b"token")])
     assert status == 200
     assert body == {"total": 2, "done": 1}
 
 
 async def test_the_mounted_admin_middleware_gates_the_subtree() -> None:
-    app = todos_app(_todos())
-    async with _running(app):
+    app = todos_app(a_todo_list())
+    async with running(app):
         admin_status, _admin_headers, admin_body = await _request(app, "GET", "/admin/stats")
         open_status, _open_headers, _open_body = await _request(app, "GET", "/todos")
     assert admin_status == 401
@@ -294,8 +264,8 @@ async def test_the_mounted_admin_middleware_gates_the_subtree() -> None:
 
 
 async def test_the_opaque_mount_sees_the_prefix_trimmed_scope() -> None:
-    app = todos_app(_todos())
-    async with _running(app):
+    app = todos_app(a_todo_list())
+    async with running(app):
         _status, _headers, body = await _request(app, "GET", "/legacy/ping")
     assert body == {"path": "/ping", "root_path": "/legacy"}
 
@@ -346,22 +316,6 @@ async def test_openapi_merges_router_and_handler_halves() -> None:
     assert [param["in"] for param in list_params if isinstance(param, dict)] == ["query"]
 
 
-async def _websocket(app: ASGIApp, path: str, incoming: list[RawMessage]) -> list[RawMessage]:
-    scope: RawMessage = {"type": "websocket", "asgi": {"version": "3.0"}, "path": path, "headers": []}
-    events = iter(incoming)
-
-    async def receive() -> RawMessage:
-        return next(events)
-
-    sent: list[RawMessage] = []
-
-    async def send(message: RawMessage) -> None:
-        sent.append(message)
-
-    await app(scope, receive, send)
-    return sent
-
-
 def _sent_replies(sent: list[RawMessage]) -> list[object]:
     replies: list[object] = []
     for message in sent:
@@ -374,9 +328,9 @@ def _sent_replies(sent: list[RawMessage]) -> list[object]:
 
 
 async def test_the_session_folds_each_submission_into_the_running_list() -> None:
-    app = todos_app(_todos())
-    async with _running(app):
-        sent = await _websocket(
+    app = todos_app(a_todo_list())
+    async with running(app):
+        sent = await drive_websocket(
             app,
             "/todos/session",
             [
@@ -398,9 +352,9 @@ async def test_the_session_folds_each_submission_into_the_running_list() -> None
 
 
 async def test_the_session_answers_a_malformed_frame_without_closing() -> None:
-    app = todos_app(_todos())
-    async with _running(app):
-        sent = await _websocket(
+    app = todos_app(a_todo_list())
+    async with running(app):
+        sent = await drive_websocket(
             app,
             "/todos/session",
             [
@@ -426,7 +380,7 @@ async def test_session_closes_on_a_binary_frame_and_returns_when_the_stream_ends
     scope = parse_websocket_scope(
         {"type": "websocket", "asgi": {"version": "3.0"}, "path": "/todos/session", "headers": []}
     )
-    handler = session.endpoint(_todos(), Match(scope, {}))
+    handler = session.endpoint(a_todo_list(), Match(scope, {}))
 
     outputs = await collect(
         handler(
@@ -445,7 +399,7 @@ async def test_session_closes_on_a_binary_frame_and_returns_when_the_stream_ends
 
 
 async def test_an_unrouted_websocket_path_is_closed_by_the_fallback() -> None:
-    app = todos_app(_todos())
-    async with _running(app):
-        sent = await _websocket(app, "/todos/nope", [{"type": "websocket.connect"}])
+    app = todos_app(a_todo_list())
+    async with running(app):
+        sent = await drive_websocket(app, "/todos/nope", [{"type": "websocket.connect"}])
     assert sent == [{"type": "websocket.close", "code": 1000, "reason": ""}]

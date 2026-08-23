@@ -15,6 +15,7 @@ dependencies = [
     "without-asgi",
     "without-http",
     "without-web",
+    "without-html",
     "without-dag",
     "without-durability",
     "without-durability-redis",
@@ -37,6 +38,7 @@ without-configmap = { workspace = true }
 without-asgi = { workspace = true }
 without-http = { workspace = true }
 without-web = { workspace = true }
+without-html = { workspace = true }
 without-dag = { workspace = true }
 without-durability = { workspace = true }
 without-durability-redis = { workspace = true }
@@ -90,6 +92,10 @@ addopts = [
     # Off by default, like pytest's own --durations: opt in with `just durations`
     # (or `--pytest-durations=N`) when profiling the suite, so routine runs stay quiet.
     "--pytest-durations", "0",
+    # `just mutate` leaves a whole copy of the package, tests included, under `mutants/`.
+    # It matches `testpaths`, so a run after a mutation run would otherwise collect both
+    # copies and fail on the duplicate module names rather than on anything real.
+    "--ignore-glob", "*/mutants/*",
 ]
 testpaths = ["packages/**/tests"]
 
@@ -157,13 +163,16 @@ omit = [
     # Imperative benchmark shells, exercised by actually running a benchmark rather
     # than unit-tested, per functional-core/imperative-shell: the process-launch and
     # orchestration modules (they spawn the server, vegeta, and austin as
-    # subprocesses) and the run-by-hand result-analysis CLIs (plot, hotspots), which
-    # read `results/` and render/print. Their pure cores (e.g. hotspots' frame
-    # classifier) are still unit-tested directly; only the CLI shell is uncovered.
+    # subprocesses), the run-by-hand result-analysis CLIs (plot, hotspots), which
+    # read `results/` and render/print, and the render benchmark, which times in
+    # process and prints its own tables. Their pure cores (hotspots' frame
+    # classifier, the render benchmark's `measure` and `agreed_output`) are still
+    # unit-tested directly; only the CLI shell is uncovered.
     "*/benchmarks/todos/servers.py",
     "*/benchmarks/harness.py",
     "*/benchmarks/plot.py",
     "*/benchmarks/hotspots.py",
+    "*/benchmarks/render/bench.py",
     # The store-backed half of the durable-workflow toy and the tests that drive it,
     # omitted only when the run *cannot* cover them. Coverage substitutes `${VAR-default}` from
     # the environment as it reads this file, and the `test` recipe sets
@@ -205,6 +214,40 @@ files = ["."]
 # `mutants/` is mutmut's per-package copy of the source under mutation; type-checking it
 # duplicates every module and just re-checks throwaway mutated code.
 exclude = ["site/", "mutants/"]
+
+# Every package keeps its tests in a directory called `tests`, so in one pass over the
+# workspace the name has to come from somewhere above it or fifteen of them collide.
+# `explicit_package_bases` names each file relative to the longest matching base below
+# instead of by walking up `__init__.py` files: the repository root makes a test module
+# `packages.without_html.tests.test_render`, unique per package, and each `src` makes its
+# own package `without_html`, which is the name the rest of the workspace imports it by.
+#
+# Without the `src` bases a source file is reached under two names at once (by path as
+# `packages.without_html.src.without_html.render`, and by import as `without_html.render`)
+# and mypy refuses the run, so the list is generated from the workspace rather than kept
+# beside it: `mypy_path` takes no globs, and a package added without its entry is a build
+# that fails on a file nobody touched.
+explicit_package_bases = true
+mypy_path = [
+    ".",
+    # [[[cog import cog; from package_bases import emit; cog.outl(emit()) ]]]
+    "packages/benchmarks/src",
+    "packages/integration/src",
+    "packages/without/src",
+    "packages/without_asgi/src",
+    "packages/without_configmap/src",
+    "packages/without_dag/src",
+    "packages/without_durability/src",
+    "packages/without_durability_postgres/src",
+    "packages/without_durability_redis/src",
+    "packages/without_durability_sqlite/src",
+    "packages/without_env/src",
+    "packages/without_html/src",
+    "packages/without_http/src",
+    "packages/without_logging/src",
+    "packages/without_web/src",
+    # [[[end]]]
+]
 
 check_untyped_defs = true
 disallow_incomplete_defs = true
@@ -289,11 +332,11 @@ force-single-line = true
     "ASYNC110", # tests poll observed state (in_flight, started counts) with sleep loops; no Event to await
     "SIM117",   # nested `with` expresses resource scoping (server > pool > request); flattening moves scoped asserts
 ]
-"packages/without-http/src/without_http/client.py" = [
+"packages/without_http/src/without_http/client.py" = [
     # `timeout` is a `Timeout` config value threaded to the API boundary (the httpx-parity public name),
     # not a raw seconds deadline; it is applied via `asyncio.timeout` inside `phase`, so ASYNC109's advice is met.
     "ASYNC109",
 ]
-"packages/without-http/src/without_http/testing.py" = [
+"packages/without_http/src/without_http/testing.py" = [
     "ASYNC109",  # a `Connect` implementation, so it carries `client.py`'s `Timeout` parameter verbatim
 ]

@@ -25,7 +25,7 @@ security, the in-memory test clients, and the feature register against httpx,
 aiohttp, niquests, and the ASGI servers split into `without-http/cookies.md`,
 `without-http/security.md`, `without-http/testing.md`, and
 `without-http/alternatives.md`), the opinionated router
-(`without-web/index.md`), the
+(`without-web/index.md`), HTML as values (`without-html/index.md`), the
 config sources (`without-env/index.md`, `without-configmap/index.md`), the DAG
 executor (`without-dag/index.md`), and durable workflows
 (`without-durability/index.md`, with the store interface in
@@ -40,6 +40,10 @@ The guides, an API reference recovered from the source docstrings, and the
 derived package dependency graph are published as a documentation site (see
 [`mkdocs.yml`](mkdocs.yml) and the hand-written [`docs/hooks.py`](docs/hooks.py));
 build it locally with `just docs` (serve) or `just docs-build` (strict build).
+
+For why each package directory is underscored (`packages/without_html`) and carries
+`__init__.py` markers, where a `conftest.py` may live, and what a new package has to
+add, see [`docs/contributing/workspace-layout.md`](docs/contributing/workspace-layout.md).
 
 For how the packages are versioned and shipped (lockstep versioning, the
 `without-core` distribution name, build-time dependency pinning, and the trusted-
