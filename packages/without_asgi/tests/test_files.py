@@ -1,14 +1,27 @@
 from __future__ import annotations
 
+import asyncio
+import os
 from collections.abc import AsyncIterator
+from datetime import UTC
+from datetime import datetime
+from errno import EINVAL
+from errno import EISDIR
 from pathlib import Path
 
 import pytest
+from pytest_mock import MockerFixture
 from without import spool
+from without_asgi import DEFAULT_CHUNK_SIZE
 from without_asgi import Outbound
+from without_asgi import RawHeaders
 from without_asgi import ResponseBody
 from without_asgi import ResponseStart
 from without_asgi import file_response
+from without_asgi import serve_file
+from without_asgi.selection import http_date
+
+from .helpers import a_scope
 
 
 async def _collect(stream: AsyncIterator[Outbound]) -> list[Outbound]:
@@ -144,3 +157,231 @@ async def test_read_ahead_with_spool_preserves_the_response(tmp_path: Path) -> N
     assert events[-1] == ResponseBody(body=b"", more_body=False)
     body = b"".join(event.body for event in events if isinstance(event, ResponseBody))
     assert body == payload
+
+
+_REPORT = b"%PDF-1.7\n" + bytes(range(256)) * 4  # 1033 bytes, several chunks at any size
+
+
+def _body(events: list[Outbound]) -> bytes:
+    return b"".join(event.body for event in events if isinstance(event, ResponseBody))
+
+
+async def _serve(
+    path: Path,
+    *,
+    headers: RawHeaders = (),
+    method: str = "GET",
+    etag: bytes | None = None,
+    cache_control: bytes | None = None,
+    content_type: str | None = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+) -> tuple[ResponseStart, bytes]:
+    scope = a_scope(path="/report.pdf", headers=headers, method=method)
+    events = await _collect(
+        await serve_file(
+            scope,
+            path,
+            etag=etag,
+            cache_control=cache_control,
+            content_type=content_type,
+            chunk_size=chunk_size,
+        )
+    )
+    return _start(events), _body(events)
+
+
+@pytest.fixture
+def report(tmp_path: Path) -> Path:
+    path = tmp_path / "report.pdf"
+    path.write_bytes(_REPORT)
+    return path
+
+
+@pytest.fixture
+def report_stat(report: Path) -> os.stat_result:
+    """The report's `stat`, taken here so an async test body does no blocking file I/O."""
+    return report.stat()
+
+
+class TestServeFile:
+    async def test_a_plain_request_is_a_200_advertising_ranges(self, report: Path) -> None:
+        start, body = await _serve(report)
+
+        assert start.status == 200
+        assert body == _REPORT
+        assert dict(start.headers)[b"accept-ranges"] == b"bytes"
+        assert dict(start.headers)[b"content-length"] == b"%d" % len(_REPORT)
+
+    async def test_the_content_type_is_guessed_from_the_suffix(self, report: Path) -> None:
+        start, _body = await _serve(report)
+
+        assert dict(start.headers)[b"content-type"] == b"application/pdf"
+
+    async def test_an_unguessable_suffix_falls_back_to_octet_stream(self, tmp_path: Path) -> None:
+        path = tmp_path / "data.unknownext"
+        path.write_bytes(_REPORT)
+
+        start, _body = await _serve(path)
+
+        assert dict(start.headers)[b"content-type"] == b"application/octet-stream"
+
+    async def test_the_derived_validator_is_lowercase_hex_of_size_and_mtime(
+        self, report: Path, report_stat: os.stat_result
+    ) -> None:
+        start, _body = await _serve(report)
+
+        assert dict(start.headers)[b"etag"] == b'W/"%x-%x"' % (report_stat.st_size, report_stat.st_mtime_ns)
+
+    async def test_a_timestamp_condition_revalidates_too(self, report: Path, report_stat: os.stat_result) -> None:
+        modified = datetime.fromtimestamp(report_stat.st_mtime, UTC)
+
+        start, body = await _serve(report, headers=((b"if-modified-since", http_date(modified)),))
+
+        assert (start.status, body) == (304, b"")
+
+    async def test_a_304_repeats_the_caching_policy(self, report: Path) -> None:
+        etag = dict((await _serve(report))[0].headers)[b"etag"]
+
+        start, _body = await _serve(report, cache_control=b"no-cache", headers=((b"if-none-match", etag),))
+
+        assert dict(start.headers)[b"cache-control"] == b"no-cache"
+
+    async def test_a_whole_file_is_chunked_at_the_requested_size(self, report: Path) -> None:
+        scope = a_scope(path="/report.pdf")
+        events = await _collect(await serve_file(scope, report, chunk_size=64))
+        bodies = [event for event in events if isinstance(event, ResponseBody)]
+
+        assert len(bodies) == len(_REPORT) // 64 + 2  # the partial tail, then the terminator
+        assert b"".join(event.body for event in bodies) == _REPORT
+
+    async def test_the_derived_validator_is_weak(self, report: Path) -> None:
+        # The filesystem's timestamp granularity can be coarser than the gap between two
+        # writes, so a size-and-mtime tag cannot claim to be strong.
+        start, _body = await _serve(report)
+
+        assert dict(start.headers)[b"etag"].startswith(b'W/"')
+
+    async def test_a_supplied_validator_is_emitted_verbatim(self, report: Path) -> None:
+        start, _body = await _serve(report, etag=b'"from-a-content-hash"')
+
+        assert dict(start.headers)[b"etag"] == b'"from-a-content-hash"'
+
+    async def test_a_matching_validator_is_a_bodyless_304(self, report: Path) -> None:
+        etag = dict((await _serve(report))[0].headers)[b"etag"]
+
+        start, body = await _serve(report, headers=((b"if-none-match", etag),))
+
+        assert start.status == 304
+        assert body == b""
+        assert b"content-length" not in dict(start.headers)
+
+    async def test_a_range_is_a_206_framing_only_the_span(self, report: Path) -> None:
+        start, body = await _serve(report, headers=((b"range", b"bytes=100-199"),))
+
+        assert start.status == 206
+        assert body == _REPORT[100:200]
+        assert dict(start.headers)[b"content-range"] == b"bytes 100-199/%d" % len(_REPORT)
+        assert dict(start.headers)[b"content-length"] == b"100"
+
+    async def test_a_suffix_range_takes_the_tail(self, report: Path) -> None:
+        start, body = await _serve(report, headers=((b"range", b"bytes=-16"),))
+
+        assert start.status == 206
+        assert body == _REPORT[-16:]
+
+    async def test_a_span_crossing_several_chunks_is_reassembled(self, report: Path) -> None:
+        start, body = await _serve(report, headers=((b"range", b"bytes=5-1000"),), chunk_size=64)
+
+        assert start.status == 206
+        assert body == _REPORT[5:1001]
+
+    async def test_a_span_ending_one_byte_past_a_chunk_boundary_is_complete(self, report: Path) -> None:
+        # 65 bytes at a chunk size of 64 leaves exactly one byte owed after the first
+        # read, which is where an off-by-one in the loop bound drops the tail while the
+        # declared Content-Length still promises it.
+        start, body = await _serve(report, headers=((b"range", b"bytes=0-64"),), chunk_size=64)
+
+        assert start.status == 206
+        assert body == _REPORT[:65]
+        assert dict(start.headers)[b"content-length"] == b"65"
+
+    async def test_every_chunk_but_the_last_says_more_is_coming(self, report: Path) -> None:
+        # Joining the bodies would pass even if the stream told the transport to stop
+        # after the first chunk, so the framing flags are asserted rather than the bytes.
+        scope = a_scope(path="/report.pdf", headers=((b"range", b"bytes=0-199"),))
+        events = await _collect(await serve_file(scope, report, chunk_size=64))
+        bodies = [event for event in events if isinstance(event, ResponseBody)]
+
+        assert [event.more_body for event in bodies] == [True, True, True, True, False]
+
+    async def test_an_unsatisfiable_range_is_a_416_naming_the_size(self, report: Path) -> None:
+        start, body = await _serve(report, headers=((b"range", b"bytes=99999-"),))
+
+        assert start.status == 416
+        assert body == b""
+        assert dict(start.headers)[b"content-range"] == b"bytes */%d" % len(_REPORT)
+        # A 416 carries no content, and says so with a length rather than leaving the
+        # transport to pick a framing.
+        assert dict(start.headers)[b"content-length"] == b"0"
+
+    async def test_a_missing_file_raises_before_any_response_start(self, tmp_path: Path) -> None:
+        with pytest.raises(FileNotFoundError):
+            await _serve(tmp_path / "gone.pdf")
+
+    @pytest.mark.security("a directory is refused before a 200 is committed to the wire")
+    async def test_a_directory_raises_rather_than_failing_mid_body(self, tmp_path: Path) -> None:
+        # `file_response` has no such check, so a directory there stats fine, emits a
+        # `200`, and only then raises out of the already-started body.
+        with pytest.raises(IsADirectoryError) as raised:
+            await _serve(tmp_path)
+
+        # An error that does not name the file it is about sends the reader looking.
+        assert raised.value.filename == str(tmp_path)
+        assert raised.value.errno == EISDIR
+
+    async def test_cache_control_is_emitted_when_given(self, report: Path) -> None:
+        start, _body = await _serve(report, cache_control=b"no-cache")
+
+        assert dict(start.headers)[b"cache-control"] == b"no-cache"
+
+    async def test_a_content_type_override_is_honored(self, report: Path) -> None:
+        start, _body = await _serve(report, content_type="application/x-custom")
+
+        assert dict(start.headers)[b"content-type"] == b"application/x-custom"
+
+    async def test_a_non_regular_file_is_refused_before_a_status_is_committed(
+        self, report: Path, mocker: MockerFixture
+    ) -> None:
+        # Windows can make no fifo, socket, or device, and coverage runs on every
+        # platform, so the mode is simulated here and the POSIX test below is the
+        # control confirming a real fifo takes the same path.
+        mocker.patch("without_asgi.files.S_ISREG", return_value=False)
+
+        with pytest.raises(OSError, match="not a regular file") as raised:
+            await _serve(report)
+
+        assert raised.value.filename == str(report)
+        assert raised.value.errno == EINVAL
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="a fifo needs a POSIX filesystem")
+    async def test_a_real_fifo_is_refused(self, tmp_path: Path) -> None:
+        pipe = tmp_path / "pipe"
+        os.mkfifo(pipe)
+
+        with pytest.raises(OSError, match="not a regular file"):
+            await _serve(pipe)
+
+    @pytest.mark.security("a file truncated mid-transfer aborts rather than framing a short body")
+    async def test_a_file_that_shrinks_mid_range_aborts_the_response(self, report: Path) -> None:
+        # The stat, the selection, and the declared Content-Length all happen on the
+        # await; the reads happen as the stream is drained. Truncating in between is
+        # therefore deterministic, and is exactly the race the guard exists for.
+        scope = a_scope(path="/report.pdf", headers=((b"range", b"bytes=0-1000"),))
+        stream = await serve_file(scope, report, chunk_size=64)
+        await asyncio.to_thread(report.write_bytes, b"much shorter")
+
+        with pytest.raises(OSError, match="file shrank") as raised:
+            await _collect(stream)
+
+        assert raised.value.filename == str(report)
+        assert raised.value.errno == EINVAL

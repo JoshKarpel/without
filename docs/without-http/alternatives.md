@@ -249,7 +249,7 @@ that does it.
 | Client certificates (mTLS) | via your `ssl.SSLContext` | [`--ssl-cert-reqs`, `--ssl-ca-certs`](https://uvicorn.dev/settings/) | [`verify_mode`, `ca_certs`](https://hypercorn.readthedocs.io/en/latest/how_to_guides/configuring.html) | [`--ssl-client-verify`, `--ssl-ca`, CRLs](https://github.com/emmett-framework/granian) |
 | Proxy headers (`x-forwarded-*`) | unwritten; ASGI-middleware-shaped, [#76](https://github.com/JoshKarpel/without/issues/76) | [on by default, trusted-IP gated](https://uvicorn.dev/settings/) | [`ProxyFixMiddleware`](https://hypercorn.readthedocs.io/en/latest/how_to_guides/proxy_fix.html), shipped as ASGI middleware | — |
 | Access logging | [no, by position](#what-the-server-leaves-out) (an ASGI middleware the caller writes) | [yes](https://uvicorn.dev/settings/) | [`accesslog` + format](https://hypercorn.readthedocs.io/en/latest/how_to_guides/configuring.html) | [opt-in, custom format](https://github.com/emmett-framework/granian) |
-| Static file serving | app-side ([`file_response`](../without-asgi/index.md#streaming-a-file)); no directory mount ([#77](https://github.com/JoshKarpel/without/issues/77)), `Range`, or conditional requests ([#70](https://github.com/JoshKarpel/without/issues/70)) | no | no | [directory mount below Python](https://github.com/emmett-framework/granian) (`--static-path-mount`, `--static-path-route`) |
+| Static file serving | app-side: a [startup inventory](../without-asgi/index.md#serving-a-tree-of-assets) rather than a directory mount, with `Range`, conditional requests, and pre-compressed variants | no | no | [directory mount below Python](https://github.com/emmett-framework/granian) (`--static-path-mount`, `--static-path-route`) |
 | Response compression | app-side ([`compress()` middleware](../without-asgi/index.md#negotiated-response-compression): brotli, zstd, and gzip, injectable coding table, RFC 9110 weights, [Heal The Breach padding](../without-asgi/index.md#compression-and-secrets) opt-in) | no; app-side ([Starlette's `GZipMiddleware`](https://www.starlette.io/middleware/#gzipmiddleware), gzip only) | no; app-side | no; app-side ([precompressed *static* files](https://github.com/emmett-framework/granian/pull/791) in flight) |
 | Metrics | live [`in_flight` count on the `Server` value](index.md#server); [no exporter, by position](#what-the-server-leaves-out) | no | — | [Prometheus exporter](https://github.com/emmett-framework/granian) |
 | Graceful shutdown | [drain on exit; budget composed by the caller](index.md#server) | [`--timeout-graceful-shutdown`](https://uvicorn.dev/settings/) | [`graceful_timeout`](https://hypercorn.readthedocs.io/en/latest/how_to_guides/configuring.html) | [kill timeout](https://github.com/emmett-framework/granian) |
@@ -317,11 +317,23 @@ a case this does not
 the position, payable when protecting a hosted app matters.
 
 Static file serving sits on the same fault line, which is why its cell is split
-rather than a `no`. `file_response` is a handler helper, so it travels to any
-server and can turn a missing file into a clean `404` before a status is on the
-wire; granian's mount serves the directory below Python without entering the
-app at all, which no composition here can match, and its docs do not settle
-whether it handles `Range` or conditional requests. `file_response` does not.
+rather than a `no`. These are handler helpers, so they travel to any server and
+can turn a missing file into a clean `404` before a status is on the wire;
+granian's mount serves the directory below Python without entering the app at
+all, which no composition here can match, and its docs do not settle whether it
+handles `Range` or conditional requests.
+
+The interesting divergence is not the layer, though, it is the shape. Every
+server in this table mounts a directory and derives a path from the request,
+which is the construction that has produced a long line of traversal advisories.
+An [`Inventory`](../without-asgi/index.md#there-is-no-directory-traversal) walks
+the tree once at startup instead, so the request key selects among precomputed
+values and no path is derived at all. That buys a shorter request path as well
+as a smaller security surface: a revalidation answers a `304` from memory with
+no syscall, and pre-compressed variants held as bytes make a `Range` over a
+compressed asset work, which on-the-fly compression cannot do at any layer. The
+price is the one in the name: the tree must not change while the process runs,
+and a development loop rebuilds the inventory rather than picking up edits.
 
 The remaining `unwritten` cell in the operations table is the server-side mirror
 of the client's unwritten compositions: a proxy-header middleware over the ASGI

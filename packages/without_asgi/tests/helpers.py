@@ -23,12 +23,12 @@ class FileDescriptor:
         return 7  # pragma: no cover - only its presence satisfies the SupportsFileno protocol; never called
 
 
-def a_scope(*, path: str, http_version: str = "1.1", headers: RawHeaders = ()) -> HttpScope:
-    """One GET scope, with everything middleware does not read already filled in."""
+def a_scope(*, path: str, http_version: str = "1.1", headers: RawHeaders = (), method: str = "GET") -> HttpScope:
+    """One request scope, with everything middleware does not read already filled in."""
     return HttpScope(
         asgi=Asgi(version="3.0", spec_version="2.4"),
         http_version=http_version,
-        method="GET",
+        method=method,
         scheme="http",
         path=path,
         raw_path=path.encode(),

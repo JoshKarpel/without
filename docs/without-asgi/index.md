@@ -232,9 +232,15 @@ read in `chunk_size` pieces via `asyncio.to_thread`, matching the package's
 `pathlib.Path` + thread-offload file-I/O discipline, and the file is closed when
 the stream ends or is closed early (`make_asgi_app` closes an abandoned outbound
 stream, e.g. on a client disconnect mid-download). A `HEAD` request needs nothing
-special: the transport drops the body chunks on the wire. Range requests (`206`)
-and conditional requests (`ETag`, `Last-Modified`) are not modeled yet; a caller
-that wants them sets the headers and status itself.
+special: the transport drops the body chunks on the wire.
+
+`file_response` answers `200` and nothing else, and that is its job rather than a
+gap. It serves content with no cacheable identity: a report just rendered, a
+temp file zipped for this one response. Such a file's validator changes on every
+request, so a conditional request buys nothing, and advertising `Accept-Ranges`
+invites a follow-up for a file that may already be gone. For a file that
+persists, `serve_file` answers `Range` and conditional requests; for a tree of
+assets, an `Inventory` does.
 
 Reads and writes are lockstep by default: the next chunk is read only once the
 consumer has drained the current one, so disk and socket never overlap. Because
@@ -251,6 +257,251 @@ return spool(await file_response(path), ahead=2)
 through a bounded queue on a background task, so the next `read` overlaps the
 current chunk's send; `ahead` still bounds the memory held and applies
 backpressure.
+
+## Conditional and range requests
+
+A resuming download, a media player seeking, and a cache revalidating all need
+two mechanisms: byte ranges (`Range` to a `206` with a `Content-Range`, or a
+`416` when unsatisfiable) and conditional requests (`If-None-Match` or
+`If-Modified-Since` to a `304`).
+
+The decision is a pure function, `selection_for`, and it is the whole of the
+logic:
+
+```python
+selection_for(
+    size=stat.st_size,
+    method=scope.method,
+    request_headers=scope.headers,
+    etag=validator,
+    last_modified=modified,
+) -> Whole | Span | NotModified | Unsatisfiable
+```
+
+Nothing in that signature mentions a file. It takes a size, two validators, and
+the request's headers, so the same decision serves bytes from a disk, from
+memory, or from anywhere else, and the whole of
+[RFC 9110 §13](https://www.rfc-editor.org/rfc/rfc9110#section-13) and
+[§14](https://www.rfc-editor.org/rfc/rfc9110#section-14) tests as a table with no
+filesystem in sight. `serve_file` and `serve_asset` are the shells that do the
+`stat` and the reads.
+
+The ordering that makes `file_response` able to answer a clean `404` is what
+makes this work too: the `stat` runs on the `await`, so a `304` and a `416` are
+both decided while nothing is on the wire.
+
+`serve_file(scope, path)` is `file_response`'s request-aware sibling for one
+named file. Its derived validator is _weak_ (`W/"<size>-<mtime>"`), because a
+filesystem's timestamp granularity can be coarser than the interval between two
+writes, so two different bodies can share a size and an `st_mtime_ns`. A weak
+validator fails the strong comparison `If-Range` requires (§13.1.5), so a
+resumed download correctly restarts rather than splicing bytes from two
+versions. Pass `etag` when you hold something better.
+
+Only **single** ranges are honored. A multi-range request needs a
+`multipart/byteranges` body, which is most of the implementation cost for a case
+almost nothing sends, and it is the shape behind both
+[CVE-2011-3192](https://httpd.apache.org/security/CVE-2011-3192.txt), where
+Apache built one copy of the resource per range, and
+[CVE-2025-62727](https://github.com/Kludex/starlette/security/advisories/GHSA-7f5h-v6xp-fcq8),
+where Starlette merged ranges in quadratic time. §14 permits a server to ignore
+a `Range` it does not want to honor, so answering with the whole representation
+is conformant, and the check is a scan for a comma rather than a split: a header
+naming a hundred thousand ranges costs one linear pass and allocates nothing.
+
+## Serving a tree of assets
+
+`inventory(root)` walks a directory once and returns a mapping of request key to
+`Asset`; `serve_asset(scope, assets, key)` answers out of it. The walk is the
+whole of the setup, so it runs once wherever the app is assembled, and the key is
+whatever the app's routing has left of the path:
+
+```python
+from collections.abc import AsyncIterator
+from contextlib import nullcontext
+from pathlib import Path
+
+from without import Stream
+from without_asgi import (
+    HttpHandler,
+    HttpScope,
+    Inbound,
+    Outbound,
+    inventory,
+    make_asgi_app,
+    serve_asset,
+)
+
+PREFIX = "/assets/"
+ASSETS = inventory(Path("dist"), cache_control=b"public, max-age=31536000, immutable")
+
+
+def serve(state: None, scope: HttpScope) -> HttpHandler:
+    key = scope.path.removeprefix(PREFIX)
+
+    async def handler(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
+        async for event in await serve_asset(scope, ASSETS, key):
+            yield event
+
+    return handler
+
+
+app = make_asgi_app(nullcontext, http=serve)
+```
+
+That app answers a `200` with the media type, validators, and `cache-control` the
+walk computed, a `304` to an `If-None-Match` holding the tag it just handed out,
+a `206` with a `Content-Range` to a `Range`, and the gzip variant with its _own_
+strong tag to a client that accepts it.
+
+The walk is an ordinary blocking call at import here, which is what `nullcontext`
+in the lifespan slot says out loud: this app sets nothing up, so there is no state
+to thread and the router ignores the argument. An app factory is the same shape
+with `ASSETS` moved into a closure. Where the app has a real lifespan, build the
+inventory there instead and let `make_asgi_app` hand it to the router per
+connection, which is also the one place the walk needs `asyncio.to_thread`, since
+by then the event loop is running and the walk hashes every file:
+
+```python
+@asynccontextmanager
+async def lifespan() -> AsyncIterator[Inventory]:
+    yield await asyncio.to_thread(
+        inventory,
+        Path("dist"),
+        cache_control=b"public, max-age=31536000, immutable",
+    )
+
+
+def serve(assets: Inventory, scope: HttpScope) -> HttpHandler:
+    # Exactly as above, closing over `assets` rather than the module-level name.
+    ...
+
+
+app = make_asgi_app(lifespan, http=serve)
+```
+
+What that buys beyond placement is one thing: teardown and rebuild ride the app's
+own cycle, which is what a process swapping in a fresh inventory wants. What
+matters either way is that the walk happens once at assembly rather than per
+request.
+
+The key is a `removeprefix` and nothing else. A path outside the prefix, a `..`, a
+decoded `%2F`, or a Windows device name all arrive as keys the mapping does not
+hold, which is the `not_found` response by omission rather than by check, for the
+[reason below](#there-is-no-directory-traversal).
+
+`serve_asset` is awaited before its events are iterated, which is `file_response`'s
+ordering and load-bearing for the same reason: the content negotiation, the
+conditional and range decision, and the `stat` that checks the recorded size all run
+on the `await`, so a `304`, a `416`, a `404`, or an `AssetChanged` is settled while
+nothing is on the wire. The handler's `inputs` goes unread, since a static asset has
+no request body to fold, and the parameter stays because it is `Processor`'s shape.
+
+Restricting the method is routing work and is deliberately not done here: anything
+that is not `GET` or `HEAD` skips the conditional and range rules entirely and is
+answered with the whole representation, so a `POST` to that router gets the asset.
+[`without-web`](../without-web/index.md#static-files)'s
+`static_files(prefix, assets)` is this router as a `Route` bound to `GET` and
+`HEAD`, adding the prefix match and the `url_for` reversibility only a router can.
+
+### There is no directory traversal
+
+This is the design decision the rest follows from, so it is worth stating
+plainly. The usual shape of "static file serving" derives a filesystem path from
+attacker-controlled input on every request, and then tries to _prove_ the
+derivation stayed inside the root. Nearly every implementation has gotten that
+proof wrong at least once:
+
+- [CVE-2023-29159](https://github.com/Kludex/starlette/security/advisories/GHSA-v5gw-mw7f-84px),
+  where `os.path.commonprefix` compared characters rather than path components,
+  so `/static/../static1.txt` read as inside the root.
+- [CVE-2024-23334](https://github.com/aio-libs/aiohttp/security/advisories/GHSA-5h86-8mv2-jq9f),
+  where a `follow_symlinks` flag skipped the containment check outright and
+  `../../../etc/passwd` worked with no symlink present at all.
+- [Werkzeug #1589](https://github.com/pallets/werkzeug/issues/1589), where
+  `/static/c:/windows/win.ini` escaped on Windows with no `..` anywhere, because
+  joining discards the base when the second component is absolute.
+- [CVE-2025-66221](https://explore.alas.aws.amazon.com/CVE-2025-66221.html) and
+  [CVE-2026-21860](https://advisories.gitlab.com/pkg/pypi/werkzeug/CVE-2026-21860/),
+  where Windows reserved device names (`CON`, then `CON.txt`) opened
+  successfully and hung on read, the second being the incomplete fix for the
+  first.
+
+An inventory never derives a path from input. The key selects among values
+computed at startup, so a `..`, a decoded `%2F` or `%00`, an absolute path, a
+drive letter, and a device name are all just keys that are not in a dictionary.
+There is no proof to get wrong, because there is no derivation. This is
+parse-don't-validate reaching the filesystem: the illegal state is not rejected,
+it is unrepresentable.
+
+Every decision that a traversal design makes per request, with an attacker in
+the loop, is made here once, over a tree the operator assembled. Only regular
+files are admitted. Each entry is resolved and confirmed to be inside the root,
+and one that escapes raises, naming both ends; no flag relaxes that, because
+that flag is precisely aiohttp's CVE. Symlinked directories are not descended
+into, so a cycle cannot hang the walk. A directory has no key at all, which is a
+`404` by omission rather than by check, and there is no directory listing and
+none behind a flag.
+
+### The assumption, and how it is checked
+
+Nothing may write into the tree while the app is running. That is what "static"
+means, and it is not enforced by file permissions: modes change, root ignores
+them, and container layers get remounted, so a permission check would look like
+enforcement while providing none.
+
+It is _detected_ where it matters. When identity bytes are owed the `stat` runs
+before any `ResponseStart`, and a size that disagrees with the inventory raises
+`AssetChanged` while nothing is committed, rather than framing a body whose
+length and validator describe different bytes.
+
+The inventory is a value, so a development loop that wants to pick up edits
+builds a new one and swaps it, on a timer or a filesystem watch, which is
+control-plane work rather than anything on the request path.
+
+### Validators
+
+`content_hash` is the default: a digest of the bytes, strong on its own merits.
+Unlike a timestamp-derived tag it does not change when a rebuild rewrites an
+unchanged file, so clients do not refetch a bundle that did not change, and it
+is identical across replicas and machines. `size_and_mtime` costs nothing to
+compute for a tree too large to read at startup, and rests entirely on the
+no-writes contract instead. Neither includes `st_ino`, which would leak a
+filesystem internal into every response, as Apache's `FileETag` default did in
+[CVE-2003-1418](https://www.tenable.com/plugins/nessus/88098). A custom
+`etag_for` returns the opaque token and the quoting is added here, so a caller
+cannot emit a malformed validator.
+
+### Pre-compression
+
+For each asset whose media type is worth encoding, a variant is built per coding
+in `encodings`, preferring a sidecar the build system already produced
+(`app.css.br`, `app.css.gz`, `app.css.zst`, the convention nginx's
+`brotli_static` and WhiteNoise use) and compressing in memory only when one is
+missing or older than the asset it encodes. A missing sidecar is logged at
+`WARNING`, because the compression level worth using for bytes compressed once
+and served forever is far slower than one worth paying per process start:
+brotli at quality 11 runs at roughly a megabyte a second, so it belongs in the
+build, and a startup cost is paid again by every replica.
+
+Each coding carries its **own** strong validator. Sharing one tag across codings
+is a real defect rather than an untidiness: a client holding the gzip copy would
+send `If-None-Match`, receive a `304`, and go on using bytes that are a
+different representation entirely. `Vary: Accept-Encoding` goes only on assets
+that actually have variants, since stamping it on an already-compressed image
+fragments every downstream cache key for nothing.
+
+Holding the encoded bytes in memory also buys something on-the-fly compression
+cannot offer at all: a `Range` over a compressed asset. The `compress`
+middleware must skip every `206`, because it has no way to restate a
+`Content-Range` computed over identity bytes; a pre-compressed variant has no
+such problem, since the range is a slice and `Content-Range` names offsets into
+the representation actually being sent.
+
+Compressing static assets is safe from BREACH, which needs a response that both
+reflects attacker-controlled input and carries a secret; a stylesheet does
+neither. That is why this uses `DEFAULT_COMPRESSORS` rather than the padded
+table this package ships for credential-bearing responses.
 
 ## Negotiated response compression
 

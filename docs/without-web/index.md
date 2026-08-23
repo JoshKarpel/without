@@ -231,6 +231,49 @@ nested opaque app is trimmed by its full accumulated path.
 `ws_mount` and `ws_delegate` are the exact WebSocket siblings (see
 [WebSocket routing](#websocket-routing)).
 
+## Static files
+
+`static_files(prefix, assets)` is a `GET`/`HEAD` `Route` serving an
+[`Inventory`](../without-asgi/index.md#serving-a-tree-of-assets) built by
+`without-asgi`. The split is the placement rule at work: reading a file and
+deciding between `200`, `206`, `304`, and `416` needs no routing vocabulary at
+all, so it lives one layer down; matching a prefix does, so it lives here.
+
+```python
+from without_asgi import inventory
+from without_web import Router, static_files, url_for
+
+assets = inventory(Path("dist/assets"), cache_control=b"public, max-age=31536000, immutable")
+styles = static_files("/assets", assets)
+
+router = Router(routes=(styles, *api_routes), fallback=not_found)
+url_for(styles, {"rest": "app.a1b2c3d4.css"})  # -> /assets/app.a1b2c3d4.css
+```
+
+The catch-all remainder _is_ the inventory key, so a request is a dictionary
+lookup and no filesystem path is built from it; see the
+[argument for that](../without-asgi/index.md#there-is-no-directory-traversal),
+which is the whole security story. What this layer adds is the two things only a
+router can: the prefix match, and reversibility. The returned `Route` is an
+ordinary value carrying its complete `segments`, so `url_for` works on it with no
+router involved, and `mount` rebases it like any other route.
+
+A catch-all does not match an empty remainder, so the bare `prefix` is itself a
+`404`. That is the right answer rather than a gap: a request for a directory is a
+listing request, and an inventory serves no listings.
+
+A single-page app's entry point is not a mount either, since it must also answer
+client-side deep links that match no asset at all. That is the router's
+`fallback`, which is the one place that sees every unmatched path:
+
+```python
+async def spa(state, match) -> Reply:
+    return await serve_asset(match.scope, assets, "index.html")
+
+
+router = Router(routes=(static_files("/assets", assets), *api_routes), fallback=spa)
+```
+
 ## Middleware: router-wide, per-prefix, or per-route
 
 A `Router`'s `middleware` runs on every dispatch. To scope middleware to *part* of

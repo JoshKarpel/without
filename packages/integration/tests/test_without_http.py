@@ -13,6 +13,7 @@ from dataclasses import field
 from pathlib import Path
 
 import httpx
+import pytest
 from integration.todos.app import todos_app
 from integration.todos.core import Todo
 from integration.todos.core import TodoList
@@ -22,8 +23,11 @@ from without_asgi import HttpHandler
 from without_asgi import HttpScope
 from without_asgi import Inbound
 from without_asgi import Outbound
+from without_asgi import Response
+from without_asgi import encode_response
 from without_asgi import file_response
 from without_asgi import headers
+from without_asgi import inventory
 from without_asgi import make_asgi_app
 from without_asgi.compression import DEFAULT_COMPRESSORS
 from without_http import DEFAULT_DECOMPRESSORS
@@ -33,6 +37,9 @@ from without_http import decompress
 from without_http import request
 from without_http import serving
 from without_http.testing import loopback_client
+from without_web import Match
+from without_web import Router
+from without_web import static_files
 from wsproto import ConnectionType
 from wsproto import WSConnection
 from wsproto.events import AcceptConnection
@@ -126,6 +133,104 @@ async def test_file_response_streams_a_file_over_without_http(tmp_path: Path) ->
         # makes that deterministic; a client fast enough to reach teardown first would
         # otherwise cancel the connection mid-read.
         await drained.wait()
+
+
+_STYLESHEET = ("body { color: rebeccapurple; }\n" * 200).encode()  # ~6 KB, several chunks
+
+
+def _assets_app(root: Path) -> ASGIApp:
+    """A `without-web` router serving an inventory, the whole stack in one app."""
+
+    @asynccontextmanager
+    async def lifespan() -> AsyncIterator[None]:
+        yield None
+
+    assets = inventory(root, cache_control=b"public, max-age=31536000, immutable")
+    router: Router[None] = Router(routes=(static_files("/static", assets),), fallback=_no_route)
+    return make_asgi_app(lifespan, http=router.dispatch)
+
+
+def _no_route(state: None, match: Match[HttpScope]) -> HttpHandler:
+    async def handler(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
+        for event in encode_response(Response(status=404, body=b"no route\n")):
+            yield event
+
+    return handler
+
+
+@asynccontextmanager
+async def _assets(tmp_path: Path) -> AsyncIterator[Client]:
+    (tmp_path / "app.css").write_bytes(_STYLESHEET)
+    async with loopback_client(_assets_app(tmp_path)) as client:
+        yield client
+
+
+async def test_a_mounted_inventory_serves_an_asset_over_without_http(tmp_path: Path) -> None:
+    async with _assets(tmp_path) as client:
+        async with request(client, "GET", "http://testserver/static/app.css") as (head, body):
+            assert head.status == 200
+            assert headers.first(head.headers, b"content-type") == b"text/css; charset=utf-8"
+            assert headers.first(head.headers, b"cache-control") == b"public, max-age=31536000, immutable"
+            assert headers.first(head.headers, b"accept-ranges") == b"bytes"
+            assert await body.read() == _STYLESHEET
+
+
+async def test_a_revalidated_asset_comes_back_as_a_bodyless_304(tmp_path: Path) -> None:
+    async with _assets(tmp_path) as client:
+        async with request(client, "GET", "http://testserver/static/app.css") as (head, body):
+            etag = headers.first(head.headers, b"etag")
+            await body.read()
+        assert etag is not None
+
+        conditional = ((b"if-none-match", etag),)
+        async with request(client, "GET", "http://testserver/static/app.css", headers=conditional) as (head, body):
+            assert head.status == 304
+            assert await body.read() == b""
+
+
+async def test_a_range_request_frames_exactly_the_span(tmp_path: Path) -> None:
+    async with _assets(tmp_path) as client:
+        ranged = ((b"range", b"bytes=100-199"),)
+        async with request(client, "GET", "http://testserver/static/app.css", headers=ranged) as (head, body):
+            assert head.status == 206
+            assert headers.first(head.headers, b"content-range") == b"bytes 100-199/%d" % len(_STYLESHEET)
+            assert await body.read() == _STYLESHEET[100:200]
+
+
+async def test_an_unsatisfiable_range_is_a_416(tmp_path: Path) -> None:
+    async with _assets(tmp_path) as client:
+        ranged = ((b"range", b"bytes=999999-"),)
+        async with request(client, "GET", "http://testserver/static/app.css", headers=ranged) as (head, body):
+            assert head.status == 416
+            assert headers.first(head.headers, b"content-range") == b"bytes */%d" % len(_STYLESHEET)
+            assert await body.read() == b""
+
+
+async def test_a_pre_compressed_variant_is_negotiated_over_the_wire(tmp_path: Path) -> None:
+    async with _assets(tmp_path) as client:
+        offer = ((b"accept-encoding", b"gzip"),)
+        async with request(client, "GET", "http://testserver/static/app.css", headers=offer) as (head, body):
+            assert head.status == 200
+            assert headers.first(head.headers, b"content-encoding") == b"gzip"
+            assert headers.first(head.headers, b"vary") == b"accept-encoding"
+            assert gzip.decompress(await body.read()) == _STYLESHEET
+
+
+async def test_a_path_outside_the_mount_reaches_the_router_fallback(tmp_path: Path) -> None:
+    # The mount is a catch-all under one prefix, not a catch-all for the app: a path it
+    # does not cover still reaches whatever the router was going to do.
+    async with _assets(tmp_path) as client:
+        async with request(client, "GET", "http://testserver/elsewhere") as (head, body):
+            assert head.status == 404
+            assert await body.read() == b"no route\n"
+
+
+@pytest.mark.security("a traversal payload crossing a real wire is a 404, not a file")
+async def test_a_traversal_payload_over_the_wire_is_a_404(tmp_path: Path) -> None:
+    async with _assets(tmp_path) as client:
+        async with request(client, "GET", "http://testserver/static/../../etc/passwd") as (head, body):
+            assert head.status == 404
+            await body.read()
 
 
 async def test_todos_router_served_over_without_http_is_reachable_by_httpx() -> None:

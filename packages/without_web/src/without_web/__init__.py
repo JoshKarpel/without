@@ -76,6 +76,7 @@ from without_web.router import with_middleware
 from without_web.router import ws_delegate
 from without_web.router import ws_mount
 from without_web.router import ws_route
+from without_web.static import static_files
 
 __all__ = [
     "FLOAT",
@@ -149,6 +150,7 @@ __all__ = [
     "query_param",
     "route",
     "split_path",
+    "static_files",
     "url_for",
     "websocket_scope",
     "with_middleware",
