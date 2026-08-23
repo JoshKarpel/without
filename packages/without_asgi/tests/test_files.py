@@ -61,16 +61,58 @@ async def test_unknown_suffix_falls_back_to_octet_stream(tmp_path: Path) -> None
     assert _headers(events)[b"content-type"] == b"application/octet-stream"
 
 
-async def test_a_suffix_naming_a_coding_declares_it_alongside_the_type(tmp_path: Path) -> None:
-    # Dropping the coding `guess_file_type` reports is how gzip bytes come to be
-    # labelled image/svg+xml, which a browser renders rather than decompressing.
+async def test_a_download_naming_a_coding_is_handed_over_under_the_codings_own_type(tmp_path: Path) -> None:
+    # Declaring `content-encoding: gzip` here would have a conformant client decode in
+    # transit, so the user who asked for report.tar.gz saves raw tar bytes under that
+    # name: the Apache `AddEncoding .gz` problem.
+    path = tmp_path / "report.tar.gz"
+    path.write_bytes(b"pretend these are gzip bytes")
+
+    headers = _headers(await collect(await file_response(path)))
+
+    assert headers[b"content-type"] == b"application/gzip"
+    assert b"content-encoding" not in headers
+
+
+async def test_a_download_in_a_coding_with_no_registered_type_is_octet_stream(tmp_path: Path) -> None:
+    path = tmp_path / "app.css.br"
+    path.write_bytes(b"pretend these are brotli bytes")
+
+    headers = _headers(await collect(await file_response(path)))
+
+    assert headers[b"content-type"] == b"application/octet-stream"
+    assert b"content-encoding" not in headers
+
+
+async def test_a_download_is_never_described_by_the_type_its_bytes_decode_to(tmp_path: Path) -> None:
+    # `.svgz` resolves through the system mime database to image/svg+xml, which is the
+    # decoded type by another route: a browser would render gzip bytes as SVG.
     path = tmp_path / "logo.svgz"
     path.write_bytes(b"pretend these are gzip bytes")
 
     headers = _headers(await collect(await file_response(path)))
 
-    assert headers[b"content-type"] == b"image/svg+xml"
-    assert headers[b"content-encoding"] == b"gzip"
+    assert headers[b"content-type"] == b"application/gzip"
+    assert b"content-encoding" not in headers
+
+
+async def test_a_download_states_the_charset_of_a_textual_type(tmp_path: Path) -> None:
+    # A stylesheet gets no `<meta charset>` sniffing to rescue it from mojibake.
+    path = tmp_path / "app.css"
+    path.write_bytes("body::after { content: 'café' }".encode())
+
+    headers = _headers(await collect(await file_response(path)))
+
+    assert headers[b"content-type"] == b"text/css; charset=utf-8"
+
+
+async def test_a_download_charset_of_none_states_no_charset(tmp_path: Path) -> None:
+    path = tmp_path / "app.css"
+    path.write_bytes(b"body {}")
+
+    headers = _headers(await collect(await file_response(path, charset=None)))
+
+    assert headers[b"content-type"] == b"text/css"
 
 
 async def test_a_suffix_naming_only_a_coding_is_an_opaque_archive(tmp_path: Path) -> None:
@@ -305,6 +347,37 @@ class TestServeFile:
 
         assert dict(start.headers)[b"content-encoding"] == b"gzip"
         assert (revalidated.status, dict(revalidated.headers)[b"content-encoding"]) == (304, b"gzip")
+
+    async def test_a_304_repeats_the_content_type(self, tmp_path: Path) -> None:
+        # Without it a `compress()` above this cannot tell a representation it would
+        # never have encoded from one it would have, so it weakens a validator that is
+        # still exactly true of the stored bytes and breaks the next `If-Range`.
+        path = tmp_path / "photo.png"
+        path.write_bytes(_REPORT)
+        scope = a_scope(path="/photo.png")
+        etag = dict(_start(await collect(await serve_file(scope, path))).headers)[b"etag"]
+
+        revalidated = _start(
+            await collect(await serve_file(a_scope(path="/photo.png", headers=((b"if-none-match", etag),)), path))
+        )
+
+        assert (revalidated.status, dict(revalidated.headers)[b"content-type"]) == (304, b"image/png")
+
+    async def test_a_textual_type_states_the_charset(self, tmp_path: Path) -> None:
+        path = tmp_path / "app.css"
+        path.write_bytes(_REPORT)
+
+        start = _start(await collect(await serve_file(a_scope(path="/app.css"), path)))
+
+        assert dict(start.headers)[b"content-type"] == b"text/css; charset=utf-8"
+
+    async def test_a_charset_of_none_states_no_charset(self, tmp_path: Path) -> None:
+        path = tmp_path / "app.css"
+        path.write_bytes(_REPORT)
+
+        start = _start(await collect(await serve_file(a_scope(path="/app.css"), path, charset=None)))
+
+        assert dict(start.headers)[b"content-type"] == b"text/css"
 
     async def test_a_304_repeats_the_caching_policy(self, report: Path) -> None:
         etag = dict((await _serve(report))[0].headers)[b"etag"]

@@ -66,8 +66,14 @@ async def _answer(
     not_found: Response = NOT_FOUND,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     path: str | None = None,
+    query_string: bytes = b"",
 ) -> tuple[ResponseStart, bytes]:
-    scope = a_scope(path=path if path is not None else f"/{key}", headers=headers, method=method)
+    scope = a_scope(
+        path=path if path is not None else f"/{key}",
+        headers=headers,
+        method=method,
+        query_string=query_string,
+    )
     served = await serve_asset(scope, assets, key, not_found=not_found, chunk_size=chunk_size)
     events = await collect(served)
     start = events[0]
@@ -545,6 +551,18 @@ class TestServing:
         assert (start.status, body) == (304, b"")
         assert _header(start, b"content-encoding") == b"gzip"
 
+    async def test_a_304_for_an_asset_with_no_variants_names_the_type_it_revalidates(self, tree: Path) -> None:
+        # An asset with no variants carries no coding for a downstream `compress()` to
+        # read, so the type is the only evidence that it was never a candidate. Without
+        # it the strong tag is weakened and the client's next `If-Range` refetches.
+        assets = inventory(tree)
+        etag = assets.assets["logo.png"].identity.etag
+
+        start, body = await _answer(assets, "logo.png", headers=((b"if-none-match", etag),))
+
+        assert (start.status, body) == (304, b"")
+        assert _header(start, b"content-type") == b"image/png"
+
 
 class TestDirectoryIndexes:
     @pytest.fixture
@@ -564,6 +582,20 @@ class TestDirectoryIndexes:
 
         assert (start.status, body) == (302, b"")
         assert _header(start, b"location") == b"guide/"
+
+    async def test_the_redirect_carries_the_query_across(self, assets: Inventory) -> None:
+        # A relative reference stating no query does not inherit the base URI's
+        # (RFC 3986 §5.3), so the search would land on the unparameterized page.
+        start, _body = await _answer(assets, "guide", path="/guide", query_string=b"theme=dark")
+
+        assert _header(start, b"location") == b"guide/?theme=dark"
+
+    async def test_the_redirect_states_a_zero_length_rather_than_being_framed_by_the_transport(
+        self, assets: Inventory
+    ) -> None:
+        start, _body = await _answer(assets, "guide", path="/guide")
+
+        assert _header(start, b"content-length") == b"0"
 
     async def test_the_redirect_target_is_relative_so_the_mount_prefix_is_irrelevant(self, tmp_path: Path) -> None:
         nested = tmp_path / "docs" / "guide"
@@ -596,6 +628,11 @@ class TestDirectoryIndexes:
         start, body = await _answer(assets, "css/app.css", path="/css/app.css")
 
         assert (start.status, body) == (200, _STYLESHEET)
+
+    async def test_the_default_not_found_states_its_own_length(self, tree: Path) -> None:
+        start, body = await _answer(inventory(tree, encodings={}), "absent")
+
+        assert (start.status, _header(start, b"content-length")) == (404, b"%d" % len(body))
 
     async def test_a_custom_not_found_response_is_used(self, tree: Path) -> None:
         teapot = Response(status=418, body=b"nope\n")

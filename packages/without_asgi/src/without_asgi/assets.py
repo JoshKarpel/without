@@ -76,6 +76,7 @@ logger = logging.getLogger(__name__)
 
 _CONTENT_TYPE = b"content-type"
 _CONTENT_ENCODING = b"content-encoding"
+_CONTENT_LENGTH = b"content-length"
 _ACCEPT_RANGES = b"accept-ranges"
 _ACCEPT_ENCODING = b"accept-encoding"
 _ETAG = b"etag"
@@ -102,10 +103,14 @@ _MOVED = 302
 # What `serve_asset` answers for a key the inventory does not hold. Public and
 # injectable: the policy is the caller's, and `static_files` passes it straight through
 # rather than keeping a second default in step with this one.
+_NOT_FOUND_BODY = b"not found\n"
 NOT_FOUND = Response(
     status=404,
-    headers=((_CONTENT_TYPE, b"text/plain; charset=utf-8"),),
-    body=b"not found\n",
+    headers=(
+        (_CONTENT_TYPE, b"text/plain; charset=utf-8"),
+        (_CONTENT_LENGTH, b"%d" % len(_NOT_FOUND_BODY)),
+    ),
+    body=_NOT_FOUND_BODY,
 )
 # Store the response, but revalidate before every reuse. Correct for any tree, whatever
 # its filenames, which is why it is the default. It is not the obvious performance loss
@@ -167,14 +172,17 @@ class Representation:
     """What a `200` or `206` says about this representation."""
     revalidation: RawHeaders
     """
-    What a `304` repeats: RFC 9110 §15.4.5's required fields, plus the
-    `content-encoding` naming *which* stored variant is being revalidated.
+    What a `304` repeats: RFC 9110 §15.4.5's required fields, plus the `content-type`
+    and `content-encoding` naming *which* stored variant is being revalidated.
 
-    §15.4.5 states a floor rather than a ceiling, and the coding earns its place there.
-    Without it a downstream `compress()` cannot tell a `304` for an already-encoded
-    variant from one it would have encoded itself, so it weakens a validator that is
-    still exactly true of the stored bytes, and the client's next `If-Range`, which
-    requires strong comparison, refetches the whole asset.
+    §15.4.5 states a floor rather than a ceiling, and both of those earn their place
+    there. Without them a downstream `compress()` cannot tell a `304` for a
+    representation it would never have encoded from one it would have encoded itself,
+    so it weakens a validator that is still exactly true of the stored bytes, and the
+    client's next `If-Range`, which requires strong comparison, refetches the whole
+    asset. The coding settles it for an already-encoded variant; the type settles it
+    for a representation with no variants at all, a PNG or a font or a video, which
+    carries no coding to read.
     """
     body: bytes | None = None
     """The encoded bytes, held in memory; `None` for the identity form, read from disk."""
@@ -188,6 +196,13 @@ class Asset:
     last_modified: datetime
     identity: Representation
     encodings: Mapping[bytes, Representation] = field(default=_NO_ENCODINGS)
+    codings: tuple[bytes, ...] = ()
+    """
+    `encodings`' keys in the server's preference order, which is what
+    `negotiate_coding` takes. Held rather than derived per request: it is a constant of
+    the asset, and rebuilding it on every request for every compressible asset is an
+    allocation on the hot path buying nothing.
+    """
     needs_trailing_slash: bool = False
     """
     Whether this key reaches a directory's index under a URL that is missing the
@@ -431,6 +446,7 @@ def _asset(
         last_modified=modified,
         identity=identity,
         encodings=MappingProxyType(encoded) if encoded else _NO_ENCODINGS,
+        codings=tuple(encoded),
     )
 
 
@@ -522,7 +538,7 @@ def _representation(
         size=size,
         etag=etag,
         described=(*headers, (_CONTENT_TYPE, content_type), *encoding, *validators, (_ACCEPT_RANGES, _BYTES), *vary),
-        revalidation=(*headers, *encoding, *validators, *vary),
+        revalidation=(*headers, (_CONTENT_TYPE, content_type), *encoding, *validators, *vary),
         body=body,
     )
 
@@ -559,9 +575,9 @@ def _with_index_aliases(assets: dict[str, Asset], index: str | None) -> Mapping[
     return assets
 
 
-def _slash_redirect(key: str) -> Response:
+def _slash_redirect(key: str, query_string: bytes) -> Response:
     """
-    Send `/assets/guide` to `/assets/guide/`.
+    Send `/assets/guide?theme=dark` to `/assets/guide/?theme=dark`.
 
     Serving the index at the slash-less URL would resolve every relative link and asset
     reference in that document one level too high, against `/assets/` instead of
@@ -571,9 +587,24 @@ def _slash_redirect(key: str) -> Response:
     under, so it names the final segment and lets the client resolve it against the
     request URI (RFC 9110 §10.2.2). The segment is percent-encoded, which also keeps a
     name containing a colon from being read as a scheme.
+
+    The query is carried across explicitly, because a relative reference that states no
+    query does not inherit the base URI's (RFC 3986 §5.3): dropping it would answer a
+    search or a tracking parameter with the unparameterized page, and it is what nginx
+    and WhiteNoise both preserve.
     """
     _, _, name = key.rpartition("/")
-    return Response(status=_MOVED, headers=((_LOCATION, quote(name, safe="").encode(_ASCII) + b"/"),))
+    query = b"" if not query_string else b"?" + query_string
+    return Response(
+        status=_MOVED,
+        headers=(
+            (_LOCATION, quote(name, safe="").encode(_ASCII) + b"/" + query),
+            # A redirect carries no body, and a head that states no length is framed by
+            # the transport instead: h11 answers a bodyless `302` with a chunked
+            # encoding and a terminating chunk nobody needs.
+            (_CONTENT_LENGTH, b"0"),
+        ),
+    )
 
 
 def _report(compressed_here: list[str]) -> None:
@@ -622,7 +653,7 @@ async def serve_asset(
     if asset is None:
         return stream_from_iterable(encode_response(not_found))
     if asset.needs_trailing_slash and not scope.path.endswith("/"):
-        return stream_from_iterable(encode_response(_slash_redirect(key)))
+        return stream_from_iterable(encode_response(_slash_redirect(key, scope.query_string)))
     chosen = _negotiated(asset, scope.headers)
     selection = selection_for(
         size=chosen.size,
@@ -644,10 +675,9 @@ async def serve_asset(
 
 
 def _negotiated(asset: Asset, request_headers: RawHeaders) -> Representation:
-    if not asset.encodings:
+    if not asset.codings:
         return asset.identity
-    # The mapping's order is the server's preference order.
-    coding = negotiate_coding(_accept_encoding(request_headers), tuple(asset.encodings))
+    coding = negotiate_coding(_accept_encoding(request_headers), asset.codings)
     return asset.identity if coding is None else asset.encodings[coding]
 
 

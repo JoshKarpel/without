@@ -235,14 +235,29 @@ stream, e.g. on a client disconnect mid-download). A `HEAD` request needs nothin
 special here: `file_response` always streams, and the transport drops the body
 chunks on the wire.
 
-`guess_file_type` reports a content *coding* alongside the media type, and both
-are used. A `logo.svgz` is gzip-encoded SVG, so it goes out as `image/svg+xml`
-with `Content-Encoding: gzip`; dropping the coding is how gzip bytes come to be
-labelled as an image a browser then tries to render. The coding is claimed only
-where a media type came with it, so a bare `archive.gz` guesses `(None, "gzip")`
-and stays an opaque `application/octet-stream` download. An explicit
-`content_type` suppresses the coding entirely, since a caller naming the type is
-describing the bytes as they are.
+`guess_file_type` reports a content *coding* alongside the media type, and what
+each helper does with it follows from whether it is serving a resource or handing
+a file over. `serve_file` and `inventory` serve a resource, so they claim the
+coding: a `logo.svgz` is gzip-encoded SVG and goes out as `image/svg+xml` with
+`Content-Encoding: gzip`, because dropping the coding is how gzip bytes come to be
+labelled as an image a browser then tries to render.
+
+`file_response` hands the file over, so it never claims one. A conformant client
+decodes `Content-Encoding` in transit, so declaring it here is how someone asks for
+`report.tar.gz` and saves raw tar bytes under that name: the Apache
+`AddEncoding .gz` problem. An encoded file is described by that coding's own media
+type instead (`application/gzip`), which is the only description true of the bytes
+on the wire, since naming the *decoded* type with no coding would describe a tar
+and send gzip. Keying that on the coding rather than the file's final suffix
+matters, because a suffix resolves through the system mime database, which knows
+`.svgz` as `image/svg+xml`: the decoded type again, by another route.
+
+A suffix naming only a coding is an opaque download either way, since a bare
+`archive.gz` guesses `(None, "gzip")` and stays `application/octet-stream`. An
+explicit `content_type` suppresses the coding entirely, since a caller naming the
+type is describing the bytes as they are, and `charset` (defaulting to `utf-8`, as
+in `inventory`) names the encoding appended to a textual type, which a stylesheet
+needs: it gets no `<meta charset>` sniffing to rescue it from mojibake.
 
 `file_response` answers `200` and nothing else, and that is its job rather than a
 gap. It serves content with no cacheable identity: a report just rendered, a
@@ -313,6 +328,9 @@ writes, so two different bodies can share a size and an `st_mtime_ns`. A weak
 validator fails the strong comparison `If-Range` requires (§13.1.5), so a
 resumed download correctly restarts rather than splicing bytes from two
 versions. Pass `etag` when you hold something better.
+
+Its `304` repeats the `Content-Type` and any `Content-Encoding` alongside the
+validators, for the reason [an asset's does](#pre-compression).
 
 Only **single** ranges are honored. A multi-range request needs a
 `multipart/byteranges` body, which is most of the implementation cost for a case
@@ -476,7 +494,10 @@ one level too high. The `Location` is relative (just the final segment plus a
 slash), because an inventory does not know what prefix it was mounted under, and
 it is a `302` rather than a `301` for the same reason: the URL shape it points at
 is not the inventory's to make permanent. This is WhiteNoise's `redirect`
-decision, and for the same reasons.
+decision, and for the same reasons. The request's query string is carried across
+explicitly, since a relative reference stating no query does not inherit the base
+URI's (RFC 3986 §5.3), and a dropped one lands a search on the unparameterized
+page.
 
 ### Response headers
 
@@ -595,13 +616,15 @@ different representation entirely. `Vary: Accept-Encoding` goes only on assets
 that actually have variants, since stamping it on an already-compressed image
 fragments every downstream cache key for nothing.
 
-A `304` repeats the variant's `Content-Encoding` alongside the validators RFC
-9110 §15.4.5 requires, which is a floor rather than a ceiling. Without it a
-downstream [`compress`](#negotiated-response-compression) cannot tell a `304` for
-an already-encoded
-variant from one it would itself have encoded, so it weakens a validator that is
-still exactly true of the stored bytes, and the client's next `If-Range`, which
-requires strong comparison, refetches the whole asset.
+A `304` repeats the `Content-Type` and the variant's `Content-Encoding` alongside
+the validators RFC 9110 §15.4.5 requires, which is a floor rather than a ceiling.
+Without them a downstream [`compress`](#negotiated-response-compression) cannot
+tell a `304` for a representation it would never have encoded from one it would
+itself have encoded, so it weakens a validator that is still exactly true of the
+stored bytes, and the client's next `If-Range`, which requires strong comparison,
+refetches the whole asset. The coding settles it for an already-encoded variant;
+the type is what settles it for an asset with **no** variants at all, a PNG or a
+font or a video, which carries no coding to read.
 
 A sidecar is suppressed by a **fixed** suffix set (`.gz`, `.zst`, `.br`), not by
 the codings currently configured. Keying it on the live table would mean a

@@ -20,12 +20,20 @@
   better. Only single ranges are honored: `multipart/byteranges` is most of the cost for a
   case almost nothing sends, and §14 permits ignoring a `Range`, so the check is a scan for
   a comma rather than a split and a header naming a hundred thousand ranges costs one
-  linear pass. `file_response` is unchanged and keeps its job, content with no cacheable
-  identity, where a validator that changes every request buys nothing. Both helpers use the
-  content *coding* `mimetypes.guess_file_type` reports alongside the media type, so a
-  `logo.svgz` goes out as `image/svg+xml` with `Content-Encoding: gzip` rather than as gzip
-  bytes a browser tries to render as an image; a suffix naming only a coding (`archive.gz`)
-  stays an opaque download, and an explicit `content_type` suppresses the coding entirely.
+  linear pass. `file_response` keeps its job, content with no cacheable
+  identity, where a validator that changes every request buys nothing. `serve_file` and
+  `inventory` serve a *resource*, so they use the content *coding*
+  `mimetypes.guess_file_type` reports alongside the media type, and a `logo.svgz` goes out
+  as `image/svg+xml` with `Content-Encoding: gzip` rather than as gzip bytes a browser
+  tries to render as an image. `file_response` hands a file *over* instead, so it never
+  declares a coding a conformant client would decode in transit, and describes an encoded
+  file by that coding's own type (`report.tar.gz` is `application/gzip`): asking for an
+  archive and saving raw tar bytes under its name is the Apache `AddEncoding .gz` failure,
+  and not one a download helper should have. A suffix naming only a coding (`archive.gz`)
+  is an opaque download either way, and an explicit `content_type` suppresses the coding
+  entirely. Both helpers take a `charset`, defaulting to `utf-8` as `inventory` does, since
+  a textual type that states none leaves the encoding to the recipient's guess, which is
+  how a UTF-8 stylesheet renders as mojibake with no `<meta charset>` to rescue it.
   For a *tree*, `inventory(root)` walks it once at startup into a mapping of key to
   `Asset`, and `serve_asset` answers out of it. This is deliberately not a directory mount:
   a mount derives a filesystem path from request input and then has to prove the derivation
@@ -41,7 +49,9 @@
   to the index inside it under *both* spellings, `"guide"` and `"guide/"`, so the keyspace
   does not depend on whether the shell above strips a trailing slash; only the slash-less
   key redirects, with a relative `302` to `/guide/` rather than the document, since serving
-  it there resolves every relative link in the page one level too high. The cost is the one in the
+  it there resolves every relative link in the page one level too high. The request's query
+  is carried across explicitly, because a relative reference stating none does not inherit
+  the base URI's (RFC 3986 §5.3). The cost is the one in the
   name: nothing may write into the tree while the process runs. That is not enforced by file
   modes, which change and which root ignores, but it is detected, since the `stat` before
   any `ResponseStart` raises `AssetChanged` rather than framing a body whose length and
@@ -68,8 +78,11 @@
   belongs in the build rather than in a cost every replica pays at startup. Each coding
   carries its *own* strong validator, since one tag shared across codings lets a client
   holding the gzip copy revalidate into a `304` and keep bytes from a different
-  representation, and a `304` repeats that coding so a downstream `compress` can tell a
-  revalidation of an already-encoded variant from one it would have encoded itself.
+  representation, and a `304` repeats both that coding and the media type, which is what lets
+  a downstream `compress` tell a revalidation it would never have encoded from one it would
+  have. The type is what carries an asset with no variants at all, a PNG or a font or a
+  video, which has no coding to read: without it that asset's strong validator is weakened
+  on every revalidation and the client's next `If-Range` refetches the whole thing.
   `Vary: Accept-Encoding` goes only on assets that have variants, since
   stamping it on an image fragments every downstream cache key for nothing. Sidecars are
   recognized by a fixed suffix set rather than by the configured codings, so an `app.css.br`

@@ -275,12 +275,19 @@ client-side deep links that match no asset at all. That is the router's
 `fallback`, which is the one place that sees every unmatched path:
 
 ```python
-async def spa(state, match) -> Reply:
-    return await serve_asset(match.scope, assets, "index.html")
+async def spa(state, scope: HttpScope) -> Reply:
+    return await serve_asset(scope, assets, "index.html")
 
 
-router = Router(routes=(static_files("/assets", assets), *api_routes), fallback=spa)
+router = Router(
+    routes=(static_files("/assets", assets), *api_routes),
+    fallback=handle(http_scope(), fn=spa),
+)
 ```
+
+A `fallback` is an `HttpEndpoint`, the same `(state, match) -> HttpHandler` a route's
+methods are, so a handler reaches it through `handle` like any other: `http_scope()`
+is the extractor that hands the scope to `fn`.
 
 ## Middleware: router-wide, per-prefix, or per-route
 
