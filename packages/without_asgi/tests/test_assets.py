@@ -376,6 +376,15 @@ class TestSymlinks:
 
         assert inventory(tree, encodings={}).get("alias.css") is not None
 
+    def test_a_symlinked_directory_raises_rather_than_leaving_the_inventory_short(self, tree: Path) -> None:
+        # `Path.walk` reports a symlinked directory among the *filenames* and does not
+        # descend it, so dropping it with the fifos would leave every asset beneath it
+        # out of the keyspace and answer 404 for them in production, with a clean startup.
+        (tree / "alias").symlink_to(tree / "css", target_is_directory=True)
+
+        with pytest.raises(ValueError, match=r"alias is a symlink to the directory"):
+            inventory(tree, encodings={})
+
     def test_a_dangling_symlink_names_the_link_rather_than_its_target(self, tree: Path) -> None:
         (tree / "dangling.css").symlink_to(tree / "never-written.css")
 
@@ -925,6 +934,32 @@ class TestSidecars:
         assets = inventory(tree, encodings=encodings)
 
         assert f"css/app.css{suffix}" not in assets.assets
+
+    @pytest.mark.parametrize(
+        ("name", "content_type"),
+        [
+            pytest.param("data.tar", b"application/x-tar", id="a-tarball-and-its-gzip"),
+            pytest.param("manual.pdf", b"application/pdf", id="a-pdf-and-its-gzip"),
+        ],
+    )
+    async def test_a_sidecar_beside_an_asset_that_is_never_encoded_keeps_its_own_url(
+        self, tree: Path, name: str, content_type: bytes
+    ) -> None:
+        # A media type this never compresses has no variant for the sidecar to become, so
+        # suppressing it would take those bytes out of the keyspace and put them back
+        # nowhere: a silent 404 for a second deliverable the operator published, which on
+        # its own is an asset in good standing.
+        payload = b"pretend this is the uncompressed form\n"
+        (tree / name).write_bytes(payload)
+        (tree / f"{name}.gz").write_bytes(gzip.compress(payload, mtime=0))
+
+        assets = inventory(tree)
+
+        assert assets.assets[name].encodings == {}
+        start, _body = await _answer(assets, f"{name}.gz")
+        assert start.status == 200
+        assert _header(start, b"content-type") == content_type
+        assert _header(start, b"content-encoding") == b"gzip"
 
     async def test_a_sidecar_with_no_asset_beside_it_is_served_as_itself(self, tree: Path) -> None:
         (tree / "orphan.gz").write_bytes(gzip.compress(b"lonely", mtime=0))

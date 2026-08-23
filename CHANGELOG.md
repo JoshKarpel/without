@@ -43,9 +43,9 @@
   traversal payload is simply a key that is not present. Every decision a mount makes per
   request with an attacker in the loop is made once here over a tree the operator
   assembled: regular files only, each resolved and confirmed inside the root (one that
-  escapes raises, and no flag relaxes that, because that flag *is* aiohttp's CVE), symlinked
-  directories not descended, a directory that cannot be read raising rather than silently
-  contributing nothing, and no directory listing at all. `index=` aliases a directory's key
+  escapes raises, and no flag relaxes that, because that flag *is* aiohttp's CVE), a symlinked
+  directory and a directory that cannot be read both raising rather than silently contributing
+  nothing, and no directory listing at all. `index=` aliases a directory's key
   to the index inside it under *both* spellings, `"guide"` and `"guide/"`, so the keyspace
   does not depend on whether the shell above strips a trailing slash; only the slash-less
   key redirects, with a relative `302` to `/guide/` rather than the document, since serving
@@ -84,10 +84,13 @@
   video, which has no coding to read: without it that asset's strong validator is weakened
   on every revalidation and the client's next `If-Range` refetches the whole thing.
   `Vary: Accept-Encoding` goes only on assets that have variants, since
-  stamping it on an image fragments every downstream cache key for nothing. Sidecars are
-  recognized by a fixed suffix set rather than by the configured codings, so an `app.css.br`
-  is never published as an asset of its own (brotli bytes labelled `text/css`) merely because
-  brotli is not among them, and a file already stored in a coding is served with it rather
+  stamping it on an image fragments every downstream cache key for nothing. A sidecar is
+  recognized as one only beside an asset that is itself encoded, and then by a fixed suffix set
+  rather than by the configured codings: an `app.css.br` is never published as an asset of its
+  own (brotli bytes labelled `text/css`) merely because brotli is not among them, while a
+  `data.tar.gz` beside its own `data.tar` keeps its URL, since a media type that is never
+  compressed has no variant for it to become and dropping it would be a silent `404` for a
+  second deliverable. A file already stored in a coding is served with it rather
   than encoded a second time. Holding encoded
   bytes in memory also makes a `Range` over a compressed asset work, which on-the-fly
   compression cannot do at all, since it has no way to restate a `Content-Range` computed

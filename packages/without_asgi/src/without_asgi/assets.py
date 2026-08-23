@@ -13,6 +13,7 @@ from dataclasses import replace
 from datetime import UTC
 from datetime import datetime
 from pathlib import Path
+from stat import S_ISDIR
 from stat import S_ISREG
 from types import MappingProxyType
 from typing import NoReturn
@@ -271,7 +272,9 @@ def inventory(
     - Each entry is resolved and confirmed to be inside `root`; one that escapes
       **raises**, naming both ends. No flag relaxes this, because that flag is
       precisely aiohttp's CVE-2024-23334.
-    - Symlinked *directories* are not descended into, so a cycle cannot hang the walk.
+    - A symlinked *directory* **raises**. Descending it could cycle and hang the walk,
+      and skipping it is the silent shortfall again, since `Path.walk` reports one among
+      the filenames rather than the directories.
     - Content type, validators, and response headers are computed now, so serving hands
       an immutable tuple through rather than rebuilding one per request.
 
@@ -315,7 +318,10 @@ def inventory(
     variant is built per coding in `encodings`, preferring a sidecar file the build
     system already produced (`app.css.br`, `app.css.gz`, `app.css.zst`, the convention
     nginx's `brotli_static` and WhiteNoise use) and compressing in memory only when one
-    is missing or older than the asset it encodes. A missing sidecar is logged, because
+    is missing or older than the asset it encodes. A sidecar is recognized as one only
+    beside an asset that is *itself* encoded, so a `data.tar.gz` published alongside its
+    own `data.tar` keeps its URL rather than disappearing into a variant that a
+    non-compressible media type never builds. A missing sidecar is logged, because
     the level worth using for bytes compressed once and served forever is far slower
     than one worth paying per process start: brotli quality 11 runs at roughly a
     megabyte per second, so it belongs in the build, not in every replica's startup.
@@ -339,7 +345,7 @@ def inventory(
     compressed_here: list[str] = []
     assets = {
         key: _asset(key, path, stat, etag_for, headers, charset, encodings, compressible, compressed_here)
-        for key, (path, stat) in _without_sidecars(found, encodings).items()
+        for key, (path, stat) in _without_sidecars(found, encodings, charset, compressible).items()
     }
     _report(compressed_here)
     return Inventory(assets=_with_index_aliases(assets, index))
@@ -373,34 +379,80 @@ def _regular_files(base: Path) -> dict[str, tuple[Path, os.stat_result]]:
             # happens to name it.
             if S_ISREG(stat.st_mode):
                 found[path.relative_to(base).as_posix()] = (resolved, stat)
+            elif S_ISDIR(stat.st_mode):
+                # `Path.walk` reports a symlinked directory among the *filenames* rather
+                # than descending it, so this is the only way a directory reaches here.
+                # Dropping it with the fifos would leave the inventory silently short
+                # every asset beneath it, which is what `_unreadable` refuses for a
+                # directory that cannot be opened.
+                raise ValueError(
+                    f"{path} is a symlink to the directory {resolved}, which the walk does not descend into, "
+                    "so every asset beneath it would be missing. Replace the link with a real directory, or "
+                    "move what it points at into the root."
+                )
     return found
 
 
 def _without_sidecars(
     found: dict[str, tuple[Path, os.stat_result]],
     encodings: Mapping[bytes, Callable[[], Compressor]],
+    charset: str | None,
+    compressible: Callable[[bytes | None], bool],
 ) -> dict[str, tuple[Path, os.stat_result]]:
     """
     Drop `app.css.br` when `app.css` is present: it is that asset's encoded form, not an
     asset of its own, and publishing it too would hand the same bytes a second URL,
     outside negotiation, under a validator unrelated to the asset's.
 
-    The suffixes are a **fixed** set, deliberately not the active `encodings` table. Key
-    the suppression on the table and a coding's absence exposes its sidecars: with
-    `encodings={b"gzip": ...}` an `app.css.br` beside `app.css` becomes an asset in its
-    own right, and with `encodings={}` every sidecar in the tree does. `.zst` is worse
-    still, because `mimetypes` has no entry for it, so `app.css.zst` would go out as
-    `application/zstd` at a URL the build system's naming makes guessable. This is why
-    WhiteNoise's `is_compressed_variant` tests a literal `(".gz", ".br")` rather than
-    anything configurable. A coding outside the table still suppresses its own sidecars,
-    so a custom one loses nothing.
+    Only where the asset beside it is one `_encodings` will actually build variants for.
+    A media type this never compresses has no variant for a sidecar to *become*, so
+    suppressing it would take those bytes out of the keyspace and put them back nowhere:
+    a `data.tar.gz` published beside its own `data.tar` would be a `404`, and a silent
+    one, since nothing about a tarball is wrong enough to say anything about at startup.
+    On its own that file is already an asset in good standing, `application/x-tar` with
+    `content-encoding: gzip`, so the presence of a second file is the last thing that
+    should decide whether it has a URL.
+
+    Where the asset *is* encoded, the suffixes are a **fixed** set, deliberately not the
+    active `encodings` table. Key the suppression on the table and a coding's absence
+    exposes its sidecars: with `encodings={b"gzip": ...}` an `app.css.br` beside
+    `app.css` becomes an asset in its own right, and with `encodings={}` every sidecar in
+    the tree does. `.zst` is worse still, because `mimetypes` has no entry for it, so
+    `app.css.zst` would go out as `application/zstd` at a URL the build system's naming
+    makes guessable. This is why WhiteNoise's `is_compressed_variant` tests a literal
+    `(".gz", ".br")` rather than anything configurable. A coding outside the table still
+    suppresses its own sidecars, so a custom one loses nothing.
     """
     suffixes = frozenset(_SIDECAR_SUFFIXES.values()) | {_sidecar_suffix(coding) for coding in encodings}
     return {
         key: entry
         for key, entry in found.items()
-        if not any(key.endswith(suffix) and key[: -len(suffix)] in found for suffix in suffixes)
+        if not any(
+            key.endswith(suffix) and _has_variants(found, key[: -len(suffix)], charset, compressible)
+            for suffix in suffixes
+        )
     }
+
+
+def _has_variants(
+    found: Mapping[str, tuple[Path, os.stat_result]],
+    key: str,
+    charset: str | None,
+    compressible: Callable[[bytes | None], bool],
+) -> bool:
+    """Whether `found` holds `key` and `_encodings` will build variants for it."""
+    entry = found.get(key)
+    if entry is None:
+        return False
+    path, _ = entry
+    content_type, stored = guessed_type(path, charset)
+    return _encodable(content_type, stored, compressible)
+
+
+def _encodable(content_type: bytes, stored: bytes | None, compressible: Callable[[bytes | None], bool]) -> bool:
+    # Bytes already in a content coding are not encoded again: stacking gzip on
+    # `logo.svgz` costs the client two unwraps to reach the same SVG.
+    return stored is None and compressible(content_type)
 
 
 def _sidecar_suffix(coding: bytes) -> str:
@@ -421,11 +473,9 @@ def _asset(
     token = _valid_token(etag_for(key, path, stat), key)
     content_type, stored = guessed_type(path, charset)
     modified = datetime.fromtimestamp(stat.st_mtime, UTC)
-    # Bytes already in a content coding are not encoded again: stacking gzip on
-    # `logo.svgz` costs the client two unwraps to reach the same SVG.
     encoded = (
         _encodings(key, path, stat, token, content_type, modified, headers, encodings, compressed_here)
-        if stored is None and compressible(content_type)
+        if _encodable(content_type, stored, compressible)
         else {}
     )
     # Vary only where the body genuinely depends on the request: stamping it on an

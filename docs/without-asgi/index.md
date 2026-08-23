@@ -468,11 +468,14 @@ Every decision that a traversal design makes per request, with an attacker in
 the loop, is made here once, over a tree the operator assembled. Only regular
 files are admitted. Each entry is resolved and confirmed to be inside the root,
 and one that escapes raises, naming both ends; no flag relaxes that, because
-that flag is precisely aiohttp's CVE. Symlinked directories are not descended
-into, so a cycle cannot hang the walk. A directory that cannot be read raises
-too, rather than contributing nothing: `Path.walk` ignores a failed `scandir` by
-default, which would leave the inventory silently short every asset beneath it
-and answer `404` for them in production. A directory has no key at all, which is
+that flag is precisely aiohttp's CVE. A symlinked directory raises, since
+descending it could cycle and hang the walk while skipping it leaves the
+inventory silently short every asset beneath it: `Path.walk` reports one among
+the *filenames* rather than the directories, so it would otherwise be dropped
+alongside the fifos. A directory that cannot be read raises for the same reason,
+rather than contributing nothing: `Path.walk` ignores a failed `scandir` by
+default, which would leave those assets a `404` in production with a clean
+startup. A directory has no key at all, which is
 a `404` by omission rather than by check, and there is no directory listing and
 none behind a flag.
 
@@ -626,8 +629,17 @@ refetches the whole asset. The coding settles it for an already-encoded variant;
 the type is what settles it for an asset with **no** variants at all, a PNG or a
 font or a video, which carries no coding to read.
 
-A sidecar is suppressed by a **fixed** suffix set (`.gz`, `.zst`, `.br`), not by
-the codings currently configured. Keying it on the live table would mean a
+A sidecar is only recognized as one beside an asset that is *itself* encoded. A
+media type this never compresses has no variant for the sidecar to become, so
+suppressing it would take those bytes out of the keyspace and put them back
+nowhere: `data.tar.gz` published alongside its own `data.tar` keeps its URL,
+rather than becoming a `404` for a second deliverable the operator meant to
+publish. On its own that file is already an asset in good standing,
+`application/x-tar` with `Content-Encoding: gzip`.
+
+Where the asset *is* encoded, the sidecar is suppressed by a **fixed** suffix set
+(`.gz`, `.zst`, `.br`), not by the codings currently configured. Keying it on the
+live table would mean a
 coding's absence exposes its sidecars: with only gzip configured an `app.css.br`
 beside `app.css` becomes an asset of its own, brotli bytes labelled `text/css`
 with no `Content-Encoding`, at a URL the build system's own naming makes

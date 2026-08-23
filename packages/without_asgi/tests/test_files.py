@@ -218,6 +218,23 @@ async def test_missing_file_raises_before_any_response_start(tmp_path: Path) -> 
         await file_response(missing)
 
 
+@pytest.mark.security("a download rewritten mid-transfer aborts rather than misframing the body")
+async def test_a_download_rewritten_mid_transfer_aborts_the_response(tmp_path: Path) -> None:
+    # The stat and the declared Content-Length happen on the await; the reads happen as
+    # the stream is drained. Rewriting in between is therefore deterministic, and is
+    # exactly the race a rotating log or an in-place build loses.
+    path = tmp_path / "rotating.log"
+    path.write_bytes(b"x" * 400)
+    stream = await file_response(path, chunk_size=64)
+    await asyncio.to_thread(path.write_bytes, b"rotated")
+
+    with pytest.raises(OSError, match="file changed size") as raised:
+        await collect(stream)
+
+    assert raised.value.filename == str(path)
+    assert raised.value.errno == EINVAL
+
+
 async def test_read_ahead_with_spool_preserves_the_response(tmp_path: Path) -> None:
     payload = bytes(range(256)) * 3  # 768 bytes, several 100-byte chunks
     path = tmp_path / "data.bin"
@@ -525,6 +542,29 @@ class TestServeFile:
         await asyncio.to_thread(report.write_bytes, b"much shorter")
 
         with pytest.raises(OSError, match="file shrank") as raised:
+            await collect(stream)
+
+        assert raised.value.filename == str(report)
+        assert raised.value.errno == EINVAL
+
+    @pytest.mark.security("a whole file rewritten mid-transfer aborts rather than misframing the body")
+    @pytest.mark.parametrize(
+        "rewritten",
+        [
+            pytest.param(b"much shorter", id="shorter-than-the-declared-length"),
+            pytest.param(_REPORT * 2, id="longer-than-the-declared-length"),
+        ],
+    )
+    async def test_a_whole_file_rewritten_mid_transfer_aborts_the_response(
+        self, report: Path, rewritten: bytes
+    ) -> None:
+        # The whole-file path declares a Content-Length from the same stat and owes
+        # exactly as many bytes as the ranged path does, so it gets the same guard.
+        scope = a_scope(path="/report.pdf")
+        stream = await serve_file(scope, report, chunk_size=64)
+        await asyncio.to_thread(report.write_bytes, rewritten)
+
+        with pytest.raises(OSError, match="file changed size") as raised:
             await collect(stream)
 
         assert raised.value.filename == str(report)

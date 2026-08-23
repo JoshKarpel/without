@@ -128,7 +128,7 @@ async def file_response(
             (_CONTENT_LENGTH, str(stat.st_size).encode(_ASCII)),
         ),
     )
-    return _stream_file(path, start, chunk_size)
+    return _stream_file(path, start, chunk_size, stat.st_size)
 
 
 async def serve_file(
@@ -332,7 +332,7 @@ def stream_selection(
     start = start_for(selection, size, described, revalidation)
     match selection:
         case Whole():
-            return _stream_file(path, start, chunk_size)
+            return _stream_file(path, start, chunk_size, size)
         case Span() as span:
             return _stream_span(path, start, chunk_size, span.first, span.length)
         case Head() | NotModified() | Unsatisfiable():
@@ -352,11 +352,12 @@ async def no_body(start: ResponseStart) -> AsyncIterator[Outbound]:
 # fails before any event is emitted), which rules out making `file_response` itself an
 # async generator; keeping the body generator at module scope means it is not rebuilt on
 # every call, which matters on a hot file-serving path.
-async def _stream_file(path: Path, start: ResponseStart, chunk_size: int) -> AsyncIterator[Outbound]:
+async def _stream_file(path: Path, start: ResponseStart, chunk_size: int, size: int) -> AsyncIterator[Outbound]:
     yield start
     # `open` resolves the path and hits the inode, which can block on a slow/networked
     # filesystem, so it goes to a pool thread like the reads rather than running on the loop.
     handle = await asyncio.to_thread(path.open, "rb")
+    sent = 0
     with handle:
         # Each read goes to a pool thread because a regular file cannot be polled by the
         # event loop. The point of doing it one chunk at a time is that a pool thread is
@@ -366,7 +367,15 @@ async def _stream_file(path: Path, start: ResponseStart, chunk_size: int) -> Asy
         # capping concurrent downloads at the thread-pool size, the wrong trade for a server
         # facing many slow clients.
         while chunk := await asyncio.to_thread(handle.read, chunk_size):
+            sent += len(chunk)
             yield ResponseBody(body=chunk, more_body=True)
+    if sent != size:
+        # The file was rewritten between the `stat` that sized the response and the reads
+        # (a log rotated, a build writing in place). The declared `Content-Length` is
+        # already on the wire, so stopping quietly would frame a short body, and running
+        # long overruns it; raising aborts the response either way. Tallied and compared
+        # once at the end rather than bounded per chunk, so the hot loop keeps its bare read.
+        raise OSError(EINVAL, "file changed size while it was being served", str(path))
     yield ResponseBody(body=b"", more_body=False)  # pragma: no mutate - values equal the field defaults
 
 
