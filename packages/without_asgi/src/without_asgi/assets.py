@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-import mimetypes
 import os
 from collections.abc import AsyncIterator
 from collections.abc import Callable
@@ -20,13 +19,17 @@ from typing import NoReturn
 from typing import assert_never
 from urllib.parse import quote
 
-from without_asgi import headers
+from without import stream_from_iterable
+
 from without_asgi.compression import DEFAULT_COMPRESSORS
 from without_asgi.compression import Compressor
+from without_asgi.compression import _accept_encoding
 from without_asgi.compression import is_compressible
 from without_asgi.compression import negotiate_coding
 from without_asgi.files import DEFAULT_CHUNK_SIZE
+from without_asgi.files import guessed_type
 from without_asgi.files import no_body
+from without_asgi.files import size_and_mtime_token
 from without_asgi.files import start_for
 from without_asgi.files import stream_selection
 from without_asgi.outbound import Outbound
@@ -55,7 +58,10 @@ from without_asgi.types import RawHeaders
 # escapes all lived. There is no proof to get wrong when there is no derivation.
 
 __all__ = [
+    "IMMUTABLE_CACHE_CONTROL",
     "NOT_FOUND",
+    "REVALIDATE_CACHE_CONTROL",
+    "STATIC_ASSET_HEADERS",
     "Asset",
     "AssetChanged",
     "Inventory",
@@ -68,8 +74,6 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-_HASH_CHUNK_SIZE = 1 << 20
-_OCTET_STREAM = "application/octet-stream"
 _CONTENT_TYPE = b"content-type"
 _CONTENT_ENCODING = b"content-encoding"
 _ACCEPT_RANGES = b"accept-ranges"
@@ -79,7 +83,6 @@ _LAST_MODIFIED = b"last-modified"
 _CACHE_CONTROL = b"cache-control"
 _VARY = b"vary"
 _BYTES = b"bytes"
-_LATIN1 = "latin-1"
 _ASCII = "ascii"
 # RFC 9110 §8.8.3: etagc is %x21 / %x23-7E, i.e. visible ASCII without the DQUOTE that
 # delimits the tag. obs-text is permitted by the grammar and deliberately not accepted
@@ -104,6 +107,34 @@ NOT_FOUND = Response(
     headers=((_CONTENT_TYPE, b"text/plain; charset=utf-8"),),
     body=b"not found\n",
 )
+# Store the response, but revalidate before every reuse. Correct for any tree, whatever
+# its filenames, which is why it is the default. It is not the obvious performance loss
+# it looks like *here*: an inventory answers a conditional request from memory, with no
+# syscall, so the cost is one round trip rather than a read. Stating it also beats saying
+# nothing, since a response carrying no `cache-control` falls to the recipient's heuristic
+# freshness (RFC 9111 §4.2.2), which invents a staleness window out of `Last-Modified`
+# that nobody chose and no test exercises.
+REVALIDATE_CACHE_CONTROL = b"public, no-cache"
+
+# Cache for a year and never revalidate (RFC 8246). Opt in with `headers.replace` *only*
+# for a tree of fingerprinted filenames, ones carrying their content hash
+# (`app.a1b2c3d4.css`), where a new build writes a new URL and the old entry is simply
+# never requested again. On stable names it pins a stale copy in every browser that saw
+# it, for a year, with no way to reach those clients, because `immutable` stops the client
+# sending even the conditional request a `304` would answer. That failure is invisible
+# until someone ships a fix nobody receives, which is why it is not the default.
+IMMUTABLE_CACHE_CONTROL = b"public, max-age=31536000, immutable"
+
+# What `inventory` applies to every asset unless told otherwise: the caching policy that
+# is right whatever the tree looks like, plus `nosniff`, which stops a browser
+# second-guessing the media type the inventory computed and is what turns a file served
+# as `text/plain` into script. Exported so a caller extends or amends it with the ordinary
+# `headers` helpers rather than retyping it.
+STATIC_ASSET_HEADERS: RawHeaders = (
+    (_CACHE_CONTROL, REVALIDATE_CACHE_CONTROL),
+    (b"x-content-type-options", b"nosniff"),
+)
+
 _NO_ENCODINGS: Mapping[bytes, Representation] = MappingProxyType({})
 
 type EtagFor = Callable[[str, Path, os.stat_result], bytes]
@@ -157,10 +188,11 @@ class Asset:
     last_modified: datetime
     identity: Representation
     encodings: Mapping[bytes, Representation] = field(default=_NO_ENCODINGS)
-    directory_index: bool = False
+    needs_trailing_slash: bool = False
     """
-    Whether this entry is the index *of a directory* rather than the file itself, so
-    its canonical URL ends in a slash. See `_slash_redirect`.
+    Whether this key reaches a directory's index under a URL that is missing the
+    trailing slash, and so should be redirected rather than answered. See
+    `_slash_redirect`.
     """
 
 
@@ -182,10 +214,8 @@ def content_hash(key: str, path: Path, stat: os.stat_result) -> bytes:
     unchanged file, so clients do not refetch a bundle that did not change, and it is
     identical across replicas and machines.
     """
-    digest = hashlib.blake2b(digest_size=16)
     with path.open("rb") as handle:
-        while chunk := handle.read(_HASH_CHUNK_SIZE):
-            digest.update(chunk)
+        digest = hashlib.file_digest(handle, lambda: hashlib.blake2b(digest_size=16))
     return digest.hexdigest().encode(_ASCII)
 
 
@@ -200,7 +230,7 @@ def size_and_mtime(key: str, path: Path, stat: os.stat_result) -> bytes:
     such assumption. Never `st_ino`, which would leak a filesystem internal into every
     response (Apache's FileETag default, CVE-2003-1418).
     """
-    return b"%x-%x" % (stat.st_size, stat.st_mtime_ns)
+    return size_and_mtime_token(stat.st_size, stat.st_mtime_ns)
 
 
 def inventory(
@@ -208,7 +238,7 @@ def inventory(
     *,
     etag_for: EtagFor = content_hash,
     index: str | None = None,
-    cache_control: bytes | None = None,
+    headers: RawHeaders = STATIC_ASSET_HEADERS,
     charset: str | None = "utf-8",
     encodings: Mapping[bytes, Callable[[], Compressor]] = DEFAULT_COMPRESSORS,
     compressible: Callable[[bytes | None], bool] = is_compressible,
@@ -231,11 +261,12 @@ def inventory(
       an immutable tuple through rather than rebuilding one per request.
 
     Keys are relative POSIX paths with no leading slash (`"css/app.css"`). `index`
-    installs an alias from a directory's key to the index file inside it, so `/guide/`
-    reaches `guide/index.html`, and the slash-less `/guide` gets a `302` to it rather
-    than the document itself (see `_slash_redirect`); every other directory key is
-    simply absent, which is a `404` by omission. There is no directory listing, and none
-    behind a flag.
+    installs an alias from a directory's key to the index file inside it, under both
+    `"guide"` and `"guide/"` so the keyspace does not depend on whether the shell above
+    strips a trailing slash; `/guide/` reaches `guide/index.html`, and the slash-less
+    `/guide` gets a `302` to it rather than the document itself (see `_slash_redirect`).
+    Every other directory key is simply absent, which is a `404` by omission. There is
+    no directory listing, and none behind a flag.
 
     A file whose suffixes name a content coding as well as a media type (`logo.svgz`,
     `bundle.tar.gz`) is served with that `content-encoding` and is not encoded again.
@@ -243,6 +274,27 @@ def inventory(
     `etag_for` returns the opaque *token*; the quoting is added here, and a token
     holding characters illegal in an entity-tag is rejected, so a caller cannot emit a
     malformed validator.
+
+    `headers` are prepended to every asset's response, on both what a `200` announces
+    and what a `304` repeats, since a policy header is needed by the browser reading the
+    response back out of cache too. They default to `STATIC_ASSET_HEADERS`:
+    `REVALIDATE_CACHE_CONTROL` plus `x-content-type-options: nosniff`. That caching
+    policy is correct whatever the tree's filenames look like, and cheap here, since a
+    revalidation is answered from memory with no syscall at all.
+
+    Where the tree holds **fingerprinted** filenames, ones carrying a content hash
+    (`app.a1b2c3d4.css`), a new build writes a new URL and the old entry is never
+    requested again, so the round trip buys nothing and `IMMUTABLE_CACHE_CONTROL` is
+    worth opting into. Do not reach for it otherwise: on stable names it pins a stale
+    copy in every browser that saw it, for a year, with no way to reach those clients.
+    Amend or extend with the `headers` module's ordinary helpers, rather than retyping:
+
+    ```python
+    inventory(root, headers=headers.replace(
+        STATIC_ASSET_HEADERS, b"cache-control", IMMUTABLE_CACHE_CONTROL))
+    inventory(root, headers=headers.add(
+        STATIC_ASSET_HEADERS, b"cross-origin-resource-policy", b"same-origin"))
+    ```
 
     **Pre-compression.** For each asset whose media type `compressible` allows, a
     variant is built per coding in `encodings`, preferring a sidecar file the build
@@ -271,7 +323,7 @@ def inventory(
     found = _regular_files(base)
     compressed_here: list[str] = []
     assets = {
-        key: _asset(key, path, stat, etag_for, cache_control, charset, encodings, compressible, compressed_here)
+        key: _asset(key, path, stat, etag_for, headers, charset, encodings, compressible, compressed_here)
         for key, (path, stat) in _without_sidecars(found, encodings).items()
     }
     _report(compressed_here)
@@ -345,19 +397,19 @@ def _asset(
     path: Path,
     stat: os.stat_result,
     etag_for: EtagFor,
-    cache_control: bytes | None,
+    headers: RawHeaders,
     charset: str | None,
     encodings: Mapping[bytes, Callable[[], Compressor]],
     compressible: Callable[[bytes | None], bool],
     compressed_here: list[str],
 ) -> Asset:
     token = _valid_token(etag_for(key, path, stat), key)
-    content_type, stored = _content_type_and_coding(path, charset)
+    content_type, stored = guessed_type(path, charset)
     modified = datetime.fromtimestamp(stat.st_mtime, UTC)
     # Bytes already in a content coding are not encoded again: stacking gzip on
     # `logo.svgz` costs the client two unwraps to reach the same SVG.
     encoded = (
-        _encodings(key, path, stat, token, content_type, modified, cache_control, encodings, compressed_here)
+        _encodings(key, path, stat, token, content_type, modified, headers, encodings, compressed_here)
         if stored is None and compressible(content_type)
         else {}
     )
@@ -371,7 +423,7 @@ def _asset(
         content_type=content_type,
         coding=stored,
         modified=modified,
-        cache_control=cache_control,
+        headers=headers,
         varies=bool(encoded),
     )
     return Asset(
@@ -389,12 +441,10 @@ def _encodings(
     token: bytes,
     content_type: bytes,
     modified: datetime,
-    cache_control: bytes | None,
+    headers: RawHeaders,
     encodings: Mapping[bytes, Callable[[], Compressor]],
     compressed_here: list[str],
 ) -> dict[bytes, Representation]:
-    if not encodings:
-        return {}
     built: dict[bytes, Representation] = {}
     identity: bytes | None = None
     for coding, make in encodings.items():
@@ -417,7 +467,7 @@ def _encodings(
             content_type=content_type,
             coding=coding,
             modified=modified,
-            cache_control=cache_control,
+            headers=headers,
             varies=True,
             body=body,
         )
@@ -461,43 +511,20 @@ def _representation(
     content_type: bytes,
     coding: bytes | None,
     modified: datetime,
-    cache_control: bytes | None,
+    headers: RawHeaders,
     varies: bool,
     body: bytes | None = None,
 ) -> Representation:
-    caching: RawHeaders = () if cache_control is None else ((_CACHE_CONTROL, cache_control),)
     vary: RawHeaders = ((_VARY, _ACCEPT_ENCODING),) if varies else ()
     encoding: RawHeaders = () if coding is None else ((_CONTENT_ENCODING, coding),)
     validators: RawHeaders = ((_ETAG, etag), (_LAST_MODIFIED, http_date(modified)))
     return Representation(
         size=size,
         etag=etag,
-        described=((_CONTENT_TYPE, content_type), *encoding, *validators, (_ACCEPT_RANGES, _BYTES), *caching, *vary),
-        revalidation=(*encoding, *validators, *caching, *vary),
+        described=(*headers, (_CONTENT_TYPE, content_type), *encoding, *validators, (_ACCEPT_RANGES, _BYTES), *vary),
+        revalidation=(*headers, *encoding, *validators, *vary),
         body=body,
     )
-
-
-def _content_type_and_coding(path: Path, charset: str | None) -> tuple[bytes, bytes | None]:
-    """
-    The media type the file's suffixes name, and the content coding its bytes are
-    already stored in.
-
-    `guess_file_type` reports both, and dropping the second is how `logo.svgz` goes out
-    as `image/svg+xml` with no `content-encoding`, i.e. gzip bytes a browser renders as
-    SVG, and `bundle.tar.gz` as a bare `application/x-tar`. The coding is claimed only
-    alongside a media type: a lone `archive.gz` guesses `(None, "gzip")`, which names an
-    opaque archive rather than a gzip-encoded something, and declaring a coding there
-    would have the client silently unwrap the file it asked to download.
-    """
-    guessed, coding = mimetypes.guess_file_type(path)
-    if guessed is None:
-        return _OCTET_STREAM.encode(_LATIN1), None
-    # A textual asset with no charset leaves the encoding to the recipient's guess,
-    # which is how a UTF-8 stylesheet ends up rendering as mojibake.
-    if charset is not None and guessed.startswith("text/"):
-        guessed = f"{guessed}; charset={charset}"
-    return guessed.encode(_LATIN1), None if coding is None else coding.encode(_ASCII)
 
 
 def _valid_token(token: bytes, key: str) -> bytes:
@@ -507,6 +534,19 @@ def _valid_token(token: bytes, key: str) -> bytes:
 
 
 def _with_index_aliases(assets: dict[str, Asset], index: str | None) -> Mapping[str, Asset]:
+    """
+    Alias a directory's key to the index file inside it, in **both** spellings.
+
+    `"guide"` and `"guide/"` are registered together so the keyspace does not depend on
+    how the shell above happens to normalize a path. `without-web`'s `split_path` strips
+    a trailing slash, so `/assets/guide/` arrives as `"guide"`; a plain-ASGI shell
+    slicing off a prefix keeps it, so the same URL arrives as `"guide/"`. Keying only
+    the slash-less form would make the inventory silently correct under one shell and a
+    `404` under the other.
+
+    Only the slash-less key is marked for redirection: a request that already carried
+    the slash is at the canonical URL and is simply answered.
+    """
     if index is None:
         return assets
     for key, asset in list(assets.items()):
@@ -514,7 +554,8 @@ def _with_index_aliases(assets: dict[str, Asset], index: str | None) -> Mapping[
         # A root-level index has no directory key to alias; it is reached by naming it,
         # which is what a router `fallback` serving a single-page app does.
         if name == index and separator and directory not in assets:
-            assets[directory] = replace(asset, directory_index=True)
+            assets[directory] = replace(asset, needs_trailing_slash=True)
+            assets[f"{directory}/"] = asset
     return assets
 
 
@@ -522,12 +563,9 @@ def _slash_redirect(key: str) -> Response:
     """
     Send `/assets/guide` to `/assets/guide/`.
 
-    `without-web`'s `split_path` strips a trailing slash, so both URLs arrive here as
-    the same key and only the request path still distinguishes them, which is why the
-    redirect lives at this altitude rather than in the router. Serving the index
-    at the slash-less URL would resolve every relative link and asset reference in that
-    document one level too high, against `/assets/` instead of `/assets/guide/`, which
-    is why static servers redirect rather than answer at both.
+    Serving the index at the slash-less URL would resolve every relative link and asset
+    reference in that document one level too high, against `/assets/` instead of
+    `/assets/guide/`, which is why static servers redirect rather than answer at both.
 
     The target is **relative**: an inventory does not know what prefix it was mounted
     under, so it names the final segment and lets the client resolve it against the
@@ -582,9 +620,9 @@ async def serve_asset(
     """
     asset = assets.get(key)
     if asset is None:
-        return _replay(encode_response(not_found))
-    if asset.directory_index and not scope.path.endswith("/"):
-        return _replay(encode_response(_slash_redirect(key)))
+        return stream_from_iterable(encode_response(not_found))
+    if asset.needs_trailing_slash and not scope.path.endswith("/"):
+        return stream_from_iterable(encode_response(_slash_redirect(key)))
     chosen = _negotiated(asset, scope.headers)
     selection = selection_for(
         size=chosen.size,
@@ -593,8 +631,8 @@ async def serve_asset(
         etag=chosen.etag,
         last_modified=asset.last_modified,
     )
-    if chosen.body is not None:
-        return _from_memory(chosen, selection, chunk_size)
+    if (body := chosen.body) is not None:
+        return _from_memory(chosen, body, selection, chunk_size)
     if isinstance(selection, Whole | Span):
         stat = await asyncio.to_thread(asset.path.stat)
         if stat.st_size != chosen.size:
@@ -608,36 +646,30 @@ async def serve_asset(
 def _negotiated(asset: Asset, request_headers: RawHeaders) -> Representation:
     if not asset.encodings:
         return asset.identity
-    # A list-valued field's value is all its occurrences joined (RFC 9110 §5.2), and the
-    # mapping's order is the server's preference order.
-    offered = headers.get_all(request_headers, _ACCEPT_ENCODING)
-    coding = negotiate_coding(b",".join(offered) if offered else None, tuple(asset.encodings))
+    # The mapping's order is the server's preference order.
+    coding = negotiate_coding(_accept_encoding(request_headers), tuple(asset.encodings))
     return asset.identity if coding is None else asset.encodings[coding]
 
 
-def _from_memory(chosen: Representation, selection: Selection, chunk_size: int) -> AsyncIterator[Outbound]:
-    body = chosen.body
-    if body is None:  # pragma: no cover - only reached with an identity representation
-        raise AssertionError
+def _from_memory(chosen: Representation, body: bytes, selection: Selection, chunk_size: int) -> AsyncIterator[Outbound]:
     start = start_for(selection, chosen.size, chosen.described, chosen.revalidation)
     match selection:
         case Whole():
-            return _stream_bytes(start, body, chunk_size)
-        case Span(first, last):
-            return _stream_bytes(start, body[first : last + 1], chunk_size)
+            return _stream_bytes(start, body, 0, len(body), chunk_size)
+        case Span() as span:
+            # Bounds rather than a slice: slicing the span out and then chunking the
+            # copy would move every byte of a large range twice.
+            return _stream_bytes(start, body, span.first, span.last + 1, chunk_size)
         case Head() | NotModified() | Unsatisfiable():
             return no_body(start)
         case _ as unreachable:
             assert_never(unreachable)
 
 
-async def _stream_bytes(start: ResponseStart, body: bytes, chunk_size: int) -> AsyncIterator[Outbound]:
+async def _stream_bytes(
+    start: ResponseStart, body: bytes, first: int, end: int, chunk_size: int
+) -> AsyncIterator[Outbound]:
     yield start
-    for offset in range(0, len(body), chunk_size):
-        yield ResponseBody(body=body[offset : offset + chunk_size], more_body=True)
+    for offset in range(first, end, chunk_size):
+        yield ResponseBody(body=body[offset : min(offset + chunk_size, end)], more_body=True)
     yield ResponseBody(body=b"", more_body=False)  # pragma: no mutate - values equal the field defaults
-
-
-async def _replay(events: tuple[Outbound, ...]) -> AsyncIterator[Outbound]:
-    for event in events:
-        yield event

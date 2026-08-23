@@ -244,7 +244,7 @@ lives here.
 from without_asgi import inventory
 from without_web import Router, static_files, url_for
 
-assets = inventory(Path("dist/assets"), cache_control=b"public, max-age=31536000, immutable")
+assets = inventory(Path("dist/assets"))
 styles = static_files("/assets", assets)
 
 router = Router(routes=(styles, *api_routes), fallback=not_found)
@@ -264,11 +264,11 @@ A catch-all does not match an empty remainder, so the bare `prefix` is itself a
 listing request, and an inventory serves no listings.
 
 Routing here is trailing-slash insensitive, because `split_path` strips the
-slash from targets and pattern literals alike. That is what leaves an inventory
-built with `index=` unable to distinguish `/assets/guide` from `/assets/guide/`
-by key, and why `serve_asset` reaches for `scope.path` and issues the
+slash from targets and pattern literals alike, so an inventory built with
+`index=` sees `/assets/guide` and `/assets/guide/` as the same key. Only
+`scope.path` still tells them apart, which is why `serve_asset` issues the
 [canonicalizing redirect](../without-asgi/index.md#index-files-and-the-trailing-slash)
-itself.
+itself rather than leaving it to the router.
 
 A single-page app's entry point is not a mount either, since it must also answer
 client-side deep links that match no asset at all. That is the router's

@@ -40,7 +40,6 @@ _CONTENT_RANGE = b"content-range"
 _ACCEPT_RANGES = b"accept-ranges"
 _ETAG = b"etag"
 _LAST_MODIFIED = b"last-modified"
-_CACHE_CONTROL = b"cache-control"
 _BYTES = b"bytes"
 # Header codecs, named once: the content type is latin-1 (byte-transparent), the length ASCII
 # digits. Hoisting the codec names keeps mutmut's codec-name mutations on these lines rather
@@ -113,7 +112,6 @@ async def serve_file(
     path: Path,
     *,
     etag: bytes | None = None,
-    cache_control: bytes | None = None,
     content_type: str | None = None,
     headers: RawHeaders = (),
     chunk_size: int = DEFAULT_CHUNK_SIZE,
@@ -138,6 +136,11 @@ async def serve_file(
     correctly restarts rather than splicing bytes from two versions. Pass `etag` when
     you hold something better, such as a content hash you already store; it is emitted
     verbatim, so quote it yourself and mark it `W/` only if it is genuinely weak.
+
+    `headers` are prepended to both what a `200` announces and what a `304` repeats, so
+    a policy header (`cache-control`, `x-content-type-options`, a CORP or CSP value) is
+    applied to a revalidated response as well, which is where a browser reading it from
+    cache needs it. Compose them with the `headers` module's helpers.
     """
     stat = await asyncio.to_thread(path.stat)
     if S_ISDIR(stat.st_mode):
@@ -150,22 +153,9 @@ async def serve_file(
     guessed, encoding = _declared(path, content_type)
     modified = datetime.fromtimestamp(stat.st_mtime, UTC)
     validator = etag if etag is not None else _derived_etag(stat.st_size, stat.st_mtime_ns)
-    described = (
-        *headers,
-        (_CONTENT_TYPE, guessed),
-        *encoding,
-        (_ETAG, validator),
-        (_LAST_MODIFIED, http_date(modified)),
-        (_ACCEPT_RANGES, _BYTES),
-        *_cache_control(cache_control),
-    )
-    revalidation = (
-        *headers,
-        *encoding,
-        (_ETAG, validator),
-        (_LAST_MODIFIED, http_date(modified)),
-        *_cache_control(cache_control),
-    )
+    validators = ((_ETAG, validator), (_LAST_MODIFIED, http_date(modified)))
+    described = (*headers, (_CONTENT_TYPE, guessed), *encoding, *validators, (_ACCEPT_RANGES, _BYTES))
+    revalidation = (*headers, *encoding, *validators)
     selection = selection_for(
         size=stat.st_size,
         method=scope.method,
@@ -176,17 +166,38 @@ async def serve_file(
     return stream_selection(path, selection, stat.st_size, described, revalidation, chunk_size)
 
 
-def _declared(path: Path, override: str | None) -> tuple[bytes, RawHeaders]:
+def guessed_type(path: Path, charset: str | None) -> tuple[bytes, bytes | None]:
     """
     The media type the file's suffixes name, and the content coding its bytes are
-    already in.
+    already stored in.
 
     `guess_file_type` reports both, and dropping the second is how `logo.svgz` goes out
     as `image/svg+xml` with no `content-encoding`, i.e. gzip bytes a browser renders as
-    SVG. The coding is only claimed alongside a media type: a bare `archive.gz` guesses
-    `(None, "gzip")`, which names an opaque archive rather than a gzip-encoded
-    something, and declaring a coding for it would have the client silently unwrap the
-    file it asked to download.
+    SVG, and `bundle.tar.gz` as a bare `application/x-tar`. The coding is only claimed
+    alongside a media type: a bare `archive.gz` guesses `(None, "gzip")`, which names an
+    opaque archive rather than a gzip-encoded something, and declaring a coding for it
+    would have the client silently unwrap the file it asked to download.
+
+    A `charset` is appended to a textual media type, because text with no charset leaves
+    the encoding to the recipient's guess, which is how a UTF-8 stylesheet ends up
+    rendering as mojibake.
+    """
+    guessed, coding = mimetypes.guess_file_type(path)
+    if guessed is None:
+        return _OCTET_STREAM.encode(_LATIN1), None
+    if charset is not None and guessed.startswith("text/"):
+        guessed = f"{guessed}; charset={charset}"
+    return guessed.encode(_LATIN1), None if coding is None else coding.encode(_LATIN1)
+
+
+def size_and_mtime_token(size: int, mtime_ns: int) -> bytes:
+    """An entity-tag token from a `stat` alone: size and mtime, hex, joined by a dash."""
+    return b"%x-%x" % (size, mtime_ns)
+
+
+def _declared(path: Path, override: str | None) -> tuple[bytes, RawHeaders]:
+    """
+    The media type and coding headers a named file is served under.
 
     An explicit `content_type` suppresses the coding entirely. A caller naming the type
     is describing the bytes as they are, so a `.gz` served as `application/gzip` is a
@@ -194,22 +205,12 @@ def _declared(path: Path, override: str | None) -> tuple[bytes, RawHeaders]:
     """
     if override is not None:
         return override.encode(_LATIN1), ()
-    guessed, coding = mimetypes.guess_file_type(path)
-    if guessed is None:
-        return _OCTET_STREAM.encode(_LATIN1), ()
-    encoding: RawHeaders = () if coding is None else ((_CONTENT_ENCODING, coding.encode(_LATIN1)),)
-    return guessed.encode(_LATIN1), encoding
+    guessed, coding = guessed_type(path, charset=None)
+    return guessed, () if coding is None else ((_CONTENT_ENCODING, coding),)
 
 
 def _derived_etag(size: int, mtime_ns: int) -> bytes:
-    # Size and modification time only. An `st_ino` here would leak a filesystem
-    # internal into every response, which is what Apache's FileETag default did
-    # (CVE-2003-1418).
-    return b'W/"%x-%x"' % (size, mtime_ns)
-
-
-def _cache_control(value: bytes | None) -> RawHeaders:
-    return () if value is None else ((_CACHE_CONTROL, value),)
+    return b'W/"%s"' % size_and_mtime_token(size, mtime_ns)
 
 
 def start_for(
@@ -233,13 +234,13 @@ def start_for(
     match selection:
         case Whole() | Head():
             return ResponseStart(status=200, headers=(*described, (_CONTENT_LENGTH, b"%d" % size)))
-        case Span(first, last):
+        case Span() as span:
             return ResponseStart(
                 status=206,
                 headers=(
                     *described,
-                    (_CONTENT_LENGTH, b"%d" % (last - first + 1)),
-                    (_CONTENT_RANGE, b"bytes %d-%d/%d" % (first, last, size)),
+                    (_CONTENT_LENGTH, b"%d" % span.length),
+                    (_CONTENT_RANGE, b"bytes %d-%d/%d" % (span.first, span.last, size)),
                 ),
             )
         case NotModified():
@@ -272,8 +273,8 @@ def stream_selection(
     match selection:
         case Whole():
             return _stream_file(path, start, chunk_size)
-        case Span(first, last):
-            return _stream_span(path, start, chunk_size, first, last - first + 1)
+        case Span() as span:
+            return _stream_span(path, start, chunk_size, span.first, span.length)
         case Head() | NotModified() | Unsatisfiable():
             return no_body(start)
         case _ as unreachable:

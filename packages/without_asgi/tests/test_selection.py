@@ -13,7 +13,6 @@ from without_asgi.selection import Whole
 from without_asgi.selection import http_date
 from without_asgi.selection import parse_http_date
 from without_asgi.selection import selection_for
-from without_asgi.types import RawHeaders
 
 # A representation big enough that clamping and suffix arithmetic are distinguishable,
 # and a modification time that is not "now", so a test can never accidentally pass by
@@ -23,10 +22,6 @@ _MODIFIED = datetime(2026, 3, 14, 15, 9, 26, tzinfo=UTC)
 _MODIFIED_HTTP = b"Sat, 14 Mar 2026 15:09:26 GMT"
 _STRONG = b'"e9d71f5ee7c92d6d"'
 _WEAK = b'W/"e9d71f5ee7c92d6d"'
-
-
-def _headers(*fields: tuple[bytes, bytes]) -> RawHeaders:
-    return fields
 
 
 def _decide(
@@ -39,7 +34,7 @@ def _decide(
     return selection_for(
         size=size,
         method=method,
-        request_headers=_headers(*fields),
+        request_headers=fields,
         etag=etag,
         last_modified=last_modified,
     )

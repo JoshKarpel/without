@@ -37,10 +37,11 @@
   assembled: regular files only, each resolved and confirmed inside the root (one that
   escapes raises, and no flag relaxes that, because that flag *is* aiohttp's CVE), symlinked
   directories not descended, a directory that cannot be read raising rather than silently
-  contributing nothing, and no directory listing at all. With `index=`, the slash-less
-  `/guide` gets a relative `302` to `/guide/` rather than the document, since serving it
-  there resolves every relative link in the page one level too high, and the router's
-  `split_path` has already made the two URLs indistinguishable by key. The cost is the one in the
+  contributing nothing, and no directory listing at all. `index=` aliases a directory's key
+  to the index inside it under *both* spellings, `"guide"` and `"guide/"`, so the keyspace
+  does not depend on whether the shell above strips a trailing slash; only the slash-less
+  key redirects, with a relative `302` to `/guide/` rather than the document, since serving
+  it there resolves every relative link in the page one level too high. The cost is the one in the
   name: nothing may write into the tree while the process runs. That is not enforced by file
   modes, which change and which root ignores, but it is detected, since the `stat` before
   any `ResponseStart` raises `AssetChanged` rather than framing a body whose length and
@@ -50,7 +51,17 @@
   when a rebuild rewrites an unchanged file, so clients do not refetch a bundle that did
   not change, and is identical across replicas; `size_and_mtime` costs nothing for a tree
   too large to read at startup and rests on the no-writes contract instead. Neither carries
-  `st_ino`, which is what Apache's `FileETag` default leaked in CVE-2003-1418. Assets are
+  `st_ino`, which is what Apache's `FileETag` default leaked in CVE-2003-1418. Response
+  policy headers are one `headers` argument, prepended to what a `200` announces and to what
+  a `304` repeats alike, since a browser reading a response back out of cache needs the
+  policy too. They default to `STATIC_ASSET_HEADERS`, `REVALIDATE_CACHE_CONTROL`
+  (`public, no-cache`) plus `nosniff`, which is correct whatever the tree's filenames look
+  like and costs a round trip rather than a read, since an inventory revalidates from
+  memory. `IMMUTABLE_CACHE_CONTROL` is exported to opt into with the ordinary `headers`
+  helpers where filenames are fingerprinted, and is deliberately not the default: on stable
+  names it pins a stale copy in every browser that saw it for a year, with no way to reach
+  those clients, and a default whose failure is a shipped fix nobody receives is the wrong
+  way round. Assets are
   also pre-compressed, preferring a sidecar the build system produced (`app.css.br`, the
   nginx and WhiteNoise convention) and compressing in memory only when one is missing or
   stale, which is logged: brotli at quality 11 runs at about a megabyte a second, so it

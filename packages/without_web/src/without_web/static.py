@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from typing import cast
 
 from without import Stream
@@ -15,13 +14,12 @@ from without_asgi import Response
 from without_asgi import serve_asset
 
 from without_web.converters import PATH
+from without_web.handlers import _emit
 from without_web.patterns import CatchAll
-from without_web.patterns import Literal
-from without_web.patterns import Segment
-from without_web.patterns import split_path
 from without_web.router import HttpEndpoint
 from without_web.router import Match
 from without_web.router import Route
+from without_web.router import _segments
 
 
 def static_files(
@@ -41,7 +39,7 @@ def static_files(
     settles and what it assumes.
 
     ```python
-    assets = inventory(Path("dist/assets"), cache_control=b"public, max-age=31536000, immutable")
+    assets = inventory(Path("dist/assets"))
     styles = static_files("/assets", assets)
     router = Router(routes=(styles, *api_routes), fallback=not_found)
 
@@ -58,9 +56,9 @@ def static_files(
     either, since it must also answer client-side deep links matching no asset at all;
     that is the router's `fallback`, which can call `serve_asset` for `index.html`.
     """
-    head: tuple[Segment, ...] = tuple(Literal(segment) for segment in split_path(prefix))
     endpoint = _endpoint(assets, parameter, not_found, chunk_size)
-    return Route(segments=(*head, CatchAll(parameter, PATH)), methods={"GET": endpoint, "HEAD": endpoint})
+    segments = (*_segments(prefix), CatchAll(parameter, PATH))
+    return Route(segments=segments, methods={"GET": endpoint, "HEAD": endpoint})
 
 
 def _endpoint(
@@ -77,19 +75,8 @@ def _endpoint(
         # The parameter name is part of `Processor`'s protocol, so it stays `inputs`
         # even though a static asset never reads the request body.
         def processor(inputs: Stream[Inbound]) -> Stream[Outbound]:
-            return _serve(match.scope, assets, key, not_found, chunk_size)
+            return _emit(serve_asset(match.scope, assets, key, not_found=not_found, chunk_size=chunk_size))
 
         return processor
 
     return build
-
-
-async def _serve(
-    scope: HttpScope,
-    assets: Inventory,
-    key: str,
-    not_found: Response,
-    chunk_size: int,
-) -> AsyncIterator[Outbound]:
-    async for event in await serve_asset(scope, assets, key, not_found=not_found, chunk_size=chunk_size):
-        yield event

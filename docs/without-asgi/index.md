@@ -349,7 +349,7 @@ from without_asgi import (
 )
 
 PREFIX = "/assets/"
-ASSETS = inventory(Path("dist"), cache_control=b"public, max-age=31536000, immutable")
+ASSETS = inventory(Path("dist"))
 
 
 def serve(state: None, scope: HttpScope) -> HttpHandler:
@@ -381,11 +381,7 @@ by then the event loop is running and the walk hashes every file:
 ```python
 @asynccontextmanager
 async def lifespan() -> AsyncIterator[Inventory]:
-    yield await asyncio.to_thread(
-        inventory,
-        Path("dist"),
-        cache_control=b"public, max-age=31536000, immutable",
-    )
+    yield await asyncio.to_thread(inventory, Path("dist"))
 
 
 def serve(assets: Inventory, scope: HttpScope) -> HttpHandler:
@@ -464,17 +460,92 @@ none behind a flag.
 
 ### Index files and the trailing slash
 
-`index="index.html"` aliases a directory's key to the index inside it, so
-`/guide/` reaches `guide/index.html`. `without-web`'s `split_path` strips a
-trailing slash, so `/guide` and `/guide/` arrive as the same key and `serve_asset`
-is the only place left that can tell them apart, from `scope.path`. The
-slash-less form gets a `302` to the slashed one rather than the document itself:
-served there, every relative link and asset reference inside the page would
-resolve against `/` instead of `/guide/`, one level too high. The `Location` is
-relative (just the final segment plus a slash), because an inventory does not
-know what prefix it was mounted under, and it is a `302` rather than a `301` for
-the same reason: the URL shape it points at is not the inventory's to make
-permanent. This is WhiteNoise's `redirect` decision, and for the same reasons.
+`index="index.html"` aliases a directory's key to the index inside it, under
+_both_ spellings: `"guide"` and `"guide/"`. Registering both is what keeps the
+keyspace independent of the shell above, which is free to normalize paths however
+it likes. `without-web`'s `split_path` strips a trailing slash, so `/guide/`
+arrives as `"guide"`; a plain-ASGI shell slicing off a prefix keeps it, so the
+same URL arrives as `"guide/"`. Keying only one form would make the inventory
+correct under one shell and a `404` under the other.
+
+Only the slash-less key redirects. A request that already carried the slash is at
+the canonical URL and is simply answered; `/guide` gets a `302` to `/guide/`
+rather than the document itself, because served there every relative link and
+asset reference inside the page would resolve against `/` instead of `/guide/`,
+one level too high. The `Location` is relative (just the final segment plus a
+slash), because an inventory does not know what prefix it was mounted under, and
+it is a `302` rather than a `301` for the same reason: the URL shape it points at
+is not the inventory's to make permanent. This is WhiteNoise's `redirect`
+decision, and for the same reasons.
+
+### Response headers
+
+`headers` are prepended to every asset's response, on both what a `200` announces
+and what a `304` repeats, since a browser reading the response back out of cache
+needs the policy header too. They default to `STATIC_ASSET_HEADERS`:
+`cache-control: public, no-cache` plus `x-content-type-options: nosniff`.
+
+`no-cache` stores the response and revalidates before every reuse, which is
+correct whatever the tree's filenames look like. It is not the round-trip tax it
+looks like here, because an inventory answers a conditional request from memory
+with no syscall at all. Stating it also beats saying nothing: a response with no
+`cache-control` falls to the recipient's _heuristic_ freshness
+([RFC 9111 §4.2.2](https://www.rfc-editor.org/rfc/rfc9111#section-4.2.2)), which
+invents a staleness window out of `Last-Modified` that nobody chose.
+
+#### Choosing a caching policy
+
+The choice turns on one question about the tree, not about traffic: **does a
+changed file get a changed URL?** A build that fingerprints filenames answers
+yes, and buys the right to never revalidate. Everything else answers no, and has
+to keep a way of telling clients the bytes moved.
+
+| Policy | Stale window after a change | Requests per asset per load | Reach for it when |
+|---|---|---|---|
+| `REVALIDATE_CACHE_CONTROL` (`public, no-cache`), the default | none | one conditional; a `304` from memory, no syscall | Any tree. Correct without knowing anything about the filenames. |
+| `IMMUTABLE_CACHE_CONTROL` (`public, max-age=31536000, immutable`) | up to a year, and unrecallable | none until the URL changes | Only fingerprinted names (`app.a1b2c3d4.css`), where a change *is* a new URL. |
+| `public, max-age=N` | up to `N` | none for `N`, then one conditional | You can name a staleness window you are willing to serve, and want it bounded rather than infinite. |
+| No `cache-control` at all (`headers=()`, or `headers.remove`) | unspecified | recipient's choice | Something in front (a CDN, a reverse proxy) owns the caching policy and you do not want to fight it. |
+
+Note the last row is not "no caching". A response carrying no `cache-control`
+falls to the recipient's _heuristic_ freshness
+([RFC 9111 §4.2.2](https://www.rfc-editor.org/rfc/rfc9111#section-4.2.2)), which
+invents a window out of `Last-Modified` that nobody chose and no test exercises.
+Prefer stating a policy over inheriting one.
+
+The `immutable` row is the one that bites. It tells the client not to send even
+the conditional request a `304` would answer, so on stable names it pins a stale
+copy in every browser that saw it, for a year, with no way to reach those
+clients: a shipped fix that nobody receives. That is why it is a value you name
+rather than one you get by default.
+
+#### Configuring them
+
+Every case is the ordinary `without_asgi.headers` helpers over the exported
+default, so there is nothing new to learn and nothing to retype:
+
+```python
+from without_asgi import IMMUTABLE_CACHE_CONTROL, STATIC_ASSET_HEADERS, headers, inventory
+
+# Opt into never revalidating, for a fingerprinted tree.
+inventory(root, headers=headers.replace(STATIC_ASSET_HEADERS, b"cache-control", IMMUTABLE_CACHE_CONTROL))
+
+# A bounded staleness window instead.
+inventory(root, headers=headers.replace(STATIC_ASSET_HEADERS, b"cache-control", b"public, max-age=300"))
+
+# Add a policy header, keeping the defaults.
+inventory(root, headers=headers.add(STATIC_ASSET_HEADERS, b"cross-origin-resource-policy", b"same-origin"))
+
+# Say nothing about caching, leaving it to whatever is in front.
+inventory(root, headers=headers.remove(STATIC_ASSET_HEADERS, b"cache-control"))
+
+# Start from nothing at all.
+inventory(root, headers=())
+```
+
+`serve_file` takes the same `headers` argument for a single named file, but
+defaults to `()`: it has no inventory behind it, so it cannot promise the
+no-writes contract the caching defaults above lean on.
 
 ### The assumption, and how it is checked
 

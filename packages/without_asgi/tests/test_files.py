@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import AsyncIterator
 from datetime import UTC
 from datetime import datetime
 from errno import EINVAL
@@ -11,6 +10,7 @@ from pathlib import Path
 
 import pytest
 from pytest_mock import MockerFixture
+from without import collect
 from without import spool
 from without_asgi import DEFAULT_CHUNK_SIZE
 from without_asgi import Outbound
@@ -22,10 +22,6 @@ from without_asgi import serve_file
 from without_asgi.selection import http_date
 
 from .helpers import a_scope
-
-
-async def _collect(stream: AsyncIterator[Outbound]) -> list[Outbound]:
-    return [event async for event in stream]
 
 
 def _start(events: list[Outbound]) -> ResponseStart:
@@ -42,7 +38,7 @@ async def test_guesses_content_type_from_suffix(tmp_path: Path) -> None:
     path = tmp_path / "report.pdf"
     path.write_bytes(b"%PDF-1.7 body")
 
-    events = await _collect(await file_response(path))
+    events = await collect(await file_response(path))
 
     assert _headers(events)[b"content-type"] == b"application/pdf"
 
@@ -51,7 +47,7 @@ async def test_content_type_override_wins_over_the_guess(tmp_path: Path) -> None
     path = tmp_path / "report.pdf"
     path.write_bytes(b"not really a pdf")
 
-    events = await _collect(await file_response(path, content_type="text/csv"))
+    events = await collect(await file_response(path, content_type="text/csv"))
 
     assert _headers(events)[b"content-type"] == b"text/csv"
 
@@ -60,7 +56,7 @@ async def test_unknown_suffix_falls_back_to_octet_stream(tmp_path: Path) -> None
     path = tmp_path / "mystery.unknownext"
     path.write_bytes(b"opaque bytes")
 
-    events = await _collect(await file_response(path))
+    events = await collect(await file_response(path))
 
     assert _headers(events)[b"content-type"] == b"application/octet-stream"
 
@@ -71,7 +67,7 @@ async def test_a_suffix_naming_a_coding_declares_it_alongside_the_type(tmp_path:
     path = tmp_path / "logo.svgz"
     path.write_bytes(b"pretend these are gzip bytes")
 
-    headers = _headers(await _collect(await file_response(path)))
+    headers = _headers(await collect(await file_response(path)))
 
     assert headers[b"content-type"] == b"image/svg+xml"
     assert headers[b"content-encoding"] == b"gzip"
@@ -81,7 +77,7 @@ async def test_a_suffix_naming_only_a_coding_is_an_opaque_archive(tmp_path: Path
     path = tmp_path / "archive.gz"
     path.write_bytes(b"pretend these are gzip bytes")
 
-    headers = _headers(await _collect(await file_response(path)))
+    headers = _headers(await collect(await file_response(path)))
 
     assert headers[b"content-type"] == b"application/octet-stream"
     assert b"content-encoding" not in headers
@@ -93,7 +89,7 @@ async def test_a_content_type_override_suppresses_the_coding(tmp_path: Path) -> 
     path = tmp_path / "logo.svgz"
     path.write_bytes(b"pretend these are gzip bytes")
 
-    headers = _headers(await _collect(await file_response(path, content_type="application/gzip")))
+    headers = _headers(await collect(await file_response(path, content_type="application/gzip")))
 
     assert headers[b"content-type"] == b"application/gzip"
     assert b"content-encoding" not in headers
@@ -103,7 +99,7 @@ async def test_content_length_is_the_file_size(tmp_path: Path) -> None:
     path = tmp_path / "note.txt"
     path.write_bytes(b"eleven byte")  # 11 bytes
 
-    events = await _collect(await file_response(path))
+    events = await collect(await file_response(path))
 
     assert _headers(events)[b"content-length"] == b"11"
 
@@ -112,7 +108,7 @@ async def test_default_status_is_200(tmp_path: Path) -> None:
     path = tmp_path / "note.txt"
     path.write_bytes(b"hi")
 
-    events = await _collect(await file_response(path))
+    events = await collect(await file_response(path))
 
     assert _start(events).status == 200
 
@@ -121,7 +117,7 @@ async def test_status_can_be_overridden(tmp_path: Path) -> None:
     path = tmp_path / "note.txt"
     path.write_bytes(b"hi")
 
-    events = await _collect(await file_response(path, status=206))
+    events = await collect(await file_response(path, status=206))
 
     assert _start(events).status == 206
 
@@ -130,7 +126,7 @@ async def test_extra_headers_are_prepended_before_the_computed_ones(tmp_path: Pa
     path = tmp_path / "report.pdf"
     path.write_bytes(b"body")
 
-    events = await _collect(
+    events = await collect(
         await file_response(path, headers=((b"content-disposition", b"attachment; filename=report.pdf"),))
     )
 
@@ -142,7 +138,7 @@ async def test_streams_the_body_in_chunks_ending_in_an_empty_final_body(tmp_path
     path = tmp_path / "data.bin"
     path.write_bytes(b"abcdefghij")  # 10 bytes
 
-    events = await _collect(await file_response(path, chunk_size=4))
+    events = await collect(await file_response(path, chunk_size=4))
 
     assert events[1:] == [
         ResponseBody(body=b"abcd", more_body=True),
@@ -157,7 +153,7 @@ async def test_body_bytes_round_trip_intact(tmp_path: Path) -> None:
     path = tmp_path / "data.bin"
     path.write_bytes(payload)
 
-    events = await _collect(await file_response(path, chunk_size=100))
+    events = await collect(await file_response(path, chunk_size=100))
 
     body = b"".join(event.body for event in events if isinstance(event, ResponseBody))
     assert body == payload
@@ -167,7 +163,7 @@ async def test_empty_file_yields_start_then_only_the_terminating_body(tmp_path: 
     path = tmp_path / "empty.bin"
     path.write_bytes(b"")
 
-    events = await _collect(await file_response(path))
+    events = await collect(await file_response(path))
 
     assert events[1:] == [ResponseBody(body=b"", more_body=False)]
     assert _headers(events)[b"content-length"] == b"0"
@@ -185,7 +181,7 @@ async def test_read_ahead_with_spool_preserves_the_response(tmp_path: Path) -> N
     path = tmp_path / "data.bin"
     path.write_bytes(payload)
 
-    events = await _collect(spool(await file_response(path, chunk_size=100), ahead=2))
+    events = await collect(spool(await file_response(path, chunk_size=100), ahead=2))
 
     assert isinstance(events[0], ResponseStart)
     assert events[-1] == ResponseBody(body=b"", more_body=False)
@@ -206,17 +202,17 @@ async def _serve(
     headers: RawHeaders = (),
     method: str = "GET",
     etag: bytes | None = None,
-    cache_control: bytes | None = None,
+    response_headers: RawHeaders = (),
     content_type: str | None = None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
 ) -> tuple[ResponseStart, bytes]:
     scope = a_scope(path="/report.pdf", headers=headers, method=method)
-    events = await _collect(
+    events = await collect(
         await serve_file(
             scope,
             path,
             etag=etag,
-            cache_control=cache_control,
+            headers=response_headers,
             content_type=content_type,
             chunk_size=chunk_size,
         )
@@ -300,11 +296,11 @@ class TestServeFile:
         path = tmp_path / "logo.svgz"
         path.write_bytes(_REPORT)
         scope = a_scope(path="/logo.svgz")
-        start = _start(await _collect(await serve_file(scope, path)))
+        start = _start(await collect(await serve_file(scope, path)))
         etag = dict(start.headers)[b"etag"]
 
         revalidated = _start(
-            await _collect(await serve_file(a_scope(path="/logo.svgz", headers=((b"if-none-match", etag),)), path))
+            await collect(await serve_file(a_scope(path="/logo.svgz", headers=((b"if-none-match", etag),)), path))
         )
 
         assert dict(start.headers)[b"content-encoding"] == b"gzip"
@@ -313,13 +309,17 @@ class TestServeFile:
     async def test_a_304_repeats_the_caching_policy(self, report: Path) -> None:
         etag = dict((await _serve(report))[0].headers)[b"etag"]
 
-        start, _body = await _serve(report, cache_control=b"no-cache", headers=((b"if-none-match", etag),))
+        start, _body = await _serve(
+            report,
+            response_headers=((b"cache-control", b"no-cache"),),
+            headers=((b"if-none-match", etag),),
+        )
 
         assert dict(start.headers)[b"cache-control"] == b"no-cache"
 
     async def test_a_whole_file_is_chunked_at_the_requested_size(self, report: Path) -> None:
         scope = a_scope(path="/report.pdf")
-        events = await _collect(await serve_file(scope, report, chunk_size=64))
+        events = await collect(await serve_file(scope, report, chunk_size=64))
         bodies = [event for event in events if isinstance(event, ResponseBody)]
 
         assert len(bodies) == len(_REPORT) // 64 + 2  # the partial tail, then the terminator
@@ -380,7 +380,7 @@ class TestServeFile:
         # Joining the bodies would pass even if the stream told the transport to stop
         # after the first chunk, so the framing flags are asserted rather than the bytes.
         scope = a_scope(path="/report.pdf", headers=((b"range", b"bytes=0-199"),))
-        events = await _collect(await serve_file(scope, report, chunk_size=64))
+        events = await collect(await serve_file(scope, report, chunk_size=64))
         bodies = [event for event in events if isinstance(event, ResponseBody)]
 
         assert [event.more_body for event in bodies] == [True, True, True, True, False]
@@ -410,8 +410,8 @@ class TestServeFile:
         assert raised.value.filename == str(tmp_path)
         assert raised.value.errno == EISDIR
 
-    async def test_cache_control_is_emitted_when_given(self, report: Path) -> None:
-        start, _body = await _serve(report, cache_control=b"no-cache")
+    async def test_given_headers_are_emitted_on_the_response(self, report: Path) -> None:
+        start, _body = await _serve(report, response_headers=((b"cache-control", b"no-cache"),))
 
         assert dict(start.headers)[b"cache-control"] == b"no-cache"
 
@@ -452,7 +452,7 @@ class TestServeFile:
         await asyncio.to_thread(report.write_bytes, b"much shorter")
 
         with pytest.raises(OSError, match="file shrank") as raised:
-            await _collect(stream)
+            await collect(stream)
 
         assert raised.value.filename == str(report)
         assert raised.value.errno == EINVAL

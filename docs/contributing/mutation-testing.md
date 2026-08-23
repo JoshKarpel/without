@@ -200,19 +200,6 @@ identical. That leaves one survivor per constant, in `h11_wire`, `h2_wire`, `ws_
 is what keeps this to one documented survivor per module instead of a `# pragma: no mutate` on every
 call site (which would also blind the killable `LookupError`/`TypeError` mutants).
 
-### Buffer sizes a result cannot depend on
-
-`without-asgi`'s `assets._HASH_CHUNK_SIZE` is how much of a file `content_hash` feeds to
-`blake2b` at a time. A digest is defined over the whole message rather than over how it was
-fed in, so every mutation of that constant produces the same tag; the same holds for any
-read-loop chunk size whose consumer is order-dependent but not boundary-dependent.
-`test_the_hash_does_not_depend_on_how_the_file_is_chunked` is the empirical form of that
-claim, hashing a file larger than one chunk, so the equivalence is asserted rather than
-merely argued here.
-
-Note the contrast with `files.DEFAULT_CHUNK_SIZE`, which is *not* equivalent: it sets a
-`ResponseBody` size, so mutating it changes the event stream a test can observe.
-
 ### Header names read through a case-insensitive lookup
 
 `headers.get_all` and `headers.first` lower-case both the wanted name and each key, because

@@ -7,6 +7,7 @@ from collections import deque
 from collections.abc import AsyncIterator
 from compression import zstd
 from contextlib import asynccontextmanager
+from contextlib import nullcontext
 from contextlib import suppress
 from dataclasses import dataclass
 from dataclasses import field
@@ -18,6 +19,7 @@ from integration.todos.app import todos_app
 from integration.todos.core import Todo
 from integration.todos.core import TodoList
 from without import Stream
+from without_asgi import REVALIDATE_CACHE_CONTROL
 from without_asgi import ASGIApp
 from without_asgi import HttpHandler
 from without_asgi import HttpScope
@@ -140,14 +142,9 @@ _STYLESHEET = ("body { color: rebeccapurple; }\n" * 200).encode()  # ~6 KB, seve
 
 def _assets_app(root: Path, *, index: str | None = None) -> ASGIApp:
     """A `without-web` router serving an inventory, the whole stack in one app."""
-
-    @asynccontextmanager
-    async def lifespan() -> AsyncIterator[None]:
-        yield None
-
-    assets = inventory(root, index=index, cache_control=b"public, max-age=31536000, immutable")
+    assets = inventory(root, index=index)
     router: Router[None] = Router(routes=(static_files("/static", assets),), fallback=_no_route)
-    return make_asgi_app(lifespan, http=router.dispatch)
+    return make_asgi_app(nullcontext, http=router.dispatch)
 
 
 def _no_route(state: None, match: Match[HttpScope]) -> HttpHandler:
@@ -170,7 +167,8 @@ async def test_a_mounted_inventory_serves_an_asset_over_without_http(tmp_path: P
         async with request(client, "GET", "http://testserver/static/app.css") as (head, body):
             assert head.status == 200
             assert headers.first(head.headers, b"content-type") == b"text/css; charset=utf-8"
-            assert headers.first(head.headers, b"cache-control") == b"public, max-age=31536000, immutable"
+            assert headers.first(head.headers, b"cache-control") == REVALIDATE_CACHE_CONTROL
+            assert headers.first(head.headers, b"x-content-type-options") == b"nosniff"
             assert headers.first(head.headers, b"accept-ranges") == b"bytes"
             assert await body.read() == _STYLESHEET
 

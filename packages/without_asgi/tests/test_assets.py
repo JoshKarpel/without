@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import logging
 import os
 import re
-from collections.abc import AsyncIterator
 from collections.abc import Callable
 from datetime import UTC
 from pathlib import Path
@@ -12,8 +12,12 @@ from pathlib import Path
 import brotli
 import pytest
 from pytest_mock import MockerFixture
+from without import collect
 from without_asgi import DEFAULT_CHUNK_SIZE
-from without_asgi import Outbound
+from without_asgi import IMMUTABLE_CACHE_CONTROL
+from without_asgi import NOT_FOUND
+from without_asgi import REVALIDATE_CACHE_CONTROL
+from without_asgi import STATIC_ASSET_HEADERS
 from without_asgi import Response
 from without_asgi import ResponseBody
 from without_asgi import ResponseStart
@@ -28,7 +32,9 @@ from without_asgi.compression import Compressor
 from without_asgi.compression import brotli_compressor
 from without_asgi.compression import gzip_compressor
 from without_asgi.compression import zstd_compressor
+from without_asgi.headers import add
 from without_asgi.headers import first
+from without_asgi.headers import replace
 from without_asgi.selection import http_date
 from without_asgi.types import RawHeaders
 
@@ -51,27 +57,19 @@ def tree(tmp_path: Path) -> Path:
     return tmp_path
 
 
-async def _collect(events: AsyncIterator[Outbound]) -> list[Outbound]:
-    return [event async for event in events]
-
-
 async def _answer(
     assets: Inventory,
     key: str,
     *,
     headers: RawHeaders = (),
     method: str = "GET",
-    not_found: Response | None = None,
+    not_found: Response = NOT_FOUND,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     path: str | None = None,
 ) -> tuple[ResponseStart, bytes]:
     scope = a_scope(path=path if path is not None else f"/{key}", headers=headers, method=method)
-    served = (
-        await serve_asset(scope, assets, key, chunk_size=chunk_size)
-        if not_found is None
-        else await serve_asset(scope, assets, key, not_found=not_found, chunk_size=chunk_size)
-    )
-    events = await _collect(served)
+    served = await serve_asset(scope, assets, key, not_found=not_found, chunk_size=chunk_size)
+    events = await collect(served)
     start = events[0]
     assert isinstance(start, ResponseStart)
     body = b"".join(event.body for event in events[1:] if isinstance(event, ResponseBody))
@@ -117,8 +115,28 @@ class TestInventoryBuild:
         assert direct is not None
         assert alias.path == direct.path
         assert alias.identity == direct.identity
-        # The alias is reached as a directory, so its canonical URL ends in a slash.
-        assert (alias.directory_index, direct.directory_index) == (True, False)
+        # The slash-less key is the one whose URL still needs canonicalizing.
+        assert (alias.needs_trailing_slash, direct.needs_trailing_slash) == (True, False)
+
+    def test_an_index_is_aliased_under_both_spellings_of_the_directory_key(self, tree: Path) -> None:
+        # A shell that strips the trailing slash and one that keeps it must both reach
+        # the index, so the keyspace cannot depend on which one is above.
+        assets = inventory(tree, index="index.html", encodings={})
+
+        slashless, slashed = assets.get("guide"), assets.get("guide/")
+        assert slashless is not None
+        assert slashed is not None
+        assert slashed.path == slashless.path
+        # A request that already carried the slash is canonical, so it is answered.
+        assert slashed.needs_trailing_slash is False
+
+    async def test_a_key_keeping_its_trailing_slash_serves_the_index_without_redirecting(self, tree: Path) -> None:
+        assets = inventory(tree, index="index.html", encodings={})
+
+        start, body = await _answer(assets, "guide/", path="/guide/")
+
+        assert start.status == 200
+        assert body == b"<p>guide</p>\n"
 
     def test_without_an_index_the_directory_key_stays_absent(self, tree: Path) -> None:
         assert inventory(tree, encodings={}).get("guide") is None
@@ -210,13 +228,49 @@ class TestInventoryBuild:
 
         assert assets.assets["css/app.css"].identity.etag == b'"%s"' % token
 
-    def test_cache_control_is_carried_when_given(self, tree: Path) -> None:
-        assets = inventory(tree, cache_control=b"public, max-age=31536000, immutable", encodings={})
+    def test_the_default_headers_are_applied_to_every_asset(self, tree: Path) -> None:
+        assets = inventory(tree, encodings={})
 
-        assert _header_of(assets, "css/app.css", b"cache-control") == b"public, max-age=31536000, immutable"
+        assert _header_of(assets, "css/app.css", b"cache-control") == REVALIDATE_CACHE_CONTROL
+        assert _header_of(assets, "css/app.css", b"x-content-type-options") == b"nosniff"
 
-    def test_no_cache_control_is_emitted_by_default(self, tree: Path) -> None:
-        assert _header_of(inventory(tree, encodings={}), "css/app.css", b"cache-control") is None
+    def test_given_headers_replace_the_defaults_rather_than_adding_to_them(self, tree: Path) -> None:
+        # A value distinct from the default, so this cannot pass by the argument being
+        # ignored and the default answering in its place.
+        assets = inventory(tree, headers=((b"cache-control", b"private, max-age=30"),), encodings={})
+
+        assert _header_of(assets, "css/app.css", b"cache-control") == b"private, max-age=30"
+        assert _header_of(assets, "css/app.css", b"x-content-type-options") is None
+
+    def test_immutable_caching_is_opted_into_rather_than_defaulted(self, tree: Path) -> None:
+        # Only correct for fingerprinted filenames, so it is reachable but never applied
+        # on the caller's behalf: a stale copy pinned for a year cannot be recalled.
+        assert _header_of(inventory(tree, encodings={}), "css/app.css", b"cache-control") != IMMUTABLE_CACHE_CONTROL
+
+        opted_in = replace(STATIC_ASSET_HEADERS, b"cache-control", IMMUTABLE_CACHE_CONTROL)
+        assets = inventory(tree, headers=opted_in, encodings={})
+
+        assert _header_of(assets, "css/app.css", b"cache-control") == IMMUTABLE_CACHE_CONTROL
+        assert _header_of(assets, "css/app.css", b"x-content-type-options") == b"nosniff"
+
+    def test_the_defaults_extend_through_the_ordinary_header_helpers(self, tree: Path) -> None:
+        extended = add(STATIC_ASSET_HEADERS, b"cross-origin-resource-policy", b"same-origin")
+        assets = inventory(tree, headers=extended, encodings={})
+
+        assert _header_of(assets, "css/app.css", b"cross-origin-resource-policy") == b"same-origin"
+        assert _header_of(assets, "css/app.css", b"cache-control") == REVALIDATE_CACHE_CONTROL
+
+    def test_headers_are_repeated_on_a_revalidation(self, tree: Path) -> None:
+        # A browser applies a policy header to the response it reads back out of cache,
+        # so a 304 that drops it silently weakens the policy it was set for.
+        assets = inventory(tree, encodings={})
+
+        revalidation = assets.assets["css/app.css"].identity.revalidation
+        assert first(revalidation, b"cache-control") == REVALIDATE_CACHE_CONTROL
+        assert first(revalidation, b"x-content-type-options") == b"nosniff"
+
+    def test_headers_can_be_turned_off_entirely(self, tree: Path) -> None:
+        assert _header_of(inventory(tree, headers=(), encodings={}), "css/app.css", b"cache-control") is None
 
     def test_an_unreadable_directory_raises_rather_than_going_silently_missing(self, tree: Path) -> None:
         # `Path.walk` ignores a failed `scandir` by default, which would leave the
@@ -612,7 +666,7 @@ class TestPreCompression:
         assets = inventory(tree)
         scope = a_scope(path="/css/app.css", headers=((b"accept-encoding", b"gzip"),))
 
-        events = await _collect(await serve_asset(scope, assets, "css/app.css", chunk_size=16))
+        events = await collect(await serve_asset(scope, assets, "css/app.css", chunk_size=16))
         bodies = [event for event in events if isinstance(event, ResponseBody)]
 
         assert len(bodies) > 2
@@ -620,11 +674,9 @@ class TestPreCompression:
         assert bodies[-1] == ResponseBody(body=b"", more_body=False)
 
     async def test_an_encoded_variant_carries_the_caching_policy_and_varies(self, tree: Path) -> None:
-        assets = inventory(tree, cache_control=b"public, max-age=31536000, immutable")
+        start, _body = await _answer(inventory(tree), "css/app.css", headers=((b"accept-encoding", b"gzip"),))
 
-        start, _body = await _answer(assets, "css/app.css", headers=((b"accept-encoding", b"gzip"),))
-
-        assert _header(start, b"cache-control") == b"public, max-age=31536000, immutable"
+        assert _header(start, b"cache-control") == REVALIDATE_CACHE_CONTROL
         assert _header(start, b"vary") == b"accept-encoding"
 
     async def test_an_offer_split_across_two_header_fields_is_read_whole(self, tree: Path) -> None:
@@ -927,17 +979,14 @@ class TestEtagFor:
 
         assert re.fullmatch(rb'"[0-9a-f]{32}"', etag)
 
-    def test_the_hash_does_not_depend_on_how_the_file_is_chunked(self, tmp_path: Path) -> None:
-        small, large = tmp_path / "small", tmp_path / "large"
-        small.mkdir()
-        large.mkdir()
-        payload = bytes(range(256)) * 8192  # 2 MB, more than one hashing chunk
-        (small / "a.css").write_bytes(payload)
-        (large / "a.css").write_bytes(payload)
+    def test_a_file_larger_than_one_read_hashes_to_its_whole_contents(self, tmp_path: Path) -> None:
+        payload = bytes(range(256)) * 8192  # 2 MB, more than `file_digest` reads at once
+        path = tmp_path / "a.css"
+        path.write_bytes(payload)
 
-        assert content_hash("a.css", small / "a.css", (small / "a.css").stat()) == content_hash(
-            "a.css", large / "a.css", (large / "a.css").stat()
-        )
+        expected = hashlib.blake2b(payload, digest_size=16).hexdigest().encode()
+
+        assert content_hash("a.css", path, path.stat()) == expected
 
     def test_size_and_mtime_is_lowercase_hex_joined_by_a_dash(self, tree: Path) -> None:
         # The exact spelling is on the wire in every `ETag`, so it is pinned rather than
