@@ -8,7 +8,11 @@
   `selection_for` is the whole of RFC 9110 §13 and §14 as one pure function of a size, two
   validators, and the request's headers, returning `Whole | Head | Span | NotModified |
   Unsatisfiable`; nothing in its signature mentions a file, so the matrix tests as a table
-  and the same decision serves bytes from anywhere. `Head` is its own arm so a `HEAD` never
+  and the same decision serves bytes from anywhere. `start_for` turns that decision into the
+  `ResponseStart` announcing it, `describing` assembles the header pair a `200` states and a
+  `304` repeats, and `no_body` is the event stream for an answer owing no bytes, so a shell
+  over an object store or bytes in memory composes those rather than reimplementing §14 and
+  §15.4.5. `Head` is its own arm so a `HEAD` never
   reads the representation to produce bytes the transport is required to drop, which is what
   keeps `curl -I` and an uptime check from costing a full read of whatever they name; it
   announces exactly what a `200` would, `Content-Length` included. `serve_file(scope, path)`

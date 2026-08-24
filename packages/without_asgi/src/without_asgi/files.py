@@ -8,6 +8,7 @@ from datetime import UTC
 from datetime import datetime
 from errno import EINVAL
 from errno import EISDIR
+from io import BufferedReader
 from os import strerror
 from pathlib import Path
 from stat import S_ISDIR
@@ -51,8 +52,10 @@ _CONTENT_ENCODING = b"content-encoding"
 _CONTENT_LENGTH = b"content-length"
 _CONTENT_RANGE = b"content-range"
 _ACCEPT_RANGES = b"accept-ranges"
+_ACCEPT_ENCODING = b"accept-encoding"
 _ETAG = b"etag"
 _LAST_MODIFIED = b"last-modified"
+_VARY = b"vary"
 _BYTES = b"bytes"
 # Header codecs, named once: the content type is latin-1 (byte-transparent), the length ASCII
 # digits. Hoisting the codec names keeps mutmut's codec-name mutations on these lines rather
@@ -186,12 +189,16 @@ async def serve_file(
         # Refusing here keeps the failure ahead of the `ResponseStart`, where the old
         # code would have committed a `200` and then raised mid-body.
         raise OSError(EINVAL, "not a regular file", str(path))
-    guessed, encoding = _declared(path, content_type, charset)
+    guessed, coding = _declared(path, content_type, charset)
     modified = datetime.fromtimestamp(stat.st_mtime, UTC)
     validator = etag if etag is not None else _derived_etag(stat.st_size, stat.st_mtime_ns)
-    validators = ((_ETAG, validator), (_LAST_MODIFIED, http_date(modified)))
-    described = (*headers, (_CONTENT_TYPE, guessed), *encoding, *validators, (_ACCEPT_RANGES, _BYTES))
-    revalidation = (*headers, (_CONTENT_TYPE, guessed), *encoding, *validators)
+    described, revalidation = describing(
+        headers=headers,
+        content_type=guessed,
+        coding=coding,
+        etag=validator,
+        modified=modified,
+    )
     selection = selection_for(
         size=stat.st_size,
         method=scope.method,
@@ -231,18 +238,52 @@ def size_and_mtime_token(size: int, mtime_ns: int) -> bytes:
     return b"%x-%x" % (size, mtime_ns)
 
 
-def _declared(path: Path, override: str | None, charset: str | None) -> tuple[bytes, RawHeaders]:
+def describing(
+    *,
+    headers: RawHeaders,
+    content_type: bytes,
+    coding: bytes | None,
+    etag: bytes,
+    modified: datetime,
+    varies: bool = False,
+) -> tuple[RawHeaders, RawHeaders]:
     """
-    The media type and coding headers a named file is served *as a resource* under.
+    What a representation is announced under, and what a `304` about it repeats.
+
+    The first tuple is what a `200` or `206` says; the second is RFC 9110 §15.4.5's
+    required fields plus the `content-type` and `content-encoding` naming *which* stored
+    variant is being revalidated. §15.4.5 states a floor rather than a ceiling, and both
+    of those earn their place there: without them a downstream `compress()` cannot tell a
+    `304` for a representation it would never have encoded from one it would have encoded
+    itself, so it weakens a validator that is still exactly true of the stored bytes, and
+    the client's next `If-Range`, which requires strong comparison, refetches the whole
+    asset.
+
+    `accept-ranges` is on the first alone: a bodyless answer offers nothing to range over.
+    `varies` adds `vary: accept-encoding` to both, for a representation reached by
+    negotiation, since a cache keys a stored `304` too. Stamping it where the body does
+    *not* depend on the request fragments every downstream cache key for nothing, which is
+    the bug filed against ngx_brotli as #97, so a file stored in a coding, which
+    negotiates nothing, does not vary either.
+    """
+    encoding: RawHeaders = () if coding is None else ((_CONTENT_ENCODING, coding),)
+    validators: RawHeaders = ((_ETAG, etag), (_LAST_MODIFIED, http_date(modified)))
+    vary: RawHeaders = ((_VARY, _ACCEPT_ENCODING),) if varies else ()
+    common: RawHeaders = (*headers, (_CONTENT_TYPE, content_type), *encoding, *validators)
+    return (*common, (_ACCEPT_RANGES, _BYTES), *vary), (*common, *vary)
+
+
+def _declared(path: Path, override: str | None, charset: str | None) -> tuple[bytes, bytes | None]:
+    """
+    The media type and content coding a named file is served *as a resource* under.
 
     An explicit `content_type` suppresses the coding entirely. A caller naming the type
     is describing the bytes as they are, so a `.gz` served as `application/gzip` is a
     body to hand over whole, not one to unwrap.
     """
     if override is not None:
-        return override.encode(_LATIN1), ()
-    guessed, coding = guessed_type(path, charset)
-    return guessed, () if coding is None else ((_CONTENT_ENCODING, coding),)
+        return override.encode(_LATIN1), None
+    return guessed_type(path, charset)
 
 
 def _handed_over(path: Path, override: str | None, charset: str | None) -> bytes:
@@ -389,15 +430,24 @@ async def _stream_span(
     yield start
     handle = await asyncio.to_thread(path.open, "rb")
     with handle:
-        await asyncio.to_thread(handle.seek, offset)
+        position = offset
         remaining = count
         while remaining > 0:
-            chunk = await asyncio.to_thread(handle.read, min(chunk_size, remaining))
+            chunk = await asyncio.to_thread(_read_at, handle, position, min(chunk_size, remaining))
             if not chunk:
                 # The file shrank under us mid-transfer. The declared `Content-Length`
                 # is already on the wire, so stopping quietly would frame a short body;
                 # raising aborts the response instead.
                 raise OSError(EINVAL, "file shrank while a range was being served", str(path))
+            position += len(chunk)
             remaining -= len(chunk)
             yield ResponseBody(body=chunk, more_body=True)
     yield ResponseBody(body=b"", more_body=False)  # pragma: no mutate - values equal the field defaults
+
+
+def _read_at(handle: BufferedReader, position: int, size: int) -> bytes:
+    # The seek rides along with the read rather than taking a pool hop of its own: an
+    # `lseek` on an open handle is far cheaper than the thread handoff that would
+    # dispatch it, so the range path pays one hop per chunk rather than one plus a hop.
+    handle.seek(position)
+    return handle.read(size)

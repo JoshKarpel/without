@@ -61,6 +61,12 @@ def static_files(
     return Route(segments=segments, methods={"GET": endpoint, "HEAD": endpoint})
 
 
+# Built by hand rather than as `handle_stream(catch_all(parameter, PATH), http_scope(), ...)`,
+# which is the same composition and the shape the docs show elsewhere. That route parses an
+# `HttpRequestHead` and runs the extractor set on every request; a static asset needs neither,
+# and this is the one endpoint in the package whose whole job is to be cheap per request. The
+# cost of the choice is that the route carries no spec, so it contributes nothing to `openapi()`,
+# which is the right trade for a stylesheet.
 def _endpoint(
     assets: Inventory,
     parameter: str,

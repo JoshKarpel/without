@@ -311,6 +311,30 @@ memory, or from anywhere else, and the whole of
 filesystem in sight. `serve_file` and `serve_asset` are the shells that do the
 `stat` and the reads.
 
+Writing a third shell, over an object store or bytes already in memory, does not
+mean reimplementing the response side either. `describing` assembles the header
+pair a `200` states and a `304` repeats, `start_for` turns a `Selection` into the
+`ResponseStart` announcing it, and `no_body` is the event stream for an answer
+owing no bytes. What is left to supply is where the bytes come from:
+
+```python
+described, revalidation = describing(
+    headers=(),
+    content_type=b"application/json",
+    coding=None,
+    etag=etag,
+    modified=modified,
+)
+selection = selection_for(
+    size=size,
+    method=scope.method,
+    request_headers=scope.headers,
+    etag=etag,
+    last_modified=modified,
+)
+start = start_for(selection, size, described, revalidation)
+```
+
 The ordering that makes `file_response` able to answer a clean `404` is what
 makes this work too: the `stat` runs on the `await`, so a `304` and a `416` are
 both decided while nothing is on the wire.

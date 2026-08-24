@@ -8,7 +8,6 @@ from collections.abc import AsyncIterator
 from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
-from dataclasses import field
 from dataclasses import replace
 from datetime import UTC
 from datetime import datetime
@@ -27,7 +26,10 @@ from without_asgi.compression import Compressor
 from without_asgi.compression import _accept_encoding
 from without_asgi.compression import is_compressible
 from without_asgi.compression import negotiate_coding
+from without_asgi.files import _CONTENT_LENGTH
+from without_asgi.files import _CONTENT_TYPE
 from without_asgi.files import DEFAULT_CHUNK_SIZE
+from without_asgi.files import describing
 from without_asgi.files import guessed_type
 from without_asgi.files import no_body
 from without_asgi.files import size_and_mtime_token
@@ -45,7 +47,6 @@ from without_asgi.selection import Selection
 from without_asgi.selection import Span
 from without_asgi.selection import Unsatisfiable
 from without_asgi.selection import Whole
-from without_asgi.selection import http_date
 from without_asgi.selection import selection_for
 from without_asgi.types import RawHeaders
 
@@ -75,16 +76,7 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-_CONTENT_TYPE = b"content-type"
-_CONTENT_ENCODING = b"content-encoding"
-_CONTENT_LENGTH = b"content-length"
-_ACCEPT_RANGES = b"accept-ranges"
-_ACCEPT_ENCODING = b"accept-encoding"
-_ETAG = b"etag"
-_LAST_MODIFIED = b"last-modified"
 _CACHE_CONTROL = b"cache-control"
-_VARY = b"vary"
-_BYTES = b"bytes"
 _ASCII = "ascii"
 # RFC 9110 §8.8.3: etagc is %x21 / %x23-7E, i.e. visible ASCII without the DQUOTE that
 # delimits the tag. obs-text is permitted by the grammar and deliberately not accepted
@@ -146,6 +138,29 @@ _NO_ENCODINGS: Mapping[bytes, Representation] = MappingProxyType({})
 type EtagFor = Callable[[str, Path, os.stat_result], bytes]
 
 
+@dataclass(frozen=True, slots=True)
+class _Policy:
+    """
+    What `inventory`'s keyword arguments settle, parsed once and threaded as one value.
+
+    Every builder below reads the same record, so a knob added to `inventory` reaches
+    them without editing four signatures, and the sidecar filter and the asset builder
+    cannot drift on what counts as encodable.
+    """
+
+    etag_for: EtagFor
+    headers: RawHeaders
+    charset: str | None
+    encodings: Mapping[bytes, Callable[[], Compressor]]
+    compressible: Callable[[bytes | None], bool]
+
+    def encodable(self, path: Path) -> bool:
+        content_type, stored = guessed_type(path, self.charset)
+        # Bytes already in a content coding are not encoded again: stacking gzip on
+        # `logo.svgz` costs the client two unwraps to reach the same SVG.
+        return stored is None and self.compressible(content_type)
+
+
 class AssetChanged(Exception):
     """
     An asset's bytes changed after the inventory was built.
@@ -173,17 +188,11 @@ class Representation:
     """What a `200` or `206` says about this representation."""
     revalidation: RawHeaders
     """
-    What a `304` repeats: RFC 9110 §15.4.5's required fields, plus the `content-type`
-    and `content-encoding` naming *which* stored variant is being revalidated.
-
-    §15.4.5 states a floor rather than a ceiling, and both of those earn their place
-    there. Without them a downstream `compress()` cannot tell a `304` for a
-    representation it would never have encoded from one it would have encoded itself,
-    so it weakens a validator that is still exactly true of the stored bytes, and the
-    client's next `If-Range`, which requires strong comparison, refetches the whole
-    asset. The coding settles it for an already-encoded variant; the type settles it
-    for a representation with no variants at all, a PNG or a font or a video, which
-    carries no coding to read.
+    What a `304` repeats, as `describing` assembles it: RFC 9110 §15.4.5's required
+    fields, plus the `content-type` and `content-encoding` naming *which* stored variant
+    is being revalidated. The coding settles that for an already-encoded variant; the
+    type settles it for a representation with no variants at all, a PNG or a font or a
+    video, which carries no coding to read.
     """
     body: bytes | None = None
     """The encoded bytes, held in memory; `None` for the identity form, read from disk."""
@@ -196,7 +205,7 @@ class Asset:
     path: Path
     last_modified: datetime
     identity: Representation
-    encodings: Mapping[bytes, Representation] = field(default=_NO_ENCODINGS)
+    encodings: Mapping[bytes, Representation] = _NO_ENCODINGS
     codings: tuple[bytes, ...] = ()
     """
     `encodings`' keys in the server's preference order, which is what
@@ -341,14 +350,20 @@ def inventory(
     base = root.resolve(strict=True)
     if not base.is_dir():
         raise NotADirectoryError(f"{base} is not a directory")
-    found = _regular_files(base)
-    compressed_here: list[str] = []
-    assets = {
-        key: _asset(key, path, stat, etag_for, headers, charset, encodings, compressible, compressed_here)
-        for key, (path, stat) in _without_sidecars(found, encodings, charset, compressible).items()
+    policy = _Policy(
+        etag_for=etag_for,
+        headers=headers,
+        charset=charset,
+        encodings=encodings,
+        compressible=compressible,
+    )
+    built = {
+        key: _asset(key, path, stat, policy)
+        for key, (path, stat) in _without_sidecars(_regular_files(base), policy).items()
     }
-    _report(compressed_here)
-    return Inventory(assets=_with_index_aliases(assets, index))
+    _report([named for (_, compressed) in built.values() for named in compressed])
+    assets = {key: asset for key, (asset, _) in built.items()}
+    return Inventory(assets=MappingProxyType(dict(_with_index_aliases(assets, index))))
 
 
 def _unreadable(error: OSError) -> NoReturn:
@@ -365,39 +380,48 @@ def _regular_files(base: Path) -> dict[str, tuple[Path, os.stat_result]]:
     for parent, _directories, names in base.walk(on_error=_unreadable):
         for name in names:
             path = parent / name
-            resolved = path.resolve()
-            if not resolved.is_relative_to(base):
-                raise ValueError(f"{path} leaves the asset root: it resolves to {resolved}, outside {base}")
-            try:
-                stat = resolved.stat()
-            except OSError as error:
-                # A dangling symlink is the usual cause, and the bare error would name
-                # the target rather than the link, leaving nothing to go and fix.
-                raise ValueError(f"{path} cannot be read: it resolves to {resolved}, which {error.strerror}") from error
-            # A fifo, socket, or device has no length to declare and no bytes to seek in,
-            # so it is left out of the keyspace rather than failing on the request that
-            # happens to name it.
-            if S_ISREG(stat.st_mode):
-                found[path.relative_to(base).as_posix()] = (resolved, stat)
-            elif S_ISDIR(stat.st_mode):
-                # `Path.walk` reports a symlinked directory among the *filenames* rather
-                # than descending it, so this is the only way a directory reaches here.
-                # Dropping it with the fifos would leave the inventory silently short
-                # every asset beneath it, which is what `_unreadable` refuses for a
-                # directory that cannot be opened.
-                raise ValueError(
-                    f"{path} is a symlink to the directory {resolved}, which the walk does not descend into, "
-                    "so every asset beneath it would be missing. Replace the link with a real directory, or "
-                    "move what it points at into the root."
-                )
+            admitted = _admitted(path, base)
+            if admitted is not None:
+                found[path.relative_to(base).as_posix()] = admitted
     return found
+
+
+def _admitted(path: Path, base: Path) -> tuple[Path, os.stat_result] | None:
+    """
+    The resolved path and `stat` of one walked entry, or `None` for one not served.
+
+    Raises for a tree problem an operator has to fix, and returns `None` only for an
+    entry that is fine to leave out of the keyspace.
+    """
+    resolved = path.resolve()
+    if not resolved.is_relative_to(base):
+        raise ValueError(f"{path} leaves the asset root: it resolves to {resolved}, outside {base}")
+    try:
+        stat = resolved.stat()
+    except OSError as error:
+        # A dangling symlink is the usual cause, and the bare error would name the target
+        # rather than the link, leaving nothing to go and fix.
+        raise ValueError(f"{path} cannot be read: it resolves to {resolved}, which {error.strerror}") from error
+    if S_ISREG(stat.st_mode):
+        return resolved, stat
+    if S_ISDIR(stat.st_mode):
+        # `Path.walk` reports a symlinked directory among the *filenames* rather than
+        # descending it, so this is the only way a directory reaches here. Dropping it
+        # with the fifos would leave the inventory silently short every asset beneath it,
+        # which is what `_unreadable` refuses for a directory that cannot be opened.
+        raise ValueError(
+            f"{path} is a symlink to the directory {resolved}, which the walk does not descend into, "
+            "so every asset beneath it would be missing. Replace the link with a real directory, or "
+            "move what it points at into the root."
+        )
+    # A fifo, socket, or device has no length to declare and no bytes to seek in, so it is
+    # left out of the keyspace rather than failing on the request that happens to name it.
+    return None
 
 
 def _without_sidecars(
     found: dict[str, tuple[Path, os.stat_result]],
-    encodings: Mapping[bytes, Callable[[], Compressor]],
-    charset: str | None,
-    compressible: Callable[[bytes | None], bool],
+    policy: _Policy,
 ) -> dict[str, tuple[Path, os.stat_result]]:
     """
     Drop `app.css.br` when `app.css` is present: it is that asset's encoded form, not an
@@ -423,81 +447,52 @@ def _without_sidecars(
     `(".gz", ".br")` rather than anything configurable. A coding outside the table still
     suppresses its own sidecars, so a custom one loses nothing.
     """
-    suffixes = frozenset(_SIDECAR_SUFFIXES.values()) | {_sidecar_suffix(coding) for coding in encodings}
+    suffixes = frozenset(_SIDECAR_SUFFIXES.values()) | {_sidecar_suffix(coding) for coding in policy.encodings}
     return {
         key: entry
         for key, entry in found.items()
-        if not any(
-            key.endswith(suffix) and _has_variants(found, key[: -len(suffix)], charset, compressible)
-            for suffix in suffixes
-        )
+        if not any(key.endswith(suffix) and _has_variants(found, key[: -len(suffix)], policy) for suffix in suffixes)
     }
 
 
-def _has_variants(
-    found: Mapping[str, tuple[Path, os.stat_result]],
-    key: str,
-    charset: str | None,
-    compressible: Callable[[bytes | None], bool],
-) -> bool:
+def _has_variants(found: Mapping[str, tuple[Path, os.stat_result]], key: str, policy: _Policy) -> bool:
     """Whether `found` holds `key` and `_encodings` will build variants for it."""
     entry = found.get(key)
     if entry is None:
         return False
     path, _ = entry
-    content_type, stored = guessed_type(path, charset)
-    return _encodable(content_type, stored, compressible)
-
-
-def _encodable(content_type: bytes, stored: bytes | None, compressible: Callable[[bytes | None], bool]) -> bool:
-    # Bytes already in a content coding are not encoded again: stacking gzip on
-    # `logo.svgz` costs the client two unwraps to reach the same SVG.
-    return stored is None and compressible(content_type)
+    return policy.encodable(path)
 
 
 def _sidecar_suffix(coding: bytes) -> str:
     return _SIDECAR_SUFFIXES.get(coding, f".{coding.decode(_ASCII)}")
 
 
-def _asset(
-    key: str,
-    path: Path,
-    stat: os.stat_result,
-    etag_for: EtagFor,
-    headers: RawHeaders,
-    charset: str | None,
-    encodings: Mapping[bytes, Callable[[], Compressor]],
-    compressible: Callable[[bytes | None], bool],
-    compressed_here: list[str],
-) -> Asset:
-    token = _valid_token(etag_for(key, path, stat), key)
-    content_type, stored = guessed_type(path, charset)
+def _asset(key: str, path: Path, stat: os.stat_result, policy: _Policy) -> tuple[Asset, list[str]]:
+    """The asset for one file, and the names of any variants compressed here rather than read."""
+    token = _valid_token(policy.etag_for(key, path, stat), key)
+    content_type, stored = guessed_type(path, policy.charset)
     modified = datetime.fromtimestamp(stat.st_mtime, UTC)
-    encoded = (
-        _encodings(key, path, stat, token, content_type, modified, headers, encodings, compressed_here)
-        if _encodable(content_type, stored, compressible)
-        else {}
+    encoded, compressed_here = (
+        _encodings(key, path, stat, token, content_type, modified, policy) if policy.encodable(path) else ({}, [])
     )
-    # Vary only where the body genuinely depends on the request: stamping it on an
-    # already-compressed image fragments every downstream cache key for nothing, which
-    # is the bug filed against ngx_brotli as #97. A file stored in a coding has one
-    # representation and negotiates nothing, so it does not vary either.
     identity = _representation(
         size=stat.st_size,
         etag=_etag(token),
         content_type=content_type,
         coding=stored,
         modified=modified,
-        headers=headers,
+        headers=policy.headers,
         varies=bool(encoded),
     )
-    return Asset(
+    asset = Asset(
         path=path,
         last_modified=modified,
         identity=identity,
-        encodings=MappingProxyType(encoded) if encoded else _NO_ENCODINGS,
+        encodings=MappingProxyType(encoded),
         codings=tuple(encoded),
     )
+    return asset, compressed_here
 
 
 def _encodings(
@@ -507,13 +502,12 @@ def _encodings(
     token: bytes,
     content_type: bytes,
     modified: datetime,
-    headers: RawHeaders,
-    encodings: Mapping[bytes, Callable[[], Compressor]],
-    compressed_here: list[str],
-) -> dict[bytes, Representation]:
+    policy: _Policy,
+) -> tuple[dict[bytes, Representation], list[str]]:
     built: dict[bytes, Representation] = {}
+    compressed_here: list[str] = []
     identity: bytes | None = None
-    for coding, make in encodings.items():
+    for coding, make in policy.encodings.items():
         body = _sidecar(path, coding, stat)
         built_here = body is None
         if body is None:
@@ -533,11 +527,11 @@ def _encodings(
             content_type=content_type,
             coding=coding,
             modified=modified,
-            headers=headers,
+            headers=policy.headers,
             varies=True,
             body=body,
         )
-    return built
+    return built, compressed_here
 
 
 def _sidecar(path: Path, coding: bytes, stat: os.stat_result) -> bytes | None:
@@ -581,16 +575,15 @@ def _representation(
     varies: bool,
     body: bytes | None = None,
 ) -> Representation:
-    vary: RawHeaders = ((_VARY, _ACCEPT_ENCODING),) if varies else ()
-    encoding: RawHeaders = () if coding is None else ((_CONTENT_ENCODING, coding),)
-    validators: RawHeaders = ((_ETAG, etag), (_LAST_MODIFIED, http_date(modified)))
-    return Representation(
-        size=size,
+    described, revalidation = describing(
+        headers=headers,
+        content_type=content_type,
+        coding=coding,
         etag=etag,
-        described=(*headers, (_CONTENT_TYPE, content_type), *encoding, *validators, (_ACCEPT_RANGES, _BYTES), *vary),
-        revalidation=(*headers, (_CONTENT_TYPE, content_type), *encoding, *validators, *vary),
-        body=body,
+        modified=modified,
+        varies=varies,
     )
+    return Representation(size=size, etag=etag, described=described, revalidation=revalidation, body=body)
 
 
 def _valid_token(token: bytes, key: str) -> bytes:

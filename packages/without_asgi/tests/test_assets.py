@@ -913,17 +913,16 @@ class TestSidecars:
         ],
     )
     @pytest.mark.parametrize(
-        ("label", "encodings"),
+        "encodings",
         [
-            pytest.param("none", {}, id="with-no-codings-configured-at-all"),
-            pytest.param("gzip-only", {b"gzip": gzip_compressor}, id="with-only-one-coding-configured"),
+            pytest.param({}, id="with-no-codings-configured-at-all"),
+            pytest.param({b"gzip": gzip_compressor}, id="with-only-one-coding-configured"),
         ],
     )
     async def test_a_sidecar_is_dropped_whether_or_not_its_coding_is_configured(
         self,
         tree: Path,
         suffix: str,
-        label: str,
         encodings: dict[bytes, Callable[[], Compressor]],
     ) -> None:
         # Keying suppression on the active table is how `app.css.br` becomes an asset of
