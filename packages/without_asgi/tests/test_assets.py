@@ -643,16 +643,27 @@ class TestDirectoryIndexes:
         # Resolved against the request URI (RFC 9110 §10.2.2) this is /assets/docs/guide/.
         assert _header(start, b"location") == b"guide/"
 
-    async def test_a_directory_whose_name_needs_encoding_is_quoted(self, tmp_path: Path) -> None:
-        nested = tmp_path / "a b:c"
+    @pytest.mark.parametrize(
+        ("name", "location"),
+        [
+            pytest.param("a b", b"a%20b/", id="a-space"),
+            # A bare colon in the first segment of a relative reference reads as a scheme,
+            # so it is escaped too. Windows serves no such directory, in a test or in an
+            # asset tree: the character is illegal in a filename there.
+            *([] if sys.platform == "win32" else [pytest.param("a b:c", b"a%20b%3Ac/", id="a-colon")]),
+        ],
+    )
+    async def test_a_directory_whose_name_needs_encoding_is_quoted(
+        self, tmp_path: Path, name: str, location: bytes
+    ) -> None:
+        nested = tmp_path / name
         nested.mkdir()
         (nested / "index.html").write_bytes(b"<p>odd</p>\n")
         assets = inventory(tmp_path, index="index.html", encodings={})
 
-        start, _body = await _answer(assets, "a b:c", path="/a b:c")
+        start, _body = await _answer(assets, name, path=f"/{name}")
 
-        # A bare colon in the first segment of a relative reference reads as a scheme.
-        assert _header(start, b"location") == b"a%20b%3Ac/"
+        assert _header(start, b"location") == location
 
     async def test_naming_the_index_directly_still_serves_it(self, assets: Inventory) -> None:
         start, body = await _answer(assets, "guide/index.html", path="/guide/index.html")
