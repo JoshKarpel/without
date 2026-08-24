@@ -813,8 +813,11 @@ async def test_the_shutdown_closes_connections_for_a_server_that_cannot_abort_cl
     try:
         # The teardown reaches the connection without `abort_clients`, so the keep-alive
         # read ends rather than hanging, whether the close lands as EOF or as a reset.
+        # Ending is the whole assertion, which is why the bytes are not one: the read
+        # above took what a single segment carried over a real socket, so the tail of
+        # the response can still be in flight here.
         with suppress(OSError):
-            assert await asyncio.wait_for(reader.read(), timeout=5) == b""
+            await asyncio.wait_for(reader.read(), timeout=5)
     finally:
         writer.close()
         with suppress(OSError):
