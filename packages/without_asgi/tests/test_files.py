@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from datetime import UTC
 from datetime import datetime
 from errno import EINVAL
@@ -481,13 +482,19 @@ class TestServeFile:
         assert raised.value.filename == str(report)
         assert raised.value.errno == EINVAL
 
-    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="a fifo needs a POSIX filesystem")
-    async def test_a_real_fifo_is_refused(self, tmp_path: Path) -> None:
-        pipe = tmp_path / "pipe"
-        os.mkfifo(pipe)
+    # The control exists only where a fifo does. Branching on the platform rather than
+    # skipping on `hasattr(os, "mkfifo")` is what the Windows leg's type check reads:
+    # the stubs declare `mkfifo` on POSIX only, so a call it can reach there is an
+    # attribute error. Excluded from the coverage gate because no single platform
+    # exercises both arms.
+    if sys.platform != "win32":  # pragma: no cover
 
-        with pytest.raises(OSError, match="not a regular file"):
-            await _serve(pipe)
+        async def test_a_real_fifo_is_refused(self, tmp_path: Path) -> None:
+            pipe = tmp_path / "pipe"
+            os.mkfifo(pipe)
+
+            with pytest.raises(OSError, match="not a regular file"):
+                await _serve(pipe)
 
     @pytest.mark.security("a file truncated mid-transfer aborts rather than framing a short body")
     async def test_a_file_that_shrinks_mid_range_aborts_the_response(self, report: Path) -> None:

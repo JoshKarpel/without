@@ -5,8 +5,10 @@ import hashlib
 import logging
 import os
 import re
+import sys
 from collections.abc import Callable
 from datetime import UTC
+from errno import EACCES
 from pathlib import Path
 
 import brotli
@@ -278,18 +280,36 @@ class TestInventoryBuild:
     def test_headers_can_be_turned_off_entirely(self, tree: Path) -> None:
         assert _header_of(inventory(tree, headers=(), encodings={}), "css/app.css", b"cache-control") is None
 
-    def test_an_unreadable_directory_raises_rather_than_going_silently_missing(self, tree: Path) -> None:
+    def test_an_unreadable_directory_raises_rather_than_going_silently_missing(
+        self, tree: Path, mocker: MockerFixture
+    ) -> None:
         # `Path.walk` ignores a failed `scandir` by default, which would leave the
-        # inventory short every asset under `locked` and answer 404 for them forever.
-        locked = tree / "locked"
-        locked.mkdir()
-        (locked / "hidden.css").write_bytes(_STYLESHEET)
-        locked.chmod(0o000)
-        try:
-            with pytest.raises(PermissionError):
-                inventory(tree, encodings={})
-        finally:
-            locked.chmod(0o755)
+        # inventory short every asset under the directory and answer 404 for them
+        # forever.
+        #
+        # Windows's `chmod` sets only a read-only bit, which does not stop a directory
+        # being read, and coverage runs on every platform, so the refusal is simulated
+        # here and the POSIX test below is the control confirming that a really
+        # unreadable directory takes the same path.
+        mocker.patch("os.scandir", side_effect=PermissionError(EACCES, "Permission denied", str(tree)))
+
+        with pytest.raises(PermissionError):
+            inventory(tree, encodings={})
+
+    # The control exists only where permissions stop a read. Excluded from the coverage
+    # gate because no single platform exercises both arms.
+    if sys.platform != "win32":  # pragma: no cover
+
+        def test_a_really_unreadable_directory_raises(self, tree: Path) -> None:
+            locked = tree / "locked"
+            locked.mkdir()
+            (locked / "hidden.css").write_bytes(_STYLESHEET)
+            locked.chmod(0o000)
+            try:
+                with pytest.raises(PermissionError):
+                    inventory(tree, encodings={})
+            finally:
+                locked.chmod(0o755)
 
 
 class TestStoredContentCodings:
@@ -407,14 +427,20 @@ class TestNonRegularFiles:
 
         assert inventory(tree, encodings={}).assets == {}
 
-    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="a fifo needs a POSIX filesystem")
-    def test_a_real_fifo_is_left_out_while_its_siblings_are_kept(self, tree: Path) -> None:
-        os.mkfifo(tree / "pipe")
+    # The control exists only where a fifo does. Branching on the platform rather than
+    # skipping on `hasattr(os, "mkfifo")` is what the Windows leg's type check reads:
+    # the stubs declare `mkfifo` on POSIX only, so a call it can reach there is an
+    # attribute error. Excluded from the coverage gate because no single platform
+    # exercises both arms.
+    if sys.platform != "win32":  # pragma: no cover
 
-        assets = inventory(tree, encodings={})
+        def test_a_real_fifo_is_left_out_while_its_siblings_are_kept(self, tree: Path) -> None:
+            os.mkfifo(tree / "pipe")
 
-        assert "pipe" not in assets.assets
-        assert "css/app.css" in assets.assets
+            assets = inventory(tree, encodings={})
+
+            assert "pipe" not in assets.assets
+            assert "css/app.css" in assets.assets
 
 
 class TestTraversalPayloadsSimplyMiss:
