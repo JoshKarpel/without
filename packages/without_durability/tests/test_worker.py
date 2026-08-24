@@ -19,7 +19,6 @@ from without_durability import Run
 from without_durability import SplitDurable
 from without_durability import Suspended
 from without_durability import claimed
-from without_durability import now_utc
 from without_durability.worker import CONTENDED
 from without_durability.worker import halves
 from without_durability.worker import passes
@@ -35,7 +34,10 @@ SMALL = {"widget": 1200, "gizmo": 800}
 LARGE = {"piano": 90_000}
 WORKFLOW = "wf-payout-1"
 BRIEF = timedelta(milliseconds=10)
-# Short enough that a test waits it out for real rather than mocking a clock.
+# Short enough that the assembled worker test waits it out for real. Every test that
+# asserts on the suspension itself drives an injected `Clock` instead, because on the
+# wall clock this window doubles as a budget for the pass: one slower than it reaches
+# `sleep` with the deadline already behind, suspends at nothing, and runs to the end.
 SETTLING = timedelta(milliseconds=20)
 # Above this, the workflow stops for a human, which is the second way a pass suspends.
 APPROVAL_OVER = 10_000
@@ -110,16 +112,31 @@ def recording(ran: list[str]) -> Callable[[Run], Awaitable[None]]:
     return counting
 
 
-async def one_pass(checkpointer: MemoryCheckpointer, scheduler: MemoryScheduler, workflow: str = WORKFLOW) -> None:
-    """Drive the worker's sink over exactly one delivered workflow, as the queue would."""
-    await passes(SplitDurable(checkpointer, scheduler), BODY)(as_stream(workflow))
+async def one_pass(
+    checkpointer: MemoryCheckpointer,
+    scheduler: MemoryScheduler,
+    workflow: str = WORKFLOW,
+    *,
+    now: Clock,
+) -> None:
+    """
+    Drive the worker's sink over exactly one delivered workflow, as the queue would.
+
+    The clock is the caller's rather than the wall's, and required rather than defaulted,
+    because `BODY` suspends on a deadline it computes from this clock and the pass only
+    suspends while the deadline is still ahead of it. On the wall clock that makes the
+    settling window a *budget for the pass itself*: a pass slower than the window runs
+    straight through, schedules nothing, and the test reads it as a workflow that never
+    waited. A clock the test moves has no such budget.
+    """
+    await passes(SplitDurable(checkpointer, scheduler), BODY, now=now)(as_stream(workflow))
 
 
 async def test_a_workflow_nobody_has_submitted_waits_without_being_scheduled() -> None:
     checkpointer = MemoryCheckpointer()
     scheduler = MemoryScheduler()
 
-    await one_pass(checkpointer, scheduler)
+    await one_pass(checkpointer, scheduler, now=Clock())
 
     assert await checkpointer.load(WORKFLOW) == {}
     assert scheduler.sleeping == {}, "a wait on a value has no deadline, so there is nothing to schedule"
@@ -131,7 +148,7 @@ async def test_a_submitted_order_runs_to_its_first_wait_and_schedules_the_wakeup
     scheduler = MemoryScheduler()
     await checkpointer.supply(WORKFLOW, "order", SMALL)
 
-    await one_pass(checkpointer, scheduler)
+    await one_pass(checkpointer, scheduler, now=Clock())
 
     recorded = await checkpointer.load(WORKFLOW)
     assert set(recorded) == {"order", "total", "settling"}
@@ -145,13 +162,14 @@ async def test_a_submitted_order_runs_to_its_first_wait_and_schedules_the_wakeup
 async def test_a_second_pass_after_the_wait_finishes_a_small_payout() -> None:
     checkpointer = MemoryCheckpointer()
     scheduler = MemoryScheduler()
+    clock = Clock()
     await checkpointer.supply(WORKFLOW, "order", SMALL)
 
-    await one_pass(checkpointer, scheduler)
-    await asyncio.sleep(SETTLING.total_seconds() * 2)  # the workflow's own window, waited out for real
+    await one_pass(checkpointer, scheduler, now=clock)
+    clock.advance(SETTLING * 2)  # the workflow's own window, moved past rather than waited out
 
-    assert await scheduler.wake_due(now_utc()) == (WORKFLOW,), "the timer finds it due and queues it again"
-    await one_pass(checkpointer, scheduler)
+    assert await scheduler.wake_due(clock()) == (WORKFLOW,), "the timer finds it due and queues it again"
+    await one_pass(checkpointer, scheduler, now=clock)
 
     assert (await checkpointer.load(WORKFLOW))["paid"] == f"pay-{WORKFLOW}-2000"
 
@@ -160,17 +178,18 @@ async def test_a_large_payout_stops_at_the_confirmation_and_resumes_once_it_is_r
     checkpointer = MemoryCheckpointer()
     scheduler = MemoryScheduler()
     await checkpointer.supply(WORKFLOW, "order", LARGE)
+    clock = Clock()
 
-    await one_pass(checkpointer, scheduler)
-    await asyncio.sleep(SETTLING.total_seconds() * 2)
-    await scheduler.wake_due(now_utc())
-    await one_pass(checkpointer, scheduler)
+    await one_pass(checkpointer, scheduler, now=clock)
+    clock.advance(SETTLING * 2)
+    await scheduler.wake_due(clock())
+    await one_pass(checkpointer, scheduler, now=clock)
 
     assert "paid" not in await checkpointer.load(WORKFLOW)
     assert scheduler.sleeping == {}, "the wait is on a person now, so this pass scheduled nothing"
 
     await checkpointer.supply(WORKFLOW, "approved-by", "auditor-7")
-    await one_pass(checkpointer, scheduler)
+    await one_pass(checkpointer, scheduler, now=clock)
 
     assert (await checkpointer.load(WORKFLOW))["paid"] == f"pay-{WORKFLOW}-90000"
 
@@ -488,7 +507,7 @@ async def test_a_queue_that_refuses_a_wakeup_fails_the_loop_rather_than_dropping
     assert taken is not None
 
     with pytest.raises(ConnectionError, match="the queue was briefly unreachable"):
-        await passes(SplitDurable(checkpointer, scheduler), BODY)(delivered(taken))
+        await passes(SplitDurable(checkpointer, scheduler), BODY, now=Clock())(delivered(taken))
 
     assert "settling" in await checkpointer.load(WORKFLOW), "the pass itself was fine; only the scheduling failed"
     assert list(scheduler.outstanding) == [taken.receipt], (
@@ -541,6 +560,7 @@ async def test_a_body_driven_without_the_worker_suspends_the_same_way() -> None:
         holder=await claimed(checkpointer, WORKFLOW),
         checkpointer=checkpointer,
         recorded=await checkpointer.load(WORKFLOW),
+        now=Clock(),
     )
 
     with pytest.raises(Suspended, match="suspended at 'settling'"):
