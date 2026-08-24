@@ -196,9 +196,99 @@ ways: the `"XXasciiXX"` wrap is an invalid codec (`LookupError`) and the `.decod
 site is a `TypeError`, both killed by any test that exercises the path. Only the *case swap*
 (`"ascii"` → `"ASCII"`) survives, because codec lookup is case-insensitive so the emitted bytes are
 identical. That leaves one survivor per constant, in `h11_wire`, `h2_wire`, `ws_wire`, `server`, and
-`client` (`without-http`) and `files` (`without-asgi`). Hoisting the name is what keeps this to one
-documented survivor per module instead of a `# pragma: no mutate` on every call site (which would
-also blind the killable `LookupError`/`TypeError` mutants).
+`client` (`without-http`) and `files`, `selection`, and `assets` (`without-asgi`). Hoisting the name
+is what keeps this to one documented survivor per module instead of a `# pragma: no mutate` on every
+call site (which would also blind the killable `LookupError`/`TypeError` mutants).
+
+### Header names read through a case-insensitive lookup
+
+`headers.get_all` and `headers.first` lower-case both the wanted name and each key, because
+HTTP field names are case-insensitive (RFC 9110). A literal passed to either is therefore
+equivalent under mutmut's case swap: `headers.first(raw, b"if-range")` and
+`b"IF-RANGE"` read the same field. This covers the `if-range`, `if-none-match`,
+`if-modified-since`, `range`, and `accept-encoding` lookups in `selection` and `assets`.
+
+A name being *written* is a different matter and is not equivalent, since the emitted bytes
+change: `add` and `replace` lower-case on introduce, but a literal placed directly into a
+`ResponseStart`'s header tuple is emitted verbatim, so every such constant is killed by a
+test that reads the response.
+
+### Parses whose alternative cannot reach a different answer
+
+`selection._span_for` splits the `Range` unit with `partition(b"=")`, and the
+`rpartition` mutant survives. The two differ only when the value holds a second `=`, and in
+that case neither can produce a span: `partition` leaves the `=` inside the range spec, so
+the digit parse fails, while `rpartition` puts it inside the unit, so the unit is no longer
+`bytes`. Both answer with the whole representation.
+
+`selection._entity_tags`'s `while index < len(joined)` survives as `<=`. At `index ==
+len(joined)` the slice is `b""`, and `b"" in b" \t,"` is true, so the extra iteration
+advances the index once and the loop exits with the same tag list.
+
+Two more in the same module survive because a *failure* downstream produces the answer the
+check was there to produce:
+
+- `_span_for`'s `if b"," in raw` guard against multi-range requests survives the
+  `b"XX,XX"` wrap. The wrapped literal turns a single-character membership test into a
+  substring one that never matches, so a multi-range spec is no longer recognised as
+  such - but it then reaches the digit parse, where `9,20-29` is not a number, and the
+  whole representation is served either way.
+- `_range_allowed`'s `condition.startswith((b'"', b"W/"))` survives both `b"w/"` and the
+  `XX` wrap. Failing to recognise a weak entity-tag routes the value into
+  `parse_http_date`, which rejects it, which returns "do not honor this range" - exactly
+  what recognising it as weak would have concluded, since `If-Range` requires a strong
+  comparison.
+
+Both are worth stating rather than leaving as puzzles, because each *looks* like a hole and
+the reasoning that clears it is not local to the mutated line.
+
+`_span_for`'s second split, `raw.strip().partition(b"-")`, survives as `rpartition` for a
+similar reason. The two agree on every well-formed spec, since `0-9` and `-100` hold one
+dash; a spec with two (`--5`) leaves a non-numeric position on one side either way.
+
+Three more in `_entity_tags` survive because `*` short-circuits everything downstream. The
+`*` branch's `index += 1` mutates to `index += 2`, and its `continue` to `break`; neither
+can change an answer, because `b"*" in candidates` is checked before any tag is compared,
+so a list that contains a star is "not modified" whatever else the scan collected. And
+`if closing < 0` survives as `<= 0` and `< 1`, since `find` is called from `index + 1` and
+so returns either `-1` or an index of at least one: a `closing` of exactly zero is not
+reachable.
+
+### Diagnostic prose
+
+`assets._report`'s warning and the messages inside `AssetChanged`, `IsADirectoryError`, and
+the range-abort `OSError` carry `operator_string` mutants that survive: an `XX`-wrapped or
+case-swapped sentence still reaches a `caplog` substring assertion, and `pytest.raises(...,
+match=...)` is a `re.search`, so `"XXnot a regular fileXX"` still matches
+`"not a regular file"`. What these messages must *do* is asserted instead, and that is what
+the tests pin: the report names the files it compressed and counts the ones it did not, and
+each error carries the `errno` and the `filename` a reader needs to act on. Pinning the
+prose itself would freeze wording that should stay editable.
+
+The two boundary mutants in the same function are *not* in this class and are killed:
+`rest > 0` decides whether a count is appended at all, so `>= 0` says "and 0 more" and
+`> 1` drops a real count of one.
+
+### Policy boundaries no fixture can sit exactly on
+
+`assets._encodings` drops a coding whose output is `>= ` the identity size, and the `>`
+mutant survives, since killing it needs an encoding that lands byte-for-byte on the
+original length. That is a measure-zero case: any codec version bump moves it, so a fixture
+pinned to it would be a standing flake rather than a test. The neighbouring behaviour is
+covered instead, by a payload small enough that gzip's container grows it while brotli
+still shrinks it, which pins both that a useless coding is dropped and that dropping it
+does not skip the codings after it.
+
+### Timezone arguments behind an absolute conversion
+
+`datetime.fromtimestamp(stat.st_mtime, UTC) -> (..., None)` survives in `files`, because the
+value reaches the wire only through `http_date`, which calls `.timestamp()`; that is an
+absolute instant, so a naive local datetime formats to the same GMT string. Verified across
+a DST fall-back hour, where the local time is ambiguous, and the round trip still holds.
+
+The same mutation in `assets` is *not* equivalent, because `Asset.last_modified` is a public
+field where naive-versus-aware is observable, and
+`test_the_modification_time_is_carried_as_an_aware_utc_value` pins it.
 
 ### Unobservable defensive-path mutations
 

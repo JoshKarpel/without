@@ -4,6 +4,110 @@
 
 ### Added
 
+- **`without-asgi`**: conditional requests, byte ranges, and static assets.
+  `selection_for` is the whole of RFC 9110 §13 and §14 as one pure function of a size, two
+  validators, and the request's headers, returning `Whole | Head | Span | NotModified |
+  Unsatisfiable`; nothing in its signature mentions a file, so the matrix tests as a table
+  and the same decision serves bytes from anywhere. `start_for` turns that decision into the
+  `ResponseStart` announcing it, `describing` assembles the header pair a `200` states and a
+  `304` repeats, and `no_body` is the event stream for an answer owing no bytes, so a shell
+  over an object store or bytes in memory composes those rather than reimplementing §14 and
+  §15.4.5. `Head` is its own arm so a `HEAD` never
+  reads the representation to produce bytes the transport is required to drop, which is what
+  keeps `curl -I` and an uptime check from costing a full read of whatever they name; it
+  announces exactly what a `200` would, `Content-Length` included. `serve_file(scope, path)`
+  is `file_response`'s request-aware sibling for one named file, answering `200`, `206`,
+  `304`, and `416`, with the `stat` still on the `await` so every one of those is decided
+  while nothing is on the wire. Its derived validator is *weak*, because a filesystem's timestamp
+  granularity can be coarser than the gap between two writes, so a resumed download
+  correctly restarts rather than splicing two versions; pass `etag` when you hold something
+  better. Only single ranges are honored: `multipart/byteranges` is most of the cost for a
+  case almost nothing sends, and §14 permits ignoring a `Range`, so the check is a scan for
+  a comma rather than a split and a header naming a hundred thousand ranges costs one
+  linear pass. `file_response` keeps its job, content with no cacheable
+  identity, where a validator that changes every request buys nothing. `serve_file` and
+  `inventory` serve a *resource*, so they use the content *coding*
+  `mimetypes.guess_file_type` reports alongside the media type, and a `logo.svgz` goes out
+  as `image/svg+xml` with `Content-Encoding: gzip` rather than as gzip bytes a browser
+  tries to render as an image. `file_response` hands a file *over* instead, so it never
+  declares a coding a conformant client would decode in transit, and describes an encoded
+  file by that coding's own type (`report.tar.gz` is `application/gzip`): asking for an
+  archive and saving raw tar bytes under its name is the Apache `AddEncoding .gz` failure,
+  and not one a download helper should have. A suffix naming only a coding (`archive.gz`)
+  is an opaque download either way, and an explicit `content_type` suppresses the coding
+  entirely. Both helpers take a `charset`, defaulting to `utf-8` as `inventory` does, since
+  a textual type that states none leaves the encoding to the recipient's guess, which is
+  how a UTF-8 stylesheet renders as mojibake with no `<meta charset>` to rescue it.
+  For a *tree*, `inventory(root)` walks it once at startup into a mapping of key to
+  `Asset`, and `serve_asset` answers out of it. This is deliberately not a directory mount:
+  a mount derives a filesystem path from request input and then has to prove the derivation
+  stayed inside the root, which is the construction behind CVE-2023-29159,
+  CVE-2024-23334, Werkzeug's drive-letter escape, and the two Windows device-name
+  advisories. An inventory never derives a path, so there is no proof to get wrong and a
+  traversal payload is simply a key that is not present. Every decision a mount makes per
+  request with an attacker in the loop is made once here over a tree the operator
+  assembled: regular files only, each resolved and confirmed inside the root (one that
+  escapes raises, and no flag relaxes that, because that flag *is* aiohttp's CVE), a symlinked
+  directory and a directory that cannot be read both raising rather than silently contributing
+  nothing, and no directory listing at all. `index=` aliases a directory's key
+  to the index inside it under *both* spellings, `"guide"` and `"guide/"`, so the keyspace
+  does not depend on whether the shell above strips a trailing slash; only the slash-less
+  key redirects, with a relative `302` to `/guide/` rather than the document, since serving
+  it there resolves every relative link in the page one level too high. The request's query
+  is carried across explicitly, because a relative reference stating none does not inherit
+  the base URI's (RFC 3986 §5.3). The cost is the one in the
+  name: nothing may write into the tree while the process runs. That is not enforced by file
+  modes, which change and which root ignores, but it is detected, since the `stat` before
+  any `ResponseStart` raises `AssetChanged` rather than framing a body whose length and
+  validator describe different bytes. The payoff is a shorter request path too: a `304` is
+  answered from memory with no syscall at all.
+  Validators default to `content_hash`, which unlike a timestamp-derived tag does not change
+  when a rebuild rewrites an unchanged file, so clients do not refetch a bundle that did
+  not change, and is identical across replicas; `size_and_mtime` costs nothing for a tree
+  too large to read at startup and rests on the no-writes contract instead. Neither carries
+  `st_ino`, which is what Apache's `FileETag` default leaked in CVE-2003-1418. Response
+  policy headers are one `headers` argument, prepended to what a `200` announces and to what
+  a `304` repeats alike, since a browser reading a response back out of cache needs the
+  policy too. They default to `STATIC_ASSET_HEADERS`, `REVALIDATE_CACHE_CONTROL`
+  (`public, no-cache`) plus `nosniff`, which is correct whatever the tree's filenames look
+  like and costs a round trip rather than a read, since an inventory revalidates from
+  memory. `IMMUTABLE_CACHE_CONTROL` is exported to opt into with the ordinary `headers`
+  helpers where filenames are fingerprinted, and is deliberately not the default: on stable
+  names it pins a stale copy in every browser that saw it for a year, with no way to reach
+  those clients, and a default whose failure is a shipped fix nobody receives is the wrong
+  way round. Assets are
+  also pre-compressed, preferring a sidecar the build system produced (`app.css.br`, the
+  nginx and WhiteNoise convention) and compressing in memory only when one is missing or
+  stale, which is logged: brotli at quality 11 runs at about a megabyte a second, so it
+  belongs in the build rather than in a cost every replica pays at startup. Each coding
+  carries its *own* strong validator, since one tag shared across codings lets a client
+  holding the gzip copy revalidate into a `304` and keep bytes from a different
+  representation, and a `304` repeats both that coding and the media type, which is what lets
+  a downstream `compress` tell a revalidation it would never have encoded from one it would
+  have. The type is what carries an asset with no variants at all, a PNG or a font or a
+  video, which has no coding to read: without it that asset's strong validator is weakened
+  on every revalidation and the client's next `If-Range` refetches the whole thing.
+  `Vary: Accept-Encoding` goes only on assets that have variants, since
+  stamping it on an image fragments every downstream cache key for nothing. A sidecar is
+  recognized as one only beside an asset that is itself encoded, and then by a fixed suffix set
+  rather than by the configured codings: an `app.css.br` is never published as an asset of its
+  own (brotli bytes labelled `text/css`) merely because brotli is not among them, while a
+  `data.tar.gz` beside its own `data.tar` keeps its URL, since a media type that is never
+  compressed has no variant for it to become and dropping it would be a silent `404` for a
+  second deliverable. A file already stored in a coding is served with it rather
+  than encoded a second time. Holding encoded
+  bytes in memory also makes a `Range` over a compressed asset work, which on-the-fly
+  compression cannot do at all, since it has no way to restate a `Content-Range` computed
+  over identity bytes.
+- **`without-web`**: `static_files(prefix, assets)`, a `GET`/`HEAD` route serving an
+  `Inventory`. The catch-all remainder is the inventory key, and the returned `Route` is an
+  ordinary value carrying its complete segments, so it reverses through `url_for` with no
+  router involved and `mount` rebases it like any other route. The split follows the
+  placement rule: deciding between `200`, `206`, `302`, `304`, and `416` needs no routing
+  vocabulary, so it lives a layer down; matching a prefix does, so it lives here. A bare
+  prefix does not match, which is correct rather than a gap, since a request for a directory
+  is a listing request. A single-page app's entry point is the router's `fallback` instead,
+  the one place that also sees the client-side deep links no asset matches.
 - **`without-html`**: a new package. HTML as immutable Python values: build a node tree with
   plain constructors (`div(cls=..., attrs=..., children=...)`), render it with a pure
   `render(node) -> str`. It depends on nothing else in the workspace, so it is usable from any
