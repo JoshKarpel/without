@@ -185,6 +185,19 @@ the `Content` they would have been, the request-side mirror of reading a respons
 body whole. Producers ship stream-first where size is unbounded (multipart), and
 buffering stays a one-call convenience.
 
+## Streaming events
+
+`event_stream(events)` serves a stream of Server-Sent Events as the outbound
+events a handler yields, one `ResponseBody` per frame so each is flushed when it
+happens. A frame is one arm of `ServerSentEvent = Event | Comment | Retry |
+Checkpoint`, a union because only those four combinations mean anything on the
+wire. Its parsing counterpart, `parse_events`, turns any `Stream[bytes]` back
+into typed events. Both are pure and touch no socket, which is why the format
+lives at this layer rather than beside a transport. `with_heartbeat` wraps a
+stream that can go quiet, inserting a frame after a silent interval so an
+intermediary does not reap the connection. See
+[Server-Sent Events](sse.md).
+
 ## Streaming a file
 
 `file_response(path)` builds the outbound stream that serves a file: a

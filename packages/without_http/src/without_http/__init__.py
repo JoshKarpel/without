@@ -51,6 +51,9 @@ from without_http.socket_options import SocketOptions
 from without_http.socket_options import receive_buffer_size
 from without_http.socket_options import send_buffer_size
 from without_http.socket_options import tcp_keepalive
+from without_http.sse import DEFAULT_RECONNECT
+from without_http.sse import NotAnEventStream
+from without_http.sse import subscribe
 from without_http.timeouts import ConnectTimeout
 from without_http.timeouts import HTTPTimeout
 from without_http.timeouts import PoolTimeout
@@ -69,6 +72,7 @@ from without_http.ws_wire import ws_events_from_outbound
 __all__ = [
     "ALPN_PROTOCOLS",
     "DEFAULT_DECOMPRESSORS",
+    "DEFAULT_RECONNECT",
     "GZIP_CONTAINER",
     "USER_AGENT",
     "Client",
@@ -83,6 +87,7 @@ __all__ = [
     "Decompressor",
     "HTTPTimeout",
     "LifespanError",
+    "NotAnEventStream",
     "PoolTimeout",
     "ReadTimeout",
     "Resolve",
@@ -125,6 +130,7 @@ __all__ = [
     "server_ssl_context",
     "serving",
     "stack",
+    "subscribe",
     "tcp_connect",
     "tcp_keepalive",
     "tls_extension",

@@ -346,6 +346,63 @@ client stops sending on the peer's half-close; the server closes with a bounded
 lingering `FIN` rather than an `RST` that could discard its own response). See
 [Security](security.md#early-responses-and-connection-close).
 
+### Server-Sent Events
+
+The event stream *format* lives in `without-asgi`, because it is two pure
+transforms that touch no socket: see
+[Server-Sent Events](../without-asgi/sse.md). One connection needs nothing from
+this package beyond the byte stream a response body already is:
+
+```python
+from without_asgi import parse_events
+
+async with request(client, "GET", url) as (head, body):
+    async for event in parse_events(body):
+        ...
+```
+
+What does need a transport is the loop that keeps the stream up. `subscribe`
+sends the request, parses the body, and when the stream ends waits and sends it
+again carrying `Last-Event-ID`, so the producer resumes where the consumer
+stopped. That resumption point moves on an event carrying an `id:` *and* on a
+`Checkpoint`, an id-only frame a producer sends after skipping work you asked not
+to see; acting on only the first replays from before the skip. A caller sees one
+uninterrupted stream of events across however many connections it took:
+
+```python
+from without_http import subscribe
+
+events = subscribe(pool, ClientRequest("GET", url))
+async for event in events:
+    ...
+await events.aclose()  # releases the connection there and then
+```
+
+**This is the only retry loop `without-http` ships**, and the
+[position against a `retry()` middleware](alternatives.md#the-client) is why it
+can be. That position rejects *policy* the library would have to invent: how
+many attempts, which statuses, what backoff. Here there is none to invent. The
+backoff arrives on the wire as `retry:`, the resumption token arrives as `id:`,
+and the terminal condition is written into the protocol, so nothing is left for
+a flag to configure.
+
+What it does and does not retry:
+
+- A non-`200` status, or a content type other than `text/event-stream`, raises
+  `NotAnEventStream` and never reconnects. An endpoint answering `404` or
+  `text/html` is not a stream that dropped, it is one that was never there.
+- The **first** connection's errors propagate, so a caller that cannot reach the
+  endpoint at all learns immediately rather than watching a silent loop.
+- Once a stream has been established, a connection error or timeout, on the
+  stream or on any later attempt, reconnects. A stream a proxy reaps every 60
+  seconds is the ordinary case, which is why the protocol has a resumption token
+  at all.
+
+The wait is `reconnect` (three seconds) until the producer names one, and is
+floored at 100ms so a hostile or broken `retry: 0` cannot spin a consumer into a
+hot reconnect loop. `sleep` is injected, so a test drives the loop without
+waiting and a caller can add jitter.
+
 ### Timeouts
 
 By default a request has **no timeouts**: a hung connect or a stalled server blocks

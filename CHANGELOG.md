@@ -4,6 +4,66 @@
 
 ### Added
 
+- **`without-asgi`**: Server-Sent Events, as the two pure transforms the format actually is.
+  `encode_event` renders one frame to bytes and `parse_events` is
+  `Stream[bytes] -> Stream[ReceivedEvent]`; neither touches a socket, which is what puts the
+  format at this layer rather than beside a transport, so an app under uvicorn emits events
+  with no transport dependency and a caller parses them out of any byte stream. `event_stream`
+  is the `file_response`-shaped server side, yielding one `ResponseBody` per event with
+  `more_body=True`, since an event sitting in a buffer has not been delivered. The whole
+  [WHATWG format](https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation)
+  is implemented, not just `data:`: comments, the multi-line join, the dispatch-on-blank-line
+  rule, one leading BOM, UTF-8 with replacement rather than raising (raising would let a
+  hostile producer kill its consumers), and unknown fields ignored so a producer can add one
+  without breaking an older consumer. Lines split on the format's three terminators and *only*
+  those, because `str.splitlines` also splits on U+2028 and five others, which would make a
+  value two lines here and one at a conformant peer. What a handler sends is
+  `ServerSentEvent`, a union of the only four frames that mean anything: `Event(data, type,
+  id)` dispatches, `Comment` is the heartbeat, `Retry` sets the reconnection time, and
+  `Checkpoint` moves the resumption point without delivering anything. A single type with
+  five optional fields was the obvious shape and the wrong one, since most of what it
+  permitted was a no-op on the wire or silently discarded on arrival (an `event:` naming a
+  frame that dispatches nothing), and splitting costs nothing because a frame carrying
+  several at once is equivalent to sending them one after another. Parsing yields the
+  narrower `Received = ReceivedEvent | Retry | Checkpoint`; `Comment` is outbound-only
+  because the spec says to ignore comments, and `parse_events` drops the directives where
+  `parse_events_with_directives` keeps them, the same split as `ResponseBody`'s trailers.
+  `Event` and `ReceivedEvent` are separate types for the usual inbound/outbound reason, and
+  differ in exactly one field: `id` is optional outbound because omitting the line leaves the
+  peer's resumption point alone where an empty one *clears* it, a choice only a sender has.
+  `type` needs no such option, since the format cannot tell an absent `event:` line from
+  `event: message`, so it is a plain `str` on both and the encoder writes no line for the
+  default. `Retry` and `Checkpoint` are shared across directions, since a type with one
+  required field has no default that could mask a parser bug. `with_heartbeat(events)` keeps
+  an idle stream from being reaped by a proxy, inserting a frame (a bare `Comment` by default,
+  the only one a conformant consumer must ignore) after a silent interval. An idle timer
+  rather than a metronome, so a busy stream sends none at all; it holds the source pull in a
+  task across a lapsed interval, because bounding `anext` with a timeout would cancel the pull
+  and lose whatever was arriving. Three of the format's own asymmetries are modeled rather than
+  smoothed over: the last event id persists across events, so a frame carrying no `id:` still
+  reports the stream's current one; `retry:` belongs to the *stream*; and an `id:` with no
+  data still moves the resumption point, because the spec's dispatch sets the last event ID
+  string before it returns early on an empty data buffer. A newline in `data` is carried by
+  splitting it across `data:` lines, which is what makes event injection structurally
+  impossible where a hand-rolled `f"data: {payload}\n\n"` forges a whole event; a newline in
+  `type` or `id` has no such spelling and raises at construction, before anything is
+  committed to the wire. `max_event_size` is unbounded by default and caps state retained
+  toward the pending event, for a producer that might be hostile or merely broken.
+- **`without-http`**: `subscribe(client, request)`, the half of Server-Sent Events that needs
+  a transport: it parses the response body, and when the stream ends waits and sends the
+  request again carrying `Last-Event-ID`, so a caller sees one uninterrupted stream of events
+  across however many connections it took. The resumption point advances on an event carrying
+  an `id:` and on a `Checkpoint`, so a producer that skips work the consumer filtered out is
+  not replayed from before the skip. This is the only retry loop the client ships, and
+  the no-retry-middleware position is what makes it possible rather than an exception to it:
+  that position rejects policy the library would have to invent, and here the backoff arrives
+  on the wire as `retry:`, the resumption token as `id:`, and the terminal condition is in the
+  protocol, so no flag is left to grow. A non-`200` or a content type other than
+  `text/event-stream` raises `NotAnEventStream` and never reconnects, the first connection's
+  errors propagate rather than starting a silent loop, and a drop after a stream is
+  established reconnects. The wait is floored at 100ms so a hostile `retry: 0` cannot spin,
+  and `sleep` is injected so a test drives the loop without waiting.
+
 - **`without-asgi`**: conditional requests, byte ranges, and static assets.
   `selection_for` is the whole of RFC 9110 §13 and §14 as one pure function of a size, two
   validators, and the request's headers, returning `Whole | Head | Span | NotModified |

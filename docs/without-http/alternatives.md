@@ -48,7 +48,7 @@ mechanisms this package does not have.
 | HTTP/3 (QUIC) | no; [new mechanism](#how-a-gap-closes-here), [#11](https://github.com/JoshKarpel/without/issues/11) | no | no | [yes](https://github.com/jawah/niquests) |
 | WebSocket client | no; [new mechanism](#how-a-gap-closes-here), [#69](https://github.com/JoshKarpel/without/issues/69) | no | [yes](https://docs.aiohttp.org/en/stable/client_quickstart.html#websockets) | [yes](https://github.com/jawah/niquests), including over HTTP/2 and HTTP/3 |
 | WebSockets over HTTP/2 (RFC 8441 extended CONNECT) | no, client or server; [#21](https://github.com/JoshKarpel/without/issues/21) | no WebSocket client | no HTTP/2 | [yes](https://github.com/jawah/niquests) |
-| Server-sent events | unwritten; [a stream transform](#how-a-gap-closes-here), [#71](https://github.com/JoshKarpel/without/issues/71) | third party ([`httpx-sse`](https://github.com/florimondmanca/httpx-sse)) | third party ([`aiohttp-sse-client`](https://github.com/rtfol/aiohttp-sse-client)) | [yes](https://github.com/jawah/niquests) |
+| Server-sent events | yes; the format is [a pure stream transform](../without-asgi/sse.md) in `without-asgi`, and [`subscribe`](index.md#server-sent-events) here reconnects and resumes | third party ([`httpx-sse`](https://github.com/florimondmanca/httpx-sse)) | third party ([`aiohttp-sse-client`](https://github.com/rtfol/aiohttp-sse-client)) | [yes](https://github.com/jawah/niquests) |
 
 ### Connections
 
@@ -82,7 +82,7 @@ mechanisms this package does not have.
 | Redirects | opt-in middleware ([`follow_redirects()`](index.md#client-middleware)) | built-in, [off by default](https://www.python-httpx.org/compatibility/) | built-in, on by default | built-in, on by default |
 | Cookies | [explicit jar](cookies.md), attached by middleware | jar on the client | jar on the session | jar on the session |
 | Auth helpers | Basic and bearer ([`basic_auth`, `bearer_auth`](index.md#client-middleware)); Digest unwritten, [middleware-shaped](#how-a-gap-closes-here), [#74](https://github.com/JoshKarpel/without/issues/74) | [Basic and Digest](https://www.python-httpx.org/quickstart/) | [Basic](https://docs.aiohttp.org/en/stable/client_reference.html#basicauth) | Basic and Digest |
-| Retries | [no, by position](#what-stays-absent) (mechanism ships, policy stays with the caller) | [connect phase only](https://www.python-httpx.org/advanced/transports/) (`HTTPTransport(retries=)`) | third party ([`aiohttp-retry`](https://github.com/inyutin/aiohttp_retry)) | off by default; [first-class `retries=`](https://niquests.readthedocs.io/en/latest/user/advanced.html) (urllib3 `Retry`) |
+| Retries | [no, by position](#what-stays-absent) (mechanism ships, policy stays with the caller; the one loop that ships is [SSE reconnection](index.md#server-sent-events), whose policy is on the wire) | [connect phase only](https://www.python-httpx.org/advanced/transports/) (`HTTPTransport(retries=)`) | third party ([`aiohttp-retry`](https://github.com/inyutin/aiohttp_retry)) | off by default; [first-class `retries=`](https://niquests.readthedocs.io/en/latest/user/advanced.html) (urllib3 `Retry`) |
 | Extension mechanism | [function composition over `Client`](index.md#client-middleware) | [event hooks](https://www.python-httpx.org/advanced/event-hooks/), custom transports | [client middlewares](https://docs.aiohttp.org/en/stable/client_reference.html) | requests-style hooks |
 | Certificate revocation, OS truststore | no (inject `ssl_context_factory`) | — | — | [OCSP, CRL, OS truststore](https://github.com/jawah/niquests) |
 | Synchronous API | [no, by position](#what-stays-absent) | yes | no | [yes](https://github.com/jawah/niquests) |
@@ -110,7 +110,6 @@ worth being specific:
 | Digest auth ([#74](https://github.com/JoshKarpel/without/issues/74)) | A looping middleware with the same shape as `follow_redirects`, since Digest answers a challenge. The challenge-free schemes (`basic_auth`, `bearer_auth`) need no loop and ship. |
 | Proxies ([#73](https://github.com/JoshKarpel/without/issues/73)), Unix sockets ([#72](https://github.com/JoshKarpel/without/issues/72)), local address | `Connect` implementations. The pool takes `Connect` at construction; none of these are written, but none needs a new interface (`tcp_connect` is the shape, already shipped). The proxy case has one edge that is *not* a `Connect`: a cleartext forward proxy wants the absolute URI in the request line, and the pool derives that target from the URL, so only the `CONNECT` tunnel fits the seam. |
 | DNS caching ([#75](https://github.com/JoshKarpel/without/issues/75)) | A `Resolve` wrapper owning the cache, injected as `tcp_connect(resolve=...)`, so resolution policy stays with the caller instead of inside the pool. The interface ships; the cache does not, because `getaddrinfo` hides record TTLs, making any staleness bound the caller's policy to choose. |
-| Server-sent events ([#71](https://github.com/JoshKarpel/without/issues/71)) | A parser from a byte stream to typed events that composes over any response body, and the encoder that is its mirror on the app side. It needs nothing from the client, so it may not even live in this package. |
 | WebSocket client ([#69](https://github.com/JoshKarpel/without/issues/69)) | A real addition: a new rim API over `wsproto`. The server-side wire mapping (`ws_wire`) exists; the client half and its API shape do not. Carrying WebSockets over HTTP/2 ([#21](https://github.com/JoshKarpel/without/issues/21)) is a second, separable addition: `wsproto`'s high-level connection is welded to the h11 handshake, so both halves would drive `frame_protocol` directly. |
 | HTTP/3 ([#11](https://github.com/JoshKarpel/without/issues/11)) | A new wire module over a QUIC implementation, following the sans-IO pattern `h11_wire`/`h2_wire` set. The largest item on this page, and the one whose constraints are most settled: an optional `aioquic` extra, TLS-only, opt-in through the existing `serving` entrypoint alongside the TCP listener, with `Alt-Svc` injection gated on this process actually terminating h3. |
 
@@ -155,6 +154,14 @@ Positions, not gaps, each with its cost named:
   a kept-alive connection can still surface an error other clients hide by
   silently replaying idempotent requests. If that race shows up in practice it
   is a pool concern to fix there, not a middleware.
+
+  [`subscribe`](index.md#server-sent-events) is the one shipped loop, and it is
+  this position holding rather than an exception to it. What the position rejects
+  is policy the library would have to invent; an event stream carries its own.
+  The backoff arrives on the wire as `retry:`, the resumption token as `id:`, and
+  the terminal condition (a non-`200`, or a content type that is not
+  `text/event-stream`) is written into the protocol. There is nothing left for a
+  flag to configure, which is exactly what a general `retry()` could not say.
 - **Unbounded per-host connections by default.** Mirrors the server's choice to
   let OS backpressure govern ([Connection pooling](index.md#connection-pooling));
   the cost is that a runaway caller opens sockets until the OS objects, where
