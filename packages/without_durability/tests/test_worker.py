@@ -10,7 +10,6 @@ from datetime import timedelta
 from time import monotonic
 
 import pytest
-from without import ticks
 from without_durability import LEASE
 from without_durability import Delivery
 from without_durability import MemoryCheckpointer
@@ -25,6 +24,7 @@ from without_durability.worker import passes
 from without_durability.worker import ready
 from without_durability.worker import waking
 from without_durability.worker import work
+from without_streams import ticks
 
 from .helpers import STARTED_AT
 from .helpers import Clock

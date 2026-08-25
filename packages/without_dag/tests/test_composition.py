@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from without import collect
-from without import from_map
-from without import stream_from_iterable
 from without_dag import Graph
+from without_streams import collect
+from without_streams import from_map
+from without_streams import stream_from_iterable
 
 
 async def test_a_compiled_graph_lifts_into_a_processor_run_once_per_event() -> None:

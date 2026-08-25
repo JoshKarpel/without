@@ -13,8 +13,8 @@ from integration.kv import Value
 from integration.kv import encode_reply
 from integration.kv import make_store
 from integration.kv import parse_request
-from without import collect
-from without import stream_from_iterable
+from without_streams import collect
+from without_streams import stream_from_iterable
 
 
 @pytest.mark.parametrize(

@@ -1,8 +1,8 @@
 import pytest
 from pydantic_settings import BaseSettings
 from pydantic_settings import SettingsConfigDict
-from without import Context
 from without_env import EnvContext
+from without_streams import Context
 
 
 class ServerSettings(BaseSettings):

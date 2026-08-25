@@ -9,8 +9,6 @@ from dataclasses import field
 from types import AsyncGeneratorType
 
 import pytest
-from without import Processor
-from without import Stream
 from without_asgi import Asgi
 from without_asgi import ASGIApp
 from without_asgi import HttpRouter
@@ -27,6 +25,8 @@ from without_asgi import WebsocketReceive
 from without_asgi import WebsocketScope
 from without_asgi import WebsocketSend
 from without_asgi import make_asgi_app
+from without_streams import Processor
+from without_streams import Stream
 
 
 @dataclass(slots=True)

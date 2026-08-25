@@ -30,10 +30,10 @@ from datetime import timedelta
 from typing import cast
 from typing import overload
 
-from without.interfaces import Processor
-from without.interfaces import Sink
-from without.interfaces import Stream
-from without.tasks import background_task
+from without_streams.interfaces import Processor
+from without_streams.interfaces import Sink
+from without_streams.interfaces import Stream
+from without_streams.tasks import background_task
 
 
 async def stream_from_iterable[T](values: Iterable[T]) -> AsyncIterator[T]:

@@ -6,7 +6,6 @@ from contextlib import asynccontextmanager
 
 import pytest
 from pytest_mock import MockerFixture
-from without.testing import yield_once
 from without_asgi import RawMessage
 from without_asgi import RawScope
 from without_asgi import Receive
@@ -30,6 +29,7 @@ from without_http.testing import pipe
 from without_http.testing import respond
 from without_http.testing import scope_from_client_request
 from without_http.testing import served_pipe
+from without_streams.testing import yield_once
 
 from .helpers import tagged_echo_app
 

@@ -26,10 +26,10 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "without-core",
+    "without-streams",
     "without-asgi",
 ]
 
 [tool.uv.sources]
-without-core = { workspace = true }
+without-streams = { workspace = true }
 without-asgi = { workspace = true }

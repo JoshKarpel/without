@@ -16,7 +16,6 @@ members = [
     "integration",
     "without-asgi",
     "without-configmap",
-    "without-core",
     "without-dag",
     "without-durability",
     "without-durability-postgres",
@@ -26,6 +25,7 @@ members = [
     "without-html",
     "without-http",
     "without-logging",
+    "without-streams",
     "without-web",
     "without-workspace",
 ]
@@ -718,7 +718,6 @@ dependencies = [
     { name = "pydantic-settings" },
     { name = "without-asgi" },
     { name = "without-configmap" },
-    { name = "without-core" },
     { name = "without-dag" },
     { name = "without-durability" },
     { name = "without-durability-postgres" },
@@ -726,6 +725,7 @@ dependencies = [
     { name = "without-durability-sqlite" },
     { name = "without-env" },
     { name = "without-http" },
+    { name = "without-streams" },
     { name = "without-web" },
 ]
 
@@ -737,7 +737,6 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.7" },
     { name = "without-asgi", editable = "packages/without_asgi" },
     { name = "without-configmap", editable = "packages/without_configmap" },
-    { name = "without-core", editable = "packages/without" },
     { name = "without-dag", editable = "packages/without_dag" },
     { name = "without-durability", editable = "packages/without_durability" },
     { name = "without-durability-postgres", editable = "packages/without_durability_postgres" },
@@ -745,6 +744,7 @@ requires-dist = [
     { name = "without-durability-sqlite", editable = "packages/without_durability_sqlite" },
     { name = "without-env", editable = "packages/without_env" },
     { name = "without-http", editable = "packages/without_http" },
+    { name = "without-streams", editable = "packages/without_streams" },
     { name = "without-web", editable = "packages/without_web" },
 ]
 
@@ -2067,13 +2067,13 @@ version = "0.0.0"
 source = { editable = "packages/without_asgi" }
 dependencies = [
     { name = "brotli" },
-    { name = "without-core" },
+    { name = "without-streams" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "brotli", specifier = ">=1.1" },
-    { name = "without-core", editable = "packages/without" },
+    { name = "without-streams", editable = "packages/without_streams" },
 ]
 
 [[package]]
@@ -2084,7 +2084,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pyyaml" },
     { name = "watchfiles" },
-    { name = "without-core" },
+    { name = "without-streams" },
 ]
 
 [package.metadata]
@@ -2092,38 +2092,33 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "watchfiles", specifier = ">=0.21" },
-    { name = "without-core", editable = "packages/without" },
+    { name = "without-streams", editable = "packages/without_streams" },
 ]
-
-[[package]]
-name = "without-core"
-version = "0.0.0"
-source = { editable = "packages/without" }
 
 [[package]]
 name = "without-dag"
 version = "0.0.0"
 source = { editable = "packages/without_dag" }
 dependencies = [
-    { name = "without-core" },
+    { name = "without-streams" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "without-core", editable = "packages/without" }]
+requires-dist = [{ name = "without-streams", editable = "packages/without_streams" }]
 
 [[package]]
 name = "without-durability"
 version = "0.0.0"
 source = { editable = "packages/without_durability" }
 dependencies = [
-    { name = "without-core" },
     { name = "without-dag" },
+    { name = "without-streams" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "without-core", editable = "packages/without" },
     { name = "without-dag", editable = "packages/without_dag" },
+    { name = "without-streams", editable = "packages/without_streams" },
 ]
 
 [[package]]
@@ -2161,14 +2156,14 @@ name = "without-durability-sqlite"
 version = "0.0.0"
 source = { editable = "packages/without_durability_sqlite" }
 dependencies = [
-    { name = "without-core" },
     { name = "without-durability" },
+    { name = "without-streams" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "without-core", editable = "packages/without" },
     { name = "without-durability", editable = "packages/without_durability" },
+    { name = "without-streams", editable = "packages/without_streams" },
 ]
 
 [[package]]
@@ -2177,13 +2172,13 @@ version = "0.0.0"
 source = { editable = "packages/without_env" }
 dependencies = [
     { name = "pydantic-settings" },
-    { name = "without-core" },
+    { name = "without-streams" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.7" },
-    { name = "without-core", editable = "packages/without" },
+    { name = "without-streams", editable = "packages/without_streams" },
 ]
 
 [[package]]
@@ -2207,7 +2202,7 @@ dependencies = [
     { name = "h11" },
     { name = "h2" },
     { name = "without-asgi" },
-    { name = "without-core" },
+    { name = "without-streams" },
     { name = "wsproto" },
 ]
 
@@ -2218,7 +2213,7 @@ requires-dist = [
     { name = "h11", specifier = ">=0.16" },
     { name = "h2", specifier = ">=4.1" },
     { name = "without-asgi", editable = "packages/without_asgi" },
-    { name = "without-core", editable = "packages/without" },
+    { name = "without-streams", editable = "packages/without_streams" },
     { name = "wsproto", specifier = ">=1.2" },
 ]
 
@@ -2227,11 +2222,16 @@ name = "without-logging"
 version = "0.0.0"
 source = { editable = "packages/without_logging" }
 dependencies = [
-    { name = "without-core" },
+    { name = "without-streams" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "without-core", editable = "packages/without" }]
+requires-dist = [{ name = "without-streams", editable = "packages/without_streams" }]
+
+[[package]]
+name = "without-streams"
+version = "0.0.0"
+source = { editable = "packages/without_streams" }
 
 [[package]]
 name = "without-web"
@@ -2239,13 +2239,13 @@ version = "0.0.0"
 source = { editable = "packages/without_web" }
 dependencies = [
     { name = "without-asgi" },
-    { name = "without-core" },
+    { name = "without-streams" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "without-asgi", editable = "packages/without_asgi" },
-    { name = "without-core", editable = "packages/without" },
+    { name = "without-streams", editable = "packages/without_streams" },
 ]
 
 [[package]]
@@ -2255,7 +2255,6 @@ source = { virtual = "." }
 dependencies = [
     { name = "without-asgi" },
     { name = "without-configmap" },
-    { name = "without-core" },
     { name = "without-dag" },
     { name = "without-durability" },
     { name = "without-durability-postgres" },
@@ -2265,6 +2264,7 @@ dependencies = [
     { name = "without-html" },
     { name = "without-http" },
     { name = "without-logging" },
+    { name = "without-streams" },
     { name = "without-web" },
 ]
 
@@ -2301,7 +2301,6 @@ docs = [
 requires-dist = [
     { name = "without-asgi", editable = "packages/without_asgi" },
     { name = "without-configmap", editable = "packages/without_configmap" },
-    { name = "without-core", editable = "packages/without" },
     { name = "without-dag", editable = "packages/without_dag" },
     { name = "without-durability", editable = "packages/without_durability" },
     { name = "without-durability-postgres", editable = "packages/without_durability_postgres" },
@@ -2311,6 +2310,7 @@ requires-dist = [
     { name = "without-html", editable = "packages/without_html" },
     { name = "without-http", editable = "packages/without_http" },
     { name = "without-logging", editable = "packages/without_logging" },
+    { name = "without-streams", editable = "packages/without_streams" },
     { name = "without-web", editable = "packages/without_web" },
 ]
 

@@ -7,8 +7,6 @@ from dataclasses import field
 from dataclasses import replace
 
 import pytest
-from without import Stream
-from without import stream_from_iterable
 from without_asgi import Disconnect
 from without_asgi import HttpHandler
 from without_asgi import HttpScope
@@ -22,6 +20,8 @@ from without_asgi.outbound import encode_response
 from without_asgi.routing import _BodyTooLarge
 from without_asgi.routing import limit_concurrent_requests
 from without_asgi.routing import limit_request_body
+from without_streams import Stream
+from without_streams import stream_from_iterable
 
 from .helpers import a_scope
 

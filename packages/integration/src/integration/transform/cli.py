@@ -7,10 +7,10 @@ from collections.abc import Callable
 
 from pydantic_settings import BaseSettings
 from pydantic_settings import SettingsConfigDict
-from without import Context
-from without import Processor
-from without import Stream
 from without_env import EnvContext
+from without_streams import Context
+from without_streams import Processor
+from without_streams import Stream
 
 from integration.transform.core import TransformConfig
 from integration.transform.core import transform

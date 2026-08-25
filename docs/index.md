@@ -22,7 +22,7 @@ mindset the code is shaped around.
 
 ## The substrate
 
-Three types carry the whole model (`without.interfaces`):
+Three types carry the whole model (`without_streams.interfaces`):
 
 - A `Stream[T]` is an asynchronous sequence of values: the one shape every
   connection takes, whoever does the I/O. A socket, a file watcher, a clock, and
@@ -38,8 +38,9 @@ Three types carry the whole model (`without.interfaces`):
 This is a [`uv`](https://docs.astral.sh/uv/) workspace of flat, version-locked
 packages. Each is its own top-level import.
 
-- [`without`](without/index.md): the core interfaces every plugin speaks, the
-  stream connectors, and a `with`-scoped background task helper.
+- [`without-streams`](without-streams/index.md): the substrate interfaces every
+  plugin speaks, the stream connectors, and a `with`-scoped background task
+  helper.
 - [`without-env`](without-env/index.md): a static `Context` parsed from
   environment variables with `pydantic-settings`.
 - [`without-configmap`](without-configmap/index.md): config from a Kubernetes
@@ -64,12 +65,13 @@ packages. Each is its own top-level import.
 
 The [package dependency graph](architecture/package-graph.md) is derived from the
 declared dependencies, and each package's API reference (its `Reference` page,
-e.g. [`without`](without/reference.md)) is recovered from the source docstrings.
+e.g. [`without-streams`](without-streams/reference.md)) is recovered from the
+source docstrings.
 
 ## Installing
 
 ```bash
-pip install without-core      # the core interfaces (imported as `without`)
+pip install without-streams   # the substrate interfaces
 pip install without-web       # plus whichever plugins you need
 ```
 

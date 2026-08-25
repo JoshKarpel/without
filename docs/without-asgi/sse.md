@@ -53,7 +53,7 @@ shape [`file_response`](index.md#streaming-a-file) produces and the same
 `Reply` `without-web` already accepts:
 
 ```python
-from without import Milliseconds
+from without_streams import Milliseconds
 from without_asgi import Checkpoint, Comment, Event, Retry, ServerSentEvent, event_stream
 
 

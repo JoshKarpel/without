@@ -9,7 +9,7 @@ authors = [
 ]
 requires-python = ">=3.14"
 dependencies = [
-    "without-core",
+    "without-streams",
     "without-env",
     "without-configmap",
     "without-asgi",
@@ -32,7 +32,7 @@ exclude-newer = "7 days"
 members = ["packages/*"]
 
 [tool.uv.sources]
-without-core = { workspace = true }
+without-streams = { workspace = true }
 without-env = { workspace = true }
 without-configmap = { workspace = true }
 without-asgi = { workspace = true }
@@ -233,7 +233,6 @@ mypy_path = [
     # [[[cog import cog; from package_bases import emit; cog.outl(emit()) ]]]
     "packages/benchmarks/src",
     "packages/integration/src",
-    "packages/without/src",
     "packages/without_asgi/src",
     "packages/without_configmap/src",
     "packages/without_dag/src",
@@ -245,6 +244,7 @@ mypy_path = [
     "packages/without_html/src",
     "packages/without_http/src",
     "packages/without_logging/src",
+    "packages/without_streams/src",
     "packages/without_web/src",
     # [[[end]]]
 ]

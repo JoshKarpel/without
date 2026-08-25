@@ -22,7 +22,6 @@ import h11
 import httpx
 import pytest
 from pytest_mock import MockerFixture
-from without import cancel_futures
 from without_asgi import ASGIApp
 from without_asgi import RawMessage
 from without_asgi import Receive
@@ -41,6 +40,7 @@ from without_http.server import _serve_h11_connection
 from without_http.testing import AUTHORITY
 from without_http.testing import SERVER_ADDRESS
 from without_http.testing import served_pipe
+from without_streams import cancel_futures
 from wsproto import ConnectionType
 from wsproto import WSConnection
 from wsproto.events import Request as WsRequest

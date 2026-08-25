@@ -21,11 +21,11 @@ from integration.kv import make_keyspace
 from integration.kv import make_session
 from integration.kv import serve
 from pytest_mock import MockerFixture
-from without import Fold
-from without import Stream
-from without import from_fold
-from without import stream_from_iterable
 from without_env import EnvContext
+from without_streams import Fold
+from without_streams import Stream
+from without_streams import from_fold
+from without_streams import stream_from_iterable
 
 
 def _serve(

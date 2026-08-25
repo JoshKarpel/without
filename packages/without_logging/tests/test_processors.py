@@ -2,13 +2,13 @@ import logging
 from datetime import UTC
 from datetime import datetime
 
-from without import collect
-from without import from_selector
-from without import stream_from_iterable
 from without_logging import Level
 from without_logging import Record
 from without_logging import add_fields
 from without_logging import at_least
+from without_streams import collect
+from without_streams import from_selector
+from without_streams import stream_from_iterable
 
 
 def record(level: int, message: str, **fields: object) -> Record:

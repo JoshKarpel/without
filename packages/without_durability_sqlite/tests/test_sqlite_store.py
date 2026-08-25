@@ -9,7 +9,6 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from without.testing import yield_once
 from without_durability import Contended
 from without_durability import Fenced
 from without_durability import Recorded
@@ -23,6 +22,7 @@ from without_durability_sqlite import SqliteEffect
 from without_durability_sqlite import SqliteScheduler
 from without_durability_sqlite import connect
 from without_durability_sqlite import migrate
+from without_streams.testing import yield_once
 
 # No `compose` mark and no service: the whole point of this store is that there is
 # nothing to start. The tests run against a real file in a temporary directory, which is

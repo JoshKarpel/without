@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from collections.abc import Callable
 
-from without import Stream
 from without_asgi import HttpHandler
 from without_asgi import HttpScope
 from without_asgi import Inbound
@@ -11,6 +10,7 @@ from without_asgi import Outbound
 from without_asgi import Response
 from without_asgi import encode_response
 from without_asgi import read_body
+from without_streams import Stream
 
 from without_web.router import Endpoint
 from without_web.router import Match

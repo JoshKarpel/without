@@ -11,9 +11,9 @@ from integration.transform.cli import stdin_lines
 from integration.transform.cli import transform_lines
 from integration.transform.core import Mode
 from integration.transform.core import TransformConfig
-from without import collect
-from without import stream_from_iterable
 from without_env import EnvContext
+from without_streams import collect
+from without_streams import stream_from_iterable
 
 
 async def test_transform_lines_transforms_each_line_with_the_config_mode() -> None:

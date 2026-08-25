@@ -15,10 +15,10 @@ jobs:
       name: pypi
       # This monorepo publishes the whole `without*` family from one run, so no
       # single PyPI project is "the" project; the repo name (`without`) is not a
-      # project (the core distributes as `without-core`). Trusted publishing is
-      # many-to-many, so this one workflow uploads the whole `without*` family:
-      # register the same trusted publisher on each project.
-      url: https://pypi.org/p/without-core
+      # project at all. Trusted publishing is many-to-many, so this one workflow
+      # uploads the whole `without*` family: register the same trusted publisher
+      # on each project.
+      url: https://pypi.org/p/without-streams
     permissions:
       id-token: write # trusted publishing exchanges this OIDC token for a PyPI upload credential
       contents: read
@@ -48,9 +48,9 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: uv run --script scripts/prepare_release.py "$VERSION"
 
-      # The publishable packages are exactly the `without*` workspace members
-      # (the core `without-core` plus its `without-` plugins); the `integration`
-      # aggregator is named outside that family, so this glob skips it.
+      # The publishable packages are exactly the `without*` workspace members;
+      # the `integration` aggregator is named outside that family, so this glob
+      # skips it.
       - name: Build every publishable package
         run: |
           for dir in packages/without*; do

@@ -5,7 +5,6 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
-from without import Stream
 from without_asgi import HttpHandler
 from without_asgi import HttpScope
 from without_asgi import Inbound
@@ -17,6 +16,7 @@ from without_asgi import ResponseStart
 from without_asgi import encode_response
 from without_asgi import inventory
 from without_asgi.headers import first
+from without_streams import Stream
 from without_web import Match
 from without_web import Route
 from without_web import Router

@@ -286,7 +286,7 @@ the chunks are an ordinary `Stream`, read-ahead is opt-in composition rather tha
 a built-in, `spool` from the core:
 
 ```python
-from without import spool
+from without_streams import spool
 
 return spool(await file_response(path), ahead=2)
 ```
@@ -392,7 +392,7 @@ from collections.abc import AsyncIterator
 from contextlib import nullcontext
 from pathlib import Path
 
-from without import Stream
+from without_streams import Stream
 from without_asgi import (
     HttpHandler,
     HttpScope,

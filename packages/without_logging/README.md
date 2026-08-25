@@ -14,7 +14,7 @@ compose.
 ```python
 import logging
 
-from without import compose, from_selector, from_sink
+from without_streams import compose, from_selector, from_sink
 from without_logging import Level, at_least, capture
 
 
@@ -45,7 +45,7 @@ closing it. Both take strings (render a `Record` to text with a `from_map` in fr
 ```python
 from datetime import timedelta
 
-from without import compose, from_map, from_selector
+from without_streams import compose, from_map, from_selector
 from without_logging import Level, at_least, offload, to_rotating_file
 
 writer = to_rotating_file(lambda i, when: directory / f"app.{i}.log", max_bytes=64 << 20, max_age=timedelta(hours=1))

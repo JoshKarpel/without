@@ -11,7 +11,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from watchfiles import awatch
-from without.interfaces import Stream
+from without_streams.interfaces import Stream
 
 type Changes = Callable[[Path], AsyncIterator[object]]
 

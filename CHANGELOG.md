@@ -138,6 +138,28 @@
 
 ### Added
 
+### Changed
+
+- **`without-core` is renamed `without-streams`, and its import name moves from `without` to
+  `without_streams`.** Install `without-streams` instead of `without-core`, and rewrite
+  `from without import ...` as `from without_streams import ...` (likewise for the
+  `.interfaces`, `.wiring`, `.tasks`, and `.testing` submodules). Nothing else about the
+  package changes: the exported names, their signatures, and their behavior are identical.
+  `core` named the package's position in the dependency graph rather than anything it
+  contains, and that position is not one the project actually claims: the whole point of
+  layers with narrow interfaces is that no layer is privileged, and `without-html` is already
+  a member of the family that depends on none of this. `streams` names the contents instead.
+  It is the narrower of the two honest names, since the substrate also carries the behavior
+  half of the model (`Context`, `sample`), but a `Context` is defined as a stream sampled for
+  its latest value, so `Stream` is the primitive the rest is derived from. With the rename
+  every `without*` distribution name now matches its import name, so no package needs a
+  `[tool.uv.build-backend] module-name` override and no distribution claims the bare
+  `without` name, which is the project rather than a package.
+
+## 0.0.5
+
+### Added
+
 - **`without-asgi`**: conditional requests, byte ranges, and static assets.
   `selection_for` is the whole of RFC 9110 §13 and §14 as one pure function of a size, two
   validators, and the request's headers, returning `Whole | Head | Span | NotModified |

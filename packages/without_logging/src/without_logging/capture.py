@@ -7,8 +7,8 @@ from collections.abc import AsyncIterator
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 
-from without.interfaces import Sink
-from without.wiring import stream_from_queue
+from without_streams.interfaces import Sink
+from without_streams.wiring import stream_from_queue
 
 from without_logging.context import merge_context
 from without_logging.record import Record

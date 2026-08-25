@@ -83,9 +83,9 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Philosophy: philosophy.md
-  - without:
-      - without/index.md
-      - Reference: without/reference.md
+  - without-streams:
+      - without-streams/index.md
+      - Reference: without-streams/reference.md
   - without-env:
       - without-env/index.md
       - Reference: without-env/reference.md

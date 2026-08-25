@@ -211,7 +211,7 @@ which is exactly what `from_map` wants: this package adds no wrapper of its own,
 because there is nothing to add.
 
 ```python
-from without import collect, from_map, stream_from_iterable
+from without_streams import collect, from_map, stream_from_iterable
 
 processor = from_map(run)  # Processor[Request, Report]
 reports = await collect(processor(stream_from_iterable([request_a, request_b])))

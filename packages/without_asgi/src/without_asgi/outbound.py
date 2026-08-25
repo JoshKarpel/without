@@ -12,7 +12,7 @@ from typing import assert_never
 from typing import runtime_checkable
 from urllib.parse import urlencode
 
-from without import Stream
+from without_streams import Stream
 
 from without_asgi.headers import merge
 from without_asgi.narrow import narrow

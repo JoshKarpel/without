@@ -5,8 +5,8 @@ from collections.abc import Callable
 from datetime import datetime
 from traceback import TracebackException
 
-from without.interfaces import Processor
-from without.interfaces import from_map
+from without_streams.interfaces import Processor
+from without_streams.interfaces import from_map
 
 from without_logging.record import Record
 

@@ -3,13 +3,13 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 
 import pytest
-from without import Stream
-from without import stream_from_iterable
 from without_asgi import WebsocketAccept
 from without_asgi import WebsocketClose
 from without_asgi import WebsocketInbound
 from without_asgi import WebsocketOutbound
 from without_asgi import WebsocketScope
+from without_streams import Stream
+from without_streams import stream_from_iterable
 from without_web import Match
 from without_web import catching_websocket
 from without_web import ws

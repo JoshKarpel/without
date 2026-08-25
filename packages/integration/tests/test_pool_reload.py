@@ -7,8 +7,6 @@ from dataclasses import dataclass
 
 from integration.pool_reload import PoolConfig
 from integration.pool_reload import reloading_pool
-from without import Sample
-from without import Stream
 from without_asgi import ASGIApp
 from without_asgi import HttpHandler
 from without_asgi import HttpScope
@@ -20,6 +18,8 @@ from without_asgi import make_asgi_app
 from without_http import ConnectionPool
 from without_http import request
 from without_http import serving
+from without_streams import Sample
+from without_streams import Stream
 
 # The proof for issue #27: a connection pool whose per-host concurrency bound is
 # reloaded live, demonstrated end-to-end over without-http. The pool is rebuilt

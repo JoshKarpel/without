@@ -24,11 +24,10 @@ docstrings, and the derived package dependency graph, lives at
 This is a `uv` workspace of flat, version-locked packages (no namespace
 packages). Each package is its own top-level import.
 
-- `packages/without` — the core: the interfaces every plugin speaks
-  (`without.interfaces`), the stream edge connectors (`without.wiring`), and a
-  `with`-scoped background task helper (`without.tasks`). Distributed on PyPI as
-  `without-core` (the bare `without` name is unavailable there); imported as
-  `without`.
+- `packages/without_streams` — the substrate: the interfaces every plugin speaks
+  (`without_streams.interfaces`), the stream edge connectors
+  (`without_streams.wiring`), and a `with`-scoped background task helper
+  (`without_streams.tasks`). Imported as `without_streams`.
 - `packages/without_env` — first plugin: a static `Context` parsed from
   environment variables (`pydantic-settings`). Imported as `without_env`.
 - `packages/without_configmap` — config from a Kubernetes mount (`watchfiles` +

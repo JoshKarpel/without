@@ -4,8 +4,8 @@ from collections.abc import Callable
 from datetime import timedelta
 
 import pytest
-from without import Milliseconds
-from without import Seconds
+from without_streams import Milliseconds
+from without_streams import Seconds
 
 
 class TestCounts:

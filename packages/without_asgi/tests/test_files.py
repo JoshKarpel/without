@@ -11,8 +11,6 @@ from pathlib import Path
 
 import pytest
 from pytest_mock import MockerFixture
-from without import collect
-from without import spool
 from without_asgi import DEFAULT_CHUNK_SIZE
 from without_asgi import Outbound
 from without_asgi import RawHeaders
@@ -21,6 +19,8 @@ from without_asgi import ResponseStart
 from without_asgi import file_response
 from without_asgi import serve_file
 from without_asgi.selection import http_date
+from without_streams import collect
+from without_streams import spool
 
 from .helpers import a_scope
 

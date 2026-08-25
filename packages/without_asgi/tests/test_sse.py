@@ -10,8 +10,6 @@ from itertools import pairwise
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
-from without import Milliseconds
-from without import stream_from_iterable
 from without_asgi import EVENT_STREAM_HEADERS
 from without_asgi import Checkpoint
 from without_asgi import Comment
@@ -28,6 +26,8 @@ from without_asgi import event_stream
 from without_asgi import parse_events
 from without_asgi import parse_events_with_directives
 from without_asgi import with_heartbeat
+from without_streams import Milliseconds
+from without_streams import stream_from_iterable
 
 # Far longer than any test's runtime, so a heartbeat only fires where one is the point.
 NEVER = timedelta(hours=1)

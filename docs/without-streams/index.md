@@ -1,12 +1,12 @@
-# without
+# without-streams
 
 The narrow waist of the project: the interfaces every plugin speaks, plus the
 stream connectors, a `with`-scoped background task helper, and the duration
 counts the boundaries share. See the
 [Philosophy](../philosophy.md) for why the model is shaped this way, and the
-[`without` API reference](../without/reference.md) for the full surface.
+[`without_streams` API reference](reference.md) for the full surface.
 
-## The substrate (`without.interfaces`)
+## The substrate (`without_streams.interfaces`)
 
 Three types carry the whole model:
 
@@ -44,7 +44,7 @@ never awaits). Emitting *several* outputs per event, by contrast, is a wiring
 concern, not a builder: fan-out to several sinks is `tee` (below), and the
 fan-in family (`broadcast`, `merge`) is reserved in issue #13.
 
-## Wiring (`without.wiring`)
+## Wiring (`without_streams.wiring`)
 
 `compose` chains one processor into the next on the event edge: pure composition,
 the only connector that needs nothing running. When its second argument is a
@@ -70,7 +70,7 @@ outlives its consumer by an indeterminate amount. `stack`
 composes middleware (any `(handler, *context) -> handler`) into one, serving both
 server handlers and HTTP clients.
 
-## Durations that cross an integer boundary (`without.durations`)
+## Durations that cross an integer boundary (`without_streams.durations`)
 
 A `timedelta` is the right type for a duration everywhere in this project,
 because it names its unit and nothing downstream has to guess whether a bare
@@ -102,7 +102,7 @@ That is the only place the question "does this divide?" is ever asked, which is
 the point: past construction there is nothing left for a boundary to check, and
 no truncation left for it to do.
 
-## Tasks (`without.tasks`)
+## Tasks (`without_streams.tasks`)
 
 The async task helpers: `sleep_forever`; the `with`-scoped `background_task`
 (starts a task on entry, cancels-then-awaits it on exit, so nothing leaks);

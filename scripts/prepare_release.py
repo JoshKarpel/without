@@ -27,7 +27,7 @@ PACKAGES_DIR = Path(__file__).resolve().parent.parent / "packages"
 
 
 def requirement_name(requirement: str) -> str:
-    """The distribution name from a PEP 508 requirement (`without-core>=1` -> `without-core`)."""
+    """The distribution name from a PEP 508 requirement (`without-streams>=1` -> `without-streams`)."""
     return re.split(r"[<>=!~;\[ ]", requirement, maxsplit=1)[0].strip()
 
 

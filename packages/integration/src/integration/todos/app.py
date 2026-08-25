@@ -8,8 +8,6 @@ from typing import assert_never
 
 from pydantic import BaseModel
 from pydantic import ValidationError
-from without import Stream
-from without import stream_from_iterable
 from without_asgi import ASGIApp
 from without_asgi import HttpHandler
 from without_asgi import HttpScope
@@ -38,6 +36,8 @@ from without_asgi.compression import compress
 from without_asgi.routing import HttpMiddleware
 from without_asgi.routing import stack
 from without_asgi.routing import wrap
+from without_streams import Stream
+from without_streams import stream_from_iterable
 from without_web import INT
 from without_web import Body
 from without_web import ExtractionError

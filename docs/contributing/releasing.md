@@ -25,12 +25,10 @@ glob is the single source of truth (the publish workflow, the release stamper,
 and the bootstrap script all derive it), so this document does not enumerate the
 packages.
 
-- The core distribution is **`without-core`**, imported as `without`: the bare
-  `without` name is unavailable on PyPI, so a `[tool.uv.build-backend]
-  module-name` override keeps the import name while the distribution carries the
-  `-core` suffix.
-- Every other `without*` member's distribution name matches its import name
-  (with `-`/`_` normalization).
+- Every `without*` member's distribution name matches its import name (with
+  `-`/`_` normalization), so no member needs a `[tool.uv.build-backend]
+  module-name` override. No distribution claims the bare `without` name: it is
+  the project, not a package.
 - **`integration`** is never published: its name sits outside the `without*`
   family the glob selects, and its `Private :: Do Not Upload` classifier makes
   PyPI reject an upload if it ever slips through.
@@ -38,7 +36,7 @@ packages.
 ## Intra-workspace dependencies are pinned at build
 
 A built wheel strips `[tool.uv.sources]`, so a sibling dependency declared as a
-bare name (`without-core`) would ship with **no version bound** and could resolve
+bare name (`without-streams`) would ship with **no version bound** and could resolve
 against an incompatible release. Before building,
 [`scripts/prepare_release.py`](https://github.com/JoshKarpel/without/blob/main/scripts/prepare_release.py) rewrites each
 publishable member's own version and pins its sibling dependencies to
@@ -99,7 +97,7 @@ recipe, then attach the trusted publisher above to each:
    days rather than all at once:
 
    ```bash
-   just bootstrap-pypi without-core without-asgi
+   just bootstrap-pypi without-streams without-asgi
    ```
 
    It uploads an empty `0.0.0` placeholder for each named project that does not

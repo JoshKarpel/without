@@ -16,7 +16,6 @@ from typing import assert_never
 from urllib.parse import unquote
 from urllib.parse import urlsplit
 
-from without import cancel_futures
 from without_asgi import Asgi
 from without_asgi import ASGIApp
 from without_asgi import Disconnect
@@ -35,6 +34,7 @@ from without_asgi import encode_inbound
 from without_asgi import parse_outbound
 from without_asgi.outbound import ResponseBody as OutboundBody
 from without_asgi.outbound import ResponseTrailers as OutboundTrailers
+from without_streams import cancel_futures
 
 from without_http.client import _NO_TIMEOUT
 from without_http.client import Client

@@ -17,8 +17,6 @@ import brotli
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
-from without import Stream
-from without import stream_from_iterable
 from without_asgi import EarlyHint
 from without_asgi import HttpHandler
 from without_asgi import HttpScope
@@ -45,6 +43,8 @@ from without_asgi.compression import negotiate_coding
 from without_asgi.compression import padded_gzip_compressor
 from without_asgi.compression import padded_zstd_compressor
 from without_asgi.routing import HttpMiddleware
+from without_streams import Stream
+from without_streams import stream_from_iterable
 
 from .helpers import FileDescriptor
 from .helpers import a_scope

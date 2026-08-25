@@ -14,7 +14,6 @@ from integration.durable import Order
 from redis.asyncio import Redis
 from redis.crc import key_slot
 from redis.exceptions import ResponseError
-from without import ticks
 from without_durability import Contended
 from without_durability import Fenced
 from without_durability import Recorded
@@ -29,6 +28,7 @@ from without_durability_redis import trimming
 from without_durability_redis.checkpointer import fenced
 from without_durability_redis.units import milliseconds
 from without_durability_redis.units import seconds
+from without_streams import ticks
 
 # `just test` starts the services in compose.yaml and publishes each address; these
 # tests drive the real server it started rather than a fake, and skip when it did not

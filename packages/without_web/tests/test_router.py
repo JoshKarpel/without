@@ -5,8 +5,6 @@ import re
 from collections.abc import AsyncIterator
 
 import pytest
-from without import Stream
-from without import stream_from_iterable
 from without_asgi import HttpHandler
 from without_asgi import HttpScope
 from without_asgi import Inbound
@@ -22,6 +20,8 @@ from without_asgi import WebsocketText
 from without_asgi import encode_response
 from without_asgi.routing import HttpMiddleware
 from without_asgi.routing import WebsocketMiddleware
+from without_streams import Stream
+from without_streams import stream_from_iterable
 from without_web import INT
 from without_web import Match
 from without_web import Router

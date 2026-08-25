@@ -1,13 +1,13 @@
-from without import Transition
-from without import collect
-from without import from_filter
-from without import from_fold
-from without import from_map
-from without import from_scan
-from without import from_selector
-from without import from_sink
-from without import stream_from_iterable
-from without.testing import resolved_next_turn
+from without_streams import Transition
+from without_streams import collect
+from without_streams import from_filter
+from without_streams import from_fold
+from without_streams import from_map
+from without_streams import from_scan
+from without_streams import from_selector
+from without_streams import from_sink
+from without_streams import stream_from_iterable
+from without_streams.testing import resolved_next_turn
 
 
 async def test_from_scan_threads_state_and_emits_each_output() -> None:

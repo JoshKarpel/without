@@ -261,15 +261,15 @@ count-preserving 2x2 builders (`from_map` / `from_scan` / `from_sink` /
 protocol with a zero-or-one body, the async generator that yields on a match and
 otherwise skips to the next input.
 
-That is ordinary enough that it belongs in `without` core, not here: needing to
+That is ordinary enough that it belongs in `without-streams`, not here: needing to
 filter a log stream is exactly what motivated adding
-[`from_selector` and `from_filter`](../without/reference.md) to the core
-builders. `from_selector(keep)` re-emits the matching records; `from_filter`
+[`from_selector` and `from_filter`](../without-streams/reference.md) to the
+substrate builders. `from_selector(keep)` re-emits the matching records; `from_filter`
 drops them (the polarity-dual). So without-logging ships only the *predicates*
 that are specific to logs, and composes them with the core selector:
 
 ```python
-from without import compose, from_selector, from_sink
+from without_streams import compose, from_selector, from_sink
 from without_logging import Level, at_least
 
 pipeline = compose(from_selector(at_least(Level.WARNING)), from_sink(write))
@@ -279,7 +279,7 @@ pipeline = compose(from_selector(at_least(Level.WARNING)), from_sink(write))
 color of function throughout `without`, so it matches what `from_selector`
 expects even though the decision just compares integers). Splitting one record
 across *several* sinks is the other direction, and it stays a wiring concern:
-`tee` from `without` core; see below.
+`tee` from `without-streams`; see below.
 
 Enrichment, by contrast, *is* count-preserving, so `add_fields` is a plain
 `from_map`. Enriching from a *shared behavior* (a value the whole pipeline sees
@@ -336,7 +336,7 @@ closes files it owns, while `to_stream` never closes the caller's stream:
 ```python
 from datetime import timedelta
 
-from without import compose, from_map, from_selector
+from without_streams import compose, from_map, from_selector
 from without_logging import Level, at_least, capture, offload, to_rotating_file
 
 
@@ -429,7 +429,7 @@ data, plus anything `add_fields`/`bind` enriched) as first-class output:
 ```python
 import sys
 
-from without import compose
+from without_streams import compose
 from without_logging import capture, offload, render_console, render_json, to_stream
 
 async with (
@@ -498,8 +498,8 @@ exception is captured as structure and not flattened to a string at the edge.
 
 A real logging setup wants more than one sink: console *and* a file, or a file
 *and* the network. That is fan-out, one record stream split into several
-independent sinks, and it is [`tee`](../without/reference.md) from `without`
-core. `tee(*sinks)` returns a single `Sink` that feeds every event to every
+independent sinks, and it is [`tee`](../without-streams/reference.md) from
+`without-streams`. `tee(*sinks)` returns a single `Sink` that feeds every event to every
 branch, consuming the input exactly once, so there is one `capture` and one pass
 through the shared middleware.
 
@@ -511,7 +511,7 @@ carrying its own filtering, rendering, and terminal:
 import logging
 import sys
 
-from without import compose, from_selector, tee
+from without_streams import compose, from_selector, tee
 from without_logging import (
     Level,
     add_fields,

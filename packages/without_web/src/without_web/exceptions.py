@@ -4,8 +4,6 @@ from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from collections.abc import Callable
 
-from without import Processor
-from without import Stream
 from without_asgi import HttpHandler
 from without_asgi import HttpScope
 from without_asgi import Outbound
@@ -19,6 +17,8 @@ from without_asgi import WebsocketScope
 from without_asgi import encode_response
 from without_asgi.routing import HttpMiddleware
 from without_asgi.routing import WebsocketMiddleware
+from without_streams import Processor
+from without_streams import Stream
 
 # An app's exception policy: given a raised exception, produce the reply to send
 # instead, or `None` to let it propagate. Writing this as `match exc:` (or
