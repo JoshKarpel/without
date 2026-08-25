@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.0.5
+## 0.0.6
 
 ### Added
 
@@ -47,8 +47,22 @@
   splitting it across `data:` lines, which is what makes event injection structurally
   impossible where a hand-rolled `f"data: {payload}\n\n"` forges a whole event; a newline in
   `type` or `id` has no such spelling and raises at construction, before anything is
-  committed to the wire. `max_event_size` is unbounded by default and caps state retained
-  toward the pending event, for a producer that might be hostile or merely broken.
+  committed to the wire. Both sides are stricter than the format about an `id`, which comes
+  back on reconnect as a `Last-Event-ID` header, so what it has to survive is a field value
+  rather than just a line: a control character (not a legal field value at all) and a
+  leading or trailing space (legal, but stripped by a field parser, so the peer would resume
+  from a point neither side chose) both raise on the way out and are ignored on the way in,
+  where the spec singles out only `NUL`. Interior spaces survive intact and are left alone.
+  Ignoring rather than raising inbound costs a
+  replay from an older id, where failing to spell the header would end a subscription
+  outright: nothing in the format is a parse error, so nothing in it hands a hostile
+  producer a way to kill its consumers. A `retry:` too large to name a duration is bounded
+  on both sides on the same terms, dropped by the parser and refused by `Retry`, since a
+  frame encoding to bytes this library would not read is not one worth writing.
+  `max_event_size` is unbounded by default and caps state retained
+  toward the pending event, for a producer that might be hostile or merely broken. A line
+  spanning many chunks is assembled from its fragments and joined once, so a megabyte of
+  JSON in one `data:` line costs time linear in its length rather than quadratic.
 - **`without-http`**: `subscribe(client, request)`, the half of Server-Sent Events that needs
   a transport: it parses the response body, and when the stream ends waits and sends the
   request again carrying `Last-Event-ID`, so a caller sees one uninterrupted stream of events
@@ -58,11 +72,20 @@
   the no-retry-middleware position is what makes it possible rather than an exception to it:
   that position rejects policy the library would have to invent, and here the backoff arrives
   on the wire as `retry:`, the resumption token as `id:`, and the terminal condition is in the
-  protocol, so no flag is left to grow. A non-`200` or a content type other than
-  `text/event-stream` raises `NotAnEventStream` and never reconnects, the first connection's
-  errors propagate rather than starting a silent loop, and a drop after a stream is
-  established reconnects. The wait is floored at 100ms so a hostile `retry: 0` cannot spin,
-  and `sleep` is injected so a test drives the loop without waiting.
+  protocol. A non-`200` or a content type other than `text/event-stream` raises
+  `NotAnEventStream` and never reconnects, the first connection's errors propagate rather than
+  starting a silent loop, and a drop after a stream is established reconnects. How far to
+  trust the peer supplying that backoff is the caller's to set: a producer's `retry:` is
+  clamped between `minimum_reconnect` (100ms) and `maximum_reconnect` (five minutes), since
+  at zero it would spin a consumer into a hot reconnect loop and a few orders of magnitude
+  too large it would park one on a subscription that goes silent forever with nothing raised
+  to notice. A window that runs backwards raises where the caller wrote it rather than at the
+  first `anext`, by which point a request has already gone out. `sleep` is injected so a test
+  drives the loop without waiting.
+
+## 0.0.5
+
+### Added
 
 - **`without-asgi`**: conditional requests, byte ranges, and static assets.
   `selection_for` is the whole of RFC 9110 §13 and §14 as one pure function of a size, two

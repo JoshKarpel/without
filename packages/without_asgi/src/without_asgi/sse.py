@@ -70,15 +70,38 @@ EVENT_STREAM_HEADERS: RawHeaders = (
 # That difference is an event injection vector, not just a conformance bug.
 _NEWLINE = re.compile(r"\r\n|\r|\n")
 
+# An `id` that would not survive the reconnect it exists for. The format itself bans only
+# NUL there, but an id comes back as a `Last-Event-ID` header, so the rule that decides
+# this is what a field value can carry, not what the format can spell:
+#
+# - The C0 controls and DEL are not legal field values at all, so an id carrying one is a
+#   resumption point no reconnect can name. HTAB is the one member a field value would
+#   accept; it is refused with the rest rather than carved out, because it falls to the
+#   next rule anyway and one character class is worth more than an exception.
+# - A leading or trailing space is legal but not preserved: a field parser strips the
+#   whitespace around a value, so the peer would answer from `abc` where the consumer
+#   meant `abc `, resuming from a point neither side chose. Interior spaces survive
+#   intact and are left alone.
+_UNRESUMABLE_ID = re.compile(r"[\x00-\x1f\x7f]|^ | $")
+
+# A `retry:` value, which is ASCII digits and few enough of them to name a duration
+# `timedelta` can hold. Matching on the count rather than converting first is what keeps
+# `int` away from a digit string long enough that the conversion is itself the attack,
+# and `str.isdigit` would not do: it also accepts U+0663 and the other decimal digits the
+# format does not take. Sixteen is a round number comfortably inside `timedelta`'s
+# maximum of a little over 8.6e16 milliseconds, not a bound derived from it.
+_MAX_RETRY_DIGITS = 16
+_RETRY = re.compile(rf"[0-9]{{1,{_MAX_RETRY_DIGITS}}}")
+
 # The type a peer assumes when a frame names none. The format cannot distinguish an
 # absent `event:` line from `event: message` or from an empty `event: `, so all three
 # are this, and the encoder writes no line for it.
 DEFAULT_EVENT_TYPE = "message"
 
 
-def _no_newline(field: str, value: str) -> None:
+def _spellable_type(value: str) -> None:
     r"""
-    Reject a value that cannot be spelled in a single-line field.
+    Reject an event type that cannot be spelled in a single-line field.
 
     A newline would end the field and let the value forge another one, so it raises
     rather than being silently stripped, and it raises where the frame is built rather
@@ -86,14 +109,34 @@ def _no_newline(field: str, value: str) -> None:
     injection problem, and it is what a hand-rolled `f"data: {payload}\n\n"` gets wrong.
     """
     if _NEWLINE.search(value):
-        raise ValueError(f"an event {field} cannot contain a newline: {value!r}")
+        raise ValueError(f"an event type cannot contain a newline: {value!r}")
 
 
-def _no_nul(value: str) -> None:
-    # The spec has a peer *ignore* an id containing NUL, so sending one is an id
-    # silently dropped on arrival rather than an error either side sees.
-    if "\x00" in value:
-        raise ValueError(f"an event id cannot contain a NUL: {value!r}")
+def _resumable_id(value: str) -> None:
+    r"""
+    Reject an id that a peer could not resume from.
+
+    Stricter than the format, deliberately, and matched by the parser ignoring the same
+    values on the way in. The spec has a peer ignore only an id containing NUL, so
+    sending one is a resumption point silently dropped on arrival rather than an error
+    either side sees; the values `_UNRESUMABLE_ID` adds are worse than dropped, because
+    they come back from the round trip either unspellable or quietly altered. Both sides
+    are opinionated because only one of them is ever ours.
+
+    One scan for the whole rule, since every newline is also a control character. The
+    newline keeps its own message, because it is the case with a motive: it would end the
+    field and let the value forge another one, which is the header injection problem
+    wearing this format's clothes, and it is what a hand-rolled `f"data: {payload}\n\n"`
+    gets wrong.
+    """
+    found = _UNRESUMABLE_ID.search(value)
+    if found is None:
+        return
+    if found[0] in ("\r", "\n"):
+        raise ValueError(f"an event id cannot contain a newline: {value!r}")
+    if found[0] == " ":
+        raise ValueError(f"an event id cannot begin or end with a space: {value!r}")
+    raise ValueError(f"an event id cannot contain a control character: {value!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,10 +171,12 @@ class Event:
     id: str | None = None
 
     def __post_init__(self) -> None:
-        _no_newline("type", self.type)
+        # The default type is a module constant, so the overwhelmingly common event pays
+        # nothing to prove it carries no newline.
+        if self.type != DEFAULT_EVENT_TYPE:
+            _spellable_type(self.type)
         if self.id is not None:
-            _no_newline("id", self.id)
-            _no_nul(self.id)
+            _resumable_id(self.id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +210,10 @@ class Retry:
     def __post_init__(self) -> None:
         if self.after < timedelta():
             raise ValueError(f"a reconnection time cannot be negative: {self.after!r}")
+        # The mirror of the parser's bound, so the two halves agree on what the format
+        # can carry: a value this side would render is one that side would drop.
+        if len(str(self.after // timedelta(milliseconds=1))) > _MAX_RETRY_DIGITS:
+            raise ValueError(f"a reconnection time cannot exceed {_MAX_RETRY_DIGITS} digits: {self.after!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,8 +231,7 @@ class Checkpoint:
     id: str
 
     def __post_init__(self) -> None:
-        _no_newline("id", self.id)
-        _no_nul(self.id)
+        _resumable_id(self.id)
 
 
 # What a handler sends. A union rather than one type with five optional fields,
@@ -208,8 +256,9 @@ class ReceivedEvent:
     last set (`""` until it sets one). Only a sender gets to choose between leaving
     that point alone and clearing it, which is why only `Event.id` is optional.
 
-    `id` never contains a carriage return or line feed, since those are what ended the
-    field. That is what makes reflecting it into a `Last-Event-ID` request header safe.
+    `id` is always one a reconnect can carry unchanged: a carriage return or line feed is
+    what ended the field, and the parser ignores an `id:` that a `Last-Event-ID` header
+    could not spell or would not preserve. That is what makes reflecting it into one safe.
     """
 
     data: str
@@ -374,19 +423,6 @@ async def event_stream(
     yield ResponseBody(b"", more_body=False)
 
 
-def _split_lines(text: str) -> tuple[list[str], str]:
-    """Complete lines and the trailing partial one, splitting only on the three terminators."""
-    # A trailing CR is held back rather than treated as a terminator: the next chunk may
-    # open with the LF that completes a CRLF pair, and ending the line now would dispatch
-    # an event on a blank line the stream never sent.
-    if text.endswith("\r"):
-        held, text = "\r", text[:-1]
-    else:
-        held = ""
-    pieces = _NEWLINE.split(text)
-    return pieces[:-1], pieces[-1] + held
-
-
 def _field(line: str) -> tuple[str, str]:
     """Split one line into its field name and value, per the spec's line handling."""
     name, colon, value = line.partition(":")
@@ -426,7 +462,10 @@ async def parse_events_with_directives(
     - **Unknown fields are ignored**, as are comments and malformed values, which is
       what lets a producer add a field without breaking a consumer that predates it.
       Nothing in the format is a parse error; the only thing raised here is the size
-      cap below, which is this library's policy rather than the format's.
+      cap below, which is this library's policy rather than the format's. Malformed
+      covers a `retry:` too large to be a duration and an `id:` carrying a control
+      character, both of which a consumer would otherwise carry into a reconnect that
+      cannot be spelled.
 
     `max_event_size` caps the characters retained toward the event being assembled
     (its data, its type, and any partial line), raising `ValueError` past the bound.
@@ -438,7 +477,15 @@ async def parse_events_with_directives(
     line ends and retains nothing.
     """
     decoder = codecs.getincrementaldecoder("utf-8-sig")(errors="replace")
-    pending = ""
+    # The line being assembled, in the fragments it arrived as. Joined exactly once, when
+    # its terminator finally shows up, so a line spanning many chunks costs time linear in
+    # its length: re-splitting an accumulated buffer on each chunk would make that
+    # quadratic, and a megabyte of JSON in one `data:` line is an ordinary event.
+    pending: list[str] = []
+    # A carriage return at the end of a chunk, which cannot be judged yet: the next chunk
+    # may open with the line feed that completes a CRLF pair, and ending the line now
+    # would dispatch an event on a blank line the stream never sent.
+    held = ""
     data: list[str] = []
     event_type = ""
     last_id = ""
@@ -476,23 +523,38 @@ async def parse_events_with_directives(
             case "id":
                 # "If the field value does not contain U+0000 NULL, then set the last
                 # event ID buffer to the field value. Otherwise, ignore the field."
-                if "\x00" not in value:
+                # `_UNRESUMABLE_ID` is ignored on the same terms, because a consumer that
+                # reflects the id into `Last-Event-ID` gets back something other than
+                # what it sent. Keeping the older id costs a replay, where reconnecting
+                # on a changed one resumes from a point neither side chose and
+                # reconnecting on an unspellable one ends the subscription outright.
+                if not _UNRESUMABLE_ID.search(value):
                     last_id = value
             case "retry":
-                # ASCII digits only: `str.isdigit` alone also accepts U+0663 and the
-                # other decimal digits the format does not take.
-                if value.isascii() and value.isdigit():
+                # A value `_RETRY` rejects is ignored like any other malformed one,
+                # rather than raised out of a parser whose contract is that nothing in
+                # the format is a parse error.
+                if _RETRY.fullmatch(value):
                     return Retry(after=timedelta(milliseconds=int(value)))
             case _:
                 return None
         return None
 
     async for chunk in chunks:
-        lines, pending = _split_lines(pending + decoder.decode(chunk))
-        for line in lines:
-            if (item := handle(line)) is not None:
-                yield item
-        if max_event_size is not None and buffered + len(event_type) + len(pending) > max_event_size:
+        text = held + decoder.decode(chunk)
+        held, text = ("\r", text[:-1]) if text.endswith("\r") else ("", text)
+        pieces = _NEWLINE.split(text)
+        if len(pieces) > 1:
+            # Every terminator in this chunk closes a line, and the first of them closes
+            # whatever earlier chunks left half-assembled.
+            pieces[0] = "".join(pending) + pieces[0]
+            pending = []
+            for line in pieces[:-1]:
+                if (item := handle(line)) is not None:
+                    yield item
+        if pieces[-1]:
+            pending.append(pieces[-1])
+        if max_event_size is not None and buffered + len(event_type) + sum(map(len, pending)) > max_event_size:
             raise ValueError(f"the event stream exceeded max_event_size ({max_event_size})")
 
     # A carriage return held back as a possible CRLF half can only have been a
@@ -502,7 +564,7 @@ async def parse_events_with_directives(
     # stream cut mid-event delivers nothing rather than a truncated value under framing
     # that would not say so, and a reconnecting consumer resumes from the last id it
     # *did* see.
-    if pending.endswith("\r") and (item := handle(pending[:-1])) is not None:
+    if held and (item := handle("".join(pending))) is not None:
         yield item
 
 

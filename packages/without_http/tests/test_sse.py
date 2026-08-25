@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
+from collections.abc import Callable
 from collections.abc import Iterator
 from datetime import timedelta
 
@@ -15,6 +16,7 @@ from without_http import ResponseBody
 from without_http import ResponseHead
 from without_http import ResponseTrailers
 from without_http import subscribe
+from without_http.testing import respond
 
 FEED = ClientRequest("GET", "https://api.test/feed")
 EVENT_STREAM = ((b"content-type", b"text/event-stream"),)
@@ -64,6 +66,11 @@ async def no_sleep(duration: timedelta) -> None:
     """Collapse the reconnection wait so a test never spends wall-clock on it."""
 
 
+async def drained(recorder: Recorder, **kwargs: object) -> list[ReceivedEvent]:
+    """Consume a subscription to its end, which is where the script runs out or it raises."""
+    return [event async for event in subscribe(recorder, FEED, sleep=no_sleep, **kwargs)]  # type: ignore[arg-type]
+
+
 async def take(events: AsyncGenerator[ReceivedEvent], count: int) -> list[ReceivedEvent]:
     """The first `count` events, then close the subscription the way a caller would."""
     taken = [await anext(events) for _ in range(count)]
@@ -106,23 +113,22 @@ class TestOneConnection:
 class TestTerminalFailures:
     @pytest.mark.parametrize("status", [204, 301, 404, 500])
     async def test_a_non_200_status_raises_and_never_reconnects(self, status: int) -> None:
-        recorder = Recorder(ClientResponse(ResponseHead(status, EVENT_STREAM), ResponseBody(_empty())))
+        recorder = Recorder(respond(status, headers=EVENT_STREAM))
         with pytest.raises(NotAnEventStream):
-            _ = [event async for event in subscribe(recorder, FEED, sleep=no_sleep)]
+            await drained(recorder)
         assert len(recorder.requests) == 1
 
     @pytest.mark.parametrize("content_type", [b"text/html", b"application/json", b"text/plain"])
     async def test_a_wrong_content_type_raises_and_never_reconnects(self, content_type: bytes) -> None:
-        head = ResponseHead(200, ((b"content-type", content_type),))
-        recorder = Recorder(ClientResponse(head, ResponseBody(_empty())))
+        recorder = Recorder(respond(headers=((b"content-type", content_type),)))
         with pytest.raises(NotAnEventStream):
-            _ = [event async for event in subscribe(recorder, FEED, sleep=no_sleep)]
+            await drained(recorder)
         assert len(recorder.requests) == 1
 
     async def test_a_missing_content_type_raises(self) -> None:
-        recorder = Recorder(ClientResponse(ResponseHead(200, ()), ResponseBody(_empty())))
+        recorder = Recorder(respond())
         with pytest.raises(NotAnEventStream):
-            _ = [event async for event in subscribe(recorder, FEED, sleep=no_sleep)]
+            await drained(recorder)
 
     async def test_media_type_parameters_are_tolerated(self) -> None:
         head = ResponseHead(200, ((b"Content-Type", b"text/event-stream; charset=utf-8"),))
@@ -138,7 +144,7 @@ class TestTerminalFailures:
     async def test_the_first_connection_error_propagates_rather_than_looping(self) -> None:
         recorder = Recorder(ConnectionRefusedError("nothing listening"))
         with pytest.raises(ConnectionRefusedError):
-            _ = [event async for event in subscribe(recorder, FEED, sleep=no_sleep)]
+            await drained(recorder)
         assert len(recorder.requests) == 1
 
 
@@ -167,6 +173,13 @@ class TestReconnection:
         await take(subscribe(recorder, FEED, sleep=no_sleep), 1)
         assert recorder.last_event_ids() == [None, b"7"]
 
+    async def test_an_id_carrying_a_control_character_is_not_reflected_into_the_header(self) -> None:
+        # The parser drops it, so the reconnect carries the last id that *was* spellable
+        # rather than a header value h11 would refuse, which would end the subscription.
+        recorder = Recorder(stream(b"id: keep\ndata: a\n\nid: bad\x0bid\ndata: b\n\n"), stream(b"data: c\n\n"))
+        await take(subscribe(recorder, FEED, sleep=no_sleep), 3)
+        assert recorder.last_event_ids() == [None, b"keep"]
+
     async def test_a_later_event_wins_over_an_earlier_checkpoint(self) -> None:
         recorder = Recorder(stream(b"id: 7\n\nid: 8\ndata: a\n\n"), stream(b"data: b\n\n"))
         await take(subscribe(recorder, FEED, sleep=no_sleep), 2)
@@ -187,9 +200,9 @@ class TestReconnection:
 
     async def test_a_terminal_failure_after_a_reconnect_still_raises(self) -> None:
         # Establishing a stream once does not make a later `404` retryable.
-        recorder = Recorder(stream(b"data: a\n\n"), ClientResponse(ResponseHead(404, ()), ResponseBody(_empty())))
+        recorder = Recorder(stream(b"data: a\n\n"), respond(404))
         with pytest.raises(NotAnEventStream):
-            _ = [event async for event in subscribe(recorder, FEED, sleep=no_sleep)]
+            await drained(recorder)
 
 
 class TestReconnectionTiming:
@@ -215,9 +228,54 @@ class TestReconnectionTiming:
         recorder = Recorder(stream(b"retry: " + directive + b"\ndata: a\n\n"), stream(b"data: b\n\n"))
         assert await _waits(recorder, count=2) == [timedelta(milliseconds=100)]
 
+    @pytest.mark.parametrize("directive", [b"300001", b"8640000000000", b"9" * 16])
+    async def test_an_enormous_retry_is_capped_so_it_cannot_park(self, directive: bytes) -> None:
+        # `retry: 8640000000000` is a plausible garble of `86400000`, and uncapped it
+        # would leave the subscription silent for centuries with nothing raised.
+        recorder = Recorder(stream(b"retry: " + directive + b"\ndata: a\n\n"), stream(b"data: b\n\n"))
+        assert await _waits(recorder, count=2) == [timedelta(minutes=5)]
+
     async def test_a_custom_initial_wait_is_honoured(self) -> None:
         recorder = Recorder(stream(b"data: a\n\n"), stream(b"data: b\n\n"))
         assert await _waits(recorder, count=2, reconnect=timedelta(seconds=30)) == [timedelta(seconds=30)]
+
+    async def test_a_custom_floor_is_honoured(self) -> None:
+        recorder = Recorder(stream(b"retry: 50\ndata: a\n\n"), stream(b"data: b\n\n"))
+        waits = await _waits(recorder, count=2, minimum_reconnect=timedelta(seconds=2))
+        assert waits == [timedelta(seconds=2)]
+
+    async def test_a_custom_ceiling_is_honoured(self) -> None:
+        # Raised past the default five minutes, so a producer this caller trusts names a
+        # longer backoff, and clamped at the value the caller chose rather than the default.
+        recorder = Recorder(stream(b"retry: 7200000\ndata: a\n\n"), stream(b"data: b\n\n"))
+        waits = await _waits(recorder, count=2, maximum_reconnect=timedelta(hours=1))
+        assert waits == [timedelta(hours=1)]
+
+    @pytest.mark.parametrize(
+        ("call", "message"),
+        [
+            (lambda: subscribe(Recorder(), FEED, minimum_reconnect=timedelta(minutes=10)), "reconnection window"),
+            (lambda: subscribe(Recorder(), FEED, maximum_reconnect=timedelta(milliseconds=10)), "reconnection window"),
+            (lambda: subscribe(Recorder(), FEED, minimum_reconnect=timedelta(seconds=-1)), "reconnection window"),
+            (lambda: subscribe(Recorder(), FEED, reconnect=timedelta(seconds=-1)), "wait cannot be negative"),
+        ],
+    )
+    def test_a_contradictory_window_is_refused_where_the_caller_wrote_it(
+        self, call: Callable[[], object], message: str
+    ) -> None:
+        # Never iterated, and the `Recorder` holds no script: the point is that the
+        # mistake is reported at the call rather than deferred to the first `anext`,
+        # which is after a request has already gone out.
+        with pytest.raises(ValueError, match=message):
+            call()
+
+    async def test_a_ceiling_equal_to_the_floor_pins_every_wait(self) -> None:
+        # The degenerate window is legal, since it is a caller saying they want one value
+        # whatever the producer asks for.
+        pinned = timedelta(seconds=9)
+        recorder = Recorder(stream(b"retry: 50\ndata: a\n\n"), stream(b"data: b\n\n"))
+        waits = await _waits(recorder, count=2, minimum_reconnect=pinned, maximum_reconnect=pinned)
+        assert waits == [pinned]
 
     async def test_the_default_sleep_waits_in_seconds(self, mocker: MockerFixture) -> None:
         # The default is the one collaborator a caller cannot inject past, and the only
@@ -234,7 +292,7 @@ class TestParserPassthrough:
     async def test_the_size_cap_reaches_the_parser(self) -> None:
         recorder = Recorder(stream(b"data: " + b"x" * 500))
         with pytest.raises(ValueError, match="exceeded max_event_size"):
-            _ = [event async for event in subscribe(recorder, FEED, sleep=no_sleep, max_event_size=64)]
+            await drained(recorder, max_event_size=64)
 
     async def test_events_split_across_chunks_are_reassembled(self) -> None:
         recorder = Recorder(stream(b"data: he", b"llo\n", b"\n"))
@@ -247,13 +305,6 @@ class TestParserPassthrough:
         assert await take(subscribe(recorder, FEED, sleep=no_sleep), 1) == [
             ReceivedEvent(type="message", data="a", id="")
         ]
-
-
-async def _empty() -> AsyncGenerator[bytes | ResponseTrailers]:
-    # The body of a response `subscribe` rejects: constructed and closed, never started,
-    # so neither line below ever runs.
-    return  # pragma: no cover
-    yield  # pragma: no cover
 
 
 async def _waits(recorder: Recorder, *, count: int, **kwargs: object) -> list[timedelta]:

@@ -52,6 +52,8 @@ from without_http.socket_options import receive_buffer_size
 from without_http.socket_options import send_buffer_size
 from without_http.socket_options import tcp_keepalive
 from without_http.sse import DEFAULT_RECONNECT
+from without_http.sse import MAXIMUM_RECONNECT
+from without_http.sse import MINIMUM_RECONNECT
 from without_http.sse import NotAnEventStream
 from without_http.sse import subscribe
 from without_http.timeouts import ConnectTimeout
@@ -74,6 +76,8 @@ __all__ = [
     "DEFAULT_DECOMPRESSORS",
     "DEFAULT_RECONNECT",
     "GZIP_CONTAINER",
+    "MAXIMUM_RECONNECT",
+    "MINIMUM_RECONNECT",
     "USER_AGENT",
     "Client",
     "ClientMiddleware",

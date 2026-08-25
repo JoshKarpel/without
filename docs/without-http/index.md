@@ -383,8 +383,8 @@ await events.aclose()  # releases the connection there and then
 can be. That position rejects *policy* the library would have to invent: how
 many attempts, which statuses, what backoff. Here there is none to invent. The
 backoff arrives on the wire as `retry:`, the resumption token arrives as `id:`,
-and the terminal condition is written into the protocol, so nothing is left for
-a flag to configure.
+and the terminal condition is written into the protocol. What the settings below
+decide is how far to trust the peer that supplies them.
 
 What it does and does not retry:
 
@@ -398,10 +398,17 @@ What it does and does not retry:
   seconds is the ordinary case, which is why the protocol has a resumption token
   at all.
 
-The wait is `reconnect` (three seconds) until the producer names one, and is
-floored at 100ms so a hostile or broken `retry: 0` cannot spin a consumer into a
-hot reconnect loop. `sleep` is injected, so a test drives the loop without
-waiting and a caller can add jitter.
+The wait is `reconnect` (three seconds) until the producer names one, after which
+it is clamped to between `minimum_reconnect` (100ms) and `maximum_reconnect`
+(five minutes). Both ends guard the same thing, a `retry:` that is hostile or
+merely wrong: at zero it would spin a consumer into a hot reconnect loop, and a
+few orders of magnitude too large it would park one on a subscription that goes
+silent forever with nothing raised to notice. Widen either end for a producer you
+trust to name its own backoff, narrow them to hold a peer to a window you chose.
+A window that runs backwards
+raises, and raises at the call rather than at the first `anext`, since by then a
+request has already gone out. `sleep` is injected, so a test drives the loop
+without waiting and a caller can add jitter.
 
 ### Timeouts
 

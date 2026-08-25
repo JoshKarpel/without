@@ -31,6 +31,8 @@ from without_http.timeouts import HTTPTimeout
 
 __all__ = [
     "DEFAULT_RECONNECT",
+    "MAXIMUM_RECONNECT",
+    "MINIMUM_RECONNECT",
     "NotAnEventStream",
     "subscribe",
 ]
@@ -42,7 +44,13 @@ DEFAULT_RECONNECT = timedelta(seconds=3)
 
 # The floor a producer's `retry:` is clamped to, so a hostile or broken `retry: 0`
 # cannot spin a consumer into a hot reconnect loop.
-_MINIMUM_RECONNECT = timedelta(milliseconds=100)
+MINIMUM_RECONNECT = timedelta(milliseconds=100)
+
+# The ceiling, for the mirrored reason: a `retry: 8640000000000` that was meant to be
+# `retry: 86400000` parks a consumer for centuries, and a subscription that is silent
+# forever with nothing raised is harder to notice than one that reconnects too often.
+# Well past any real backoff, which browsers spell in seconds.
+MAXIMUM_RECONNECT = timedelta(minutes=5)
 
 
 class NotAnEventStream(Exception):
@@ -66,11 +74,13 @@ def _is_event_stream(head: ResponseHead) -> bool:
     return content_type.split(b";")[0].strip().lower() == EVENT_STREAM_MEDIA_TYPE
 
 
-async def subscribe(
+def subscribe(
     client: Client,
     request: ClientRequest,
     *,
     reconnect: timedelta = DEFAULT_RECONNECT,
+    minimum_reconnect: timedelta = MINIMUM_RECONNECT,
+    maximum_reconnect: timedelta = MAXIMUM_RECONNECT,
     max_event_size: int | None = None,
     sleep: Callable[[timedelta], Awaitable[None]] = _sleep,
 ) -> AsyncGenerator[ReceivedEvent]:
@@ -79,7 +89,7 @@ async def subscribe(
 
     The composition the two halves of Server-Sent Events exist to be assembled into: it
     sends `request` through `client`, parses the response body with
-    `without_asgi.sse.events_with_reconnects`, and when the stream ends it waits and
+    `without_asgi.sse.parse_events_with_directives`, and when the stream ends it waits and
     sends the request again carrying `Last-Event-ID`, so the producer can resume where
     the consumer stopped. What a caller sees is one uninterrupted stream of events
     across however many connections it took.
@@ -106,7 +116,8 @@ async def subscribe(
     the library would have to invent (how many attempts, which statuses, what backoff),
     and here there is none to invent. The backoff arrives on the wire as `retry:`, the
     resumption token arrives as `id:`, and the terminal condition is written into the
-    protocol. Nothing is left for a flag to configure, so nothing grows one.
+    protocol. What the settings below decide is how far to trust the peer that supplies
+    them.
 
     - A **non-`200` status or a content type other than `text/event-stream`** raises
       `NotAnEventStream` and never reconnects, per the spec's terminal failure.
@@ -118,32 +129,69 @@ async def subscribe(
       one, which is why the protocol has a resumption token at all.
 
     `reconnect` is the wait until the producer names one with `retry:`, after which its
-    value is used, floored at 100ms so a hostile or broken `retry: 0` cannot spin a
-    consumer into a hot reconnect loop. `max_event_size` is passed through to the
-    parser. `sleep` is the delay, injected so a test drives the loop without waiting
-    (and so a caller can add jitter).
+    value is used, clamped to between `minimum_reconnect` (100ms) and
+    `maximum_reconnect` (five minutes). Both ends guard the same thing, a `retry:` that
+    is hostile or merely wrong: at zero it would spin a consumer into a hot reconnect
+    loop, and a few orders of magnitude too large it would park one on a subscription
+    that goes silent forever with nothing raised to notice. Widen either end for a
+    producer you trust to name its own backoff, or narrow them to hold a peer to a
+    window you chose. `max_event_size` is passed through to the parser. `sleep` is the
+    delay, injected so a test drives the loop without waiting (and so a caller can add
+    jitter).
 
     The last id seen is reflected into the `Last-Event-ID` header of every later
     request, and `accept: text/event-stream` is set unless `request` already carries
-    one. Reflecting a producer's value into a request header is safe here because a
-    parsed `id` cannot contain a carriage return or line feed: those are what ended
-    the field.
+    one. Reflecting a producer's value into a request header is safe here because the
+    parser only ever hands on an id a header can carry unchanged: a carriage return or
+    line feed is what ended the field, and an `id:` a field value could not spell, or
+    would silently alter, is ignored rather than resumed from.
 
     An `AsyncGenerator` rather than a bare `AsyncIterator`, because this holds a live
     connection and a caller that stops early should be able to say so: `aclose()`
     releases it there and then, rather than at whenever the collector gets to it.
     """
+    # An ordinary function wrapping the generator, so a contradictory window is refused
+    # where the caller wrote it. The same guards inside the generator body would not run
+    # until the first `anext`, which is after the first request is on the wire and may be
+    # arbitrarily long after the mistake was made.
+    if not timedelta() <= minimum_reconnect <= maximum_reconnect:
+        raise ValueError(
+            f"the reconnection window runs from zero upwards, not from {minimum_reconnect!r} to {maximum_reconnect!r}"
+        )
+    if reconnect < timedelta():
+        raise ValueError(f"an initial reconnection wait cannot be negative: {reconnect!r}")
+    return _subscribed(
+        client,
+        request,
+        reconnect=reconnect,
+        minimum_reconnect=minimum_reconnect,
+        maximum_reconnect=maximum_reconnect,
+        max_event_size=max_event_size,
+        sleep=sleep,
+    )
+
+
+async def _subscribed(
+    client: Client,
+    request: ClientRequest,
+    *,
+    reconnect: timedelta,
+    minimum_reconnect: timedelta,
+    maximum_reconnect: timedelta,
+    max_event_size: int | None,
+    sleep: Callable[[timedelta], Awaitable[None]],
+) -> AsyncGenerator[ReceivedEvent]:
     last_id = ""
     wait = reconnect
     established = False
+    # The caller wins on `accept`, so a producer that wants a narrower type stated gets
+    # it. Settled once, since `request` is the same on every attempt; only
+    # `last-event-id` moves, and it is ours to set, replacing whatever the last attempt
+    # left behind.
+    offered = merge(((b"accept", EVENT_STREAM_MEDIA_TYPE),), request.headers)
 
     while True:
-        # The caller wins on `accept`, so a producer that wants a narrower type stated
-        # gets it; `last-event-id` is ours to set, and replaces whatever a previous
-        # attempt left behind.
-        headers = merge(((b"accept", EVENT_STREAM_MEDIA_TYPE),), request.headers)
-        if last_id:
-            headers = replace_header(headers, b"last-event-id", last_id.encode())
+        headers = replace_header(offered, b"last-event-id", last_id.encode()) if last_id else offered
         attempt = replace(request, headers=headers)
         try:
             head, body = await client(attempt)
@@ -168,7 +216,7 @@ async def subscribe(
                         last_id = item.id
                         yield item
                     case Retry(after):
-                        wait = max(after, _MINIMUM_RECONNECT)
+                        wait = min(max(after, minimum_reconnect), maximum_reconnect)
                     case Checkpoint(moved_to):
                         # A frame that moved the resumption point without delivering an
                         # event. Missing these resumes from before whatever the producer

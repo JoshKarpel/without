@@ -144,7 +144,10 @@ producer a way to kill its consumers. Exactly one leading byte order mark is
 stripped. Chunk boundaries are invisible, so a multi-byte character or a CRLF
 pair split across two chunks parses as if it had arrived whole. Unknown fields,
 comments, and malformed values are ignored, which is what lets a producer add a
-field without breaking a consumer that predates it.
+field without breaking a consumer that predates it. Nothing in the format is a
+parse error, so "malformed" reaches further than the spec's own list: a `retry:`
+too large to name a duration is dropped rather than raised, on the same grounds
+as the replacement decoding above.
 
 `parse_events` yields only `ReceivedEvent`, because that is all most consumers
 want. `parse_events_with_directives` yields the fuller `Received` union, adding
@@ -192,9 +195,30 @@ A newline in `type` or `id` has no spelling at all: it would end the field and
 let the value forge another one. So it raises in the constructor of the frame
 that carries it (`Event`, or `Checkpoint` for an id) rather than at encode time,
 which puts the failure where the frame is built instead of mid-stream after the
-response head is already committed. A `NUL` in `id` raises for a quieter reason:
-the spec has the *peer* ignore such an id, so sending one is an id silently
-dropped on arrival.
+response head is already committed.
+
+An `id` is held to a stricter rule than the rest of the format, for a quieter
+reason: it comes back on reconnect as a `Last-Event-ID` header, so what it has to
+survive is a *field value*, not just a line.
+
+- **A control character** is not a legal field value at all, so an id carrying
+  one is a resumption point no reconnect can name.
+- **A leading or trailing space** is legal but not preserved: a field parser
+  strips the whitespace around a value, so the peer would answer from `abc` where
+  the consumer meant `abc `. Interior spaces survive intact and are left alone.
+
+The parser is opinionated to match, ignoring an `id:` that breaks either rule
+where the spec ignores only a `NUL`. Being strict on both sides is the point,
+since only one of them is ever this library: an id we refuse to send cannot break
+someone else's consumer, and an id we refuse to accept cannot break a reconnect
+of ours. Ignoring rather than raising on the way in costs a replay from an older
+id, where reconnecting on a changed one resumes from a point neither side chose
+and reconnecting on an unspellable one ends the subscription outright.
+
+`Retry` is bounded on both sides for the same reason. The parser drops a `retry:`
+value too long to name a duration, so `Retry` refuses to construct one this
+library's own parser would drop: a frame that encodes to bytes we would not read
+is not one worth writing.
 
 ## What to watch in deployment
 

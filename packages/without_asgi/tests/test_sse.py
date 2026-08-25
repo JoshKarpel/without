@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from collections.abc import Callable
 from collections.abc import Iterable
 from datetime import timedelta
 from itertools import pairwise
@@ -34,18 +35,13 @@ NEVER = timedelta(hours=1)
 AT_ONCE = timedelta(0)
 
 
-async def chunked(*chunks: bytes) -> AsyncIterator[bytes]:
-    for chunk in chunks:
-        yield chunk
-
-
-async def collected(wire: bytes, **kwargs: object) -> list[ReceivedEvent]:
-    """Parse one whole byte string, the common shape for a conformance case."""
-    return [event async for event in parse_events(chunked(wire), **kwargs)]  # type: ignore[arg-type]
+async def collected(*wire: bytes, max_event_size: int | None = None) -> list[ReceivedEvent]:
+    """Parse a body arriving as `wire`, one chunk per argument: the conformance-case shape."""
+    return [event async for event in parse_events(stream_from_iterable(wire), max_event_size=max_event_size)]
 
 
 async def collected_with_directives(wire: bytes) -> list[Received]:
-    return [item async for item in parse_events_with_directives(chunked(wire))]
+    return [item async for item in parse_events_with_directives(stream_from_iterable([wire]))]
 
 
 def encode_all(events: Iterable[ServerSentEvent]) -> bytes:
@@ -92,9 +88,13 @@ class TestEncoding:
             b"data: harmless\ndata: \ndata: event: admin\ndata: data: escalate\n\n"
         )
 
-    def test_a_forged_field_arrives_as_data_rather_than_as_an_event(self) -> None:
+    async def test_a_forged_field_arrives_as_data_rather_than_as_an_event(self) -> None:
+        # The claim the encoding above exists to make, put through a parser: one event,
+        # still typed `safe`, carrying the forgery as text.
         wire = encode_event(Event(data="harmless\n\nevent: admin\ndata: escalate", type="safe"))
-        assert b"\nevent: admin" not in wire
+        assert await collected(wire) == [
+            ReceivedEvent(data="harmless\n\nevent: admin\ndata: escalate", type="safe", id="")
+        ]
 
     def test_a_comment_renders_a_colon_line(self) -> None:
         assert encode_event(Comment("keepalive")) == b":keepalive\n\n"
@@ -129,13 +129,42 @@ class TestEncoding:
             Checkpoint("a\nb")
 
     @pytest.mark.parametrize("build", [lambda bad: Event(data="x", id=bad), Checkpoint])
-    def test_a_nul_in_an_id_is_rejected_because_a_peer_would_silently_drop_it(self, build: object) -> None:
-        with pytest.raises(ValueError, match="event id cannot contain a NUL"):
-            build("a\x00b")  # type: ignore[operator]
+    @pytest.mark.parametrize("bad", ["a\x00b", "a\x0bb", "a\x1fb", "a\x7fb", "a\tb"])
+    def test_a_control_character_in_an_id_is_rejected_because_a_peer_cannot_resume_from_it(
+        self, build: Callable[[str], object], bad: str
+    ) -> None:
+        # A NUL the spec has a peer ignore outright; the rest cannot be spelled in the
+        # `Last-Event-ID` header the id comes back in.
+        with pytest.raises(ValueError, match="event id cannot contain a control character"):
+            build(bad)
+
+    @pytest.mark.parametrize("build", [lambda bad: Event(data="x", id=bad), Checkpoint])
+    @pytest.mark.parametrize("bad", [" ab", "ab ", " ", "  ab  "])
+    def test_an_id_padded_with_spaces_is_rejected_because_the_header_would_strip_them(
+        self, build: Callable[[str], object], bad: str
+    ) -> None:
+        # Legal in a field value, but a field parser strips the whitespace around one, so
+        # the peer would resume from a point neither side chose.
+        with pytest.raises(ValueError, match="event id cannot begin or end with a space"):
+            build(bad)
+
+    @pytest.mark.parametrize("build", [lambda good: Event(data="x", id=good), Checkpoint])
+    def test_an_interior_space_in_an_id_is_left_alone(self, build: Callable[[str], object]) -> None:
+        # It survives the round trip intact, so the rule has no business refusing it.
+        assert build("a b") is not None
 
     def test_a_negative_reconnection_time_is_rejected(self) -> None:
         with pytest.raises(ValueError, match="reconnection time cannot be negative"):
             Retry(timedelta(seconds=-1))
+
+    def test_a_reconnection_time_this_library_s_own_parser_would_drop_is_rejected(self) -> None:
+        # The encode side of the parser's bound, so both halves agree on what the format
+        # can carry.
+        with pytest.raises(ValueError, match="reconnection time cannot exceed 16 digits"):
+            Retry(timedelta(milliseconds=10**16))
+
+    def test_the_largest_renderable_reconnection_time_is_accepted(self) -> None:
+        assert encode_event(Retry(timedelta(milliseconds=10**16 - 1))) == b"retry: 9999999999999999\n\n"
 
 
 class TestParsing:
@@ -186,9 +215,30 @@ class TestParsing:
             message("b"),
         ]
 
-    async def test_an_id_containing_a_nul_is_ignored_leaving_the_previous_one(self) -> None:
-        wire = b"id: keep\ndata: a\n\nid: bad\x00id\ndata: b\n\n"
+    @pytest.mark.parametrize("bad", [b"bad\x00id", b"bad\x0bid", b"bad\x1fid", b"bad\x7fid", b"bad\tid"])
+    async def test_an_id_containing_a_control_character_is_ignored_leaving_the_previous_one(self, bad: bytes) -> None:
+        # Resuming from an older id costs a replay; carrying one of these into a
+        # `Last-Event-ID` header would end the subscription instead.
+        wire = b"id: keep\ndata: a\n\nid: " + bad + b"\ndata: b\n\n"
         assert await collected(wire) == [message("a", event_id="keep"), message("b", event_id="keep")]
+
+    @pytest.mark.parametrize("bad", [b"id:  padded", b"id: padded "])
+    async def test_an_id_padded_with_spaces_is_ignored_leaving_the_previous_one(self, bad: bytes) -> None:
+        # The parser strips one leading space as the field separator; what is left here
+        # is padding a `Last-Event-ID` header would strip on the way back, so resuming on
+        # it would resume from a point the producer never named. Note the doubled space
+        # in the first case: the first belongs to the format, the second to the value.
+        wire = b"id: keep\ndata: a\n\n" + bad + b"\ndata: b\n\n"
+        assert await collected(wire) == [message("a", event_id="keep"), message("b", event_id="keep")]
+
+    async def test_an_interior_space_in_an_id_is_kept(self) -> None:
+        # Only the padding is refused: a space inside the value survives the round trip.
+        assert await collected(b"id: two words\ndata: a\n\n") == [message("a", event_id="two words")]
+
+    async def test_an_id_carrying_a_non_ascii_character_is_kept(self) -> None:
+        # A high byte is legal in an HTTP field value, so the rule leaves it alone.
+        wire = "id: héllo\ndata: a\n\n".encode()
+        assert await collected(wire) == [message("a", event_id="héllo")]
 
     async def test_an_empty_event_field_falls_back_to_message(self) -> None:
         assert await collected(b"event\ndata: a\n\n") == [message("a")]
@@ -244,6 +294,21 @@ class TestDirectives:
         # U+0663 is an Arabic-Indic three: `str.isdigit` accepts it and the format does not.
         assert await collected_with_directives(b"retry: " + value + b"\ndata: x\n\n") == [message("x")]
 
+    @pytest.mark.parametrize("digits", [17, 4301])
+    async def test_a_retry_value_too_large_to_be_a_duration_is_ignored_rather_than_raising(self, digits: int) -> None:
+        # `timedelta` overflows past 17 digits, and `int` itself refuses a string of
+        # more than 4300; either raising out of the parser would hand a producer a way
+        # to kill its consumers, which is the same reason decoding replaces rather than
+        # raises.
+        value = b"9" * digits
+        assert await collected_with_directives(b"retry: " + value + b"\ndata: x\n\n") == [message("x")]
+
+    async def test_the_largest_representable_retry_value_is_still_read(self) -> None:
+        value = b"9" * 16
+        assert await collected_with_directives(b"retry: " + value + b"\n\n") == [
+            Retry(after=timedelta(milliseconds=int(value)))
+        ]
+
     async def test_an_id_only_frame_is_surfaced_as_a_checkpoint(self) -> None:
         # The spec sets the last event ID string before returning early on empty data,
         # so this moves the resumption point without delivering anything.
@@ -273,21 +338,26 @@ class TestDirectives:
 
 class TestChunkBoundaries:
     async def test_a_crlf_split_across_chunks_is_one_terminator(self) -> None:
-        events = [event async for event in parse_events(chunked(b"data: hello\r", b"\n\r\n"))]
-        assert events == [message("hello")]
+        assert await collected(b"data: hello\r", b"\n\r\n") == [message("hello")]
 
     async def test_a_multi_byte_character_split_across_chunks_is_decoded_whole(self) -> None:
-        events = [event async for event in parse_events(chunked(b"data: \xe2\x82", b"\xac\n\n"))]
-        assert events == [message("€")]
+        assert await collected(b"data: \xe2\x82", b"\xac\n\n") == [message("€")]
 
     async def test_a_byte_order_mark_split_across_chunks_is_still_stripped(self) -> None:
-        events = [event async for event in parse_events(chunked(b"\xef\xbb", b"\xbfdata: hi\n\n"))]
-        assert events == [message("hi")]
+        assert await collected(b"\xef\xbb", b"\xbfdata: hi\n\n") == [message("hi")]
 
     async def test_a_lone_trailing_cr_does_not_dispatch_until_the_next_chunk_settles_it(self) -> None:
         # Ending the line on the CR would dispatch on a blank line the stream never sent.
-        events = [event async for event in parse_events(chunked(b"data: a\r", b"\ndata: b\n\n"))]
-        assert events == [message("a\nb")]
+        assert await collected(b"data: a\r", b"\ndata: b\n\n") == [message("a\nb")]
+
+    async def test_a_line_spanning_many_chunks_is_assembled_whole(self) -> None:
+        # The fragments are joined once, when the terminator arrives, rather than the
+        # buffer being re-split on each chunk.
+        pieces = [b"data: "] + [b"x" * 1000] * 200 + [b"\n\n"]
+        assert await collected(*pieces) == [message("x" * 200_000)]
+
+    async def test_an_empty_chunk_carries_the_stream_no_further(self) -> None:
+        assert await collected(b"data: a", b"", b"b\n\n") == [message("ab")]
 
 
 class TestSizeCap:
@@ -296,13 +366,18 @@ class TestSizeCap:
         assert len(events[0].data) == 100_000
 
     async def test_data_that_never_dispatches_trips_the_cap(self) -> None:
-        endless = chunked(*[b"data: filler\n"] * 50)
         with pytest.raises(ValueError, match="exceeded max_event_size"):
-            _ = [event async for event in parse_events(endless, max_event_size=64)]
+            await collected(*[b"data: filler\n"] * 50, max_event_size=64)
 
     async def test_a_single_line_that_never_ends_trips_the_cap(self) -> None:
         with pytest.raises(ValueError, match="exceeded max_event_size"):
-            _ = [event async for event in parse_events(chunked(b"data: " + b"x" * 500), max_event_size=64)]
+            await collected(b"data: " + b"x" * 500, max_event_size=64)
+
+    async def test_a_single_line_assembled_across_chunks_still_trips_the_cap(self) -> None:
+        # The cap counts the fragments of the line being assembled, so a long value
+        # cannot escape it by arriving a little at a time.
+        with pytest.raises(ValueError, match="exceeded max_event_size"):
+            await collected(*[b"id: " + b"x" * 20] + [b"x" * 20] * 10, max_event_size=64)
 
     async def test_dispatching_resets_the_cap_so_a_long_stream_of_small_events_passes(self) -> None:
         assert len(await collected(b"data: small\n\n" * 100, max_event_size=64)) == 100
@@ -310,8 +385,7 @@ class TestSizeCap:
     async def test_heartbeat_comments_retain_nothing_and_never_trip_the_cap(self) -> None:
         # A comment is discarded as its line ends, which is why the cap counts retained
         # state rather than bytes consumed.
-        heartbeats = chunked(*[b": keepalive\n"] * 500)
-        assert [event async for event in parse_events(heartbeats, max_event_size=16)] == []
+        assert await collected(*[b": keepalive\n"] * 500, max_event_size=16) == []
 
 
 class TestHeartbeat:
@@ -424,7 +498,11 @@ async def _silent() -> AsyncIterator[ServerSentEvent]:
 # leading space a parser strips, colons, a BOM, and a line separator `str.splitlines`
 # would wrongly split on.
 _TEXT = st.text(alphabet=st.sampled_from("ab \r\n:\u2028\ufeff€\x00"), max_size=24)
-_IDS = st.text(alphabet=st.sampled_from("ab :\u2028€"), max_size=8)
+# Ids an `Event` will accept, so the round-trip properties draw from what a producer can
+# actually send. The interior space is the one worth keeping in the alphabet: it survives
+# a `Last-Event-ID` header where a leading or trailing one does not, which is why the
+# strategy strips rather than filters.
+_IDS = st.text(alphabet=st.sampled_from("ab :\u2028€"), max_size=8).map(lambda value: value.strip(" "))
 
 
 @st.composite
@@ -472,8 +550,7 @@ async def test_the_parse_is_the_same_however_the_bytes_are_chunked(
     points = sorted({0, len(wire)} | {point for point in splits if 0 < point < len(wire)})
     chunks = [wire[start:end] for start, end in pairwise(points)]
     whole = await collected(wire)
-    piecewise = [event async for event in parse_events(chunked(*chunks))]
-    assert piecewise == whole
+    assert await collected(*chunks) == whole
     assert whole == await collected(encode_all(events))
 
 

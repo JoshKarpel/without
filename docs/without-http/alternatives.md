@@ -160,8 +160,9 @@ Positions, not gaps, each with its cost named:
   is policy the library would have to invent; an event stream carries its own.
   The backoff arrives on the wire as `retry:`, the resumption token as `id:`, and
   the terminal condition (a non-`200`, or a content type that is not
-  `text/event-stream`) is written into the protocol. There is nothing left for a
-  flag to configure, which is exactly what a general `retry()` could not say.
+  `text/event-stream`) is written into the protocol, which is exactly what a
+  general `retry()` could not say. Its two settings bound how far the peer
+  supplying that backoff is trusted.
 - **Unbounded per-host connections by default.** Mirrors the server's choice to
   let OS backpressure govern ([Connection pooling](index.md#connection-pooling));
   the cost is that a runaway caller opens sockets until the OS objects, where
