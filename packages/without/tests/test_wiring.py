@@ -7,6 +7,7 @@ from time import monotonic
 
 import pytest
 from without import Transition
+from without import close_stream
 from without import collect
 from without import compose
 from without import from_scan
@@ -121,6 +122,40 @@ async def test_tee_surfaces_a_sink_failure() -> None:
         await tee(from_sink(record), from_sink(fail))(stream_from_iterable([1, 2, 3]))
 
     assert any(isinstance(error, SinkFailed) for error in excinfo.value.exceptions)
+
+
+async def test_close_stream_runs_an_abandoned_generators_cleanup() -> None:
+    released = asyncio.Event()
+
+    async def holding() -> AsyncIterator[int]:
+        try:
+            while True:
+                yield 1
+        finally:
+            released.set()
+
+    source = holding()
+    assert await anext(source) == 1
+
+    await close_stream(source)
+
+    assert released.is_set()
+
+
+async def test_close_stream_leaves_a_source_that_is_not_a_generator_alone() -> None:
+    # `Stream` is `__aiter__`-only, so a source may be an object with nothing to release.
+    class Counting:
+        def __aiter__(self) -> Counting:
+            return self
+
+        async def __anext__(self) -> int:
+            return 9
+
+    source = Counting()
+
+    await close_stream(source)
+
+    assert await anext(aiter(source)) == 9
 
 
 async def test_stream_from_queue_yields_pushed_values_in_order() -> None:

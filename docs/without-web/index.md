@@ -363,7 +363,9 @@ sequential media type (NDJSON, SSE `text/event-stream`, `application/json-seq`,
 ...): `Single` renders OpenAPI's `schema`, `Sequence` renders 3.2's `itemSchema`
 (one item's shape), and the document is emitted as `3.2.0`. This is
 *documentation only*: `without-web` is agnostic to the framing on the wire, the
-media type is the app's string, and the handler emits the bytes. A
+media type is the app's string, and the handler emits the bytes. For the SSE
+case, [`event_stream`](../without-asgi/sse.md) produces those bytes, and it is a
+`Reply` like any other. A
 streaming-input route has no `body` extractor to recover an inbound schema from,
 so it declares one directly: `@post.stream(..., request_body=Body(
 "application/x-ndjson", Sequence(...)))`.

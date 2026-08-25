@@ -85,6 +85,34 @@ scope uses `wrap`. Cross-request shared state (a rate-limit budget, a cache) is
 built once when the middleware is constructed and captured in its closure, then
 injected at app assembly, not reached into as a global.
 
+## Why a client-side SSE parser lives here
+
+`sse.py` holds *both* directions of Server-Sent Events, including `parse_events`,
+whose only callers are client-side. That looks like a layering mistake and is not:
+the same placement rule applies as for middleware, and this package is the lowest
+layer whose vocabulary the format needs. Two facts settle it.
+
+The **encoder's** users do not have `without-http`. A `without-asgi` app under
+uvicorn is a supported deployment, so putting `event_stream` in `without-http`
+would drag h11, h2, wsproto, and aiohappyeyeballs into an app that uses none of
+them. And this package already owns payload formats in *both* directions:
+`multipart_content` is a client request-body encoder living here, consumed by
+`without_http.request`. The `asgi` in the name is the layer, not the direction.
+
+The two halves stay together because they are one format that must agree byte for
+byte, and the round-trip property test is the main thing that proves it. What
+does *not* live here is the reconnecting loop (`without_http.subscribe`), because
+it needs the client exchange to reconnect with: the `ClientResponse` it opens each
+attempt against, and the timeouts it reads as a stream that dropped rather than a
+fault.
+
+So the dividing line is the transport, not purity. `with_heartbeat` is the case
+that shows the difference: it reads a clock, so it is not pure, but it needs only
+a stream and an interval, so it belongs here rather than beside the transport.
+Purity is a property worth keeping and stating per function (the codec has it,
+the heartbeat does not); what decides *placement* is the lowest layer whose
+vocabulary a thing needs.
+
 ## Note: `scope["state"]` is intentionally not surfaced
 
 The spec's `state` namespace is the standardized mechanism for passing data from

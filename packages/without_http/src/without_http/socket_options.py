@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import socket
-from datetime import timedelta
+
+from without import Seconds
 
 type SocketOptions = tuple[tuple[int, int, int], ...]
+
+# Shared immutable defaults for the keepalive probe timing: a frozen count is a value, so
+# every caller can hold the same one.
+_KEEPALIVE_IDLE = Seconds(60)
+_KEEPALIVE_INTERVAL = Seconds(10)
 
 
 def apply_socket_options(sock: socket.socket | None, options: SocketOptions) -> None:
@@ -16,8 +22,8 @@ def apply_socket_options(sock: socket.socket | None, options: SocketOptions) -> 
 
 def tcp_keepalive(
     *,
-    idle: timedelta = timedelta(seconds=60),
-    interval: timedelta = timedelta(seconds=10),
+    idle: Seconds = _KEEPALIVE_IDLE,
+    interval: Seconds = _KEEPALIVE_INTERVAL,
     count: int = 6,
 ) -> SocketOptions:
     """
@@ -35,9 +41,10 @@ def tcp_keepalive(
     - `count`: unanswered probes before the connection is declared dead.
 
     So a broken idle connection is dropped roughly `idle + interval * count` after it goes
-    quiet. `idle`/`interval` MUST be a whole number of seconds, since the OS options carry
-    only integer seconds (a sub-second component is rejected here rather than silently
-    truncated); `count` is a plain probe count, not a duration.
+    quiet. `idle`/`interval` are counts of `Seconds` because the OS options carry only
+    integer seconds: a finer duration is not something either can be built from, so
+    nothing is silently truncated on the way to the socket. `count` is a plain probe
+    count, not a duration.
 
     Enabling keepalive (`SO_KEEPALIVE`) is portable, but the per-probe tuning is not
     uniformly spelled or present, so the result includes each knob only where the running
@@ -50,16 +57,13 @@ def tcp_keepalive(
       available", Windows 10+); older Windows exposes none of them, so only `SO_KEEPALIVE`
       is enabled and the probe timing stays at the system default.
     """
-    for name, duration in (("idle", idle), ("interval", interval)):
-        if duration.microseconds:
-            raise ValueError(f"{name} must be a whole number of seconds, got {duration}")
     # macOS has no TCP_KEEPIDLE and spells the idle knob TCP_KEEPALIVE; Linux and modern
     # Windows use TCP_KEEPIDLE, so prefer it and fall back to the macOS name.
     idle_option = getattr(socket, "TCP_KEEPIDLE", None) or getattr(socket, "TCP_KEEPALIVE", None)
     options = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
     for option, value in (
-        (idle_option, int(idle.total_seconds())),
-        (getattr(socket, "TCP_KEEPINTVL", None), int(interval.total_seconds())),
+        (idle_option, idle.count),
+        (getattr(socket, "TCP_KEEPINTVL", None), interval.count),
         (getattr(socket, "TCP_KEEPCNT", None), count),
     ):
         # The skip path only fires on a platform missing a knob (e.g. older Windows),

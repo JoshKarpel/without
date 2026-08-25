@@ -316,6 +316,57 @@ async def test_the_websocket_handler_echoes_inbound_frames_through_the_wired_str
     await task
 
 
+async def test_outbound_stream_is_closed_when_the_client_goes_away_mid_response() -> None:
+    # The guarantee a long-lived response depends on: an event source's `finally` runs at
+    # the `send` that fails, not at whenever the collector reaches the abandoned generator.
+    released = asyncio.Event()
+
+    def router(state: str, scope: HttpScope) -> Processor[Inbound, Outbound]:
+        async def stream_forever(inputs: Stream[Inbound]) -> AsyncIterator[Outbound]:
+            try:
+                await anext(aiter(inputs))
+                yield ResponseStart(status=200)
+                while True:
+                    yield ResponseBody(body=b"tick", more_body=True)
+            finally:
+                released.set()
+
+        return stream_forever
+
+    wrapped = make_asgi_app(_lifespan(Trace(), "state"), router)
+    inbox, outbox, task = _start_lifespan(wrapped)
+    await inbox.put({"type": "lifespan.startup"})
+    await outbox.get()
+
+    async def receive() -> RawMessage:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: RawMessage) -> None:
+        if message["type"] == "http.response.body":
+            raise ConnectionResetError("the client hung up")
+
+    with pytest.raises(ConnectionResetError):
+        await wrapped(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "GET",
+                "path": "/",
+                "query_string": b"",
+                "headers": [],
+            },
+            receive,
+            send,
+        )
+
+    assert released.is_set()
+
+    await inbox.put({"type": "lifespan.shutdown"})
+    await outbox.get()
+    await task
+
+
 async def test_inbound_stream_is_closed_when_a_handler_abandons_the_body() -> None:
     captured: list[Stream[Inbound]] = []
 

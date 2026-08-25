@@ -94,6 +94,7 @@ nav:
       - Reference: without-configmap/reference.md
   - without-asgi:
       - without-asgi/index.md
+      - without-asgi/sse.md
       - Reference: without-asgi/reference.md
   - without-web:
       - without-web/index.md

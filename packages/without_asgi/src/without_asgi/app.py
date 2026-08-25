@@ -8,7 +8,9 @@ from dataclasses import dataclass
 from typing import assert_never
 
 from without import Processor
+from without import Sink
 from without import Stream
+from without import close_stream
 from without import stream_from_iterable
 
 from without_asgi.inbound import Inbound
@@ -150,6 +152,19 @@ def refuse_websocket(state: object, head: WebsocketScope) -> WebsocketHandler:
     return handler
 
 
+async def _closing[T](sink: Sink[T], events: Stream[T]) -> None:
+    """
+    Drive `events` into `sink`, closing the stream on the way out however that goes.
+
+    The outbound counterpart of `aclosing` around the inbound stream, over `close_stream`
+    because a handler returns a `Stream` rather than a generator specifically.
+    """
+    try:
+        await sink(events)
+    finally:
+        await close_stream(events)
+
+
 def make_asgi_app[T](
     lifespan: Lifespan[T],
     http: HttpRouter[T] = refuse_http,
@@ -188,11 +203,16 @@ def make_asgi_app[T](
                 # `aclosing` closes the inbound stream when the handler exits, so a
                 # handler that abandons the request body early does not leave the
                 # generator (and any resource its `finally` releases) dangling for GC.
+                # `_closing` is the same guarantee on the way out, and it is the one a
+                # long-lived response depends on: a client that goes away mid-stream ends
+                # this at the `send` that fails, and the handler's own `finally` (an event
+                # source, a heartbeat's pull task) has to run there rather than whenever
+                # the collector reaches it.
                 async with aclosing(http_inbound(receive)) as inbound:
-                    await http_outbound(send)(http(cell.require(), head)(inbound))
+                    await _closing(http_outbound(send), http(cell.require(), head)(inbound))
             case WebsocketScope() as head:
                 async with aclosing(websocket_inbound(receive)) as inbound:
-                    await websocket_outbound(send)(websocket(cell.require(), head)(inbound))
+                    await _closing(websocket_outbound(send), websocket(cell.require(), head)(inbound))
             case _ as unreachable:
                 assert_never(unreachable)
 

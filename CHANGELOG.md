@@ -1,5 +1,139 @@
 # Changelog
 
+## 0.0.6
+
+### Added
+
+- **`without-asgi`**: Server-Sent Events, as the two pure transforms the format actually is.
+  `encode_event` renders one frame to bytes and `parse_events` is
+  `Stream[bytes] -> Stream[ReceivedEvent]`; neither touches a socket, which is what puts the
+  format at this layer rather than beside a transport, so an app under uvicorn emits events
+  with no transport dependency and a caller parses them out of any byte stream. `event_stream`
+  is the `file_response`-shaped server side, yielding one `ResponseBody` per event with
+  `more_body=True`, since an event sitting in a buffer has not been delivered, and closing
+  the source with the response so a client that goes away mid-stream releases whatever the
+  handler held there and then. The whole
+  [WHATWG format](https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation)
+  is implemented, not just `data:`: comments, the multi-line join, the dispatch-on-blank-line
+  rule, one leading BOM, UTF-8 with replacement rather than raising (raising would let a
+  hostile producer kill its consumers), and unknown fields ignored so a producer can add one
+  without breaking an older consumer. Lines split on the format's three terminators and *only*
+  those, because `str.splitlines` also splits on U+2028 and five others, which would make a
+  value two lines here and one at a conformant peer. What a handler sends is
+  `ServerSentEvent`, a union of the only four frames that mean anything: `Event(data, type,
+  id)` dispatches, `Comment` is the heartbeat, `Retry` sets the reconnection time, and
+  `Checkpoint` moves the resumption point without delivering anything. A single type with
+  five optional fields was the obvious shape and the wrong one, since most of what it
+  permitted was a no-op on the wire or silently discarded on arrival (an `event:` naming a
+  frame that dispatches nothing), and splitting costs nothing because a frame carrying
+  several at once is equivalent to sending them one after another. Parsing yields the
+  narrower `Received = ReceivedEvent | Retry | Checkpoint`; `Comment` is outbound-only
+  because the spec says to ignore comments, and `parse_events` drops the directives where
+  `parse_events_with_directives` keeps them, the same split as `ResponseBody`'s trailers.
+  `Event` and `ReceivedEvent` are separate types for the usual inbound/outbound reason, and
+  differ in exactly one field: `id` is optional outbound because omitting the line leaves the
+  peer's resumption point alone where an empty one *clears* it, a choice only a sender has.
+  `type` needs no such option, since the format cannot tell an absent `event:` line from
+  `event: message`, so it is a plain `str` on both and the encoder writes no line for the
+  default. `Retry` and `Checkpoint` are shared across directions, since a type with one
+  required field has no default that could mask a parser bug. `with_heartbeat(events)` keeps
+  an idle stream from being reaped by a proxy, inserting a frame (a bare `Comment` by default,
+  the only one a conformant consumer must ignore) after a silent interval. An idle timer
+  rather than a metronome, so a busy stream sends none at all; it holds the source pull in a
+  task across a lapsed interval, because bounding `anext` with a timeout would cancel the pull
+  and lose whatever was arriving. Three of the format's own asymmetries are modeled rather than
+  smoothed over: the last event id persists across events, so a frame carrying no `id:` still
+  reports the stream's current one, and across connections, since both parsers take a
+  `last_event_id` seeding the point a reconnect resumed from; `retry:` belongs to the
+  *stream*; and an `id:` with no
+  data still moves the resumption point, because the spec's dispatch sets the last event ID
+  string before it returns early on an empty data buffer. A newline in `data` is carried by
+  splitting it across `data:` lines, which is what makes event injection structurally
+  impossible where a hand-rolled `f"data: {payload}\n\n"` forges a whole event; a newline in
+  `type` or `id` has no such spelling and raises at construction, before anything is
+  committed to the wire. Both sides are stricter than the format about an `id`, which comes
+  back on reconnect as a `Last-Event-ID` header, so what it has to survive is a field value
+  rather than just a line: a control character (not a legal field value at all) and a
+  leading or trailing space (legal, but stripped by a field parser, so the peer would resume
+  from a point neither side chose) both raise on the way out and are ignored on the way in,
+  where the spec singles out only `NUL`. Interior spaces survive intact and are left alone.
+  Ignoring rather than raising inbound costs a
+  replay from an older id, where failing to spell the header would end a subscription
+  outright: nothing in the format is a parse error, so nothing in it hands a hostile
+  producer a way to kill its consumers. A `retry:` too large to name a duration is bounded
+  on both sides on the same terms, dropped by the parser and refused by `Retry`, since a
+  frame encoding to bytes this library would not read is not one worth writing. The line
+  carries whole milliseconds, so `Retry` takes a count of `Milliseconds` rather than a
+  `timedelta` and a finer duration is not a value it can be built from: truncating one is at
+  its worst at the bottom of the range, where half a millisecond renders `retry: 0`, which
+  does not mean "almost no wait" but "reconnect immediately".
+  `max_event_size` is unbounded by default and caps state retained
+  toward the pending event, for a producer that might be hostile or merely broken. A line
+  spanning many chunks is assembled from its fragments and joined once, so a megabyte of
+  JSON in one `data:` line costs time linear in its length rather than quadratic.
+- **`without-http`**: `subscribe(attempt)`, the half of Server-Sent Events that needs
+  a transport: it parses the response body, and when the stream ends waits and opens another
+  connection carrying `Last-Event-ID`, so a caller sees one uninterrupted stream of events
+  across however many connections it took. `attempt` is a function that opens one connection
+  (`lambda headers: client(ClientRequest("GET", url, headers))`) rather than a
+  `ClientRequest`, because a request is not replayable: its body is a `Stream[bytes]`, which
+  the interface allows to be iterated exactly once, so re-sending one value would put a full
+  body on the wire for the first attempt and an empty one for every attempt after it.
+  Building the request per attempt makes that unrepresentable, and is what lets an event
+  stream ride a `POST` (the shape MCP's Streamable HTTP uses) rather than only the bodyless
+  `GET` a reused request survives. The resumption point advances on an event carrying
+  an `id:` and on a `Checkpoint`, so a producer that skips work the consumer filtered out is
+  not replayed from before the skip. This is the only retry loop the client ships, and
+  the no-retry-middleware position is what makes it possible rather than an exception to it:
+  that position rejects policy the library would have to invent, and here the backoff arrives
+  on the wire as `retry:`, the resumption token as `id:`, and the terminal condition is in the
+  protocol. A non-`200` or a content type other than `text/event-stream` raises
+  `NotAnEventStream` and never reconnects, the first connection's errors propagate rather than
+  starting a silent loop, and a drop after a stream is established reconnects. How far to
+  trust the peer supplying that backoff is the caller's to set: a producer's `retry:` is
+  clamped between `minimum_reconnect` (100ms) and `maximum_reconnect` (five minutes), since
+  at zero it would spin a consumer into a hot reconnect loop and a few orders of magnitude
+  too large it would park one on a subscription that goes silent forever with nothing raised
+  to notice. A window that runs backwards raises where the caller wrote it rather than at the
+  first `anext`, by which point a request has already gone out. `sleep` is injected so a test
+  drives the loop without waiting.
+- **`without`**: `close_stream(source)`, how a consumer releases a stream it abandons. A
+  `Stream` is `__aiter__`-only, so a source may be a generator holding a `finally` (a file,
+  a task, a connection) or an object with nothing to release; this is that difference in one
+  place rather than in every consumer that can stop early, and without it the cleanup waits
+  on garbage collection, so a long-lived source outlives its consumer by an indeterminate
+  amount.
+- **`without`**: `Seconds` and `Milliseconds`, for the parameters whose duration has to cross
+  a boundary carrying whole units of one. A `timedelta` names its unit, which is why it is
+  the right type everywhere else, but it cannot say that a duration *survives* the boundary
+  ahead: a TCP keepalive knob carries integer seconds, an SSE `retry:` line and SQLite's
+  `busy_timeout` carry integer milliseconds, and each truncates whatever it is handed.
+  Truncation is worst where it is least visible, half a millisecond of `retry:` becoming
+  `retry: 0`, which does not mean "almost no wait" but "reconnect immediately". What makes
+  these worth having is what they cannot hold: each is a count, so no argument to either
+  constructor names a finer unit, and a duration too fine to cross is not one the type can be
+  asked to carry. `duration` is the `timedelta` back out and `of` is the one way in from one,
+  which is the only place the question of whether it divides is ever asked.
+
+### Changed
+
+- **`without-http`**: `tcp_keepalive` takes `idle` and `interval` as counts of `Seconds`
+  rather than `timedelta`s. The values it produces were always integer seconds; what changes
+  is that a finer duration can no longer be written at the call site, in place of the check
+  that used to reject one after the fact.
+- **`without-durability-sqlite`**: `connect` takes `timeout` as a count of `Milliseconds`,
+  the unit `PRAGMA busy_timeout` carries, so a duration finer than the pragma can express is
+  no longer silently truncated into it.
+
+### Fixed
+
+- **`without-asgi`**: `make_asgi_app` closes a handler's outbound stream when the connection
+  ends, as it already did for the inbound one. A client that goes away mid-response ends the
+  exchange at the `send` that fails, and a streaming handler's own `finally` now runs there
+  rather than at whenever the garbage collector reaches the abandoned generator, which is
+  what a long-lived response (an event stream, a heartbeat's pull task) depends on to release
+  what it holds.
+
 ## 0.0.5
 
 ### Added

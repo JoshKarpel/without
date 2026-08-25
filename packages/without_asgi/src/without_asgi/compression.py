@@ -26,6 +26,7 @@ from without_asgi.outbound import ZeroCopySend
 from without_asgi.routing import HttpMiddleware
 from without_asgi.routing import wrap
 from without_asgi.scope import HttpScope
+from without_asgi.sse import EVENT_STREAM_MEDIA_TYPE
 from without_asgi.types import RawHeaders
 
 __all__ = [
@@ -511,7 +512,7 @@ def is_compressible(content_type: bytes | None) -> bool:
     if content_type is None:
         return False
     media = content_type.split(b";")[0].strip().lower()
-    if media == b"text/event-stream":
+    if media == EVENT_STREAM_MEDIA_TYPE:
         return False
     if media.startswith(b"text/"):
         return True

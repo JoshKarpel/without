@@ -346,6 +346,82 @@ client stops sending on the peer's half-close; the server closes with a bounded
 lingering `FIN` rather than an `RST` that could discard its own response). See
 [Security](security.md#early-responses-and-connection-close).
 
+### Server-Sent Events
+
+The event stream *format* lives in `without-asgi`, because it is two pure
+transforms that touch no socket: see
+[Server-Sent Events](../without-asgi/sse.md). One connection needs nothing from
+this package beyond the byte stream a response body already is:
+
+```python
+from without_asgi import parse_events
+
+async with request(client, "GET", url) as (head, body):
+    async for event in parse_events(body):
+        ...
+```
+
+What does need a transport is the loop that keeps the stream up. `subscribe`
+opens a connection, parses the body, and when the stream ends waits and opens
+another one carrying `Last-Event-ID`, so the producer resumes where the consumer
+stopped. That resumption point moves on an event carrying an `id:` *and* on a
+`Checkpoint`, an id-only frame a producer sends after skipping work you asked not
+to see; acting on only the first replays from before the skip. A caller sees one
+uninterrupted stream of events across however many connections it took:
+
+```python
+from without_http import subscribe
+
+events = subscribe(lambda headers: pool(ClientRequest("GET", url, headers)))
+async for event in events:
+    if done(event):
+        break
+await events.aclose()  # releases the connection there and then
+```
+
+What `subscribe` takes is a *function* that opens one connection, not a
+`ClientRequest`. A request is not replayable: its body is a `Stream[bytes]`,
+which the interface allows to be iterated exactly once, so re-sending one request
+value would put a full body on the wire for the first attempt and an empty one
+for every attempt after it. Building the request inside the function makes that
+unrepresentable, and it is what lets an event stream ride a `POST` (the shape
+MCP's Streamable HTTP uses) rather than only the bodyless `GET` a reused request
+survives. The headers handed to it are `accept: text/event-stream` and, once the
+stream has a resumption point, `last-event-id`; `merge` them with your own to
+decide which side wins on a name you also set.
+
+**This is the only retry loop `without-http` ships**, and the
+[position against a `retry()` middleware](alternatives.md#the-client) is why it
+can be. That position rejects *policy* the library would have to invent: how
+many attempts, which statuses, what backoff. Here there is none to invent. The
+backoff arrives on the wire as `retry:`, the resumption token arrives as `id:`,
+and the terminal condition is written into the protocol. What the settings below
+decide is how far to trust the peer that supplies them.
+
+What it does and does not retry:
+
+- A non-`200` status, or a content type other than `text/event-stream`, raises
+  `NotAnEventStream` and never reconnects. An endpoint answering `404` or
+  `text/html` is not a stream that dropped, it is one that was never there.
+- The **first** connection's errors propagate, so a caller that cannot reach the
+  endpoint at all learns immediately rather than watching a silent loop.
+- Once a stream has been established, a connection error or timeout, on the
+  stream or on any later attempt, reconnects. A stream a proxy reaps every 60
+  seconds is the ordinary case, which is why the protocol has a resumption token
+  at all.
+
+The wait is `reconnect` (three seconds) until the producer names one, after which
+it is clamped to between `minimum_reconnect` (100ms) and `maximum_reconnect`
+(five minutes). Both ends guard the same thing, a `retry:` that is hostile or
+merely wrong: at zero it would spin a consumer into a hot reconnect loop, and a
+few orders of magnitude too large it would park one on a subscription that goes
+silent forever with nothing raised to notice. Widen either end for a producer you
+trust to name its own backoff, narrow them to hold a peer to a window you chose.
+A window that runs backwards
+raises, and raises at the call rather than at the first `anext`, since by then a
+request has already gone out. `sleep` is injected, so a test drives the loop
+without waiting and a caller can add jitter.
+
 ### Timeouts
 
 By default a request has **no timeouts**: a hung connect or a stalled server blocks
@@ -425,8 +501,7 @@ and tears it down when the peer stops answering, independent of any request. It 
 **on by default**, as one entry in the pool's `socket_options`:
 
 ```python
-from datetime import timedelta
-
+from without import Seconds
 from without_http import ConnectionPool, tcp_keepalive
 
 # The default: probe after 60s idle, every 10s, drop after 6 unanswered probes.
@@ -434,15 +509,15 @@ async with ConnectionPool() as pool:
     ...
 
 # Tune the probe timing, or pass () to leave the kernel's own defaults alone.
-async with ConnectionPool(
-    socket_options=tcp_keepalive(idle=timedelta(seconds=30), interval=timedelta(seconds=5), count=4)
-) as pool:
+async with ConnectionPool(socket_options=tcp_keepalive(idle=Seconds(30), interval=Seconds(5), count=4)) as pool:
     ...
 ```
 
-`idle` and `interval` are `timedelta`s and MUST be a whole number of seconds (the
-underlying options carry only integer seconds, so a sub-second component is rejected
-rather than silently truncated); `count` is a plain probe count. `SO_KEEPALIVE` is
+`idle` and `interval` are counts of
+[`Seconds`](../without/index.md#durations-that-cross-an-integer-boundary-withoutdurations), because the
+underlying options carry only integer seconds: a finer duration is not something either
+can be built from, so none is silently truncated on the way to the socket. `count` is a
+plain probe count. `SO_KEEPALIVE` is
 enabled portably; the per-probe tuning maps to the Linux
 `TCP_KEEPIDLE`/`TCP_KEEPINTVL`/`TCP_KEEPCNT` socket options, and a platform that lacks
 one of those knobs keeps its own default for that axis.
