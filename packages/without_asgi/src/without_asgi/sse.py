@@ -10,7 +10,9 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import assert_never
 
+from without import Milliseconds
 from without import Stream
+from without import close_stream
 
 from without_asgi.headers import merge
 from without_asgi.outbound import Outbound
@@ -82,7 +84,12 @@ _NEWLINE = re.compile(r"\r\n|\r|\n")
 #   whitespace around a value, so the peer would answer from `abc` where the consumer
 #   meant `abc `, resuming from a point neither side chose. Interior spaces survive
 #   intact and are left alone.
-_UNRESUMABLE_ID = re.compile(r"[\x00-\x1f\x7f]|^ | $")
+#
+# `\A` and `\Z` rather than `^` and `$`, because `$` also matches *before* a trailing
+# newline: an id of `"abc \n"` would then match the space first, and the value would be
+# refused for the space it ends with rather than the newline it carries. Both are
+# refused either way; the anchors decide which message the caller reads.
+_UNRESUMABLE_ID = re.compile(r"[\x00-\x1f\x7f]|\A | \Z")
 
 # A `retry:` value, which is ASCII digits and few enough of them to name a duration
 # `timedelta` can hold. Matching on the count rather than converting first is what keeps
@@ -201,18 +208,25 @@ class Retry:
 
     Its own frame rather than a field on `Event`, because it is a property of the
     *stream*: a frame carrying only `retry:` dispatches no event, so a value hung on an
-    event would have nowhere to live when a producer sent one on its own. Sent in whole
-    milliseconds; `without-http`'s `subscribe` is what acts on it.
+    event would have nowhere to live when a producer sent one on its own.
+    `without-http`'s `subscribe` is what acts on it.
+
+    `after` is a count of `Milliseconds` because that is what the line carries, and the
+    type says so where a caller writes the value rather than where it reaches the wire.
+    Truncating a finer duration instead is at its worst at the bottom of the range: half
+    a millisecond would render `retry: 0`, which does not mean "almost no wait" but
+    "reconnect immediately". `Milliseconds(0)` stays legal, because zero is a wait a
+    sender chose rather than one that fell out of a conversion.
     """
 
-    after: timedelta
+    after: Milliseconds
 
     def __post_init__(self) -> None:
-        if self.after < timedelta():
+        if self.after.count < 0:
             raise ValueError(f"a reconnection time cannot be negative: {self.after!r}")
         # The mirror of the parser's bound, so the two halves agree on what the format
         # can carry: a value this side would render is one that side would drop.
-        if len(str(self.after // timedelta(milliseconds=1))) > _MAX_RETRY_DIGITS:
+        if len(str(self.after.count)) > _MAX_RETRY_DIGITS:
             raise ValueError(f"a reconnection time cannot exceed {_MAX_RETRY_DIGITS} digits: {self.after!r}")
 
 
@@ -338,8 +352,7 @@ async def with_heartbeat(
         pull.cancel()
         with suppress(BaseException):
             await pull
-        if isinstance(source, AsyncGenerator):
-            await source.aclose()
+        await close_stream(source)
 
 
 def _data_lines(data: str) -> list[str]:
@@ -368,7 +381,7 @@ def encode_event(event: ServerSentEvent) -> bytes:
             # remainder of the comment on a line the peer reads as a field.
             lines = [f":{piece}" for piece in _NEWLINE.split(text)]
         case Retry(after):
-            lines = [f"retry: {after // timedelta(milliseconds=1)}"]
+            lines = [f"retry: {after.count}"]
         case Checkpoint(event_id):
             lines = [f"id: {event_id}"]
         case _ as unreachable:
@@ -381,7 +394,7 @@ async def event_stream(
     *,
     status: int = 200,
     headers: RawHeaders = (),
-) -> AsyncIterator[Outbound]:
+) -> AsyncGenerator[Outbound]:
     """
     Serve a stream of frames as the `ResponseStart` + `ResponseBody` event stream a
     handler yields.
@@ -416,10 +429,24 @@ async def event_stream(
 
     There is no `content-length`, and there cannot be. Compression is separately
     declined for this media type; see `is_compressible`.
+
+    An `AsyncGenerator` rather than a bare `AsyncIterator`, because closing the response
+    closes `events` with it. That is what carries `with_heartbeat`'s promise through this
+    composition: a client that goes away mid-stream ends the response at the `send` that
+    fails, and the source's `finally` runs there rather than at whenever the collector
+    reaches it.
     """
     yield ResponseStart(status=status, headers=merge(EVENT_STREAM_HEADERS, headers))
-    async for event in events:
-        yield ResponseBody(encode_event(event), more_body=True)
+    source = aiter(events)
+    try:
+        async for event in source:
+            yield ResponseBody(encode_event(event), more_body=True)
+    finally:
+        # Closing the response closes the source with it, which is what makes
+        # `with_heartbeat`'s promise hold through this composition: without it the pull
+        # task and whatever the source holds open live on until the generator is
+        # finalized, at whenever the collector gets to it.
+        await close_stream(source)
     yield ResponseBody(b"", more_body=False)
 
 
@@ -482,6 +509,12 @@ async def parse_events_with_directives(
     # its length: re-splitting an accumulated buffer on each chunk would make that
     # quadratic, and a megabyte of JSON in one `data:` line is an ordinary event.
     pending: list[str] = []
+    # The characters `pending` holds, carried alongside it rather than summed for the size
+    # check below. Summing would make the cap the very thing it defends against: a
+    # producer dribbling one byte per chunk toward a line that never ends would cost time
+    # quadratic in the number of chunks, so a bounded parser would hang where an unbounded
+    # one keeps up.
+    pending_size = 0
     # A carriage return at the end of a chunk, which cannot be judged yet: the next chunk
     # may open with the line feed that completes a CRLF pair, and ending the line now
     # would dispatch an event on a blank line the stream never sent.
@@ -535,7 +568,7 @@ async def parse_events_with_directives(
                 # rather than raised out of a parser whose contract is that nothing in
                 # the format is a parse error.
                 if _RETRY.fullmatch(value):
-                    return Retry(after=timedelta(milliseconds=int(value)))
+                    return Retry(after=Milliseconds(int(value)))
             case _:
                 return None
         return None
@@ -548,13 +581,14 @@ async def parse_events_with_directives(
             # Every terminator in this chunk closes a line, and the first of them closes
             # whatever earlier chunks left half-assembled.
             pieces[0] = "".join(pending) + pieces[0]
-            pending = []
+            pending, pending_size = [], 0
             for line in pieces[:-1]:
                 if (item := handle(line)) is not None:
                     yield item
         if pieces[-1]:
             pending.append(pieces[-1])
-        if max_event_size is not None and buffered + len(event_type) + sum(map(len, pending)) > max_event_size:
+            pending_size += len(pieces[-1])
+        if max_event_size is not None and buffered + len(event_type) + pending_size > max_event_size:
             raise ValueError(f"the event stream exceeded max_event_size ({max_event_size})")
 
     # A carriage return held back as a possible CRLF half can only have been a

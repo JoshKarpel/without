@@ -53,11 +53,12 @@ shape [`file_response`](index.md#streaming-a-file) produces and the same
 `Reply` `without-web` already accepts:
 
 ```python
+from without import Milliseconds
 from without_asgi import Checkpoint, Comment, Event, Retry, ServerSentEvent, event_stream
 
 
 async def progress(job: Job) -> AsyncIterator[ServerSentEvent]:
-    yield Retry(timedelta(seconds=30))
+    yield Retry(Milliseconds(30_000))
     async for step in job.steps():
         if step.filtered:
             yield Checkpoint(step.cursor)  # skipped, but do not replay it
@@ -123,7 +124,10 @@ This is the one piece of the module that reads a clock; the encoder and parser
 stay pure. It pulls the source into a task so a lapsed interval leaves that pull
 running, since bounding `anext` with a timeout would cancel the pull and lose
 whatever the source was about to produce. Closing the returned generator cancels
-the pull and closes the source.
+the pull and closes the source, and `event_stream` closes what it iterates, so
+the guarantee holds through the composition above: closing the response closes
+the heartbeat wrapper, which closes `progress(job)`, there and then rather than
+at whenever the collector gets to it.
 
 ## Receiving events
 
@@ -219,6 +223,16 @@ and reconnecting on an unspellable one ends the subscription outright.
 value too long to name a duration, so `Retry` refuses to construct one this
 library's own parser would drop: a frame that encodes to bytes we would not read
 is not one worth writing.
+
+The line carries whole milliseconds, so `after` is a count of
+[`Milliseconds`](../without/index.md#durations-that-cross-an-integer-boundary-withoutdurations)
+rather than a `timedelta`, and a finer duration is not something a `Retry` can be
+built from at all. Truncating one is at its worst at the bottom of the range:
+half a millisecond renders `retry: 0`, which does not mean "almost no wait" but
+"reconnect immediately". `subscribe` clamps that to `MINIMUM_RECONNECT`, so this
+library's own consumer cannot be made to hot loop, but a browser `EventSource`
+takes it at face value. `Retry(Milliseconds(0))` stays legal, because zero is a
+wait a sender chose rather than one that fell out of a conversion.
 
 ## What to watch in deployment
 

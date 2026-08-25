@@ -10,6 +10,7 @@ from itertools import pairwise
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
+from without import Milliseconds
 from without import stream_from_iterable
 from without_asgi import EVENT_STREAM_HEADERS
 from without_asgi import Checkpoint
@@ -106,7 +107,7 @@ class TestEncoding:
         assert encode_event(Comment()) == b":\n\n"
 
     def test_retry_renders_as_whole_milliseconds(self) -> None:
-        assert encode_event(Retry(timedelta(milliseconds=1500))) == b"retry: 1500\n\n"
+        assert encode_event(Retry(Milliseconds(1500))) == b"retry: 1500\n\n"
 
     def test_a_checkpoint_renders_an_id_with_no_data(self) -> None:
         assert encode_event(Checkpoint("42")) == b"id: 42\n\n"
@@ -148,6 +149,15 @@ class TestEncoding:
         with pytest.raises(ValueError, match="event id cannot begin or end with a space"):
             build(bad)
 
+    @pytest.mark.parametrize("build", [lambda bad: Event(data="x", id=bad), Checkpoint])
+    def test_an_id_that_is_both_padded_and_newline_bearing_names_the_newline(
+        self, build: Callable[[str], object]
+    ) -> None:
+        # Refused either way, but the newline is the case with a motive, so it is the one
+        # the caller is told about rather than the trailing space that precedes it.
+        with pytest.raises(ValueError, match="event id cannot contain a newline"):
+            build("abc \n")
+
     @pytest.mark.parametrize("build", [lambda good: Event(data="x", id=good), Checkpoint])
     def test_an_interior_space_in_an_id_is_left_alone(self, build: Callable[[str], object]) -> None:
         # It survives the round trip intact, so the rule has no business refusing it.
@@ -155,16 +165,30 @@ class TestEncoding:
 
     def test_a_negative_reconnection_time_is_rejected(self) -> None:
         with pytest.raises(ValueError, match="reconnection time cannot be negative"):
-            Retry(timedelta(seconds=-1))
+            Retry(Milliseconds(-1000))
 
     def test_a_reconnection_time_this_library_s_own_parser_would_drop_is_rejected(self) -> None:
         # The encode side of the parser's bound, so both halves agree on what the format
         # can carry.
         with pytest.raises(ValueError, match="reconnection time cannot exceed 16 digits"):
-            Retry(timedelta(milliseconds=10**16))
+            Retry(Milliseconds(10**16))
 
     def test_the_largest_renderable_reconnection_time_is_accepted(self) -> None:
-        assert encode_event(Retry(timedelta(milliseconds=10**16 - 1))) == b"retry: 9999999999999999\n\n"
+        assert encode_event(Retry(Milliseconds(10**16 - 1))) == b"retry: 9999999999999999\n\n"
+
+    @pytest.mark.parametrize(
+        "fractional", [timedelta(microseconds=1), timedelta(microseconds=500), timedelta(seconds=1.0005)]
+    )
+    def test_a_reconnection_time_finer_than_a_millisecond_cannot_be_spelled(self, fractional: timedelta) -> None:
+        # The line carries whole milliseconds, and at the bottom of the range truncation
+        # renders `retry: 0`, which reads on the wire as "reconnect immediately".
+        # `subscribe` clamps that, but a browser `EventSource` hot loops on it. There is
+        # no way to hand one to `Retry` at all: the count is the only way in.
+        with pytest.raises(ValueError, match="a whole number of milliseconds cannot express"):
+            Retry(Milliseconds.of(fractional))
+
+    def test_a_zero_reconnection_time_is_a_value_a_sender_chose(self) -> None:
+        assert encode_event(Retry(Milliseconds(0))) == b"retry: 0\n\n"
 
 
 class TestParsing:
@@ -278,13 +302,13 @@ class TestParsing:
 class TestDirectives:
     async def test_a_retry_directive_is_surfaced_as_its_own_item(self) -> None:
         assert await collected_with_directives(b"retry: 4000\ndata: hello\n\n") == [
-            Retry(after=timedelta(seconds=4)),
+            Retry(after=Milliseconds(4000)),
             message("hello"),
         ]
 
     async def test_a_retry_directive_alone_dispatches_no_event_but_is_still_surfaced(self) -> None:
         # The reason `Retry` is its own arm: there is no event here to hang it on.
-        assert await collected_with_directives(b"retry: 4000\n\n") == [Retry(after=timedelta(seconds=4))]
+        assert await collected_with_directives(b"retry: 4000\n\n") == [Retry(after=Milliseconds(4000))]
 
     async def test_directives_are_dropped_by_the_common_parser(self) -> None:
         assert await collected(b"retry: 4000\ndata: hello\n\n") == [message("hello")]
@@ -305,9 +329,7 @@ class TestDirectives:
 
     async def test_the_largest_representable_retry_value_is_still_read(self) -> None:
         value = b"9" * 16
-        assert await collected_with_directives(b"retry: " + value + b"\n\n") == [
-            Retry(after=timedelta(milliseconds=int(value)))
-        ]
+        assert await collected_with_directives(b"retry: " + value + b"\n\n") == [Retry(after=Milliseconds(int(value)))]
 
     async def test_an_id_only_frame_is_surfaced_as_a_checkpoint(self) -> None:
         # The spec sets the last event ID string before returning early on empty data,
@@ -482,6 +504,25 @@ class TestEventStreamResponse:
             (b"x-accel-buffering", b"no"),
         )
 
+    async def test_closing_the_response_closes_the_source_there_and_then(self) -> None:
+        # What makes `event_stream(with_heartbeat(...))` keep the promise `with_heartbeat`
+        # makes on its own: without it the source and its pull task outlive the response
+        # until the generator is finalized, at whenever the collector gets to it.
+        closed = asyncio.Event()
+
+        async def watched() -> AsyncIterator[ServerSentEvent]:
+            try:
+                while True:
+                    yield Event(data="a")
+            finally:
+                closed.set()
+
+        outbound = event_stream(with_heartbeat(watched(), every=NEVER))
+        assert isinstance(await anext(outbound), ResponseStart)
+        assert await anext(outbound) == ResponseBody(b"data: a\n\n", more_body=True)
+        await outbound.aclose()
+        assert closed.is_set()
+
     async def test_no_content_length_is_declared(self) -> None:
         start = await anext(event_stream(stream_from_iterable([])))
         assert isinstance(start, ResponseStart)
@@ -560,7 +601,7 @@ async def test_no_data_value_can_forge_a_field(data: str) -> None:
     assert parsed == [ReceivedEvent(data=normalized(data), type="fixed", id="fixed")]
 
 
-@given(directives=st.lists(st.integers(0, 9999).map(lambda ms: Retry(timedelta(milliseconds=ms))), max_size=4))
+@given(directives=st.lists(st.integers(0, 9999).map(lambda ms: Retry(Milliseconds(ms))), max_size=4))
 async def test_retry_directives_survive_the_round_trip(directives: list[Retry]) -> None:
     assert await collected_with_directives(encode_all(directives)) == directives
 

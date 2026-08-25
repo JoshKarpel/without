@@ -153,6 +153,25 @@ async def spool[T](source: Stream[T], ahead: int) -> AsyncIterator[T]:
             yield item
 
 
+async def close_stream(source: Stream[object]) -> None:
+    """
+    Close `source` if it is a generator: how a consumer releases a stream it abandons.
+
+    `Stream` is `__aiter__`-only, so a source may be a generator holding a `finally` (a
+    file, a task, a connection) or an object with nothing to release. This is the
+    difference between the two, in one place, because the alternative is every consumer
+    that can stop early carrying the same check.
+
+    Reach for it wherever a consumer may not drain what it was given, which is the case
+    whenever it can raise or be closed part-way through: without it the generator's
+    cleanup waits on garbage collection, so a long-lived source outlives the consumer by
+    an indeterminate amount. `contextlib.aclosing` is the same guarantee for a source
+    already known to be a generator.
+    """
+    if isinstance(source, AsyncGenerator):
+        await source.aclose()
+
+
 async def collect[T](source: Stream[T]) -> list[T]:
     """
     Drain a `Stream` into a list: the terminal that materializes every value.

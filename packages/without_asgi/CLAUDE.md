@@ -102,7 +102,9 @@ them. And this package already owns payload formats in *both* directions:
 The two halves stay together because they are one format that must agree byte for
 byte, and the round-trip property test is the main thing that proves it. What
 does *not* live here is the reconnecting loop (`without_http.subscribe`), because
-it needs a `Client` to reconnect with.
+it needs the client exchange to reconnect with: the `ClientResponse` it opens each
+attempt against, and the timeouts it reads as a stream that dropped rather than a
+fault.
 
 So the dividing line is the transport, not purity. `with_heartbeat` is the case
 that shows the difference: it reads a clock, so it is not pure, but it needs only

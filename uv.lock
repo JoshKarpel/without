@@ -2161,11 +2161,15 @@ name = "without-durability-sqlite"
 version = "0.0.0"
 source = { editable = "packages/without_durability_sqlite" }
 dependencies = [
+    { name = "without-core" },
     { name = "without-durability" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "without-durability", editable = "packages/without_durability" }]
+requires-dist = [
+    { name = "without-core", editable = "packages/without" },
+    { name = "without-durability", editable = "packages/without_durability" },
+]
 
 [[package]]
 name = "without-env"

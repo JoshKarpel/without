@@ -4,21 +4,18 @@ import asyncio
 from collections.abc import AsyncGenerator
 from collections.abc import Awaitable
 from collections.abc import Callable
-from dataclasses import replace
 from datetime import timedelta
 from typing import assert_never
 
+from without_asgi import RawHeaders
 from without_asgi.headers import first
-from without_asgi.headers import merge
-from without_asgi.headers import replace as replace_header
 from without_asgi.sse import EVENT_STREAM_MEDIA_TYPE
 from without_asgi.sse import Checkpoint
 from without_asgi.sse import ReceivedEvent
 from without_asgi.sse import Retry
 from without_asgi.sse import parse_events_with_directives
 
-from without_http.client import Client
-from without_http.client import ClientRequest
+from without_http.client import ClientResponse
 from without_http.client import ResponseHead
 from without_http.timeouts import HTTPTimeout
 
@@ -26,8 +23,9 @@ from without_http.timeouts import HTTPTimeout
 # stream transforms in `without-asgi` (`without_asgi.sse`), which is why a handler can
 # emit an event stream under uvicorn and a caller can parse one out of any
 # `Stream[bytes]`. What lives here is the loop those two cannot express on their own:
-# reconnecting a dropped stream and resuming it from the last id, which needs a `Client`
-# to reconnect *with*.
+# reconnecting a dropped stream and resuming it from the last id, which needs a client
+# exchange to reconnect *with* — the `ClientResponse` it opens each attempt against, and
+# the timeouts it treats as a stream that dropped rather than a fault.
 
 __all__ = [
     "DEFAULT_RECONNECT",
@@ -75,8 +73,7 @@ def _is_event_stream(head: ResponseHead) -> bool:
 
 
 def subscribe(
-    client: Client,
-    request: ClientRequest,
+    attempt: Callable[[RawHeaders], Awaitable[ClientResponse]],
     *,
     reconnect: timedelta = DEFAULT_RECONNECT,
     minimum_reconnect: timedelta = MINIMUM_RECONNECT,
@@ -88,16 +85,30 @@ def subscribe(
     Consume an event stream, reconnecting and resuming when it drops.
 
     The composition the two halves of Server-Sent Events exist to be assembled into: it
-    sends `request` through `client`, parses the response body with
-    `without_asgi.sse.parse_events_with_directives`, and when the stream ends it waits and
-    sends the request again carrying `Last-Event-ID`, so the producer can resume where
-    the consumer stopped. What a caller sees is one uninterrupted stream of events
-    across however many connections it took.
+    opens a connection, parses the response body with
+    `without_asgi.sse.parse_events_with_directives`, and when the stream ends it waits
+    and opens another one carrying `Last-Event-ID`, so the producer can resume where the
+    consumer stopped. What a caller sees is one uninterrupted stream of events across
+    however many connections it took.
 
     ```python
-    async for event in subscribe(client, ClientRequest("GET", "https://api.test/feed")):
+    async for event in subscribe(lambda headers: client(ClientRequest("GET", url, headers))):
         print(event.type, event.data)
     ```
+
+    `attempt` opens one connection: given the headers this loop wants on the request, it
+    answers with the response. A *function* rather than a `ClientRequest`, because a
+    request is not replayable. Its body is a `Stream[bytes]`, which the interface allows
+    to be iterated exactly once, and the bodies this package builds are one-shot async
+    generators, so re-sending one request value would put a full body on the wire for
+    the first attempt and an empty one on every attempt after it. Building the request
+    inside `attempt` makes that unrepresentable rather than documented, and it is what
+    lets an event stream ride a `POST` (the shape MCP's Streamable HTTP uses) instead of
+    only the bodyless `GET` a reused request survives.
+
+    The headers handed to `attempt` are `accept: text/event-stream` and, once the stream
+    has a resumption point, `last-event-id`. Pass them through as above, or `merge` them
+    with your own to decide which side wins on a name you also set.
 
     Descending a layer is the whole point of the split, and costs one line. A caller
     that wants exactly one connection, or its own reconnection policy, skips this and
@@ -139,12 +150,10 @@ def subscribe(
     delay, injected so a test drives the loop without waiting (and so a caller can add
     jitter).
 
-    The last id seen is reflected into the `Last-Event-ID` header of every later
-    request, and `accept: text/event-stream` is set unless `request` already carries
-    one. Reflecting a producer's value into a request header is safe here because the
-    parser only ever hands on an id a header can carry unchanged: a carriage return or
-    line feed is what ended the field, and an `id:` a field value could not spell, or
-    would silently alter, is ignored rather than resumed from.
+    Reflecting a producer's value into a request header is safe here because the parser
+    only ever hands on an id a header can carry unchanged: a carriage return or line
+    feed is what ended the field, and an `id:` a field value could not spell, or would
+    silently alter, is ignored rather than resumed from.
 
     An `AsyncGenerator` rather than a bare `AsyncIterator`, because this holds a live
     connection and a caller that stops early should be able to say so: `aclose()`
@@ -161,8 +170,7 @@ def subscribe(
     if reconnect < timedelta():
         raise ValueError(f"an initial reconnection wait cannot be negative: {reconnect!r}")
     return _subscribed(
-        client,
-        request,
+        attempt,
         reconnect=reconnect,
         minimum_reconnect=minimum_reconnect,
         maximum_reconnect=maximum_reconnect,
@@ -172,8 +180,7 @@ def subscribe(
 
 
 async def _subscribed(
-    client: Client,
-    request: ClientRequest,
+    attempt: Callable[[RawHeaders], Awaitable[ClientResponse]],
     *,
     reconnect: timedelta,
     minimum_reconnect: timedelta,
@@ -184,17 +191,14 @@ async def _subscribed(
     last_id = ""
     wait = reconnect
     established = False
-    # The caller wins on `accept`, so a producer that wants a narrower type stated gets
-    # it. Settled once, since `request` is the same on every attempt; only
-    # `last-event-id` moves, and it is ours to set, replacing whatever the last attempt
-    # left behind.
-    offered = merge(((b"accept", EVENT_STREAM_MEDIA_TYPE),), request.headers)
+    # What every attempt offers. `last-event-id` joins it once the stream has a
+    # resumption point, and the caller decides how these meet the request's own headers.
+    offered: RawHeaders = ((b"accept", EVENT_STREAM_MEDIA_TYPE),)
 
     while True:
-        headers = replace_header(offered, b"last-event-id", last_id.encode()) if last_id else offered
-        attempt = replace(request, headers=headers)
+        headers = (*offered, (b"last-event-id", last_id.encode())) if last_id else offered
         try:
-            head, body = await client(attempt)
+            head, body = await attempt(headers)
         except OSError, HTTPTimeout:
             if not established:
                 raise
@@ -216,7 +220,7 @@ async def _subscribed(
                         last_id = item.id
                         yield item
                     case Retry(after):
-                        wait = min(max(after, minimum_reconnect), maximum_reconnect)
+                        wait = min(max(after.duration, minimum_reconnect), maximum_reconnect)
                     case Checkpoint(moved_to):
                         # A frame that moved the resumption point without delivering an
                         # event. Missing these resumes from before whatever the producer

@@ -7,6 +7,7 @@ from collections.abc import Callable
 from datetime import timedelta
 
 import pytest
+from without import Seconds
 from without_asgi import RawMessage
 from without_asgi import Receive
 from without_asgi import Send
@@ -69,7 +70,7 @@ async def test_open_leaves_keepalive_off_when_no_options_are_given(listener: tup
 # naming a platform-specific constant, and run everywhere instead of skipping (a skipped
 # body would leave the test uncovered, and this repo measures test files at 100%).
 def test_tcp_keepalive_enables_keepalive_then_the_configured_probe_values() -> None:
-    options = tcp_keepalive(idle=timedelta(seconds=45), interval=timedelta(seconds=7), count=3)
+    options = tcp_keepalive(idle=Seconds(45), interval=Seconds(7), count=3)
     assert options[0] == (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     assert all(level == socket.IPPROTO_TCP for level, _option, _value in options[1:])
     assert [value for _level, _option, value in options[1:]] == [45, 7, 3]
@@ -77,7 +78,7 @@ def test_tcp_keepalive_enables_keepalive_then_the_configured_probe_values() -> N
 
 async def test_open_applies_the_configured_probe_values_to_the_socket(listener: tuple[str, int]) -> None:
     host, port = listener
-    options = tcp_keepalive(idle=timedelta(seconds=45), interval=timedelta(seconds=7), count=3)
+    options = tcp_keepalive(idle=Seconds(45), interval=Seconds(7), count=3)
     _reader, writer, _ = await _open(host, port, ssl_context=None, socket_options=options)
     sock = writer.get_extra_info("socket")
     try:
@@ -96,21 +97,11 @@ def test_pool_enables_keepalive_by_default() -> None:
     assert ConnectionPool().socket_options == tcp_keepalive()
 
 
-@pytest.mark.parametrize(
-    ("make", "axis"),
-    [
-        (lambda d: tcp_keepalive(idle=d), "idle"),
-        (lambda d: tcp_keepalive(interval=d), "interval"),
-    ],
-    ids=["idle", "interval"],
-)
-def test_a_fractional_second_probe_duration_is_rejected_naming_the_axis(
-    make: Callable[[timedelta], SocketOptions], axis: str
-) -> None:
-    # Anchor on the axis name so a mutated label (e.g. "IDLE"/"INTERVAL") is not accepted
-    # by a loose substring match.
-    with pytest.raises(ValueError, match=rf"^{axis} must be a whole number of seconds"):
-        make(timedelta(milliseconds=1500))
+def test_a_fractional_second_probe_duration_cannot_be_expressed_at_all() -> None:
+    # The OS options carry integer seconds, and `Seconds` is what says so: there is no
+    # way to hand `tcp_keepalive` a finer duration, so nothing here has to check for one.
+    with pytest.raises(ValueError, match="a whole number of seconds cannot express"):
+        tcp_keepalive(idle=Seconds.of(timedelta(milliseconds=1500)))
 
 
 def test_a_platform_missing_every_probe_knob_enables_only_so_keepalive(
@@ -130,7 +121,7 @@ def test_the_idle_knob_falls_back_to_the_macos_keepalive_name(monkeypatch: pytes
     macos_idle_option = 0x1234
     monkeypatch.setattr(socket, "TCP_KEEPALIVE", macos_idle_option, raising=False)
 
-    options = tcp_keepalive(idle=timedelta(seconds=45))
+    options = tcp_keepalive(idle=Seconds(45))
 
     assert options[1] == (socket.IPPROTO_TCP, macos_idle_option, 45)
 

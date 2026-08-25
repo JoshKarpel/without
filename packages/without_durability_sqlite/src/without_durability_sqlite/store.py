@@ -65,6 +65,7 @@ from pathlib import Path
 from time import monotonic
 from typing import cast
 
+from without import Milliseconds
 from without_durability.codec import JSON
 from without_durability.codec import CheckpointCodec
 from without_durability.interfaces import LEASE
@@ -80,6 +81,10 @@ from without_durability.stepwise import now_utc
 # poll interval it has to agree with something outside this store (the checkpoint claim
 # the worker takes for exactly as long).
 POLL = timedelta(milliseconds=50)
+
+# How long a process finding the write lock taken waits for it, in the unit
+# `PRAGMA busy_timeout` carries. A frozen count is a value, so one serves every caller.
+BUSY_TIMEOUT = Milliseconds(5_000)
 
 # `value` is TEXT rather than a richer type, which is the same shape the Redis store's
 # hash field has and leaves the same question open: what goes *in* the text is the
@@ -302,7 +307,7 @@ class Database:
             await asyncio.to_thread(self.connection.close)
 
 
-def connect(path: Path | str, *, timeout: timedelta = timedelta(seconds=5)) -> Database:
+def connect(path: Path | str, *, timeout: Milliseconds = BUSY_TIMEOUT) -> Database:
     """
     Open the database this store runs on, configured for durability rather than speed.
 
@@ -323,7 +328,7 @@ def connect(path: Path | str, *, timeout: timedelta = timedelta(seconds=5)) -> D
     connection = sqlite3.connect(path, autocommit=True, check_same_thread=False)
     connection.execute("PRAGMA journal_mode = WAL")
     connection.execute("PRAGMA synchronous = FULL")
-    connection.execute(f"PRAGMA busy_timeout = {int(timeout.total_seconds() * 1000)}")
+    connection.execute(f"PRAGMA busy_timeout = {timeout.count}")
     return Database(connection=connection)
 
 

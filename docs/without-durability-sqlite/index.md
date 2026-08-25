@@ -99,7 +99,10 @@ under WAL is `NORMAL`, and it trades away exactly the property this package exis
 for: a commit can be lost on power loss or an OS crash. Everything `run_durably`
 reasons about assumes the commit held, so this pays the fsync. `busy_timeout` is set
 so a second process finding the write lock taken waits rather than failing, which is
-the ordinary case when two processes share the file.
+the ordinary case when two processes share the file. The pragma carries whole
+milliseconds, so `timeout` is a count of
+[`Milliseconds`](../without/index.md#durations-that-cross-an-integer-boundary-withoutdurations) rather
+than a duration that would be truncated on its way into the statement.
 
 ## Gaps
 

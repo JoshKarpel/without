@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
+from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Iterator
 from datetime import timedelta
 
 import pytest
 from pytest_mock import MockerFixture
+from without import Stream
+from without_asgi import RawHeaders
 from without_asgi import ReceivedEvent
+from without_asgi.headers import merge
 from without_http import ClientRequest
 from without_http import ClientResponse
 from without_http import NotAnEventStream
@@ -18,7 +22,7 @@ from without_http import ResponseTrailers
 from without_http import subscribe
 from without_http.testing import respond
 
-FEED = ClientRequest("GET", "https://api.test/feed")
+FEED = "https://api.test/feed"
 EVENT_STREAM = ((b"content-type", b"text/event-stream"),)
 
 
@@ -66,9 +70,14 @@ async def no_sleep(duration: timedelta) -> None:
     """Collapse the reconnection wait so a test never spends wall-clock on it."""
 
 
+def feed(recorder: Recorder, headers: RawHeaders = ()) -> Callable[[RawHeaders], Awaitable[ClientResponse]]:
+    """Open the feed through `recorder`, building a fresh `GET` for each attempt."""
+    return lambda offered: recorder(ClientRequest("GET", FEED, merge(offered, headers)))
+
+
 async def drained(recorder: Recorder, **kwargs: object) -> list[ReceivedEvent]:
     """Consume a subscription to its end, which is where the script runs out or it raises."""
-    return [event async for event in subscribe(recorder, FEED, sleep=no_sleep, **kwargs)]  # type: ignore[arg-type]
+    return [event async for event in subscribe(feed(recorder), sleep=no_sleep, **kwargs)]  # type: ignore[arg-type]
 
 
 async def take(events: AsyncGenerator[ReceivedEvent], count: int) -> list[ReceivedEvent]:
@@ -81,33 +90,49 @@ async def take(events: AsyncGenerator[ReceivedEvent], count: int) -> list[Receiv
 class TestOneConnection:
     async def test_it_yields_the_events_the_stream_carries(self) -> None:
         recorder = Recorder(stream(b"data: a\n\n", b"event: tick\ndata: b\n\n"))
-        assert await take(subscribe(recorder, FEED, sleep=no_sleep), 2) == [
+        assert await take(subscribe(feed(recorder), sleep=no_sleep), 2) == [
             ReceivedEvent(type="message", data="a", id=""),
             ReceivedEvent(type="tick", data="b", id=""),
         ]
 
     async def test_a_caller_can_stop_consuming_and_the_body_is_closed(self) -> None:
         recorder = Recorder(stream(b"data: a\n\n", b"data: b\n\n"))
-        events = subscribe(recorder, FEED, sleep=no_sleep)
+        events = subscribe(feed(recorder), sleep=no_sleep)
         assert await take(events, 1) == [ReceivedEvent(type="message", data="a", id="")]
         assert len(recorder.requests) == 1
 
     async def test_it_offers_the_event_stream_media_type(self) -> None:
         recorder = Recorder(stream(b"data: a\n\n"))
-        await take(subscribe(recorder, FEED, sleep=no_sleep), 1)
+        await take(subscribe(feed(recorder), sleep=no_sleep), 1)
         assert (b"accept", b"text/event-stream") in recorder.requests[0].headers
 
-    async def test_a_caller_supplied_accept_wins(self) -> None:
+    async def test_a_caller_merging_over_the_offer_wins_on_accept(self) -> None:
+        # Which side wins is the caller's to decide now that they build the request, so
+        # this pins the documented composition rather than a policy the loop holds.
         recorder = Recorder(stream(b"data: a\n\n"))
-        request = ClientRequest("GET", "https://api.test/feed", headers=((b"accept", b"text/event-stream; q=0.9"),))
-        await take(subscribe(recorder, request, sleep=no_sleep), 1)
+        narrower = ((b"accept", b"text/event-stream; q=0.9"),)
+        await take(subscribe(feed(recorder, narrower), sleep=no_sleep), 1)
         accepts = [value for name, value in recorder.requests[0].headers if name == b"accept"]
         assert accepts == [b"text/event-stream; q=0.9"]
 
     async def test_the_first_request_carries_no_last_event_id(self) -> None:
         recorder = Recorder(stream(b"data: a\n\n"))
-        await take(subscribe(recorder, FEED, sleep=no_sleep), 1)
+        await take(subscribe(feed(recorder), sleep=no_sleep), 1)
         assert recorder.last_event_ids() == [None]
+
+    async def test_each_attempt_builds_its_own_request_so_a_one_shot_body_survives(self) -> None:
+        # The reason `attempt` is a function: a `ClientRequest`'s body is iterable once,
+        # so a single request value reused across attempts would put the payload on the
+        # wire for the first connection and nothing at all for every one after it.
+        recorder = Recorder(stream(b"data: a\n\n"), stream(b"data: b\n\n"))
+
+        async def payload() -> AsyncGenerator[bytes]:
+            yield b"subscribe me"
+
+        await take(
+            subscribe(lambda headers: recorder(ClientRequest("POST", FEED, headers, payload())), sleep=no_sleep), 2
+        )
+        assert [await _read(request.body) for request in recorder.requests] == [b"subscribe me", b"subscribe me"]
 
 
 class TestTerminalFailures:
@@ -137,7 +162,7 @@ class TestTerminalFailures:
             yield b"data: a\n\n"
 
         recorder = Recorder(ClientResponse(head, ResponseBody(body())))
-        assert await take(subscribe(recorder, FEED, sleep=no_sleep), 1) == [
+        assert await take(subscribe(feed(recorder), sleep=no_sleep), 1) == [
             ReceivedEvent(type="message", data="a", id="")
         ]
 
@@ -151,51 +176,51 @@ class TestTerminalFailures:
 class TestReconnection:
     async def test_a_stream_that_ends_is_reconnected(self) -> None:
         recorder = Recorder(stream(b"data: a\n\n"), stream(b"data: b\n\n"))
-        events = await take(subscribe(recorder, FEED, sleep=no_sleep), 2)
+        events = await take(subscribe(feed(recorder), sleep=no_sleep), 2)
         assert [event.data for event in events] == ["a", "b"]
         assert len(recorder.requests) == 2
 
     async def test_the_last_id_seen_resumes_the_next_connection(self) -> None:
         recorder = Recorder(stream(b"id: 41\ndata: a\n\n"), stream(b"id: 42\ndata: b\n\n"), stream(b"data: c\n\n"))
-        await take(subscribe(recorder, FEED, sleep=no_sleep), 3)
+        await take(subscribe(feed(recorder), sleep=no_sleep), 3)
         assert recorder.last_event_ids() == [None, b"41", b"42"]
 
     async def test_a_checkpoint_moves_the_resumption_point_without_delivering_an_event(self) -> None:
         # An id-only frame dispatches nothing, so its id reaches the loop only as a
         # `Checkpoint`. Missing it resumes from before whatever the producer skipped.
         recorder = Recorder(stream(b"data: a\n\nid: 99\n\n"), stream(b"data: b\n\n"))
-        events = await take(subscribe(recorder, FEED, sleep=no_sleep), 2)
+        events = await take(subscribe(feed(recorder), sleep=no_sleep), 2)
         assert [event.data for event in events] == ["a", "b"]
         assert recorder.last_event_ids() == [None, b"99"]
 
     async def test_a_checkpoint_before_any_event_still_resumes(self) -> None:
         recorder = Recorder(stream(b"id: 7\n\n"), stream(b"data: a\n\n"))
-        await take(subscribe(recorder, FEED, sleep=no_sleep), 1)
+        await take(subscribe(feed(recorder), sleep=no_sleep), 1)
         assert recorder.last_event_ids() == [None, b"7"]
 
     async def test_an_id_carrying_a_control_character_is_not_reflected_into_the_header(self) -> None:
         # The parser drops it, so the reconnect carries the last id that *was* spellable
         # rather than a header value h11 would refuse, which would end the subscription.
         recorder = Recorder(stream(b"id: keep\ndata: a\n\nid: bad\x0bid\ndata: b\n\n"), stream(b"data: c\n\n"))
-        await take(subscribe(recorder, FEED, sleep=no_sleep), 3)
+        await take(subscribe(feed(recorder), sleep=no_sleep), 3)
         assert recorder.last_event_ids() == [None, b"keep"]
 
     async def test_a_later_event_wins_over_an_earlier_checkpoint(self) -> None:
         recorder = Recorder(stream(b"id: 7\n\nid: 8\ndata: a\n\n"), stream(b"data: b\n\n"))
-        await take(subscribe(recorder, FEED, sleep=no_sleep), 2)
+        await take(subscribe(feed(recorder), sleep=no_sleep), 2)
         assert recorder.last_event_ids() == [None, b"8"]
 
     async def test_a_connection_error_mid_stream_reconnects_rather_than_surfacing(self) -> None:
         recorder = Recorder(stream(b"data: a\n\n", then=ConnectionResetError), stream(b"data: b\n\n"))
-        assert [event.data for event in await take(subscribe(recorder, FEED, sleep=no_sleep), 2)] == ["a", "b"]
+        assert [event.data for event in await take(subscribe(feed(recorder), sleep=no_sleep), 2)] == ["a", "b"]
 
     async def test_a_read_timeout_mid_stream_reconnects(self) -> None:
         recorder = Recorder(stream(b"data: a\n\n", then=ReadTimeout), stream(b"data: b\n\n"))
-        assert [event.data for event in await take(subscribe(recorder, FEED, sleep=no_sleep), 2)] == ["a", "b"]
+        assert [event.data for event in await take(subscribe(feed(recorder), sleep=no_sleep), 2)] == ["a", "b"]
 
     async def test_a_failed_reconnect_is_retried_once_a_stream_was_established(self) -> None:
         recorder = Recorder(stream(b"data: a\n\n"), ConnectionRefusedError("blip"), stream(b"data: b\n\n"))
-        assert [event.data for event in await take(subscribe(recorder, FEED, sleep=no_sleep), 2)] == ["a", "b"]
+        assert [event.data for event in await take(subscribe(feed(recorder), sleep=no_sleep), 2)] == ["a", "b"]
         assert len(recorder.requests) == 3
 
     async def test_a_terminal_failure_after_a_reconnect_still_raises(self) -> None:
@@ -254,10 +279,10 @@ class TestReconnectionTiming:
     @pytest.mark.parametrize(
         ("call", "message"),
         [
-            (lambda: subscribe(Recorder(), FEED, minimum_reconnect=timedelta(minutes=10)), "reconnection window"),
-            (lambda: subscribe(Recorder(), FEED, maximum_reconnect=timedelta(milliseconds=10)), "reconnection window"),
-            (lambda: subscribe(Recorder(), FEED, minimum_reconnect=timedelta(seconds=-1)), "reconnection window"),
-            (lambda: subscribe(Recorder(), FEED, reconnect=timedelta(seconds=-1)), "wait cannot be negative"),
+            (lambda: subscribe(feed(Recorder()), minimum_reconnect=timedelta(minutes=10)), "reconnection window"),
+            (lambda: subscribe(feed(Recorder()), maximum_reconnect=timedelta(milliseconds=10)), "reconnection window"),
+            (lambda: subscribe(feed(Recorder()), minimum_reconnect=timedelta(seconds=-1)), "reconnection window"),
+            (lambda: subscribe(feed(Recorder()), reconnect=timedelta(seconds=-1)), "wait cannot be negative"),
         ],
     )
     def test_a_contradictory_window_is_refused_where_the_caller_wrote_it(
@@ -284,7 +309,7 @@ class TestReconnectionTiming:
         # marginally before `time.monotonic` shows the full interval.
         slept = mocker.patch("without_http.sse.asyncio.sleep")
         recorder = Recorder(stream(b"data: a\n\n"), stream(b"data: b\n\n"))
-        assert len(await take(subscribe(recorder, FEED, reconnect=timedelta(milliseconds=1500)), 2)) == 2
+        assert len(await take(subscribe(feed(recorder), reconnect=timedelta(milliseconds=1500)), 2)) == 2
         slept.assert_awaited_once_with(1.5)
 
 
@@ -296,15 +321,19 @@ class TestParserPassthrough:
 
     async def test_events_split_across_chunks_are_reassembled(self) -> None:
         recorder = Recorder(stream(b"data: he", b"llo\n", b"\n"))
-        assert await take(subscribe(recorder, FEED, sleep=no_sleep), 1) == [
+        assert await take(subscribe(feed(recorder), sleep=no_sleep), 1) == [
             ReceivedEvent(type="message", data="hello", id="")
         ]
 
     async def test_comments_are_dropped_rather_than_surfaced(self) -> None:
         recorder = Recorder(stream(b": keepalive\n\ndata: a\n\n"))
-        assert await take(subscribe(recorder, FEED, sleep=no_sleep), 1) == [
+        assert await take(subscribe(feed(recorder), sleep=no_sleep), 1) == [
             ReceivedEvent(type="message", data="a", id="")
         ]
+
+
+async def _read(body: Stream[bytes]) -> bytes:
+    return b"".join([chunk async for chunk in body])
 
 
 async def _waits(recorder: Recorder, *, count: int, **kwargs: object) -> list[timedelta]:
@@ -314,5 +343,5 @@ async def _waits(recorder: Recorder, *, count: int, **kwargs: object) -> list[ti
     async def record(duration: timedelta) -> None:
         recorded.append(duration)
 
-    await take(subscribe(recorder, FEED, sleep=record, **kwargs), count)  # type: ignore[arg-type]
+    await take(subscribe(feed(recorder), sleep=record, **kwargs), count)  # type: ignore[arg-type]
     return recorded

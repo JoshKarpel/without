@@ -24,8 +24,10 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
+    "without-core",
     "without-durability",
 ]
 
 [tool.uv.sources]
+without-core = { workspace = true }
 without-durability = { workspace = true }

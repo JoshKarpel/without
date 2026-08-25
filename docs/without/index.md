@@ -1,7 +1,8 @@
 # without
 
 The narrow waist of the project: the interfaces every plugin speaks, plus the
-stream connectors and a `with`-scoped background task helper. See the
+stream connectors, a `with`-scoped background task helper, and the duration
+counts the boundaries share. See the
 [Philosophy](../philosophy.md) for why the model is shaped this way, and the
 [`without` API reference](../without/reference.md) for the full surface.
 
@@ -60,9 +61,46 @@ into a `Stream`, `collect` drains one to a list, `stream_from_queue` turns a
 push-based queue (an accept loop, a callback client) into the pull-based stream
 the rest of the system consumes, and `spool` drives a source ahead of its
 consumer (read-ahead) by pumping it into a bounded queue on a background task.
-`stack`
+`close_stream` is how a consumer releases a stream it *abandons*: a `Stream` is
+`__aiter__`-only, so a source may be a generator holding a `finally` (a file, a
+task, a connection) or an object with nothing to release, and this is that
+difference in one place rather than in every consumer that can stop early.
+Without it the cleanup waits on garbage collection, so a long-lived source
+outlives its consumer by an indeterminate amount. `stack`
 composes middleware (any `(handler, *context) -> handler`) into one, serving both
 server handlers and HTTP clients.
+
+## Durations that cross an integer boundary (`without.durations`)
+
+A `timedelta` is the right type for a duration everywhere in this project,
+because it names its unit and nothing downstream has to guess whether a bare
+number meant seconds or milliseconds. What it cannot say is that a duration
+*survives* the boundary it is about to cross. A TCP keepalive knob carries whole
+seconds, an SSE `retry:` line carries whole milliseconds, SQLite's `busy_timeout`
+carries whole milliseconds: each one truncates whatever it is handed, and
+truncation is at its worst where it is least visible. Half a millisecond of
+`retry:` becomes `retry: 0`, which does not mean "almost no wait", it means
+"reconnect immediately".
+
+`Seconds` and `Milliseconds` are what such a parameter declares instead, and what
+makes them worth having is what they *cannot* hold:
+
+```python
+tcp_keepalive(idle=Seconds(60), interval=Seconds(10))
+yield Retry(Milliseconds(30_000))
+```
+
+Each is a count, not a duration, so there is no argument to either constructor
+that names a finer unit. `duration` is the `timedelta` back out, for arithmetic
+and for anything taking a plain duration, and `of` is the one way in from one:
+
+```python
+Seconds.of(settings.keepalive_idle)  # raises on a duration finer than a second
+```
+
+That is the only place the question "does this divide?" is ever asked, which is
+the point: past construction there is nothing left for a boundary to check, and
+no truncation left for it to do.
 
 ## Tasks (`without.tasks`)
 
