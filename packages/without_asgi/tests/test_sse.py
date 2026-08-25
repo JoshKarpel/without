@@ -36,13 +36,20 @@ NEVER = timedelta(hours=1)
 AT_ONCE = timedelta(0)
 
 
-async def collected(*wire: bytes, max_event_size: int | None = None) -> list[ReceivedEvent]:
+async def collected(*wire: bytes, last_event_id: str = "", max_event_size: int | None = None) -> list[ReceivedEvent]:
     """Parse a body arriving as `wire`, one chunk per argument: the conformance-case shape."""
-    return [event async for event in parse_events(stream_from_iterable(wire), max_event_size=max_event_size)]
+    return [
+        event
+        async for event in parse_events(
+            stream_from_iterable(wire), last_event_id=last_event_id, max_event_size=max_event_size
+        )
+    ]
 
 
-async def collected_with_directives(wire: bytes) -> list[Received]:
-    return [item async for item in parse_events_with_directives(stream_from_iterable([wire]))]
+async def collected_with_directives(wire: bytes, *, last_event_id: str = "") -> list[Received]:
+    return [
+        item async for item in parse_events_with_directives(stream_from_iterable([wire]), last_event_id=last_event_id)
+    ]
 
 
 def encode_all(events: Iterable[ServerSentEvent]) -> bytes:
@@ -358,6 +365,26 @@ class TestDirectives:
         assert await collected(b"id: 99\n\n") == []
 
 
+class TestResumption:
+    async def test_an_event_without_an_id_carries_the_id_the_stream_resumed_from(self) -> None:
+        # The spec seeds a reconnected parser's last event ID buffer from the value the
+        # connection resumed with, so a producer that stamps ids periodically does not
+        # hand a consumer an empty resumption point between them.
+        assert await collected(b"data: hello\n\n", last_event_id="41") == [message("hello", event_id="41")]
+
+    async def test_the_id_the_stream_resumed_from_is_not_re_announced_as_a_checkpoint(self) -> None:
+        # The caller supplied it, so it already knows: only a *move* is worth surfacing.
+        assert await collected_with_directives(b": ping\n\n", last_event_id="41") == []
+
+    async def test_an_id_field_replaces_the_one_the_stream_resumed_from(self) -> None:
+        assert await collected_with_directives(b"id: 42\ndata: hello\n\n", last_event_id="41") == [
+            message("hello", event_id="42")
+        ]
+
+    async def test_moving_off_the_resumed_id_without_an_event_is_a_checkpoint(self) -> None:
+        assert await collected_with_directives(b"id: 42\n\n", last_event_id="41") == [Checkpoint(id="42")]
+
+
 class TestChunkBoundaries:
     async def test_a_crlf_split_across_chunks_is_one_terminator(self) -> None:
         assert await collected(b"data: hello\r", b"\n\r\n") == [message("hello")]
@@ -520,6 +547,26 @@ class TestEventStreamResponse:
         outbound = event_stream(with_heartbeat(watched(), every=NEVER))
         assert isinstance(await anext(outbound), ResponseStart)
         assert await anext(outbound) == ResponseBody(b"data: a\n\n", more_body=True)
+        await outbound.aclose()
+        assert closed.is_set()
+
+    async def test_closing_the_response_between_the_head_and_the_first_chunk_closes_the_source(self) -> None:
+        # The window a client that goes away during the handshake lands in: the app has
+        # yielded its head and nothing else. A source holding something already (here, a
+        # generator that has run into its `try`) must still be released there.
+        closed = asyncio.Event()
+
+        async def watched() -> AsyncIterator[ServerSentEvent]:
+            try:
+                while True:
+                    yield Event(data="a")
+            finally:
+                closed.set()
+
+        source = watched()
+        assert await anext(source) == Event(data="a")
+        outbound = event_stream(source)
+        assert isinstance(await anext(outbound), ResponseStart)
         await outbound.aclose()
         assert closed.is_set()
 

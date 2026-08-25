@@ -43,7 +43,9 @@
   task across a lapsed interval, because bounding `anext` with a timeout would cancel the pull
   and lose whatever was arriving. Three of the format's own asymmetries are modeled rather than
   smoothed over: the last event id persists across events, so a frame carrying no `id:` still
-  reports the stream's current one; `retry:` belongs to the *stream*; and an `id:` with no
+  reports the stream's current one, and across connections, since both parsers take a
+  `last_event_id` seeding the point a reconnect resumed from; `retry:` belongs to the
+  *stream*; and an `id:` with no
   data still moves the resumption point, because the spec's dispatch sets the last event ID
   string before it returns early on an empty data buffer. A newline in `data` is carried by
   splitting it across `data:` lines, which is what makes event injection structurally

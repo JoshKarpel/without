@@ -169,8 +169,14 @@ the common path pays nothing for a feature it does not use.
 
 Three details of the format surprise people, and all three are load-bearing:
 
-- **The last event id persists across events.** An event whose own frame carried
-  no `id:` still reports whichever id the stream last set.
+- **The last event id persists across events, and across connections.** An event
+  whose own frame carried no `id:` still reports whichever id the stream last
+  set, and on a reconnect that starts as the id the connection resumed from: both
+  parsers take a `last_event_id` to seed it, which
+  [`subscribe`](../without-http/index.md#server-sent-events) passes for you. A
+  parser starting from empty would report `""` for the first id-less event after
+  a drop, and a consumer storing that as its resumption point would replay the
+  feed from the beginning.
 - **`retry:` is a property of the stream, not of an event.** A frame carrying
   only `retry:` and a blank line dispatches nothing, so a reconnection time hung
   on the next event would be dropped whenever a producer sent one on its own.

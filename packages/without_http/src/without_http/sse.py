@@ -7,6 +7,7 @@ from collections.abc import Callable
 from datetime import timedelta
 from typing import assert_never
 
+from without import close_stream
 from without_asgi import RawHeaders
 from without_asgi.headers import first
 from without_asgi.sse import EVENT_STREAM_MEDIA_TYPE
@@ -213,8 +214,13 @@ async def _subscribed(
             )
         established = True
 
+        # Each connection parses from the id it resumed with, so an event carrying no
+        # `id:` of its own reports that rather than nothing: the spec seeds a reconnected
+        # parser's last event ID buffer for exactly this reason, and a parser starting
+        # from empty would erase the resumption point the next reconnect needs.
+        items = parse_events_with_directives(body, last_event_id=last_id, max_event_size=max_event_size)
         try:
-            async for item in parse_events_with_directives(body, max_event_size=max_event_size):
+            async for item in items:
                 match item:
                     case ReceivedEvent():
                         last_id = item.id
@@ -233,6 +239,9 @@ async def _subscribed(
             # fault to surface: that is what the resumption token is for.
             pass
         finally:
+            # The parser as well as the body, because a caller closing the subscription
+            # stops this generator at the `yield` above and leaves both of them open.
+            await close_stream(items)
             await body.aclose()
 
         await sleep(wait)

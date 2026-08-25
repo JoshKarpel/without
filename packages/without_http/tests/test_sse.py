@@ -185,6 +185,15 @@ class TestReconnection:
         await take(subscribe(feed(recorder), sleep=no_sleep), 3)
         assert recorder.last_event_ids() == [None, b"41", b"42"]
 
+    async def test_an_event_without_an_id_keeps_the_point_the_connection_resumed_from(self) -> None:
+        # A producer that stamps ids periodically sends id-less events in between. Each
+        # connection's parser is seeded with the id it resumed from, so those events
+        # report it rather than erasing it and replaying the feed from the beginning.
+        recorder = Recorder(stream(b"id: 41\ndata: a\n\n"), stream(b"data: b\n\n"), stream(b"data: c\n\n"))
+        events = await take(subscribe(feed(recorder), sleep=no_sleep), 3)
+        assert [event.id for event in events] == ["41", "41", "41"]
+        assert recorder.last_event_ids() == [None, b"41", b"41"]
+
     async def test_a_checkpoint_moves_the_resumption_point_without_delivering_an_event(self) -> None:
         # An id-only frame dispatches nothing, so its id reaches the loop only as a
         # `Checkpoint`. Missing it resumes from before whatever the producer skipped.

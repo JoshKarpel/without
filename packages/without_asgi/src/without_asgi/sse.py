@@ -436,9 +436,9 @@ async def event_stream(
     fails, and the source's `finally` runs there rather than at whenever the collector
     reaches it.
     """
-    yield ResponseStart(status=status, headers=merge(EVENT_STREAM_HEADERS, headers))
     source = aiter(events)
     try:
+        yield ResponseStart(status=status, headers=merge(EVENT_STREAM_HEADERS, headers))
         async for event in source:
             yield ResponseBody(encode_event(event), more_body=True)
     finally:
@@ -464,6 +464,7 @@ def _field(line: str) -> tuple[str, str]:
 async def parse_events_with_directives(
     chunks: Stream[bytes],
     *,
+    last_event_id: str = "",
     max_event_size: int | None = None,
 ) -> AsyncIterator[Received]:
     """
@@ -494,6 +495,14 @@ async def parse_events_with_directives(
       character, both of which a consumer would otherwise carry into a reconnect that
       cannot be spelled.
 
+    `last_event_id` seeds the resumption point this stream continues from, which is what
+    a caller reconnecting a dropped stream passes back in (`subscribe` does it for you).
+    The spec initializes a reconnected parser's last event ID buffer from the value the
+    connection was resumed with, and only an `id:` field replaces it, so an event that
+    carries no id of its own reports the id it is resuming from rather than nothing. A
+    parser that started from empty would hand back `""` there, and a consumer storing
+    that as its next resumption point would reconnect from the beginning of the feed.
+
     `max_event_size` caps the characters retained toward the event being assembled
     (its data, its type, and any partial line), raising `ValueError` past the bound.
     It is `None`, unbounded, by default: the bound is worth setting exactly when the
@@ -521,11 +530,12 @@ async def parse_events_with_directives(
     held = ""
     data: list[str] = []
     event_type = ""
-    last_id = ""
+    last_id = last_event_id
     # What the consumer has already been told the resumption point is, so a frame that
     # only moves it produces exactly one `Checkpoint` and an event that carries it
-    # produces none.
-    reported_id = ""
+    # produces none. Seeded alongside `last_id`, because a caller that resumed from an id
+    # already knows it and does not need a `Checkpoint` announcing what it just sent.
+    reported_id = last_event_id
     buffered = 0
 
     def handle(line: str) -> Received | None:
@@ -605,6 +615,7 @@ async def parse_events_with_directives(
 async def parse_events(
     chunks: Stream[bytes],
     *,
+    last_event_id: str = "",
     max_event_size: int | None = None,
 ) -> AsyncIterator[ReceivedEvent]:
     """
@@ -612,9 +623,10 @@ async def parse_events(
 
     The common path, and the one to reach for unless you are deciding when and where to
     reconnect: `async for event in parse_events(response.body)`. See
-    `parse_events_with_directives` for the decoding rules and for `max_event_size`, and
-    `without-http`'s `subscribe` for a loop that reconnects and resumes on its own.
+    `parse_events_with_directives` for the decoding rules and for `last_event_id` and
+    `max_event_size`, and `without-http`'s `subscribe` for a loop that reconnects and
+    resumes on its own.
     """
-    async for item in parse_events_with_directives(chunks, max_event_size=max_event_size):
+    async for item in parse_events_with_directives(chunks, last_event_id=last_event_id, max_event_size=max_event_size):
         if isinstance(item, ReceivedEvent):
             yield item
