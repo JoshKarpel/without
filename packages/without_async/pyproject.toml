@@ -3,13 +3,9 @@ requires = ["uv_build>=0.12.3,<0.13"]
 build-backend = "uv_build"
 
 [project]
-# The bare `without` distribution name is rejected by PyPI (too similar to an
-# existing project / prohibited; PyPI does not disclose which). The importable
-# module stays `without` via `[tool.uv.build-backend] module-name` below, so
-# only the published distribution name carries the `-core` suffix.
-name = "without-core"
+name = "without-async"
 version = "0.0.0"
-description = "Core interfaces and executor for without: the sans-IO stream-processor substrate."
+description = "The asyncio primitives without is built from: scoped background tasks, bounded concurrency, optional timeouts, and durations that cross an integer boundary."
 readme = "README.md"
 license = "MIT"
 authors = [
@@ -25,10 +21,6 @@ classifiers = [
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries",
-    "Topic :: Software Development :: Libraries :: Application Frameworks",
     "Typing :: Typed",
 ]
 dependencies = []
-
-[tool.uv.build-backend]
-module-name = "without"

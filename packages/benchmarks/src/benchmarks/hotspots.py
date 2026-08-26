@@ -26,7 +26,8 @@ _TOP_LEVEL = {
     "without_web": "without-web",
     "without_env": "without-env",
     "without_configmap": "without-configmap",
-    "without": "without-core",
+    "without_streams": "without-streams",
+    "without_async": "without-async",
     "h11": "h11",
     "h2": "h2",
     "hpack": "hpack",
@@ -48,8 +49,8 @@ def package(frame: Mapping[str, object]) -> str:
 
     The module is taken from the path *after* the install/source marker
     (`site-packages/` or `/src/`), so the repository root (which is itself named
-    `without/`) cannot masquerade as the `without` core package. Frames without
-    such a marker are interpreter internals or the stdlib.
+    `without/`) cannot be read as a top-level module. Frames without such a
+    marker are interpreter internals or the stdlib.
     """
     raw = frame.get("file")
     path = (raw if isinstance(raw, str) else "").replace("\\", "/")

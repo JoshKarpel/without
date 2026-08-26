@@ -11,10 +11,6 @@ from pathlib import Path
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
-from without import compose
-from without import from_map
-from without import from_selector
-from without import stream_from_iterable
 from without_logging import Level
 from without_logging import Record
 from without_logging import at_least
@@ -24,6 +20,10 @@ from without_logging import offload
 from without_logging import to_rotating_file
 from without_logging import to_stream
 from without_logging.sinks import now_utc
+from without_streams import compose
+from without_streams import from_map
+from without_streams import from_selector
+from without_streams import stream_from_iterable
 
 EPOCH = datetime(2026, 1, 1, tzinfo=UTC)
 

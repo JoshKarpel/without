@@ -9,7 +9,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from without.testing import yield_once
+from without_async.testing import yield_once
 from without_durability import Contended
 from without_durability import Fenced
 from without_durability import Recorded

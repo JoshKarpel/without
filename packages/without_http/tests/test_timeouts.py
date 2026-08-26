@@ -13,7 +13,7 @@ import h2.config
 import h2.connection
 import h2.settings
 import pytest
-from without import cancel_futures
+from without_async import cancel_futures
 from without_http import Client
 from without_http import ConnectionPool
 from without_http import ConnectTimeout

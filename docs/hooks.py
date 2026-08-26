@@ -30,9 +30,9 @@ class Member:
     """
     A workspace member, parsed from its `pyproject.toml`.
 
-    `name` is the published distribution name; `module` is the importable
-    package, which can differ: the core distributes as `without-core` but
-    imports as `without` via a `[tool.uv.build-backend] module-name` override.
+    `name` is the published distribution name and `module` is the importable
+    package; every member's module is its distribution name with `-` normalized
+    to `_`.
     """
 
     name: str
@@ -45,15 +45,6 @@ def import_name(distribution_name: str) -> str:
     return distribution_name.replace("-", "_")
 
 
-def module_override(document: dict[str, object]) -> str | None:
-    """The `[tool.uv.build-backend] module-name`, when a member renames its import away from its distribution."""
-    tool = document.get("tool")
-    uv = tool.get("uv") if isinstance(tool, dict) else None
-    backend = uv.get("build-backend") if isinstance(uv, dict) else None
-    override = backend.get("module-name") if isinstance(backend, dict) else None
-    return override if isinstance(override, str) else None
-
-
 def parse_member(document: dict[str, object]) -> Member:
     project = document["project"]
     if not isinstance(project, dict):
@@ -63,7 +54,7 @@ def parse_member(document: dict[str, object]) -> Member:
     dependencies = tuple(str(dep) for dep in raw_dependencies) if isinstance(raw_dependencies, list) else ()
     return Member(
         name=name,
-        module=module_override(document) or import_name(name),
+        module=import_name(name),
         description=str(project.get("description", "")),
         dependencies=dependencies,
     )
@@ -99,8 +90,8 @@ def workspace_edges(members: dict[str, Member]) -> list[tuple[str, str]]:
 
 def render_graph_page(members: dict[str, Member]) -> str:
     published = {name: members[name] for name in publishable(members)}
-    # Bottom-to-top so the depended-on core (arrow heads) ranks at the top and
-    # dependents build upward from it, while each arrow still reads "depends on".
+    # Bottom-to-top so the most depended-on packages (arrow heads) rank at the top
+    # and dependents build upward from them, while each arrow still reads "depends on".
     lines = ["graph BT"]
     lines.extend(f"    {import_name(name)}[{name}]" for name in published)
     lines.extend(
@@ -118,19 +109,8 @@ def render_graph_page(members: dict[str, Member]) -> str:
 
 
 def publishable(members: dict[str, Member]) -> list[str]:
-    """The `without*` family, ordered with the core first: exactly what publishes."""
-    others = sorted(name for name in members if name.startswith("without") and name != "without-core")
-    return ["without-core", *others]
-
-
-def package_dir(member: Member) -> str:
-    """
-    The docs directory that holds a package's guide and generated reference.
-
-    The core distributes as `without-core` but its guide lives under `without`
-    (its import name); every other member's directory is its distribution name.
-    """
-    return member.module if member.name == "without-core" else member.name
+    """The `without*` family: exactly what publishes."""
+    return sorted(name for name in members if name.startswith("without"))
 
 
 def render_reference_page(member: Member) -> str:
@@ -145,9 +125,7 @@ def on_files(files: Files, config: MkDocsConfig) -> Files:
 
     for name in publishable(members):
         member = members[name]
-        files.append(
-            File.generated(config, f"{package_dir(member)}/reference.md", content=render_reference_page(member))
-        )
+        files.append(File.generated(config, f"{member.name}/reference.md", content=render_reference_page(member)))
 
     root_pages = (
         ("PHILOSOPHY.md", "philosophy.md"),

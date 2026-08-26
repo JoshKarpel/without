@@ -6,15 +6,15 @@ import pytest
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 from pydantic_settings import SettingsConfigDict
-from without import Context
-from without import Processor
-from without import Transition
-from without import collect
-from without import from_scan
-from without import sample
 from without_configmap import read_yaml_file
 from without_configmap import watch_config
 from without_env import EnvContext
+from without_streams import Context
+from without_streams import Processor
+from without_streams import Transition
+from without_streams import collect
+from without_streams import from_scan
+from without_streams import sample
 
 
 class Limits(BaseSettings):

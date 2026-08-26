@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import pytest
-from without import collect
-from without import stream_from_iterable
 from without_asgi import ClientDisconnect
 from without_asgi import Disconnect
 from without_asgi import Inbound
@@ -32,6 +30,8 @@ from without_asgi import lifespan_outbound
 from without_asgi import read_body
 from without_asgi import websocket_inbound
 from without_asgi import websocket_outbound
+from without_streams import collect
+from without_streams import stream_from_iterable
 
 
 def _scripted(messages: list[RawMessage]) -> Receive:

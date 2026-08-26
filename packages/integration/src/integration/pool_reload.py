@@ -5,10 +5,10 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
-from without import Sample
-from without import Stream
-from without import sample
 from without_http import ConnectionPool
+from without_streams import Sample
+from without_streams import Stream
+from without_streams import sample
 
 # Can a connection pool's config be reloaded live? Yes, and without any
 # resizable primitive. A pool bound (`max_connections_per_host`) is enforced by a

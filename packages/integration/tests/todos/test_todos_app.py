@@ -6,8 +6,6 @@ from integration.todos.app import _recover
 from integration.todos.app import session
 from integration.todos.app import todos_app
 from integration.todos.app import todos_openapi
-from without import collect
-from without import stream_from_iterable
 from without_asgi import ASGIApp
 from without_asgi import RawMessage
 from without_asgi import WebsocketAccept
@@ -17,6 +15,8 @@ from without_asgi import WebsocketConnect
 from without_asgi import WebsocketReceive
 from without_asgi import WebsocketText
 from without_asgi.scope import parse_websocket_scope
+from without_streams import collect
+from without_streams import stream_from_iterable
 from without_web import Match
 
 from packages.integration.tests.helpers import a_todo_list

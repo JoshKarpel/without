@@ -6,19 +6,19 @@ from datetime import timedelta
 from time import monotonic
 
 import pytest
-from without import Transition
-from without import close_stream
-from without import collect
-from without import compose
-from without import from_scan
-from without import from_sink
-from without import sample
-from without import spool
-from without import stream_from_iterable
-from without import stream_from_queue
-from without import tee
-from without import ticks
-from without.testing import yield_once
+from without_async.testing import yield_once
+from without_streams import Transition
+from without_streams import close_stream
+from without_streams import collect
+from without_streams import compose
+from without_streams import from_scan
+from without_streams import from_sink
+from without_streams import sample
+from without_streams import spool
+from without_streams import stream_from_iterable
+from without_streams import stream_from_queue
+from without_streams import tee
+from without_streams import ticks
 
 
 async def test_compose_runs_first_then_second() -> None:

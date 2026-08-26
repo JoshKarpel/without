@@ -5,9 +5,9 @@ from datetime import UTC
 from datetime import datetime
 from traceback import TracebackException
 
-from without import Sink
-from without import from_sink
 from without_logging import Record
+from without_streams import Sink
+from without_streams import from_sink
 
 
 def sink_into(collected: list[Record]) -> Sink[Record]:

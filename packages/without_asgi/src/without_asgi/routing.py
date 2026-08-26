@@ -4,10 +4,10 @@ from collections.abc import AsyncIterator
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from without import Processor
-from without import Stream
-from without import compose
-from without import stack
+from without_streams import Processor
+from without_streams import Stream
+from without_streams import compose
+from without_streams import stack
 
 from without_asgi.app import HttpHandler
 from without_asgi.app import HttpRouter

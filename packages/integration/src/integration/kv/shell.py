@@ -41,14 +41,14 @@ from datetime import timedelta
 
 from pydantic_settings import BaseSettings
 from pydantic_settings import SettingsConfigDict
-from without import Context
-from without import Fold
-from without import Processor
-from without import Transition
-from without import from_fold
-from without import from_scan
-from without import stream_from_queue
-from without import timeout
+from without_async import timeout
+from without_streams import Context
+from without_streams import Fold
+from without_streams import Processor
+from without_streams import Transition
+from without_streams import from_fold
+from without_streams import from_scan
+from without_streams import stream_from_queue
 
 from integration.kv.core import EMPTY_STORE
 from integration.kv.core import Reply

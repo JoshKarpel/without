@@ -22,9 +22,6 @@ import h2.events
 import h2.exceptions
 import h2.settings
 import h11
-from without import background_task
-from without import cancel_futures
-from without import timeout
 from without_asgi import ASGIApp
 from without_asgi import Disconnect
 from without_asgi import EarlyHint
@@ -50,6 +47,9 @@ from without_asgi import encode_websocket_inbound
 from without_asgi import encode_websocket_scope
 from without_asgi import parse_outbound
 from without_asgi import parse_websocket_outbound
+from without_async import background_task
+from without_async import cancel_futures
+from without_async import timeout
 from wsproto import ConnectionType
 from wsproto import WSConnection
 from wsproto.events import BytesMessage

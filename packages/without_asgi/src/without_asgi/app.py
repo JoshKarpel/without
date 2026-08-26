@@ -7,11 +7,11 @@ from contextlib import aclosing
 from dataclasses import dataclass
 from typing import assert_never
 
-from without import Processor
-from without import Sink
-from without import Stream
-from without import close_stream
-from without import stream_from_iterable
+from without_streams import Processor
+from without_streams import Sink
+from without_streams import Stream
+from without_streams import close_stream
+from without_streams import stream_from_iterable
 
 from without_asgi.inbound import Inbound
 from without_asgi.inbound import Shutdown

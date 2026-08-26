@@ -4,8 +4,6 @@ import json
 from collections.abc import AsyncIterator
 
 import pytest
-from without import Stream
-from without import stream_from_iterable
 from without_asgi import HttpScope
 from without_asgi import Inbound
 from without_asgi import Outbound
@@ -17,6 +15,8 @@ from without_asgi import WebsocketHandler
 from without_asgi import WebsocketInbound
 from without_asgi import WebsocketOutbound
 from without_asgi import WebsocketScope
+from without_streams import Stream
+from without_streams import stream_from_iterable
 from without_web import INT
 from without_web import Body
 from without_web import Describable

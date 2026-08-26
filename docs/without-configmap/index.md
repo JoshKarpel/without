@@ -21,7 +21,7 @@ Feed the stream through `without.sample` to read the latest value as a `Context`
 from pathlib import Path
 
 from pydantic import BaseModel
-from without import sample
+from without_streams import sample
 from without_configmap import read_yaml_file, watch_config
 
 

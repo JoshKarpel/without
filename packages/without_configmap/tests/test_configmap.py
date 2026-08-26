@@ -2,10 +2,10 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 from pydantic import BaseModel
-from without import collect
-from without import sample
 from without_configmap import read_yaml_file
 from without_configmap import watch_config
+from without_streams import collect
+from without_streams import sample
 
 
 class DbConfig(BaseModel):

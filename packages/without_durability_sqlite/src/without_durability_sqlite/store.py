@@ -65,7 +65,7 @@ from pathlib import Path
 from time import monotonic
 from typing import cast
 
-from without import Milliseconds
+from without_async import Milliseconds
 from without_durability.codec import JSON
 from without_durability.codec import CheckpointCodec
 from without_durability.interfaces import LEASE

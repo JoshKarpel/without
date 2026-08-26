@@ -39,10 +39,6 @@ import h2.exceptions
 import h11
 from aiohappyeyeballs import AddrInfoType
 from aiohappyeyeballs import start_connection
-from without import Endo
-from without import Stream
-from without import cancel_futures
-from without import stack
 from without_asgi import Content
 from without_asgi import RawHeaders
 from without_asgi import StreamingContent
@@ -53,6 +49,10 @@ from without_asgi.compression import brotli_compressor
 from without_asgi.compression import gzip_compressor
 from without_asgi.compression import zstd_compressor
 from without_asgi.headers import merge
+from without_async import cancel_futures
+from without_streams import Endo
+from without_streams import Stream
+from without_streams import stack
 
 from without_http.h2_wire import request_headers
 from without_http.h2_wire import response_status_and_headers

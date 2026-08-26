@@ -47,11 +47,11 @@ from uuid import uuid4
 from redis.asyncio import Redis
 from redis.commands.core import AsyncScript
 from redis.exceptions import ResponseError
-from without import Sink
-from without import from_sink
 from without_durability.interfaces import LEASE
 from without_durability.interfaces import Delivery
 from without_durability.interfaces import check_duration
+from without_streams import Sink
+from without_streams import from_sink
 
 from without_durability_redis.units import milliseconds
 

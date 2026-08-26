@@ -7,7 +7,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import overload
 
-from without import Stream
 from without_asgi import HttpHandler
 from without_asgi import HttpScope
 from without_asgi import Inbound
@@ -19,6 +18,7 @@ from without_asgi import WebsocketOutbound
 from without_asgi import WebsocketScope
 from without_asgi import encode_response
 from without_asgi import read_body
+from without_streams import Stream
 
 from without_web.extractors import BufferedRequest
 from without_web.extractors import ExtractionError

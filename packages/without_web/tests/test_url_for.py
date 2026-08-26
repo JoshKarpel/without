@@ -4,12 +4,12 @@ import re
 import uuid
 
 import pytest
-from without import Stream
-from without import stream_from_iterable
 from without_asgi import HttpScope
 from without_asgi import Response
 from without_asgi import WebsocketInbound
 from without_asgi import WebsocketOutbound
+from without_streams import Stream
+from without_streams import stream_from_iterable
 from without_web import INT
 from without_web import STR
 from without_web import UUID

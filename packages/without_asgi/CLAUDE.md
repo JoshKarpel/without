@@ -46,8 +46,8 @@ lifespan scope with no `asgi` key).
 ## Where built-in middleware lives
 
 `without-asgi` owns the `Middleware` / `wrap` vocabulary (`routing.py`) and
-re-exports the generic `stack` from `without` core (`stack` composes any
-`(handler, *context) -> handler` middleware, server or client, so it lives in core),
+re-exports the generic `stack` from `without-streams` (`stack` composes any
+`(handler, *context) -> handler` middleware, server or client, so it lives in the substrate),
 making it the default home for built-in middleware. The placement rule across the
 three HTTP packages: **a middleware lives in the lowest layer whose vocabulary it
 needs, and in the package that owns the exchange shape it wraps.**

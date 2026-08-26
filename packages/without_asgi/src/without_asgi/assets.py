@@ -19,7 +19,7 @@ from typing import NoReturn
 from typing import assert_never
 from urllib.parse import quote
 
-from without import stream_from_iterable
+from without_streams import stream_from_iterable
 
 from without_asgi.compression import DEFAULT_COMPRESSORS
 from without_asgi.compression import Compressor

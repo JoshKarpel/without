@@ -10,9 +10,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import assert_never
 
-from without import Processor
-from without import Transition
-from without import from_scan
+from without_streams import Processor
+from without_streams import Transition
+from without_streams import from_scan
 
 
 @dataclass(frozen=True, slots=True)

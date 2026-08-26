@@ -413,7 +413,7 @@ the pragmas suppress. It would auto-catch a few hand-documented equivalent survi
 `multi_segment=False` → `None` on a `bool` parameter, `writer.write(None)`), but that is a small,
 package-specific win, not a reduction in pragmas.
 
-It cannot run on `without` core at all. mutmut's trampoline rewrite of the `@overload` functions in
+It cannot run on `without-streams` at all. mutmut's trampoline rewrite of the `@overload` functions in
 `wiring.py` makes mypy report "an overloaded function outside a stub file must have an
 implementation" on a line the filter cannot map back to any mutant, so
 `filter_mutants_with_type_checker` raises and aborts the whole package run. This fires even with

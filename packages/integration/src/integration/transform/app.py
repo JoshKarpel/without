@@ -7,10 +7,6 @@ from typing import assert_never
 from urllib.parse import parse_qs
 
 from pydantic import BaseModel
-from without import Stream
-from without import compose
-from without import sample
-from without import stream_from_iterable
 from without_asgi import ASGIApp
 from without_asgi import HttpHandler
 from without_asgi import HttpScope
@@ -40,6 +36,10 @@ from without_asgi.routing import WebsocketMiddleware
 from without_asgi.routing import buffered
 from without_asgi.routing import stack
 from without_asgi.routing import wrap
+from without_streams import Stream
+from without_streams import compose
+from without_streams import sample
+from without_streams import stream_from_iterable
 
 from integration.responses import json_response
 from integration.responses import text_response

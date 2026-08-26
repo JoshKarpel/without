@@ -18,7 +18,6 @@ import pytest
 from integration.todos.app import todos_app
 from integration.todos.core import Todo
 from integration.todos.core import TodoList
-from without import Stream
 from without_asgi import REVALIDATE_CACHE_CONTROL
 from without_asgi import ASGIApp
 from without_asgi import HttpHandler
@@ -39,6 +38,7 @@ from without_http import decompress
 from without_http import request
 from without_http import serving
 from without_http.testing import loopback_client
+from without_streams import Stream
 from without_web import Match
 from without_web import Router
 from without_web import static_files

@@ -11,8 +11,6 @@ from typing import Protocol
 from typing import assert_never
 from typing import overload
 
-from without import Stream
-from without import stream_from_iterable
 from without_asgi import HttpHandler
 from without_asgi import HttpRouter
 from without_asgi import HttpScope
@@ -27,6 +25,8 @@ from without_asgi.routing import HttpMiddleware
 from without_asgi.routing import Middleware
 from without_asgi.routing import WebsocketMiddleware
 from without_asgi.routing import stack
+from without_streams import Stream
+from without_streams import stream_from_iterable
 
 from without_web.converters import PATH
 from without_web.converters import Converter

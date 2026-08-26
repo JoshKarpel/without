@@ -15,7 +15,7 @@ from typing import Protocol
 from typing import runtime_checkable
 
 import brotli
-from without import Stream
+from without_streams import Stream
 
 from without_asgi import headers
 from without_asgi.outbound import Outbound

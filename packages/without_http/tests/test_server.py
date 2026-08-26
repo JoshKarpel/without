@@ -22,11 +22,11 @@ import h11
 import httpx
 import pytest
 from pytest_mock import MockerFixture
-from without import cancel_futures
 from without_asgi import ASGIApp
 from without_asgi import RawMessage
 from without_asgi import Receive
 from without_asgi import Send
+from without_async import cancel_futures
 from without_http import serving
 from without_http.server import _DEFAULT_LIMITS
 from without_http.server import _MID_ACCEPT_FLUSH_TICKS

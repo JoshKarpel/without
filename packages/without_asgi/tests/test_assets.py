@@ -14,7 +14,6 @@ from pathlib import Path
 import brotli
 import pytest
 from pytest_mock import MockerFixture
-from without import collect
 from without_asgi import DEFAULT_CHUNK_SIZE
 from without_asgi import IMMUTABLE_CACHE_CONTROL
 from without_asgi import NOT_FOUND
@@ -39,6 +38,7 @@ from without_asgi.headers import first
 from without_asgi.headers import replace
 from without_asgi.selection import http_date
 from without_asgi.types import RawHeaders
+from without_streams import collect
 
 from .helpers import a_scope
 

@@ -15,7 +15,7 @@ those state machines, and uses `without-asgi`'s server-direction codecs to
 translate between typed events and the ASGI dicts an app expects.
 
 ```python
-from without import sleep_forever
+from without_async import sleep_forever
 from without_asgi import make_asgi_app
 from without_http import ConnectionPool, request, serving
 

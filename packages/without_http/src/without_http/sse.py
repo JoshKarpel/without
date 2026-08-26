@@ -7,7 +7,6 @@ from collections.abc import Callable
 from datetime import timedelta
 from typing import assert_never
 
-from without import close_stream
 from without_asgi import RawHeaders
 from without_asgi.headers import first
 from without_asgi.sse import EVENT_STREAM_MEDIA_TYPE
@@ -15,6 +14,7 @@ from without_asgi.sse import Checkpoint
 from without_asgi.sse import ReceivedEvent
 from without_asgi.sse import Retry
 from without_asgi.sse import parse_events_with_directives
+from without_streams import close_stream
 
 from without_http.client import ClientResponse
 from without_http.client import ResponseHead

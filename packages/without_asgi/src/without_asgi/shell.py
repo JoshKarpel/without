@@ -3,9 +3,9 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from typing import assert_never
 
-from without import Sink
-from without import Stream
-from without import from_sink
+from without_streams import Sink
+from without_streams import Stream
+from without_streams import from_sink
 
 from without_asgi.inbound import Disconnect
 from without_asgi.inbound import Inbound

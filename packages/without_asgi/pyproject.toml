@@ -25,9 +25,11 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "without-core",
+    "without-async",
+    "without-streams",
     "brotli>=1.1",
 ]
 
 [tool.uv.sources]
-without-core = { workspace = true }
+without-async = { workspace = true }
+without-streams = { workspace = true }

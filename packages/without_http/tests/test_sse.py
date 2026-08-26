@@ -8,7 +8,6 @@ from datetime import timedelta
 
 import pytest
 from pytest_mock import MockerFixture
-from without import Stream
 from without_asgi import RawHeaders
 from without_asgi import ReceivedEvent
 from without_asgi.headers import merge
@@ -21,6 +20,7 @@ from without_http import ResponseHead
 from without_http import ResponseTrailers
 from without_http import subscribe
 from without_http.testing import respond
+from without_streams import Stream
 
 FEED = "https://api.test/feed"
 EVENT_STREAM = ((b"content-type", b"text/event-stream"),)

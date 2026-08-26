@@ -103,7 +103,7 @@
   place rather than in every consumer that can stop early, and without it the cleanup waits
   on garbage collection, so a long-lived source outlives its consumer by an indeterminate
   amount.
-- **`without`**: `Seconds` and `Milliseconds`, for the parameters whose duration has to cross
+- **`without-async`**: `Seconds` and `Milliseconds`, for the parameters whose duration has to cross
   a boundary carrying whole units of one. A `timedelta` names its unit, which is why it is
   the right type everywhere else, but it cannot say that a duration *survives* the boundary
   ahead: a TCP keepalive knob carries integer seconds, an SSE `retry:` line and SQLite's
@@ -117,6 +117,33 @@
 
 ### Changed
 
+- **`without-core` is renamed `without-streams`, and its import name moves from `without` to
+  `without_streams`.** Install `without-streams` instead of `without-core`, and rewrite
+  `from without import ...` as `from without_streams import ...` (likewise for the
+  `.interfaces` and `.wiring` submodules; `.tasks` and `.testing` move further, see below).
+  `core` named the package's position in the dependency graph rather than anything it
+  contains, and that position is not one the project actually claims: the whole point of
+  layers with narrow interfaces is that no layer is privileged, and `without-html` is already
+  a member of the family that depends on none of this. `streams` names the contents instead.
+  It is the narrower of the two honest names, since the substrate also carries the behavior
+  half of the model (`Context`, `sample`), but a `Context` is defined as a stream sampled for
+  its latest value, so `Stream` is the primitive the rest is derived from. With the rename
+  every `without*` distribution name now matches its import name, so no package needs a
+  `[tool.uv.build-backend] module-name` override and no distribution claims the bare
+  `without` name, which is the project rather than a package.
+- **The asyncio primitives move out of the substrate into `without-async`.** `background_task`,
+  `timeout`, `sleep_forever`, `cancel_futures`, `as_async_iterator`, and `limit_concurrency`
+  are imported from `without_async` rather than `without_streams`, as are `yield_once` and
+  `resolved_next_turn` from `without_async.testing`; the names, signatures, and behavior are
+  unchanged, and `without-streams` no longer re-exports them. Applying the same test that
+  produced the rename finds these do not belong under a name that says `streams`: not one of
+  their signatures mentions a `Stream`, a `Processor`, or a `Context`, and `without-streams`
+  itself only reaches for `background_task` to run `sample`'s drain. Keeping them together
+  made the dependency graph say things that were not true, most visibly
+  `without-durability-sqlite` depending on the whole substrate to reach a `busy_timeout` count
+  and a test helper; it now depends on `without-async` alone. The membership rule is that a
+  symbol belongs there when its signature mentions only standard library types, which is
+  decidable by reading one line.
 - **`without-http`**: `tcp_keepalive` takes `idle` and `interval` as counts of `Seconds`
   rather than `timedelta`s. The values it produces were always integer seconds; what changes
   is that a finer duration can no longer be written at the call site, in place of the check

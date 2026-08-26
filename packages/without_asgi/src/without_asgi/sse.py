@@ -10,9 +10,9 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import assert_never
 
-from without import Milliseconds
-from without import Stream
-from without import close_stream
+from without_async import Milliseconds
+from without_streams import Stream
+from without_streams import close_stream
 
 from without_asgi.headers import merge
 from without_asgi.outbound import Outbound

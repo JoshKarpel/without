@@ -53,7 +53,7 @@ shape [`file_response`](index.md#streaming-a-file) produces and the same
 `Reply` `without-web` already accepts:
 
 ```python
-from without import Milliseconds
+from without_async import Milliseconds
 from without_asgi import Checkpoint, Comment, Event, Retry, ServerSentEvent, event_stream
 
 
@@ -231,7 +231,7 @@ library's own parser would drop: a frame that encodes to bytes we would not read
 is not one worth writing.
 
 The line carries whole milliseconds, so `after` is a count of
-[`Milliseconds`](../without/index.md#durations-that-cross-an-integer-boundary-withoutdurations)
+[`Milliseconds`](../without-async/index.md#durations-that-cross-an-integer-boundary-without_asyncdurations)
 rather than a `timedelta`, and a finer duration is not something a `Retry` can be
 built from at all. Truncating one is at its worst at the bottom of the range:
 half a millisecond renders `retry: 0`, which does not mean "almost no wait" but

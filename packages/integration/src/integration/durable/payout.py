@@ -21,7 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 
-from without import cancel_futures
+from without_async import cancel_futures
 from without_durability import Run
 
 type Cents = dict[str, int]

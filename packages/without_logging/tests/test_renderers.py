@@ -6,14 +6,14 @@ from decimal import Decimal
 from traceback import TracebackException
 
 import pytest
-from without import Processor
-from without import collect
-from without import stream_from_iterable
 from without_logging import Record
 from without_logging import exception_to_dict
 from without_logging import exception_to_text
 from without_logging import render_console
 from without_logging import render_json
+from without_streams import Processor
+from without_streams import collect
+from without_streams import stream_from_iterable
 
 from .helpers import a_record
 

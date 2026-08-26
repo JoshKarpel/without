@@ -6,13 +6,13 @@ from contextlib import asynccontextmanager
 
 import pytest
 from pytest_mock import MockerFixture
-from without.testing import yield_once
 from without_asgi import RawMessage
 from without_asgi import RawScope
 from without_asgi import Receive
 from without_asgi import Send
 from without_asgi import extension
 from without_asgi import parse_http_scope
+from without_async.testing import yield_once
 from without_http import Client
 from without_http import ClientRequest
 from without_http import ClientResponse

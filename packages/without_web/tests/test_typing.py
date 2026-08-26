@@ -17,11 +17,11 @@ from typing import assert_type
 # used and keeps them.
 
 if TYPE_CHECKING:
-    from without import Stream
     from without_asgi import HttpScope
     from without_asgi import Inbound
     from without_asgi import Response
     from without_asgi import WebsocketScope
+    from without_streams import Stream
     from without_web import INT
     from without_web import BufferedRequest
     from without_web import Extractor

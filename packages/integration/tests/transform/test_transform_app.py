@@ -16,9 +16,6 @@ from integration.transform.app import text_transform_app
 from integration.transform.app import transform_socket
 from integration.transform.core import Mode
 from integration.transform.core import TransformConfig
-from without import Stream
-from without import collect
-from without import stream_from_iterable
 from without_asgi import ASGIApp
 from without_asgi import Disconnect
 from without_asgi import HttpScope
@@ -42,6 +39,9 @@ from without_asgi.scope import parse_http_scope
 from without_asgi.scope import parse_websocket_scope
 from without_configmap import read_yaml_file
 from without_configmap import watch_config
+from without_streams import Stream
+from without_streams import collect
+from without_streams import stream_from_iterable
 
 from packages.integration.tests.helpers import drive_websocket
 from packages.integration.tests.helpers import running

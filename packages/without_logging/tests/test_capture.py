@@ -2,9 +2,6 @@ import asyncio
 import logging
 
 from pytest_mock import MockerFixture
-from without import compose
-from without import from_selector
-from without import tee
 from without_logging import Level
 from without_logging import Record
 from without_logging import add_fields
@@ -12,6 +9,9 @@ from without_logging import at_least
 from without_logging import capture
 from without_logging import parse_record
 from without_logging.capture import CaptureHandler
+from without_streams import compose
+from without_streams import from_selector
+from without_streams import tee
 
 from .helpers import a_record
 from .helpers import sink_into

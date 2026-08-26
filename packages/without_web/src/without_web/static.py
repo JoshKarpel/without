@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import cast
 
-from without import Stream
 from without_asgi import DEFAULT_CHUNK_SIZE
 from without_asgi import NOT_FOUND
 from without_asgi import HttpHandler
@@ -12,6 +11,7 @@ from without_asgi import Inventory
 from without_asgi import Outbound
 from without_asgi import Response
 from without_asgi import serve_asset
+from without_streams import Stream
 
 from without_web.converters import PATH
 from without_web.handlers import _emit

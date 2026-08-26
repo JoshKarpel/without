@@ -24,10 +24,12 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "without-core",
+    "without-async",
+    "without-streams",
     "without-dag",
 ]
 
 [tool.uv.sources]
-without-core = { workspace = true }
+without-async = { workspace = true }
+without-streams = { workspace = true }
 without-dag = { workspace = true }

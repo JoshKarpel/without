@@ -1,12 +1,16 @@
-# without
+# without-streams
 
 The narrow waist of the project: the interfaces every plugin speaks, plus the
-stream connectors, a `with`-scoped background task helper, and the duration
-counts the boundaries share. See the
+connectors that wire them together. See the
 [Philosophy](../philosophy.md) for why the model is shaped this way, and the
-[`without` API reference](../without/reference.md) for the full surface.
+[`without_streams` API reference](reference.md) for the full surface.
 
-## The substrate (`without.interfaces`)
+The asyncio primitives underneath (`background_task`, `timeout`,
+`limit_concurrency`, and the `Seconds` / `Milliseconds` counts) live one layer
+down in [`without-async`](../without-async/index.md), which speaks only the
+standard library and can be taken without this package.
+
+## The substrate (`without_streams.interfaces`)
 
 Three types carry the whole model:
 
@@ -44,7 +48,7 @@ never awaits). Emitting *several* outputs per event, by contrast, is a wiring
 concern, not a builder: fan-out to several sinks is `tee` (below), and the
 fan-in family (`broadcast`, `merge`) is reserved in issue #13.
 
-## Wiring (`without.wiring`)
+## Wiring (`without_streams.wiring`)
 
 `compose` chains one processor into the next on the event edge: pure composition,
 the only connector that needs nothing running. When its second argument is a
@@ -70,45 +74,6 @@ outlives its consumer by an indeterminate amount. `stack`
 composes middleware (any `(handler, *context) -> handler`) into one, serving both
 server handlers and HTTP clients.
 
-## Durations that cross an integer boundary (`without.durations`)
-
-A `timedelta` is the right type for a duration everywhere in this project,
-because it names its unit and nothing downstream has to guess whether a bare
-number meant seconds or milliseconds. What it cannot say is that a duration
-*survives* the boundary it is about to cross. A TCP keepalive knob carries whole
-seconds, an SSE `retry:` line carries whole milliseconds, SQLite's `busy_timeout`
-carries whole milliseconds: each one truncates whatever it is handed, and
-truncation is at its worst where it is least visible. Half a millisecond of
-`retry:` becomes `retry: 0`, which does not mean "almost no wait", it means
-"reconnect immediately".
-
-`Seconds` and `Milliseconds` are what such a parameter declares instead, and what
-makes them worth having is what they *cannot* hold:
-
-```python
-tcp_keepalive(idle=Seconds(60), interval=Seconds(10))
-yield Retry(Milliseconds(30_000))
-```
-
-Each is a count, not a duration, so there is no argument to either constructor
-that names a finer unit. `duration` is the `timedelta` back out, for arithmetic
-and for anything taking a plain duration, and `of` is the one way in from one:
-
-```python
-Seconds.of(settings.keepalive_idle)  # raises on a duration finer than a second
-```
-
-That is the only place the question "does this divide?" is ever asked, which is
-the point: past construction there is nothing left for a boundary to check, and
-no truncation left for it to do.
-
-## Tasks (`without.tasks`)
-
-The async task helpers: `sleep_forever`; the `with`-scoped `background_task`
-(starts a task on entry, cancels-then-awaits it on exit, so nothing leaks);
-`timeout`, a `timedelta | None`-typed wrapper over `asyncio.timeout` that models
-"no limit" as `None` (an always-open context) rather than a sentinel float;
-`limit_concurrency`, a bounded-concurrency driver that pulls work from a source
-only while below the limit (so a lazy source is never advanced past it); and its
-building blocks `cancel_futures` (cancel a set, then await them all) and
-`as_async_iterator` (normalize a sync or async iterable into one async iterator).
+`ticks` is the clock as a source: a stream of moments, one now and one every
+interval after, so *when* periodic work happens is a stream a caller supplies
+rather than a loop buried inside the work.

@@ -7,10 +7,10 @@ from collections.abc import Callable
 from datetime import timedelta
 
 import pytest
-from without import Seconds
 from without_asgi import RawMessage
 from without_asgi import Receive
 from without_asgi import Send
+from without_async import Seconds
 from without_http import ConnectionPool
 from without_http import SocketOptions
 from without_http import receive_buffer_size
