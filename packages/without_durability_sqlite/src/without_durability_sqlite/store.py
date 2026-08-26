@@ -65,6 +65,7 @@ from pathlib import Path
 from time import monotonic
 from typing import cast
 
+from without_async import Milliseconds
 from without_durability.codec import JSON
 from without_durability.codec import CheckpointCodec
 from without_durability.interfaces import LEASE
@@ -74,7 +75,6 @@ from without_durability.interfaces import Pass
 from without_durability.interfaces import Recorded
 from without_durability.interfaces import check_duration
 from without_durability.stepwise import now_utc
-from without_streams import Milliseconds
 
 # How often a worker with nothing to do asks again, which is the price of having no
 # blocking read. The *lease* is not restated here: it is `interfaces.LEASE`, because unlike the

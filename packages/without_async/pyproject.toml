@@ -3,9 +3,9 @@ requires = ["uv_build>=0.12.3,<0.13"]
 build-backend = "uv_build"
 
 [project]
-name = "without-durability-sqlite"
+name = "without-async"
 version = "0.0.0"
-description = "A without-durability checkpoint store and queue backed by one SQLite file, with no server and no third-party driver."
+description = "The asyncio primitives without is built from: scoped background tasks, bounded concurrency, optional timeouts, and durations that cross an integer boundary."
 readme = "README.md"
 license = "MIT"
 authors = [
@@ -23,11 +23,4 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
     "Typing :: Typed",
 ]
-dependencies = [
-    "without-async",
-    "without-durability",
-]
-
-[tool.uv.sources]
-without-async = { workspace = true }
-without-durability = { workspace = true }
+dependencies = []

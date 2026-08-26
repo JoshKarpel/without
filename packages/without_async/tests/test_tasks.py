@@ -5,14 +5,14 @@ from contextlib import suppress
 from datetime import timedelta
 
 import pytest
-from without_streams import as_async_iterator
-from without_streams import background_task
-from without_streams import cancel_futures
-from without_streams import limit_concurrency
-from without_streams import sleep_forever
-from without_streams import timeout
-from without_streams.testing import resolved_next_turn
-from without_streams.testing import yield_once
+from without_async import as_async_iterator
+from without_async import background_task
+from without_async import cancel_futures
+from without_async import limit_concurrency
+from without_async import sleep_forever
+from without_async import timeout
+from without_async.testing import resolved_next_turn
+from without_async.testing import yield_once
 
 
 async def test_timeout_raises_when_the_block_outlives_the_duration() -> None:

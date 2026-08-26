@@ -14,11 +14,12 @@ because none of them names the shared lower layer. `without` names that layer as
 a narrow interface, so the pieces compose. It is meant to feel like a library
 (your control flow stays visible) rather than a framework.
 
-The [Philosophy](philosophy.md) page rests on two ideas: the stateful stream
-processor as a universal way to model computation, and an ecosystem of thin
-layers with narrow interfaces, so you meet one altitude, descend when you need to,
-and can replace a layer without rewriting the rest. Read it first to get the
-mindset the code is shaped around.
+The [Philosophy](philosophy.md) page rests on one idea: an ecosystem of thin
+layers with narrow interfaces, where every boundary is a value you can hold, so
+you meet one altitude, descend when you need to, and can replace a layer without
+rewriting the rest. The stateful stream processor is the vocabulary those layers
+speak, which is what keeps the interfaces between them narrow. Read it first to
+get the mindset the code is shaped around.
 
 ## The substrate
 
@@ -38,9 +39,10 @@ Three types carry the whole model (`without_streams.interfaces`):
 This is a [`uv`](https://docs.astral.sh/uv/) workspace of flat, version-locked
 packages. Each is its own top-level import.
 
+- [`without-async`](without-async/index.md): the asyncio primitives everything
+  else is built from, speaking only the standard library.
 - [`without-streams`](without-streams/index.md): the substrate interfaces every
-  plugin speaks, the stream connectors, and a `with`-scoped background task
-  helper.
+  plugin speaks, and the stream connectors.
 - [`without-env`](without-env/index.md): a static `Context` parsed from
   environment variables with `pydantic-settings`.
 - [`without-configmap`](without-configmap/index.md): config from a Kubernetes

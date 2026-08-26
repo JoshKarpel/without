@@ -8,8 +8,8 @@ how packages are versioned and published see
 ## Every package keeps its tests in a directory called `tests`
 
 pytest and mypy both derive a module name for a file from where it sits on disk, and both
-check the whole workspace in one pass. Fifteen packages each holding `tests/conftest.py`
-is therefore fifteen files competing for one module name, and the tools say so:
+check the whole workspace in one pass. Every package holding a `tests/conftest.py` is
+therefore one more file competing for the same module name, and the tools say so:
 
 ```text
 _pytest.pathlib.ImportPathMismatchError: ('tests.conftest', ...)

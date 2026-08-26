@@ -9,6 +9,7 @@ authors = [
 ]
 requires-python = ">=3.14"
 dependencies = [
+    "without-async",
     "without-streams",
     "without-env",
     "without-configmap",
@@ -32,6 +33,7 @@ exclude-newer = "7 days"
 members = ["packages/*"]
 
 [tool.uv.sources]
+without-async = { workspace = true }
 without-streams = { workspace = true }
 without-env = { workspace = true }
 without-configmap = { workspace = true }
@@ -234,6 +236,7 @@ mypy_path = [
     "packages/benchmarks/src",
     "packages/integration/src",
     "packages/without_asgi/src",
+    "packages/without_async/src",
     "packages/without_configmap/src",
     "packages/without_dag/src",
     "packages/without_durability/src",

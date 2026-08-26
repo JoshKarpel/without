@@ -49,9 +49,9 @@ from without_asgi.compression import brotli_compressor
 from without_asgi.compression import gzip_compressor
 from without_asgi.compression import zstd_compressor
 from without_asgi.headers import merge
+from without_async import cancel_futures
 from without_streams import Endo
 from without_streams import Stream
-from without_streams import cancel_futures
 from without_streams import stack
 
 from without_http.h2_wire import request_headers

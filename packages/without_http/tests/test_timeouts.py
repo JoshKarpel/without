@@ -13,6 +13,7 @@ import h2.config
 import h2.connection
 import h2.settings
 import pytest
+from without_async import cancel_futures
 from without_http import Client
 from without_http import ConnectionPool
 from without_http import ConnectTimeout
@@ -24,7 +25,6 @@ from without_http import WriteTimeout
 from without_http import deadline
 from without_http import request
 from without_http import serving
-from without_streams import cancel_futures
 
 from .helpers import HOST
 from .helpers import large_upload

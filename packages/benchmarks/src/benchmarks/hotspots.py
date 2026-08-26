@@ -27,6 +27,7 @@ _TOP_LEVEL = {
     "without_env": "without-env",
     "without_configmap": "without-configmap",
     "without_streams": "without-streams",
+    "without_async": "without-async",
     "h11": "h11",
     "h2": "h2",
     "hpack": "hpack",

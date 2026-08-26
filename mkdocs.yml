@@ -83,6 +83,9 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Philosophy: philosophy.md
+  - without-async:
+      - without-async/index.md
+      - Reference: without-async/reference.md
   - without-streams:
       - without-streams/index.md
       - Reference: without-streams/reference.md

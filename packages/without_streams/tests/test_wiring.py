@@ -6,6 +6,7 @@ from datetime import timedelta
 from time import monotonic
 
 import pytest
+from without_async.testing import yield_once
 from without_streams import Transition
 from without_streams import close_stream
 from without_streams import collect
@@ -18,7 +19,6 @@ from without_streams import stream_from_iterable
 from without_streams import stream_from_queue
 from without_streams import tee
 from without_streams import ticks
-from without_streams.testing import yield_once
 
 
 async def test_compose_runs_first_then_second() -> None:

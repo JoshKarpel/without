@@ -12,6 +12,7 @@ from without_asgi import Receive
 from without_asgi import Send
 from without_asgi import extension
 from without_asgi import parse_http_scope
+from without_async.testing import yield_once
 from without_http import Client
 from without_http import ClientRequest
 from without_http import ClientResponse
@@ -29,7 +30,6 @@ from without_http.testing import pipe
 from without_http.testing import respond
 from without_http.testing import scope_from_client_request
 from without_http.testing import served_pipe
-from without_streams.testing import yield_once
 
 from .helpers import tagged_echo_app
 

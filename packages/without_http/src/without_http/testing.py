@@ -34,7 +34,7 @@ from without_asgi import encode_inbound
 from without_asgi import parse_outbound
 from without_asgi.outbound import ResponseBody as OutboundBody
 from without_asgi.outbound import ResponseTrailers as OutboundTrailers
-from without_streams import cancel_futures
+from without_async import cancel_futures
 
 from without_http.client import _NO_TIMEOUT
 from without_http.client import Client

@@ -1,5 +1,3 @@
-from without_streams.durations import Milliseconds
-from without_streams.durations import Seconds
 from without_streams.interfaces import Context
 from without_streams.interfaces import Fold
 from without_streams.interfaces import Processor
@@ -12,12 +10,6 @@ from without_streams.interfaces import from_map
 from without_streams.interfaces import from_scan
 from without_streams.interfaces import from_selector
 from without_streams.interfaces import from_sink
-from without_streams.tasks import as_async_iterator
-from without_streams.tasks import background_task
-from without_streams.tasks import cancel_futures
-from without_streams.tasks import limit_concurrency
-from without_streams.tasks import sleep_forever
-from without_streams.tasks import timeout
 from without_streams.wiring import Endo
 from without_streams.wiring import Sample
 from without_streams.wiring import close_stream
@@ -35,16 +27,11 @@ __all__ = [
     "Context",
     "Endo",
     "Fold",
-    "Milliseconds",
     "Processor",
     "Sample",
-    "Seconds",
     "Sink",
     "Stream",
     "Transition",
-    "as_async_iterator",
-    "background_task",
-    "cancel_futures",
     "close_stream",
     "collect",
     "compose",
@@ -54,14 +41,11 @@ __all__ = [
     "from_scan",
     "from_selector",
     "from_sink",
-    "limit_concurrency",
     "sample",
-    "sleep_forever",
     "spool",
     "stack",
     "stream_from_iterable",
     "stream_from_queue",
     "tee",
     "ticks",
-    "timeout",
 ]

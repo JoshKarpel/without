@@ -47,9 +47,9 @@ from without_asgi import encode_websocket_inbound
 from without_asgi import encode_websocket_scope
 from without_asgi import parse_outbound
 from without_asgi import parse_websocket_outbound
-from without_streams import background_task
-from without_streams import cancel_futures
-from without_streams import timeout
+from without_async import background_task
+from without_async import cancel_futures
+from without_async import timeout
 from wsproto import ConnectionType
 from wsproto import WSConnection
 from wsproto.events import BytesMessage

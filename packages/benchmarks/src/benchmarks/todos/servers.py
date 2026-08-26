@@ -8,8 +8,8 @@ from typing import cast
 import uvicorn
 import uvloop
 from without_asgi import ASGIApp
+from without_async import sleep_forever
 from without_http import serving
-from without_streams import sleep_forever
 
 from benchmarks.todos.apps import fastapi_todos
 from benchmarks.todos.apps import without_todos

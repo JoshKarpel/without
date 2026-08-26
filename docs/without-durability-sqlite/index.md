@@ -101,7 +101,7 @@ reasons about assumes the commit held, so this pays the fsync. `busy_timeout` is
 so a second process finding the write lock taken waits rather than failing, which is
 the ordinary case when two processes share the file. The pragma carries whole
 milliseconds, so `timeout` is a count of
-[`Milliseconds`](../without/index.md#durations-that-cross-an-integer-boundary-withoutdurations) rather
+[`Milliseconds`](../without-async/index.md#durations-that-cross-an-integer-boundary-without_asyncdurations) rather
 than a duration that would be truncated on its way into the statement.
 
 ## Gaps

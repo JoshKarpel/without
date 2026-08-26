@@ -10,6 +10,7 @@ import pytest
 from without_asgi import RawMessage
 from without_asgi import Receive
 from without_asgi import Send
+from without_async import Seconds
 from without_http import ConnectionPool
 from without_http import SocketOptions
 from without_http import receive_buffer_size
@@ -18,7 +19,6 @@ from without_http import serving
 from without_http import tcp_keepalive
 from without_http.client import _open
 from without_http.socket_options import apply_socket_options
-from without_streams import Seconds
 
 HOST = "127.0.0.1"
 

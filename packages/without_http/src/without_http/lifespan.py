@@ -19,7 +19,7 @@ from without_asgi import StartupFailed
 from without_asgi import encode_lifespan_event
 from without_asgi import encode_scope
 from without_asgi import parse_lifespan_reply
-from without_streams import cancel_futures
+from without_async import cancel_futures
 
 # Lifespan uses its own spec version, distinct from the HTTP/WebSocket scopes.
 _LIFESPAN = LifespanScope(asgi=Asgi(version="3.0", spec_version="2.0"))

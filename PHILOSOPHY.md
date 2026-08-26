@@ -1,19 +1,35 @@
 # The Philosophy of `without`
 
-Two ideas, and what follows from them.
+One idea, the vocabulary that makes it work, and what follows from both.
 
-The first is that a **stateful stream processor** is a universal way to model
-computation, general enough that a web handler, a database replica, a log
-pipeline, a config reloader, and a durable workflow are all the same shape with
-different lifetimes. The second is that an ecosystem built on that shape should
-be **layers with narrow interfaces between them**, so that a user meets only the
-altitude they need, descends when they need more, and can replace any one layer
-without rewriting the others.
+The idea is that a Python ecosystem should be built out of **thin layers with
+narrow interfaces between them**, so that a user meets only the altitude they
+need, descends when they need more, and can replace any one layer without
+rewriting the others.
 
-Everything else here is downstream of those two. The craft principles the code
-leans on (values over places, parse don't validate, functional core and
-imperative shell) are the tools that make the two ideas work in Python; they get
-their own section near the end, and they are not the philosophy.
+Stated that way it is a virtue every library claims, so here is the version that
+can be wrong. **Every boundary between two layers is a value you can hold**, so
+descending one layer costs exactly that layer and nothing above or below it. A
+route is a value carrying its own segments, so it reverses into a URL with no
+router present, moves between applications, and ships from a package that does
+not know where it will be mounted. Wherever that fails (a piece you cannot lift
+out of the assembly that produced it, a descent that forces edits above and
+below) the claim is false there, and it is a defect to fix rather than a nuance
+to explain. The sections below are what holding to it demands.
+
+Layers that thin need a shared vocabulary, or every pair of them meets through
+an adapter and the interfaces stop being narrow. The vocabulary is the
+**stateful stream processor**: a shape general enough that a web handler, a
+database replica, a log pipeline, a config reloader, and a durable workflow are
+all the same thing with different lifetimes. It is the highest-leverage piece of
+the design and it is deliberately not the point of it. `without-html` speaks
+none of it and is a full member of the family; `without-async` sits below it
+entirely. A layer earns its place by being replaceable, not by being a stream.
+
+Everything else here is downstream of the idea and its vocabulary. The craft
+principles the code leans on (values over places, parse don't validate,
+functional core and imperative shell) are the tools that make them work in
+Python; they get their own section near the end, and they are not the philosophy.
 
 This is the standard new work is measured against, not a tour of what exists:
 each package's own guide carries its design narrative, and where a guide and this
@@ -21,132 +37,14 @@ document disagree about what the code *does*, the guide is closer to the code.
 Some of what follows is ahead of the code, and those gaps are marked in the main
 text rather than left to be discovered.
 
-## Everything is a stateful stream processor
-
-### The claim, and why its emptiness is the point
-
-Python has many frameworks with similar but incompatible shapes: ASGI apps,
-Click commands, Kafka consumers, asyncio protocols, task queues, DAG operators.
-They do not compose, because none of them names the layer they share. The wager
-is that if you name that layer precisely enough to write down as types, pieces
-written independently snap together. That makes the project a **narrow waist**
-in the sense the internet protocol stack means it, a thin universal layer that
-everything above and below is written against, and so an interface rather than a
-framework.
-
-The shape is a processor that consumes a stream of inputs, carries state across
-them, and produces a stream of outputs. Taken as a claim about the world, that is
-nearly vacuous, in the way "everything is a file" and "everything is a Turing
-machine" are vacuous. The emptiness is what makes it work. A universal modeling
-method earns its keep not by describing any one system especially well but by
-describing *all* of them the same way, so that two systems written by people who
-never met can be wired together without an adapter.
-
-So the success metric is not expressiveness. It is composition. Can a
-configuration source and a network connection, written independently and ignorant
-of each other, be plugged together? If yes, the interface is doing its job, and
-the interface is the project. Everything else is a plugin, and a plugin is also
-how an interface gets tested: one with a single implementation has not been shown
-to be an interface at all.
-
-### Lifespan is a variable, not a category
-
-The sharpest form of the claim: an HTTP request handler and a long-lived database
-replica are the *same shape* with different state lifespans. One holds state for
-milliseconds, the other for weeks. Nothing else about them differs at this layer.
-
-Frameworks usually treat those as separate kinds of thing with separate
-vocabularies, which is why moving logic between them means rewriting it. Naming
-the shared shape names a *what* independent of any *how*, and the lifespan
-becomes a parameter rather than a category you are stuck inside.
-
-The practical payoff is that lifecycle bookkeeping disappears. A connection's
-lifecycle simply *is* its stream's lifecycle: end of stream is end of connection,
-so a pile of "is this finished yet" state never needs to exist.
-
-### The model nests, and you choose how far
-
-The shape holds at every zoom level, which is what makes it worth calling
-universal:
-
-- A server is a stream of connections. A connection is a stream of requests. A
-  request is a stream of events. Same shape three times, at three lifetimes.
-- Inside a single step, one input value can drive a whole concurrent graph of
-  sub-computations that recombines into one output. That is value-level fan-out
-  living *within* a processor, distinct from splitting the stream itself.
-- A durable workflow's pass is a stream of completed steps folded into a
-  checkpoint, which is why adding durability needed a store and a queue rather
-  than an engine.
-
-Available at every level is not the same as mandatory at every level, and the
-difference matters more than it first appears. Reaching for the shape is how you
-make two things snap together, so it earns its place at the boundaries you
-actually have to compose across. Below those, ordinary code is ordinary code, and
-decomposing further because the model would permit it buys nothing.
-
-So one problem admits several honest zoom choices. A workflow can be a set of
-services exchanging messages over queues, which puts the processor boundary at
-every step; or it can be straight-line code with a stream of runs moving behind
-it, which puts the boundary around the whole workflow and leaves its interior as
-plain Python. People build both, and this is meant to *help* build either rather
-than to insist on one. The question a new problem raises is which zoom level pays,
-not whether the model needs an escape hatch.
-
-### The model has two halves: events and behaviors
-
-A stream alone cannot express held state without smuggling in a mutable place, so
-the model has a second half, borrowed from Conal Elliott's
-[functional reactive programming](http://conal.net/papers/icfp97/): *events*,
-where every occurrence matters and a consumer sees all of them, and *behaviors*,
-where only the latest value matters and a reader samples it without blocking.
-
-This is what stops long-lived state from being a special kind of object. Config,
-a connection pool, a sampling rate: none is a different category, each is another
-processor's output that a reader samples instead of consumes. The question "is
-this state, or is it a process?" dissolves, because "behavior" names how a reader
-connects to something rather than what that thing is.
-
-The duality then recurs at every layer that has both reads. A graph executor
-yields each result the instant it lands *and* offers the single-value read that
-keeps only the output. A new interface should be able to say which half it
-offers, and one that is secretly both is an interface to split.
-
-### State threads through; it does not sit somewhere
-
-Where state lives is decided by its scope, not by taste:
-
-- Thread it *down* when it is scoped to that level. A per-connection counter
-  belongs to that connection.
-- Funnel it *up* to a single serial owner when it is shared. A serial consumer
-  pulls its next event only after the current one is fully handled, so its
-  read-modify-write is serialized without a lock even across suspension points.
-
-That dissolves what looks like a forced choice between one serialized owner and
-many concurrent workers over shared mutable state. You can have the concurrent,
-fractally per-request shape *and* keep shared state out of any place, by
-funneling it into one serial owner the concurrent parts message.
-
-This is also where the model parts ways with the actor model it superficially
-resembles. Both serialize mutation through one queue, which is why they rhyme.
-They differ on whether the serial owner is a place you address or a value you
-compose. Borrow the mailbox, not the identity.
-
-### There is no privileged executor
-
-Something has to supply impure source streams and run the loops, but it is a thin
-interpreter of the wiring rather than a concept a user models with, so it gets no
-type and no peer status beside the substrate's own.
-
-Homogeneity of *interface* is the goal, and homogeneity of *implementation* is
-explicitly not: if every node were free to do I/O, the testability that makes the
-model worth having would be gone.
-
 ## Layers you can descend, remix, and replace
 
-One universal shape is not enough on its own. If the substrate is all you ship,
-every user starts from raw materials, and the interoperability the first idea
-buys is spent on ceremony. The second idea is that the ecosystem is a stack of
-thin layers, each a narrow interface over the one below.
+Python's frameworks are mostly all-or-nothing. Adopting one means adopting its
+router, its serializer, its dependency injection, its testing client, and its
+opinion about where your state lives, and reaching past any one of them puts you
+outside the supported path. The alternative is not a smaller framework, it is a
+stack of thin layers where each is separately useful, separately replaceable, and
+narrow enough to describe in a paragraph.
 
 ### Progressive disclosure of complexity
 
@@ -269,22 +167,185 @@ what a connector would have given them. That is the trade, taken deliberately.
 The gap today: fan-out to several terminal branches ships, but fan-in over a
 *changing* set of sources does not, and more than one package has now wanted it.
 
+### A package is named for its contents, never for its position
+
+A layer nobody can describe without pointing at the graph is a layer whose
+boundary was never decided. So a package's name says what is *in* it, and a name
+that instead says where it sits (`core`, `base`, `common`, `utils`) is the signal
+that the contents were never chosen: nothing can be excluded from a package whose
+name admits anything, and a package that admits anything is the one place things
+land because it is already there.
+
+The rule has teeth in both directions. `core` had to go because no layer here is
+privileged and `without-html` already depends on none of it. Having renamed the
+package for its contents, the contents then have to match: the asyncio primitives
+under it named no stream in any signature, so they became `without-async` rather
+than staying under a word that no longer described them. Splitting them out is
+also what let `without-durability-sqlite` stop depending on the whole substrate to
+reach a millisecond count.
+
+The saving throw against the grab bag is a membership rule specific enough that a
+symbol can be argued *out* of the package. `without-async` takes a symbol when its
+signature mentions only standard library types, which is decidable by reading one
+line. That is the property that matters, and "utilities" is the counterexample: a
+name admitting anything gives a reviewer nothing to point at, so the pressure to
+dump something always wins.
+
+Two limits, both live rather than hypothetical. The rule is a convention held by
+review, not a check: nothing fails when it stops being true. And it is about the
+layering rather than the name, so `Seconds` and `Milliseconds` satisfy it while
+not being asyncio at all, and `without-async` over-reaches by those two symbols.
+They stay because every duration they carry is one something waits out, which is
+the subject `timeout` already has, and because the alternative was a ninety-line
+distribution. That is a judgment about where the line falls, and the thing to
+preserve is that it was made out loud: a name that stretches once, on a stated
+reason, is a different failure from a name that admits anything.
+
+## The vocabulary: a stateful stream processor
+
+Thin layers only stay thin if they share a vocabulary. Otherwise every pair of
+them meets through an adapter, and the adapters are where the coupling goes to
+hide. So one shape is named precisely enough to write down as types, and the
+layers speak it to each other.
+
+### Why its emptiness is the point
+
+Python has many frameworks with similar but incompatible shapes: ASGI apps,
+Click commands, Kafka consumers, asyncio protocols, task queues, DAG operators.
+They do not compose, because none of them names the layer they share. The wager
+is that if you name that layer precisely enough, pieces written independently
+snap together. That makes the shared layer a **narrow waist** in the sense the
+internet protocol stack means it, a thin universal layer that everything above
+and below is written against, and so an interface rather than a framework.
+
+The shape is a processor that consumes a stream of inputs, carries state across
+them, and produces a stream of outputs. Taken as a claim about the world, that is
+nearly vacuous, in the way "everything is a file" and "everything is a Turing
+machine" are vacuous. The emptiness is what makes it work. A universal modeling
+method earns its keep not by describing any one system especially well but by
+describing *all* of them the same way, so that two systems written by people who
+never met can be wired together without an adapter.
+
+So the success metric is not expressiveness. It is composition. Can a
+configuration source and a network connection, written independently and ignorant
+of each other, be plugged together? If yes, the vocabulary is doing its job.
+Everything else is a plugin, and a plugin is also how an interface gets tested:
+one with a single implementation has not been shown to be an interface at all.
+
+Being the vocabulary is not the same as being the point. A layer earns its place
+by being replaceable, not by speaking streams: `without-html` speaks none of this
+and is a full member of the family, and `without-async` sits below it entirely. A
+package that reaches for the shape where it has nothing to compose across has
+paid for a boundary it does not have.
+
+### Lifespan is a variable, not a category
+
+The sharpest form of the claim: an HTTP request handler and a long-lived database
+replica are the *same shape* with different state lifespans. One holds state for
+milliseconds, the other for weeks. Nothing else about them differs at this layer.
+
+Frameworks usually treat those as separate kinds of thing with separate
+vocabularies, which is why moving logic between them means rewriting it. Naming
+the shared shape names a *what* independent of any *how*, and the lifespan
+becomes a parameter rather than a category you are stuck inside.
+
+The practical payoff is that lifecycle bookkeeping disappears. A connection's
+lifecycle simply *is* its stream's lifecycle: end of stream is end of connection,
+so a pile of "is this finished yet" state never needs to exist.
+
+### The model nests, and you choose how far
+
+The shape holds at every zoom level, which is what makes it worth calling
+universal:
+
+- A server is a stream of connections. A connection is a stream of requests. A
+  request is a stream of events. Same shape three times, at three lifetimes.
+- Inside a single step, one input value can drive a whole concurrent graph of
+  sub-computations that recombines into one output. That is value-level fan-out
+  living *within* a processor, distinct from splitting the stream itself.
+- A durable workflow's pass is a stream of completed steps folded into a
+  checkpoint, which is why adding durability needed a store and a queue rather
+  than an engine.
+
+Available at every level is not the same as mandatory at every level, and the
+difference matters more than it first appears. Reaching for the shape is how you
+make two things snap together, so it earns its place at the boundaries you
+actually have to compose across. Below those, ordinary code is ordinary code, and
+decomposing further because the model would permit it buys nothing.
+
+So one problem admits several honest zoom choices. A workflow can be a set of
+services exchanging messages over queues, which puts the processor boundary at
+every step; or it can be straight-line code with a stream of runs moving behind
+it, which puts the boundary around the whole workflow and leaves its interior as
+plain Python. People build both, and this is meant to *help* build either rather
+than to insist on one. The question a new problem raises is which zoom level pays,
+not whether the model needs an escape hatch.
+
+### The model has two halves: events and behaviors
+
+A stream alone cannot express held state without smuggling in a mutable place, so
+the model has a second half, borrowed from Conal Elliott's
+[functional reactive programming](http://conal.net/papers/icfp97/): *events*,
+where every occurrence matters and a consumer sees all of them, and *behaviors*,
+where only the latest value matters and a reader samples it without blocking.
+
+This is what stops long-lived state from being a special kind of object. Config,
+a connection pool, a sampling rate: none is a different category, each is another
+processor's output that a reader samples instead of consumes. The question "is
+this state, or is it a process?" dissolves, because "behavior" names how a reader
+connects to something rather than what that thing is.
+
+The duality then recurs at every layer that has both reads. A graph executor
+yields each result the instant it lands *and* offers the single-value read that
+keeps only the output. A new interface should be able to say which half it
+offers, and one that is secretly both is an interface to split.
+
+### State threads through; it does not sit somewhere
+
+Where state lives is decided by its scope, not by taste:
+
+- Thread it *down* when it is scoped to that level. A per-connection counter
+  belongs to that connection.
+- Funnel it *up* to a single serial owner when it is shared. A serial consumer
+  pulls its next event only after the current one is fully handled, so its
+  read-modify-write is serialized without a lock even across suspension points.
+
+That dissolves what looks like a forced choice between one serialized owner and
+many concurrent workers over shared mutable state. You can have the concurrent,
+fractally per-request shape *and* keep shared state out of any place, by
+funneling it into one serial owner the concurrent parts message.
+
+This is also where the model parts ways with the actor model it superficially
+resembles. Both serialize mutation through one queue, which is why they rhyme.
+They differ on whether the serial owner is a place you address or a value you
+compose. Borrow the mailbox, not the identity.
+
+### There is no privileged executor
+
+Something has to supply impure source streams and run the loops, but it is a thin
+interpreter of the wiring rather than a concept a user models with, so it gets no
+type and no peer status beside the substrate's own.
+
+Homogeneity of *interface* is the goal, and homogeneity of *implementation* is
+explicitly not: if every node were free to do I/O, the testability that makes the
+model worth having would be gone.
+
 ## The tools we build it with
 
 None of what follows is this project's idea, and none of it is the philosophy.
-These are the practices that make the two ideas above work in Python, and each
-earns its place by supporting one of them. They are listed so that a
-contributor knows which discipline is load-bearing here and why, not to argue for
-them again.
+These are the practices that make the layering work in Python, and each earns its
+place by supporting it. They are listed so that a contributor knows which
+discipline is load-bearing here and why, not to argue for them again.
 
 **[Values over places](https://www.infoq.com/presentations/Value-Values/)**
-(Rich Hickey) is what makes the stream model composable at all. An immutable
-value can be handed to every branch of a fan-out with no lock and no defensive
-copy, which is why splitting a stream is free, why a checkpoint is just a
-mapping, and why a serial owner's state is safe across suspension points. Two
-habits follow: when something arrives as a place, turn it into a value at the
-edge while it is still live; and watch for values that are secretly places, since
-a frozen container can hold a mutable interior.
+(Rich Hickey) is what makes a boundary something you can hold. An immutable value
+travels out of the assembly that produced it, and can be handed to every branch of
+a fan-out with no lock and no defensive copy, which is why a route reverses with no
+router present, why splitting a stream is free, why a checkpoint is just a mapping,
+and why a serial owner's state is safe across suspension points. Two habits follow:
+when something arrives as a place, turn it into a value at the edge while it is
+still live; and watch for values that are secretly places, since a frozen container
+can hold a mutable interior.
 
 **[Functional core, imperative shell](https://www.destroyallsoftware.com/screencasts/catalog/functional-core-imperative-shell)**
 (Gary Bernhardt) is what makes a layer swappable. A core that does not know which
@@ -341,8 +402,8 @@ bolted on, and where a path deliberately has none, that is stated as a property.
 Glitches on diamond dependencies, feedback cycles, and teardown ordering are
 open, and are tracked as open.
 
-One gap in the two big ideas is named above: a missing fan-in over a changing set
-of sources. Two smaller ones sit in the craft: a derived-name convention that is
+One gap in the vocabulary is named above: a missing fan-in over a changing set of
+sources. Two smaller ones sit in the craft: a derived-name convention that is
 documented rather than enforced, and a workflow-authoring rule that nothing
 checks.
 

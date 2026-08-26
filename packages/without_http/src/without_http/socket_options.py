@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import socket
 
-from without_streams import Seconds
+from without_async import Seconds
 
 type SocketOptions = tuple[tuple[int, int, int], ...]
 

@@ -24,4 +24,9 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Application Frameworks",
     "Typing :: Typed",
 ]
-dependencies = []
+dependencies = [
+    "without-async",
+]
+
+[tool.uv.sources]
+without-async = { workspace = true }

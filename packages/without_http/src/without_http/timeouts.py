@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 
-from without_streams import timeout
+from without_async import timeout
 
 
 @dataclass(frozen=True, slots=True)

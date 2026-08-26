@@ -26,6 +26,7 @@ from without_asgi import ASGIApp
 from without_asgi import RawMessage
 from without_asgi import Receive
 from without_asgi import Send
+from without_async import cancel_futures
 from without_http import serving
 from without_http.server import _DEFAULT_LIMITS
 from without_http.server import _MID_ACCEPT_FLUSH_TICKS
@@ -40,7 +41,6 @@ from without_http.server import _serve_h11_connection
 from without_http.testing import AUTHORITY
 from without_http.testing import SERVER_ADDRESS
 from without_http.testing import served_pipe
-from without_streams import cancel_futures
 from wsproto import ConnectionType
 from wsproto import WSConnection
 from wsproto.events import Request as WsRequest

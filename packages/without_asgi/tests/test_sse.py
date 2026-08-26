@@ -26,7 +26,7 @@ from without_asgi import event_stream
 from without_asgi import parse_events
 from without_asgi import parse_events_with_directives
 from without_asgi import with_heartbeat
-from without_streams import Milliseconds
+from without_async import Milliseconds
 from without_streams import stream_from_iterable
 
 # Far longer than any test's runtime, so a heartbeat only fires where one is the point.

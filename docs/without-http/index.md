@@ -23,7 +23,7 @@ including which absences are gaps and which are positions, see
 ## Server
 
 ```python
-from without_streams import sleep_forever
+from without_async import sleep_forever
 from without_asgi import make_asgi_app
 from without_http import serving
 
@@ -501,7 +501,7 @@ and tears it down when the peer stops answering, independent of any request. It 
 **on by default**, as one entry in the pool's `socket_options`:
 
 ```python
-from without_streams import Seconds
+from without_async import Seconds
 from without_http import ConnectionPool, tcp_keepalive
 
 # The default: probe after 60s idle, every 10s, drop after 6 unanswered probes.
@@ -514,7 +514,7 @@ async with ConnectionPool(socket_options=tcp_keepalive(idle=Seconds(30), interva
 ```
 
 `idle` and `interval` are counts of
-[`Seconds`](../without/index.md#durations-that-cross-an-integer-boundary-withoutdurations), because the
+[`Seconds`](../without-async/index.md#durations-that-cross-an-integer-boundary-without_asyncdurations), because the
 underlying options carry only integer seconds: a finer duration is not something either
 can be built from, so none is silently truncated on the way to the socket. `count` is a
 plain probe count. `SO_KEEPALIVE` is

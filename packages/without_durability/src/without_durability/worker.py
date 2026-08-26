@@ -45,10 +45,10 @@ from datetime import datetime
 from datetime import timedelta
 from typing import assert_never
 
+from without_async import limit_concurrency
 from without_streams import Sink
 from without_streams import Stream
 from without_streams import from_sink
-from without_streams import limit_concurrency
 from without_streams import ticks
 
 from without_durability.interfaces import LEASE

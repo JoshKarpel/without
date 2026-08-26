@@ -19,6 +19,7 @@ requires-python = ">=3.14"
 dependencies = [
     # The without stack under test, plus the shared todo core the peer shells reuse.
     "integration",
+    "without-async",
     "without-http",
     "without-asgi",
     # The peer stack: FastAPI over the *same* core, served by uvicorn as deployed
@@ -43,5 +44,6 @@ dependencies = [
 
 [tool.uv.sources]
 integration = { workspace = true }
+without-async = { workspace = true }
 without-http = { workspace = true }
 without-asgi = { workspace = true }

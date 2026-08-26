@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import assert_never
 
-from without_streams import Milliseconds
+from without_async import Milliseconds
 from without_streams import Stream
 from without_streams import close_stream
 
