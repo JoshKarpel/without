@@ -52,6 +52,9 @@ packages. Each is its own top-level import.
 - [`without-web`](without-web/index.md): an opinionated HTTP/WebSocket router
   with trie matching, typed path params, mounting, scoped middleware, exception
   handlers, and OpenAPI.
+- [`without-cli`](without-cli/index.md): command-line parsing as values, with
+  typed tokens that are the parse, the help, and the read at once, and options
+  that read the environment and secret mounts through the same validation.
 - [`without-http`](without-http/index.md): an `asyncio` ASGI server and HTTP
   client built on the sans-IO `h11`/`h2`/`wsproto` state machines.
 - [`without-html`](without-html/index.md): HTML as immutable Python values, with

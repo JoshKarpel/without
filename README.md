@@ -45,6 +45,11 @@ packages). Each package is its own top-level import.
 - `packages/without_web` — an opinionated HTTP/WebSocket router over
   `without-asgi`: trie matching, typed path params, 405-vs-404, mounting, scoped
   middleware, exception handlers, and OpenAPI. Imported as `without_web`.
+- `packages/without_cli` — command-line parsing as values: typed tokens that are
+  the parse, the usage entry, and the read at once; commands as `Arm` values that
+  register nothing; options that read the environment and secret mounts through
+  the same validation; and help as a `Usage` value that plain text is one
+  rendering of, so it depends on nothing. Imported as `without_cli`.
 - `packages/without_http` — an `asyncio` ASGI **server** (and HTTP client) built
   on the sans-IO `h11`/`h2`/`wsproto` state machines: `serving(app)` owns the socket
   and the wire protocol (HTTP/1.1, HTTP/2, and WebSockets) and drives any ASGI app.

@@ -102,6 +102,9 @@ nav:
   - without-web:
       - without-web/index.md
       - Reference: without-web/reference.md
+  - without-cli:
+      - without-cli/index.md
+      - Reference: without-cli/reference.md
   - without-http:
       - without-http/index.md
       - without-http/cookies.md

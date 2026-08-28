@@ -15,9 +15,11 @@ from without_streams.wiring import Sample
 from without_streams.wiring import close_stream
 from without_streams.wiring import collect
 from without_streams.wiring import compose
+from without_streams.wiring import offload
 from without_streams.wiring import sample
 from without_streams.wiring import spool
 from without_streams.wiring import stack
+from without_streams.wiring import stream_from_blocking
 from without_streams.wiring import stream_from_iterable
 from without_streams.wiring import stream_from_queue
 from without_streams.wiring import tee
@@ -41,9 +43,11 @@ __all__ = [
     "from_scan",
     "from_selector",
     "from_sink",
+    "offload",
     "sample",
     "spool",
     "stack",
+    "stream_from_blocking",
     "stream_from_iterable",
     "stream_from_queue",
     "tee",

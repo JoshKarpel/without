@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-import asyncio
 import os
-import queue
-from collections.abc import AsyncIterator
 from collections.abc import Callable
 from collections.abc import Iterator
-from contextlib import asynccontextmanager
 from datetime import UTC
 from datetime import datetime
 from datetime import time
@@ -14,73 +10,6 @@ from datetime import timedelta
 from datetime import tzinfo
 from pathlib import Path
 from typing import TextIO
-
-from without_streams.interfaces import Sink
-from without_streams.interfaces import Stream
-
-
-@asynccontextmanager
-async def offload[T](work: Callable[[Iterator[list[T]]], None]) -> AsyncIterator[Sink[T]]:
-    """
-    Run a blocking `work` on a dedicated thread, fed by the yielded async `Sink`.
-
-    The point is efficient blocking I/O under heavy logging. An async file library
-    (`aiofiles`, `anyio`) hops to a worker thread *per operation*, so a busy log
-    stream pays that round-trip on every write. Here a single long-lived thread
-    owns the resource and does *all* the I/O: `work` is plain blocking Python that
-    consumes the items, and the yielded `Sink` just drops each onto a thread-safe
-    queue the worker drains. No per-item thread hop, and the "processor body" stays
-    ordinary synchronous code.
-
-    Items arrive in *bursts*: each element of the iterator is everything available
-    on the queue at that instant (at least one item, blocking for the first). A
-    burst boundary is therefore exactly the moment the worker has caught up, which
-    is where a writer flushes: under load bursts are large and flushes are few, and
-    when idle each burst is a single item flushed at once. So durability needs no
-    flush-frequency knob; it falls out of the queue's own backlog.
-
-    Lifecycle is bounded by the `with` block: the thread starts on entry, and on
-    exit the queue is shut down so the worker drains what remains and then ends,
-    and the thread is joined (so a file is closed before the block returns). If
-    `work` raises, that surfaces when the block exits.
-
-    Nest this *outside* the consumer that drives the sink, so the worker outlives
-    the draining. With `capture`, that means `async with offload(...) as writer:`
-    around `async with capture(..., writer):`, not the other way round.
-
-    The queue is unbounded in this first cut: the async side never blocks or drops,
-    at the cost of growing memory if the worker cannot keep up with a sustained
-    burst (a stalled disk). A bounded, drop-counting variant is a deliberate
-    follow-up. The bidirectional case (a full `Processor` bridged onto a thread,
-    with an output queue as well) is intentionally out of scope; this covers the
-    terminal-sink need (writing) without that extra state.
-    """
-    items: queue.Queue[T] = queue.Queue()
-
-    def drain() -> Iterator[list[T]]:
-        while True:
-            try:
-                batch = [items.get()]
-            except queue.ShutDown:
-                return
-            # Take everything queued at this instant into the burst. No Empty to catch and no
-            # get_nowait-in-a-try for control flow: the worker is the queue's *only* consumer, so
-            # qsize() is an exact count of items still present to take (a producer may add more,
-            # which simply waits for the next burst; nobody else removes), and each get succeeds.
-            batch.extend(items.get_nowait() for _ in range(items.qsize()))
-            yield batch
-
-    worker = asyncio.create_task(asyncio.to_thread(work, drain()))
-
-    async def sink(inputs: Stream[T]) -> None:
-        async for item in inputs:
-            items.put_nowait(item)
-
-    try:
-        yield sink
-    finally:
-        items.shutdown()
-        await worker
 
 
 def now_utc() -> datetime:
