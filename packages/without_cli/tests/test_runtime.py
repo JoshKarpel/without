@@ -107,11 +107,15 @@ class TestReadFiles:
 
     def test_an_unreadable_file_raises(self, tmp_path: Path) -> None:
         # A file that exists but cannot be read is a broken deployment, not an
-        # unconfigured one, so it is not quietly treated as absent.
+        # unconfigured one, so it is not quietly treated as absent. Reading a
+        # directory is the portable way to provoke that: POSIX raises
+        # `IsADirectoryError` and Windows `PermissionError`, so the assertion is
+        # on their common base.
         directory = tmp_path / "a-directory"
         directory.mkdir()
-        with pytest.raises(IsADirectoryError, match="a-directory"):
+        with pytest.raises(OSError, match="a-directory") as raised:
             read_files([directory])
+        assert not isinstance(raised.value, FileNotFoundError)
 
     def test_run_reads_the_files_a_program_names(self, tmp_path: Path) -> None:
         mount = tmp_path / "token"

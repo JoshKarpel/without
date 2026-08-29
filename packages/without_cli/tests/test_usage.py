@@ -101,7 +101,7 @@ class TestRendering:
         app = group("app", commands=(command("show", token)(unreached),))
         described = usage((app.node, app.node.children[0]))
         rendered = render(described)
-        assert "[file: /run/secrets/token; env: TOKEN; required]" in rendered
+        assert f"[file: {mount}; env: TOKEN; required]" in rendered
 
     def test_an_argument_summary_is_shown(self) -> None:
         assert "TEXT  What to do." in _usage_for(["add", "--help"])
