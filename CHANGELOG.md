@@ -49,7 +49,10 @@
   is what makes it pipeline, at the cost of holding a thread for the source's lifetime. Because a
   blocked thread cannot be cancelled, the worker is a daemon thread (a pooled one would hang
   `asyncio.run`'s shutdown) and abandoning the stream releases the producer's backpressure so it
-  wakes to notice and closes its source, rather than parking on a semaphore nobody will post to.
+  wakes to notice, rather than parking on a semaphore nobody will post to. A generator source is
+  closed as that thread unwinds, so its `finally` runs promptly instead of waiting on garbage
+  collection; anything else is left open, since a file is its own iterator and closing it would
+  dispose of a source the caller still owns (`sys.stdin` being the one this exists to wrap).
   It and `offload` share a mechanism and deliberately differ in interface: a source has to be
   pulled, so this one bounds its queue and pushes backpressure into the producer, while a sink is
   pushed, so bounding `offload` would mean choosing between blocking the async side and dropping,
@@ -215,13 +218,13 @@
   registered first supplied the parse for both. That was invisible while every converter was
   a module-level singleton (equal names meant the same object) and became reachable as soon as
   one was built by a function. Equality is now `name` and `parse` together; `schema` stays out
-  of it, since it takes no part in matching and OpenAPI reads it off the route's own segments.
+  of it, along with `render`, since neither takes part in matching and OpenAPI and `url_for`
+  read them off the route's own segments.
   A converter built by a factory should be `@cache`d on its inputs, as `choice` is, so that
   two call sites for the same thing still share one branch.
 - **`without-web`**: a path segment is converted once per branch rather than once per route
-  passing through it, and two catch-alls under one parent are no longer collapsed into
-  whichever was registered first. Trie branches are keyed on the converter alone, with each
-  route's parameter names carried to its own leaf.
+  passing through it. Trie branches are keyed on the converter alone, with each route's
+  parameter names carried to its own leaf.
 
 - **`without-asgi`**: `make_asgi_app` closes a handler's outbound stream when the connection
   ends, as it already did for the inbound one. A client that goes away mid-response ends the
@@ -344,7 +347,11 @@
   rather than the request reaching a handler and 400-ing, and the enum's values become
   OpenAPI's own `enum` for that parameter, declared once on the enum itself. It is `@cache`d
   per enum so two call sites share one converter and therefore one trie branch, which is the
-  pattern any converter built by a function should follow.
+  pattern any converter built by a function should follow. Both directions read the member's
+  *value*, so `url_for` renders `/deploy/prod` for a plain `Enum` as much as for a `StrEnum`,
+  where `str(member)` would have spelled the Python identifier. That is `Converter`'s new
+  `render`, `parse`'s inverse: it defaults to `str`, which is right wherever a value's text
+  form is its URL form, and is the converter's own business wherever it is not.
 - **`without-html`**: a new package. HTML as immutable Python values: build a node tree with
   plain constructors (`div(cls=..., attrs=..., children=...)`), render it with a pure
   `render(node) -> str`. It depends on nothing else in the workspace, so it is usable from any

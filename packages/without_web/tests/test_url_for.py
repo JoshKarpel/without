@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from enum import Enum
 
 import pytest
 from without_asgi import HttpScope
@@ -16,6 +17,7 @@ from without_web import UUID
 from without_web import Match
 from without_web import buffered
 from without_web import catch_all
+from without_web import choice
 from without_web import mount
 from without_web import path_param
 from without_web import route
@@ -68,6 +70,18 @@ def test_url_for_renders_a_uuid_parameter() -> None:
 
 def test_url_for_allows_slashes_in_a_catch_all() -> None:
     assert url_for(serve_file, {"rest": "a/b/c.txt"}) == "/files/a/b/c.txt"
+
+
+def test_url_for_renders_an_enum_member_as_the_value_it_routes_on() -> None:
+    # A plain `Enum` is the case `str` gets wrong: `str(Region.WEST)` is
+    # "Region.WEST", while the segment `choice` matches on is "west".
+    class Region(Enum):
+        WEST = "west"
+        EAST = "east"
+
+    where = path_param("region", choice(Region))
+    listing = route(t"/regions/{where}", get=_ok)
+    assert url_for(listing, {"region": Region.WEST}) == "/regions/west"
 
 
 def test_url_for_reverses_a_websocket_route() -> None:

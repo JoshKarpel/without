@@ -18,6 +18,10 @@ class TestLines:
             ([], []),
             (["no newline at all"], ["no newline at all"]),
             (["a\r\nb\r\n"], ["a\r\n", "b\r\n"]),
+            ([""], []),
+            (["one\n", "", "two\n"], ["one\n", "two\n"]),
+            (["a\r", "\nb\r\n"], ["a\r\n", "b\r\n"]),
+            (["a\r", "b\r"], ["a\r", "b\r"]),
         ],
     )
     def test_chunks_are_resplit_on_line_boundaries(self, chunks: list[str], expected: list[str]) -> None:

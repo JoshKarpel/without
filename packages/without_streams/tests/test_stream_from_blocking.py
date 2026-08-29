@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import threading
 from collections.abc import Iterator
 
@@ -176,3 +177,33 @@ class TestAbandonment:
         # would wait on a semaphore nobody will ever post to.
         assert await asyncio.to_thread(stopped.wait, 5)
         assert len(produced) < 10
+
+
+class TestBorrowedSources:
+    # A file is its own iterator (`iter(f) is f`) and `close` shuts it for good, so
+    # a source that is not a generator belongs to whoever passed it in. `sys.stdin`
+    # is the case that matters: closing it on exhaustion would leave the rest of
+    # the process unable to read its own input.
+
+    async def test_exhausting_a_borrowed_source_leaves_it_open(self) -> None:
+        handle = io.StringIO("a\nb\n")
+        assert await collect(stream_from_blocking(handle)) == ["a\n", "b\n"]
+        assert not handle.closed
+
+    async def test_abandoning_a_borrowed_source_leaves_it_open(self) -> None:
+        handle = io.StringIO("a\nb\nc\n")
+        before = set(threading.enumerate())
+        values = stream_from_blocking(handle, ahead=1)
+        try:
+            # The worker is parked on backpressure with two lines left, so it is
+            # alive to be caught here and gone by the time it could close anything.
+            assert await anext(values) == "a\n"
+            [worker] = [thread for thread in threading.enumerate() if thread not in before]
+        finally:
+            await close_stream(values)
+        # A source is disposed of as the worker unwinds, which is after the
+        # consumer has moved on, so the assertion waits for that unwinding rather
+        # than racing it and passing whether or not the handle survived.
+        await asyncio.to_thread(worker.join, 5)
+        assert not worker.is_alive()
+        assert not handle.closed

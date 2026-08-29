@@ -137,26 +137,32 @@ def test_routes_sharing_a_branch_each_bind_their_own_parameter_name() -> None:
     assert (second.leaf, second.params) == ("leaf-b", {"other": 7})
 
 
-def test_catch_alls_under_one_parent_are_keyed_on_their_converters() -> None:
-    # A node used to hold a single catch-all, so the first one registered won and
-    # a sibling with a different converter was unreachable. Keyed on the
-    # converter they are separate branches, and a rejection backtracks to the
-    # next one exactly as it does for a single-segment param.
+def test_two_catch_alls_under_one_parent_are_a_build_error() -> None:
+    # A catch-all consumes every remaining segment, so it has no more specific
+    # sibling to be tried before: whichever the walk reaches first answers for
+    # both however they convert. `PATH` accepts anything at all, so a second
+    # catch-all under a parent that already has one (which is what `delegate`
+    # mounts) would be silently unreachable rather than merely lower-precedence.
     numeric = Converter(
         name="numbers",
         parse=lambda raw: tuple(int(part) for part in raw.split("/")),
         schema={"type": "string"},
     )
-    tree = _tree(
-        ((Literal("f"), CatchAll("numbers", numeric)), "route-numeric"),
-        ((Literal("f"), CatchAll("rest", PATH)), "route-text"),
-    )
-    digits = walk(tree, ("f", "1", "2"))
-    words = walk(tree, ("f", "a", "b"))
-    assert digits is not None
-    assert words is not None
-    assert (digits.leaf, digits.params) == ("route-numeric", {"numbers": (1, 2)})
-    assert (words.leaf, words.params) == ("route-text", {"rest": "a/b"})
+    with pytest.raises(ValueError, match=r"^ambiguous route: two catch-alls resolve at the same path$"):
+        _tree(
+            ((Literal("f"), CatchAll("rest", PATH)), "route-text"),
+            ((Literal("f"), CatchAll("numbers", numeric)), "route-numeric"),
+        )
+
+
+def test_two_catch_alls_with_one_converter_are_a_duplicate_route() -> None:
+    # The other spelling of the same fault: sharing a converter they share a
+    # branch, so it is the leaf that collides rather than the segment.
+    with pytest.raises(ValueError, match=r"^duplicate route: two endpoints resolve to the same path$"):
+        _tree(
+            ((Literal("f"), CatchAll("rest", PATH)), "first"),
+            ((Literal("f"), CatchAll("other", PATH)), "second"),
+        )
 
 
 def test_a_route_binds_the_value_from_the_converter_it_declared() -> None:

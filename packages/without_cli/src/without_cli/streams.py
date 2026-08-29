@@ -107,11 +107,18 @@ def lines(chunks: Iterable[str]) -> Iterator[str]:
     """
     pending = ""
     for chunk in chunks:
+        # An empty chunk (a zero-length read, or `Streams.captured("")`) carries no
+        # boundary, and `splitlines` on an empty string yields nothing to unpack.
+        if not chunk:
+            continue
         pending += chunk
         *complete, pending = pending.splitlines(keepends=True)
         # `splitlines` cannot tell a final line that ended from one still arriving,
-        # so a terminated tail is a complete line and only an unterminated one is held.
-        if pending.endswith(("\n", "\r")):
+        # so a terminated tail is a complete line and only an unterminated one is
+        # held. A tail ending in `\r` is held even so, because the next chunk may
+        # open with the `\n` that completes a `\r\n` split across the boundary; a
+        # lone `\r` terminator is then yielded when the input ends.
+        if pending.endswith("\n"):
             complete.append(pending)
             pending = ""
         yield from complete

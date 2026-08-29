@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Awaitable
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
@@ -147,6 +148,21 @@ def _positional_layout(name: str, parameters: tuple[Parameter, ...]) -> None:
     names = [p.name for p in positionals]
     if len(set(names)) != len(names):
         raise DeclarationError(f"command {name!r} declares two positionals with the same name")
+
+
+def _option_spellings(name: str, parameters: tuple[Parameter, ...]) -> None:
+    """
+    Refuse a level that spells one option twice.
+
+    The binder resolves a spelling to exactly one option, so the later declaration
+    silently wins and the earlier one is dead: `option("--x", once(STR))` followed
+    by `flag("--x")` leaves `--x` taking no value, and `prog --x hi` fails on a
+    stray `hi` rather than on the two tokens that disagree.
+    """
+    spellings = Counter(spelling for p in parameters if isinstance(p, Option) for spelling in p.names)
+    repeated = next((spelling for spelling, count in spellings.items() if count > 1), None)
+    if repeated is not None:
+        raise DeclarationError(f"{name!r} declares the option {repeated!r} twice")
 
 
 def _first_line(docstring: str | None) -> str:
@@ -639,6 +655,7 @@ def command(
     """
     parameters = tuple(p for extractor in extractors for p in extractor.parameters)
     _positional_layout(name, parameters)
+    _option_spellings(name, parameters)
 
     def bind(fn: Callable[..., Returned]) -> Arm[Never]:
         def resolve(levels: tuple[Level, ...]) -> Action[Never]:
@@ -1179,6 +1196,7 @@ def _nest(
     """The body of `group`, shared by its stateful and pure-namespacing forms."""
     parameters = tuple(p for extractor in extractors for p in extractor.parameters)
     _no_positionals(name, parameters)
+    _option_spellings(name, parameters)
     _child_names(name, commands)
     if state is None and extractors:
         raise DeclarationError(f"{name!r} declares options but no `state` to parse them into")

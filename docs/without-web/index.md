@@ -130,13 +130,21 @@ parameter, declared once on the enum itself. `url_for(deploy, {"profile":
 Profile.PROD})` renders `/deploy/prod`, since the member round-trips back through
 the same converter.
 
+Both directions read the member's _value_, so a plain `Enum` and an `IntEnum`
+work the same way a `StrEnum` does. Reversing is the direction where that
+matters: `str(member)` on a plain `Enum` is `"Profile.PROD"`, the Python
+spelling, so a converter that parses something other than the value's text form
+supplies its own `render` as well. It is `parse`'s inverse, and it defaults to
+`str`.
+
 ### A converter is the trie's branch key
 
 This is the one thing worth knowing about converters beyond what they parse,
 because it decides when two routes share a branch. Two path-param segments merge
 into one branch when their converters compare **equal**, and equality is `name`
-and `parse` together. (`schema` is excluded: it takes no part in matching, and
-OpenAPI reads it off the route's own segments rather than through the trie.)
+and `parse` together. (`schema` and `render` are excluded: neither takes any part
+in matching, and OpenAPI and `url_for` read them off the route's own segments
+rather than through the trie.)
 
 Comparing `parse` is what makes the merge safe. The built-ins are module-level
 values, so every route that writes `path_param("id", INT)` holds the same `INT`,

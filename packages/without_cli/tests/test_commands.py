@@ -17,6 +17,7 @@ from without_cli import argument
 from without_cli import command
 from without_cli import count
 from without_cli import default
+from without_cli import flag
 from without_cli import group
 from without_cli import many
 from without_cli import once
@@ -56,6 +57,24 @@ class TestDeclaration:
         with pytest.raises(DeclarationError, match="same name"):
             command("bad", argument("a", once(STR)), argument("a", once(INT)))
 
+    def test_two_options_cannot_share_a_spelling(self) -> None:
+        # The binder resolves a spelling to one option, so the later declaration
+        # would silently win: `--x` would take no value and `prog --x hi` would
+        # fail on a stray `hi` rather than on the two tokens that disagree.
+        with pytest.raises(DeclarationError, match="declares the option '--x' twice"):
+            command("bad", option("--x", once(STR)), flag("--x"))
+
+    def test_an_alias_shared_with_another_option_is_refused(self) -> None:
+        # Aliases count the same as the canonical name: `-v` reaching two options
+        # is as ambiguous as `--verbose` being declared twice.
+        with pytest.raises(DeclarationError, match="declares the option '-v' twice"):
+            command("bad", flag(("-v", "--verbose")), count(("-v", "--volume")))
+
+    def test_a_group_refuses_two_options_with_one_spelling(self) -> None:
+        leaf = command("leaf")(unreached)
+        with pytest.raises(DeclarationError, match="declares the option '--x' twice"):
+            group("app", option("--x", once(STR)), flag("--x"), state=_never_pair, commands=(leaf,))
+
     def test_a_level_with_no_commands_is_refused(self) -> None:
         with pytest.raises(DeclarationError, match="declares no commands"):
             group("empty", commands=())
@@ -84,6 +103,13 @@ class TestDeclaration:
 
 @asynccontextmanager
 async def _never(streams: Streams, value: str) -> AsyncIterator[None]:  # pragma: no cover - never entered
+    yield None
+
+
+@asynccontextmanager
+async def _never_pair(
+    streams: Streams, value: str, toggle: bool
+) -> AsyncIterator[None]:  # pragma: no cover - never entered
     yield None
 
 

@@ -38,6 +38,14 @@ class Converter(Generic[_V_co]):  # noqa: UP046 - PEP 695 infers a frozen datacl
     (`path_param("id", INT)`), so the name, parse, type, and schema are all
     declared in one place.
 
+    `render` is `parse`'s inverse, which `url_for` needs to spell a value back
+    into a segment. It defaults to `str`, which is right wherever a value's text
+    form *is* its URL form, and is a converter's own business wherever it is not:
+    `str(member)` on a plain `Enum` is `"Profile.PROD"`, while the segment
+    `choice` parses is `"prod"`. It takes an `object` because reverse routing is
+    handed whatever the caller passed; a value the converter cannot spell fails
+    the round-trip check `url_for` makes anyway.
+
     **Equality is `name` and `parse` together, because a converter is a trie
     key.** Two path-param segments merge into one branch when their converters
     compare equal, and the merged branch keeps one of them, so converters that
@@ -49,15 +57,17 @@ class Converter(Generic[_V_co]):  # noqa: UP046 - PEP 695 infers a frozen datacl
     named. A converter *factory* should be `@cache`d on its inputs (see `choice`)
     so that calling it twice for the same thing returns the same value and merges.
 
-    `schema` is excluded, and not merely because a `Mapping` is unhashable and a
-    trie key must not be: it takes no part in matching, and OpenAPI reads it off
-    the route's own segments rather than through the trie, so two branches
-    merging has never affected a rendered schema.
+    `schema` and `render` are excluded, and `schema` not merely because a
+    `Mapping` is unhashable and a trie key must not be: neither takes any part in
+    matching, and OpenAPI and `url_for` both read them off the route's own
+    segments rather than through the trie, so two branches merging has never
+    affected a rendered schema or a generated URL.
     """
 
     name: str
     parse: Callable[[str], _V_co]
     schema: Mapping[str, object] = field(compare=False)
+    render: Callable[[object], str] = field(default=str, compare=False)
 
 
 @cache
@@ -94,7 +104,17 @@ def choice[E: Enum](enum: type[E]) -> Converter[E]:
         except KeyError as exc:
             raise ValueError(f"{raw!r} is not one of {', '.join(by_value)}") from exc
 
-    return Converter(name=enum.__name__, parse=parse, schema={"type": "string", "enum": list(by_value)})
+    def render(value: object) -> str:
+        # The inverse of matching on the value: `str` on a plain `Enum` member is
+        # `"Level.WARNING"`, which is the Python spelling rather than the URL's.
+        return str(value.value) if isinstance(value, Enum) else str(value)
+
+    return Converter(
+        name=enum.__name__,
+        parse=parse,
+        schema={"type": "string", "enum": list(by_value)},
+        render=render,
+    )
 
 
 STR: Converter[str] = Converter(name="str", parse=str, schema={"type": "string"})

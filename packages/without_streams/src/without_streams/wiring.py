@@ -24,6 +24,7 @@ from collections.abc import AsyncGenerator
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from collections.abc import Callable
+from collections.abc import Generator
 from collections.abc import Iterable
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
@@ -207,10 +208,11 @@ async def stream_from_blocking[T](values: Iterable[T], *, ahead: int = 1) -> Asy
       can be forever, so the worker is a daemon thread: the process exits without
       waiting for it, where a pooled thread would hang `asyncio.run`'s shutdown.
     - The producer's own cleanup runs when that thread unwinds, which may be
-      after the consumer has moved on. The source is closed explicitly there
-      rather than left to garbage collection, so it is as prompt as it can be,
-      but a source that must release a resource on a deadline wants an async
-      adapter rather than this one.
+      after the consumer has moved on. A *generator* source is closed explicitly
+      there rather than left to garbage collection, so its `finally` is as prompt
+      as it can be, but a source that must release a resource on a deadline wants
+      an async adapter rather than this one. Anything else is left open, because
+      it belongs to whoever passed it in and may well be read again.
     """
     if ahead < 1:
         raise ValueError(f"ahead must be at least 1, but got {ahead}")
@@ -247,10 +249,12 @@ async def stream_from_blocking[T](values: Iterable[T], *, ahead: int = 1) -> Asy
         finally:
             # The generator's `finally` runs here rather than whenever the last
             # reference happens to be dropped, so a source holding a resource
-            # releases it as soon as this thread unwinds.
-            closing = getattr(iterator, "close", None)
-            if closing is not None:
-                closing()
+            # releases it as soon as this thread unwinds. Only a generator is
+            # closed: `iter(f) is f` for a file, so closing whatever has a `close`
+            # would dispose of a source the caller still owns and still reads
+            # (`sys.stdin` being the one this exists to wrap).
+            if isinstance(iterator, Generator):
+                iterator.close()
 
     threading.Thread(target=drain, name="stream_from_blocking", daemon=True).start()
     try:

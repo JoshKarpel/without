@@ -66,6 +66,13 @@ class Level(IntEnum):
     HIGH = 9
 
 
+class Region(Enum):
+    # A plain `Enum`: `str(Region.WEST)` is "Region.WEST", so its Python spelling
+    # and its URL spelling are not the same string.
+    WEST = "west"
+    EAST = "east"
+
+
 class TestEquality:
     def test_a_converter_is_its_name_and_its_parse(self) -> None:
         # Both halves matter because a converter is a trie key: branches merge
@@ -91,6 +98,13 @@ class TestEquality:
             Converter(name="int", parse=int, schema={})
         )
 
+    def test_the_render_is_not_part_of_the_comparison(self) -> None:
+        # Same reason as the schema: it takes no part in matching, and `url_for`
+        # reads it off the route's own segments rather than through the trie.
+        assert Converter(name="int", parse=int, schema={}) == Converter(
+            name="int", parse=int, schema={}, render=lambda value: "!"
+        )
+
     def test_two_closures_over_the_same_logic_are_still_distinct(self) -> None:
         # The conservative answer, and the reason a converter *factory* must
         # cache: nothing can prove two closures behave alike, so an uncached
@@ -110,6 +124,17 @@ class TestChoice:
         # Values, not member names, so the URL spelling and the Python identifier
         # are free to differ.
         assert choice(enum).parse(segment) == expected
+
+    @pytest.mark.parametrize(
+        ("member", "segment"),
+        [(Profile.PROD, "prod"), (Level.HIGH, "9"), (Region.WEST, "west")],
+    )
+    def test_choice_renders_a_member_back_to_the_segment_it_parses(self, member: Enum, segment: str) -> None:
+        # `Region` is the case `str` alone gets wrong: a plain `Enum` renders as
+        # "Region.WEST", which is the Python spelling and would not route back.
+        converter = choice(type(member))
+        assert converter.render(member) == segment
+        assert converter.parse(converter.render(member)) is member
 
     def test_choice_rejects_a_segment_outside_the_enum(self) -> None:
         # A `ValueError` makes the trie branch fail to match and the walk

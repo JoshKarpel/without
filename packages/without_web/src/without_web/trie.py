@@ -49,6 +49,11 @@ class Node[L]:
     `params` is ordered so the walk tries more specific branches first: a typed
     converter (`int`, `uuid`) before the catch-most `str`. That recovers route
     precedence from the tree's structure rather than from registration order.
+
+    `catchall` holds at most one entry, because a catch-all consumes every
+    remaining segment and so has no more specific sibling to be tried before:
+    whichever of two the walk reached first would answer for both. `build`
+    refuses the second one rather than leaving it silently unreachable.
     """
 
     literals: Mapping[str, Node[L]]
@@ -76,6 +81,11 @@ def build[L](routes: Iterable[tuple[tuple[Segment, ...], L]]) -> Node[L]:
     exactly the same targets. Converters travel on the segments themselves, so
     there is no registry to resolve and no unknown-converter fault: a path-param
     token *is* its converter.
+
+    Two catch-alls under one parent are the same fault wearing a different hat:
+    each consumes every remaining segment, so the first the walk reaches answers
+    for both however they convert, and the second is dead. That raises here too,
+    rather than at the request that would have wanted it.
     """
     root: _Builder[L] = _Builder()
     for segments, leaf in routes:
@@ -99,6 +109,8 @@ def _insert[L](node: _Builder[L], segments: tuple[Segment, ...], leaf: L, names:
         case CatchAll(name, converter):
             if rest:
                 raise ValueError("invalid route: a catch-all must be the last segment")
+            if node.catchall and converter not in node.catchall:
+                raise ValueError("ambiguous route: two catch-alls resolve at the same path")
             child = node.catchall.setdefault(converter, _Builder())
             names = (*names, name)
     _insert(child, tuple(rest), leaf, names)
@@ -107,9 +119,8 @@ def _insert[L](node: _Builder[L], segments: tuple[Segment, ...], leaf: L, names:
 def _freeze[L](builder: _Builder[L]) -> Node[L]:
     literals = {text: _freeze(child) for text, child in builder.literals.items()}
     params = tuple((converter, _freeze(child)) for converter, child in sorted(builder.params.items(), key=_precedence))
-    catchall = tuple(
-        (converter, _freeze(child)) for converter, child in sorted(builder.catchall.items(), key=_precedence)
-    )
+    # There is at most one catch-all, so nothing to order.
+    catchall = tuple((converter, _freeze(child)) for converter, child in builder.catchall.items())
     return Node(literals=literals, params=params, catchall=catchall, leaf=builder.leaf)
 
 
