@@ -104,8 +104,10 @@ class TestConverters:
             choice(Ambiguous)
 
     def test_converters_compare_by_their_placeholder(self) -> None:
-        # Equality ignores `parse` so a converter can be a dictionary key and a
-        # trie-style comparison, matching how `without-web` treats its own.
+        # Equality ignores `parse`, which a CLI can afford because nothing here
+        # keys a structure on a converter. `without-web` compares `parse` too,
+        # because there a converter *is* the routing trie's branch key and two
+        # that compare equal are merged.
         assert Converter(metavar="INT", parse=int) == Converter(metavar="INT", parse=float)
         assert Converter(metavar="INT", parse=int) != Converter(metavar="NUM", parse=int)
 

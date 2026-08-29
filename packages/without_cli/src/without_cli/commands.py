@@ -626,7 +626,7 @@ def command(
     Each token supplies one argument to the handler, in declaration order, after
     the two every command receives: the `Streams` to write to and the state its
     program built. The overloads tie the token types to those parameters, so a
-    `argument("id", INT)` paired with a handler expecting a `str` is a mypy error
+    `argument("id", once(INT))` paired with a handler expecting a `str` is a mypy error
     with no runtime introspection anywhere.
 
     `summary` is the one line `--help` shows beside the command's name. Omitting

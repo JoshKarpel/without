@@ -2,7 +2,7 @@
 Generate the typed `@overload` ladders for `without-cli`.
 
 These ladders tie a variadic list of `Extractor` tokens to a handler's parameters
-(or a state factory's) at each arity, so a `argument("id", INT)` paired with a
+(or a state factory's) at each arity, so an `argument("id", once(INT))` paired with a
 handler expecting a `str` is a mypy error rather than a runtime surprise. They
 are pure mechanical repetition over arity, so they are generated rather than
 hand-maintained: `cog` invokes `emit(name)` in place (see the `# [[[cog ... ]]]`

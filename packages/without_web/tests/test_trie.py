@@ -110,16 +110,64 @@ def test_a_segment_after_a_catch_all_is_a_build_error() -> None:
         _tree(((CatchAll("rest", PATH), Literal("more")), "unreachable"))
 
 
+def test_two_routes_that_differ_only_in_a_parameter_name_are_a_duplicate() -> None:
+    # Branches are keyed on the converter alone, so what a route *calls* its
+    # parameter cannot make it a different route: no request could tell
+    # `/u/{id:int}` from `/u/{other:int}`, and both were silently reachable
+    # before, first-wins.
+    with pytest.raises(ValueError, match=r"^duplicate route: two endpoints resolve to the same path$"):
+        _tree(
+            ((Literal("u"), Param("id", INT)), "first"),
+            ((Literal("u"), Param("other", INT)), "second"),
+        )
+
+
+def test_routes_sharing_a_branch_each_bind_their_own_parameter_name() -> None:
+    # The other half of merging on the converter: one branch, but the name is a
+    # property of the route, so each leaf reports what its own segment called it.
+    tree = _tree(
+        ((Literal("u"), Param("id", INT), Literal("a")), "leaf-a"),
+        ((Literal("u"), Param("other", INT), Literal("b")), "leaf-b"),
+    )
+    first = walk(tree, ("u", "7", "a"))
+    second = walk(tree, ("u", "7", "b"))
+    assert first is not None
+    assert second is not None
+    assert (first.leaf, first.params) == ("leaf-a", {"id": 7})
+    assert (second.leaf, second.params) == ("leaf-b", {"other": 7})
+
+
+def test_catch_alls_under_one_parent_are_keyed_on_their_converters() -> None:
+    # A node used to hold a single catch-all, so the first one registered won and
+    # a sibling with a different converter was unreachable. Keyed on the
+    # converter they are separate branches, and a rejection backtracks to the
+    # next one exactly as it does for a single-segment param.
+    numeric = Converter(
+        name="numbers",
+        parse=lambda raw: tuple(int(part) for part in raw.split("/")),
+        schema={"type": "string"},
+    )
+    tree = _tree(
+        ((Literal("f"), CatchAll("numbers", numeric)), "route-numeric"),
+        ((Literal("f"), CatchAll("rest", PATH)), "route-text"),
+    )
+    digits = walk(tree, ("f", "1", "2"))
+    words = walk(tree, ("f", "a", "b"))
+    assert digits is not None
+    assert words is not None
+    assert (digits.leaf, digits.params) == ("route-numeric", {"numbers": (1, 2)})
+    assert (words.leaf, words.params) == ("route-text", {"rest": "a/b"})
+
+
 def test_a_route_binds_the_value_from_the_converter_it_declared() -> None:
-    # `_insert` keys a param branch on `(name, converter)`, and `Converter`
-    # compares by `name` alone because `parse` and `schema` are `compare=False`.
-    # So two converters that share a name but not a parse merge onto one node,
-    # `setdefault` keeps whichever was inserted first, and the second route's
-    # handler is handed a value its own converter never produced.
+    # Converters sharing a name but not a parse are distinct branch keys, so
+    # neither route can be handed the other's value. Comparing `parse` is what
+    # buys this: by `name` alone these two would merge onto one node and the
+    # first one inserted would supply the parse for both.
     #
-    # Every shipped converter is a module-level singleton, which is why this has
-    # not bitten: equal names have always meant the same object. A converter
-    # *factory* (one per enum, say) is what breaks that.
+    # Every shipped converter is a module-level singleton, so equal names have
+    # always meant the same object and the distinction never showed. A converter
+    # *factory* (one per enum, say) is what surfaces it.
     first = Converter(name="colour", parse=lambda raw: f"first:{raw}", schema={"type": "string"})
     second = Converter(name="colour", parse=lambda raw: f"second:{raw}", schema={"type": "string"})
     tree = _tree(

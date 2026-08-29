@@ -4,6 +4,7 @@ from without_web.converters import PATH
 from without_web.converters import STR
 from without_web.converters import UUID
 from without_web.converters import Converter
+from without_web.converters import choice
 from without_web.exceptions import ExceptionRecover
 from without_web.exceptions import WebsocketExceptionRecover
 from without_web.exceptions import catching
@@ -128,6 +129,7 @@ __all__ = [
     "catch_all",
     "catching",
     "catching_websocket",
+    "choice",
     "delegate",
     "delete",
     "describe",

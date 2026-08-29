@@ -108,6 +108,108 @@ token carries its converter value straight into the trie, so an app adds its own
 by constructing a `Converter` and using it in a `path_param`; there is no
 registry to register it in.
 
+`choice` builds one from an enum, matching a segment against the members' values:
+
+```python
+class Profile(StrEnum):
+    DEV = "dev"
+    PROD = "prod"
+
+
+profile = path_param("profile", choice(Profile))
+
+
+@get(t"/deploy/{profile}", profile)
+async def deploy(state: State, chosen: Profile) -> Response: ...
+```
+
+The handler receives `Profile.PROD`, not `"prod"`. A segment outside the set
+rejects, so `/deploy/staging` dead-ends the walk and reaches the `fallback`
+rather than the handler, and the values become OpenAPI's own `enum` for that
+parameter, declared once on the enum itself. `url_for(deploy, {"profile":
+Profile.PROD})` renders `/deploy/prod`, since the member round-trips back through
+the same converter.
+
+### A converter is the trie's branch key
+
+This is the one thing worth knowing about converters beyond what they parse,
+because it decides when two routes share a branch. Two path-param segments merge
+into one branch when their converters compare **equal**, and equality is `name`
+and `parse` together. (`schema` is excluded: it takes no part in matching, and
+OpenAPI reads it off the route's own segments rather than through the trie.)
+
+Comparing `parse` is what makes the merge safe. The built-ins are module-level
+values, so every route that writes `path_param("id", INT)` holds the same `INT`,
+and the whole application shares one `int` branch per node, as it should. Two
+converters built separately with different `parse` functions stay distinct
+however they are named, so neither route can be handed the other's value.
+
+**Build a custom converter once, at module level, and share the value.** Two
+equivalent converters built at two call sites do not compare equal, because
+nothing can prove two closures behave alike:
+
+```python
+# Do this.
+SLUG = Converter(name="slug", parse=_parse_slug, schema={"type": "string"})
+
+
+# Not this: each call builds a fresh closure, so the two do not merge.
+def slug() -> Converter[str]:
+    return Converter(name="slug", parse=lambda raw: raw.lower(), schema={"type": "string"})
+```
+
+Both routes still resolve if you get this wrong, by backtracking, so nothing
+visibly breaks. What you lose is quieter: the segment is converted once per
+branch instead of once, and a genuine duplicate between the two stops being
+caught at build time.
+
+**A converter built by a function wants `@cache`.** That is how `choice` stays
+shareable while still being written as a call, and it is the pattern to copy:
+
+```python
+@cache
+def choice[E: Enum](enum: type[E]) -> Converter[E]: ...
+```
+
+`choice(Profile)` in two modules returns the *same* converter, so the two routes
+share one branch. Two different enums return different converters even if the
+enums have identical values and names, because their `parse` closures differ.
+
+### Two routes cannot differ only in a parameter's name
+
+Because the branch is keyed on the converter alone, what a route *calls* its
+parameter is a property of that route rather than of the tree, and each leaf
+reports its own name. So these coexist, sharing one `int` branch:
+
+```python
+uid = path_param("id", INT)
+member = path_param("member", INT)
+
+
+@get(t"/u/{uid}/profile", uid)  # binds `id`
+async def profile(state: State, value: int) -> Response: ...
+
+
+@get(t"/u/{member}/posts", member)  # binds `member`
+async def posts(state: State, value: int) -> Response: ...
+```
+
+but two routes whose *whole path* differs only in the name are a `duplicate
+route` error when the `Router` is built, because no request could tell them
+apart:
+
+```python
+@get(t"/u/{uid}", uid)
+async def one(state: State, value: int) -> Response: ...
+
+
+@get(t"/u/{member}", member)
+async def two(state: State, value: int) -> Response: ...
+
+
+Router(routes=(one, two), fallback=not_found)  # ValueError: duplicate route
+```
+
 ## Reading the request: extractors
 
 An `Extractor[C, V]` is parsing-as-a-value: a pure `C -> V` (from the request

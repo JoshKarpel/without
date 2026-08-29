@@ -29,7 +29,10 @@ class Converter(Generic[_V_co]):  # noqa: UP046 - PEP 695 infers a frozen datacl
     (`--port PORT` uses the option's own name, `INT` names the type), so a token
     that reuses a converter value declares its name, parse, type, and usage
     placeholder exactly once. Equality is by `metavar` alone, so `parse` is
-    excluded from comparison.
+    excluded from comparison; nothing here keys a structure on a converter, so
+    what equality means is a convenience rather than a correctness property.
+    (`without-web`'s converter compares `parse` as well, because there a
+    converter *is* the routing trie's branch key and two comparing equal merge.)
     """
 
     metavar: str

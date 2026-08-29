@@ -5,9 +5,11 @@
 ### Added
 
 - **`without-cli`**: command-line parsing as values, the CLI sibling of `without-web`'s
-  extractors. A token (`argument`, `option`, `flag`, `count`, `rest`) is one declaration that
+  extractors. A token (`argument`, `option`, `flag`, `count`) is one declaration that
   is the parse, the usage entry, and the typed read at once, so a command's help, its arity
-  table, and the value its handler receives cannot disagree; `@command` returns an `Arm` value
+  table, and the value its handler receives cannot disagree; positionals and options take the
+  same cardinality vocabulary (`once`, `optional`, `default`, `many`), so an optional positional
+  and a variadic one need no vocabulary of their own; `@command` returns an `Arm` value
   and registers nothing, so a package can ship one and a consumer place it anywhere in a single
   edit. An `@overload` ladder ties each token's type to the handler parameter it fills, with no
   runtime introspection of a function signature, which is the mechanism that gives `typer` its
@@ -23,9 +25,13 @@
   from with `sources=(FromFile(...), FromEnv(...))`, covering Kubernetes and Docker secret mounts
   through the same validation the command line goes through, with the files read by the shell and
   handed to the parser as a value. `parse_argv` is a total, pure function of argv, environment,
-  and file contents returning `Bound | Helped | Rejected`: it never exits, never prints, and
+  and file contents returning `Bound | Answered | Rejected`: it never exits, never prints, and
   extracts *every* value up front, so a `Bound` proves the invocation is valid and nothing is
-  opened for a command line that was never going to run. Help is a `Usage` value that plain text
+  opened for a command line that was never going to run. It holds no opinion about which flags
+  are magic either: `answered` is the caller's list of spellings that stop the scan, and `run`
+  is the only place that names `-h`, `--help`, and `--version` or decides what they mean, so a
+  program wanting `-?`, a `help` subcommand, or none of it writes its own shell and changes
+  nothing below. Help is a `Usage` value that plain text
   is merely one rendering of, so no styling library sits on the path every program crosses and
   the package depends on nothing. The streams are injected, so output is asserted on by passing
   `Streams.captured()` rather than by capturing a process.
@@ -196,8 +202,26 @@
 - **`without-durability-sqlite`**: `connect` takes `timeout` as a count of `Milliseconds`,
   the unit `PRAGMA busy_timeout` carries, so a duration finer than the pragma can express is
   no longer silently truncated into it.
+- **`without-web`**: two routes that differ only in what they *name* a path parameter are now
+  the build-time `duplicate route` error they always were in substance. No request can tell
+  `/u/{id:int}` from `/u/{other:int}`, and both used to be reachable, with whichever was
+  registered first silently winning.
 
 ### Fixed
+
+- **`without-web`**: a route is no longer handed a value some *other* route's converter
+  produced. A converter is the routing trie's branch key, and it compared by `name` alone, so
+  two converters sharing a name but not a `parse` merged onto one branch and whichever was
+  registered first supplied the parse for both. That was invisible while every converter was
+  a module-level singleton (equal names meant the same object) and became reachable as soon as
+  one was built by a function. Equality is now `name` and `parse` together; `schema` stays out
+  of it, since it takes no part in matching and OpenAPI reads it off the route's own segments.
+  A converter built by a factory should be `@cache`d on its inputs, as `choice` is, so that
+  two call sites for the same thing still share one branch.
+- **`without-web`**: a path segment is converted once per branch rather than once per route
+  passing through it, and two catch-alls under one parent are no longer collapsed into
+  whichever was registered first. Trie branches are keyed on the converter alone, with each
+  route's parameter names carried to its own leaf.
 
 - **`without-asgi`**: `make_asgi_app` closes a handler's outbound stream when the connection
   ends, as it already did for the inbound one. A client that goes away mid-response ends the
@@ -314,6 +338,13 @@
   prefix does not match, which is correct rather than a gap, since a request for a directory
   is a listing request. A single-page app's entry point is the router's `fallback` instead,
   the one place that also sees the client-side deep links no asset matches.
+- **`without-web`**: `choice(SomeEnum)`, a converter matching a path segment against an enum's
+  values and parsing it to the member (`path_param("profile", choice(Profile))`). A segment
+  outside the set rejects, so the trie branch simply fails to match and the walk backtracks
+  rather than the request reaching a handler and 400-ing, and the enum's values become
+  OpenAPI's own `enum` for that parameter, declared once on the enum itself. It is `@cache`d
+  per enum so two call sites share one converter and therefore one trie branch, which is the
+  pattern any converter built by a function should follow.
 - **`without-html`**: a new package. HTML as immutable Python values: build a node tree with
   plain constructors (`div(cls=..., attrs=..., children=...)`), render it with a pure
   `render(node) -> str`. It depends on nothing else in the workspace, so it is usable from any
