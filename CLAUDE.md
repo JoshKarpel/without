@@ -32,7 +32,9 @@ security, the in-memory test clients, and the feature register against httpx,
 aiohttp, niquests, and the ASGI servers split into `without-http/cookies.md`,
 `without-http/security.md`, `without-http/testing.md`, and
 `without-http/alternatives.md`), the opinionated router
-(`without-web/index.md`), the command-line parser (`without-cli/index.md`),
+(`without-web/index.md`), the command-line parser (`without-cli/index.md`, with
+the comparison against argparse, click, and typer in
+`without-cli/alternatives.md`),
 HTML as values (`without-html/index.md`), the
 config sources (`without-env/index.md`, `without-configmap/index.md`), the DAG
 executor (`without-dag/index.md`), and durable workflows

@@ -21,7 +21,7 @@ class Session(Streams):
     verbosity: int
 
 
-@command("add", argument("text", STR), option(("-t", "--tag"), many(STR)), summary="Add a todo.")
+@command("add", argument("text", once(STR)), option(("-t", "--tag"), many(STR)), summary="Add a todo.")
 async def add(session: Session, text: str, tags: tuple[str, ...]) -> int:
     todo = await session.client.create(text, tags)
     session.stdout.write(f"{todo.id}\n")
@@ -47,6 +47,10 @@ if __name__ == "__main__":
 ```
 
 ## The bet: a parser is a value, not a decorator's side effect
+
+The evidence for what follows, one program written four ways against `argparse`,
+`click`, and `typer`, with what each parameter costs and what each type checker
+catches, is on [alternatives](alternatives.md).
 
 `click` has most of the right nouns. Its parameters really are objects you can
 construct and share, `Command.main(standalone_mode=False)` really does hand the
@@ -92,26 +96,41 @@ binder reads an arity from, so those three cannot disagree.
 tags = option(("-t", "--tag"), many(STR), summary="Repeatable.")
 ```
 
-`argument` and `rest` take positionals, `option` takes a named value, and `flag`
-and `count` take valueless switches (`-vvv` is `3`). Because a token is an
-ordinary value, a `--verbose` shared across a dozen commands is a module-level
-name rather than a decorator copied twelve times.
+`argument` takes positionals, `option` takes a named value, and `flag` and
+`count` take valueless switches (`-vvv` is `3`). Because a token is an ordinary
+value, a `--verbose` shared across a dozen commands is a module-level name rather
+than a decorator copied twelve times.
 
 A **`Converter`** is a `str -> V` parser paired with the placeholder that names
-it. `STR`, `INT`, `FLOAT`, `BOOL`, `UUID`, and `PATH` ship; an application adds
-its own by constructing one, because there is no registry to register it in. A
-converter raising `ValueError` *rejects*, which becomes a `Rejected` naming the
+it. `STR`, `INT`, `FLOAT`, `BOOL`, `UUID`, and `PATH` ship, and `choice(SomeEnum)`
+builds one that accepts an enum's values and yields its members; an application
+adds its own by constructing one, because there is no registry to register it in.
+A converter raising `ValueError` *rejects*, which becomes a `Rejected` naming the
 parameter rather than a traceback.
 
 A **`Cardinality`** (`once`, `optional`, `default`, `many`) says how many values
-an option takes *and* what they become. Keeping those together is what stops the
+a token takes *and* what they become. Keeping those together is what stops the
 help text from drifting from the parser: `once(INT)` is the single place saying
-the option is required, takes one value, and yields an `int`.
+the token is required, takes one value, and yields an `int`.
+
+Positionals and options take that same vocabulary, which is why there is no
+separate `rest` function and no separate optional-positional one:
+
+```python
+argument("source", once(STR))  # SOURCE
+argument("target", optional(STR))  # [TARGET], a `str | None`
+argument("port", default(80, INT))  # [PORT], an `int` either way
+argument("paths", many(STR))  # [PATHS...]
+```
+
+Assignment is greedy and in declaration order, so a `many` argument is valid only
+as the last positional and a required one may not follow an optional one; `command`
+refuses either layout where it is written.
 
 `into(make, *tokens)` combines several tokens into one that builds a typed
-value, for when a command outgrows its arity ceiling or genuinely wants a model.
-It is the escape hatch, not the primary form: binding tokens straight onto
-handler parameters is what keeps the common case short.
+value, for when a command outgrows its twenty-token arity ceiling or genuinely
+wants a model. It is the escape hatch, not the primary form: binding tokens
+straight onto handler parameters is what keeps the common case short.
 
 ## Sources: the environment and secret mounts, at the same boundary
 
@@ -147,7 +166,7 @@ instead of a filesystem.
 `@command(name, *tokens)` returns an `Arm` and registers nothing, exactly as
 `@get` returns a `Route`. Each token supplies one argument to the handler, after
 the one every command receives: the state its enclosing group built. The overload
-ladder ties those types, so an `argument("id", INT)` paired with a handler
+ladder ties those types, so an `argument("id", once(INT))` paired with a handler
 expecting a `str` is a mypy error with no runtime introspection anywhere.
 
 Because an arm carries its own name, parsing, usage, and behaviour, a package can
@@ -219,9 +238,9 @@ unchanged.
 
 ## Parsing is total, pure, and finishes before anything opens
 
-`parse_argv(app, argv=..., env=..., files=...)` returns `Bound | Helped |
-Rejected` and never exits, prints, or raises for a bad command line. All four
-inputs are values, so the whole parser is testable with no process, no
+`parse_argv(app, argv=..., env=..., files=..., answered=...)` returns
+`Bound | Answered | Rejected` and never exits, prints, or raises for a bad command
+line. Every input is a value, so the whole parser is testable with no process, no
 `sys.argv`, no `os.environ`, and no filesystem.
 
 Crucially, **every value is extracted at parse time**, not when the command runs.
@@ -307,10 +326,53 @@ touches the filesystem, or starts a loop, and each of those is an argument with 
 real default. It *returns* rather than exits, so the caller keeps the
 continuation.
 
-Its policy is the obvious one: help to stdout with `0`, a bad command line to
-stderr with `2`, otherwise the command's own code. An application wanting
-different answers matches on `parse_argv`'s outcome itself, which costs it `run`
-and nothing else.
+Its policy is the obvious one, and all of it is here rather than in the parser:
+help and a version to stdout with `0`, a bad
+command line to stderr with `2`, otherwise the command's own code. An application
+wanting different answers matches on `parse_argv`'s outcome itself, which costs
+it `run` and nothing else.
+
+## The parser stops; the shell decides
+
+`--help` means nothing to `parse_argv`. It is `run` that names the conventional
+spellings and says what each one does:
+
+```python
+ANSWERED = ("-h", "--help", "--version")
+
+match parse_argv(app, argv=argv, answered=ANSWERED):
+    case Answered(spelling) as answer if spelling in HELP:
+        streams.stdout.write(render(answer.usage))
+```
+
+`answered` is the caller's list of spellings that should stop the scan and come
+back as an `Answered` carrying the spelling met and the level it was addressed to.
+Called without it, `parse_argv(app, argv=["--help"])` rejects `--help` as an
+option nobody declared, which is the honest answer from a function that has no
+opinion. So a program wanting `-?`, or a `help` subcommand, or `--license`, or
+none of it, passes its own list and writes its own shell, and nothing below `run`
+changes.
+
+Stopping has to happen in the scan even though *deciding* does not, for two
+reasons that are worth being explicit about, because they are what rules out
+making these tokens. Only the scan knows whether a token is a flag or the value
+of the option before it. And a token could not answer anyway: extraction runs
+after the whole path is bound, so `todos db migrate --help` would have already
+failed on the required `--dsn` you were asking how to spell.
+
+`version` is per level, so `run` reads it off whichever level was addressed:
+
+```python
+app = group("todos", commands=(add, db), version="todos 1.4.2")
+```
+
+That is what lets `todos db --version` report the version of the package that
+shipped the `db` arm and `todos --version` the application's. A level that
+declares no version has not opted in, and `run` rejects the flag there; that
+rejection is `run`'s rule, so `run` is what builds it. A level that declares an
+*option* by one of those names keeps it, which is how a program takes `--version`
+back for itself. No spelling has a standing precedence over another, since the
+scan runs left to right and stops at the first one it meets.
 
 ## What is deliberately absent
 
@@ -321,11 +383,12 @@ and nothing else.
   carries every level's parameters and children), and candidates should be a
   value with the per-shell scripts as separate renderings, but none of it is
   written.
-- **No `--version` flag.** Declare one as an ordinary `flag` for now.
-- **No optional positional.** `argument` requires its value and `rest` takes zero
-  or more; there is nothing in between.
 - **No abbreviation matching, no `--no-` negation, no interspersed parent
   options.** Each is a real convention and none is implemented.
+- **A converter's own placeholder does not reach an option's usage line.**
+  `--profile` shows as `--profile PROFILE` even when `choice(Profile)` names
+  itself `[dev|prod]`, because an option's placeholder is derived from its name;
+  the rejection message uses the converter's. Pass `metavar=` to override.
 - **A rejection reports the leaf's usage**, even when the option that failed was
   declared by an ancestor, because extraction runs the whole path at once and
   does not record which level raised.

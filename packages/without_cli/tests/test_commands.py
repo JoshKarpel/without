@@ -16,11 +16,13 @@ from without_cli import Streams
 from without_cli import argument
 from without_cli import command
 from without_cli import count
+from without_cli import default
 from without_cli import group
+from without_cli import many
 from without_cli import once
 from without_cli import option
+from without_cli import optional
 from without_cli import parse_argv
-from without_cli import rest
 from without_cli import source_paths
 
 from .helpers import Database
@@ -33,16 +35,26 @@ from .helpers import unreached
 
 class TestDeclaration:
     def test_two_variadic_positionals_are_refused(self) -> None:
-        with pytest.raises(DeclarationError, match="more than one `rest`"):
-            command("bad", rest("a", STR), rest("b", STR))
+        with pytest.raises(DeclarationError, match="more than one `many` argument"):
+            command("bad", argument("a", many(STR)), argument("b", many(STR)))
 
     def test_a_variadic_positional_must_come_last(self) -> None:
         with pytest.raises(DeclarationError, match="not its last positional"):
-            command("bad", rest("a", STR), argument("b", STR))
+            command("bad", argument("a", many(STR)), argument("b", once(STR)))
+
+    def test_a_required_positional_cannot_follow_an_optional_one(self) -> None:
+        # With one bare token to hand out, the greedy assignment would give it to
+        # `a` and leave `b` empty, so the layout can never be satisfied.
+        with pytest.raises(DeclarationError, match="required argument after an optional one"):
+            command("bad", argument("a", optional(STR)), argument("b", once(STR)))
+
+    def test_a_defaulted_positional_also_counts_as_optional(self) -> None:
+        with pytest.raises(DeclarationError, match="required argument after an optional one"):
+            command("bad", argument("a", default("x", STR)), argument("b", once(STR)))
 
     def test_two_positionals_cannot_share_a_name(self) -> None:
         with pytest.raises(DeclarationError, match="same name"):
-            command("bad", argument("a", STR), argument("a", INT))
+            command("bad", argument("a", once(STR)), argument("a", once(INT)))
 
     def test_a_level_with_no_commands_is_refused(self) -> None:
         with pytest.raises(DeclarationError, match="declares no commands"):
@@ -57,7 +69,7 @@ class TestDeclaration:
     def test_a_level_with_subcommands_cannot_take_positionals(self) -> None:
         leaf = command("leaf")(unreached)
         with pytest.raises(DeclarationError, match="cannot also declare positional"):
-            group("app", argument("oops", STR), state=_never, commands=(leaf,))
+            group("app", argument("oops", once(STR)), state=_never, commands=(leaf,))
 
     def test_options_with_nothing_to_parse_them_into_are_refused(self) -> None:
         # A program with no `state` has nowhere to put its own options, so
@@ -83,6 +95,39 @@ class TestArmsAreValues:
         assert add.summary == "Add a todo."
         assert [p.metavar for p in add.positionals] == ["TEXT"]
         assert [o.canonical for o in add.options] == ["--tag", "--loud"]
+
+    def test_a_command_with_no_summary_describes_itself_from_its_docstring(self) -> None:
+        async def handler(streams: Streams) -> int:
+            """Trim the backlog."""
+            return 0
+
+        assert command("prune")(handler).node.summary == "Trim the backlog."
+
+    def test_a_docstring_opening_on_the_next_line_reads_the_same(self) -> None:
+        async def handler(streams: Streams) -> int:
+            """
+            Trim the backlog.
+
+            The rest of the docstring is for whoever reads the code, not for
+            `--help`, so only the first line crosses.
+            """
+            return 0
+
+        assert command("prune")(handler).node.summary == "Trim the backlog."
+
+    def test_an_explicit_summary_beats_the_docstring(self) -> None:
+        async def handler(streams: Streams) -> int:
+            """Words for the next reader of the code."""
+            return 0
+
+        arm = command("prune", summary="Words for the person running it.")(handler)
+        assert arm.node.summary == "Words for the person running it."
+
+    def test_a_command_with_neither_has_no_summary(self) -> None:
+        async def handler(streams: Streams) -> int:
+            return 0
+
+        assert command("prune")(handler).node.summary == ""
 
     def test_the_canonical_name_is_the_long_one_whichever_order_it_is_written(self) -> None:
         [short_first] = option(("-t", "--tag"), once(STR)).parameters
@@ -176,7 +221,7 @@ class TestStateLifetime:
             opened.append("opened")
             yield Session.opened(streams, endpoint=endpoint, verbosity=0)
 
-        @command("go", argument("count", INT))
+        @command("go", argument("count", once(INT)))
         async def go(state: Session, number: int) -> int:
             state.stdout.write(f"{state.endpoint}:{number}")
             return 0

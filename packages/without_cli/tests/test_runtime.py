@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from without_cli import STR
+from without_cli import Answered
 from without_cli import FromEnv
 from without_cli import FromFile
 from without_cli import Streams
@@ -11,10 +12,12 @@ from without_cli import command
 from without_cli import group
 from without_cli import once
 from without_cli import option
+from without_cli import parse_argv
 from without_cli import read_files
 from without_cli import run
 
 from .helpers import build
+from .helpers import unreached
 
 
 class TestRun:
@@ -28,6 +31,30 @@ class TestRun:
         assert run(build(), argv=["--help"], env={}, streams=capture.streams) == 0
         assert capture.stdout.startswith("usage: todos [OPTIONS] COMMAND")
         assert capture.stderr == ""
+
+    def test_a_version_goes_to_stdout_with_a_zero_code(self) -> None:
+        app = group("app", commands=(command("show")(unreached),), version="app 1.4.2")
+        capture = Streams.captured()
+        assert run(app, argv=["--version"], env={}, streams=capture.streams) == 0
+        assert capture.stdout == "app 1.4.2\n"
+        assert capture.stderr == ""
+
+    def test_a_version_on_a_level_that_declares_none_is_this_shells_rejection(self) -> None:
+        # The parser stopped without an opinion; refusing an unversioned level is
+        # `run`'s rule, so `run` is where the rejection is built.
+        app = group("app", commands=(command("show")(unreached),))
+        capture = Streams.captured()
+        assert run(app, argv=["--version"], env={}, streams=capture.streams) == 2
+        assert capture.stdout == ""
+        assert "unknown option --version" in capture.stderr
+
+    def test_a_shell_can_answer_its_own_spellings_without_touching_the_parser(self) -> None:
+        # The point of moving the policy out: this whole alternative shell is the
+        # `parse_argv` call plus a match, and `without-cli` knows none of it.
+        app = group("app", commands=(command("show")(unreached),))
+        outcome = parse_argv(app, argv=["--license"], answered=("--license", "-?"))
+        assert isinstance(outcome, Answered)
+        assert outcome.spelling == "--license"
 
     def test_a_bad_command_line_goes_to_stderr_with_code_two(self) -> None:
         capture = Streams.captured()

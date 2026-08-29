@@ -3,12 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from without_cli import ANSWERED
 from without_cli import INT
 from without_cli import STR
+from without_cli import Answered
+from without_cli import Arm
 from without_cli import Bound
 from without_cli import FromEnv
 from without_cli import FromFile
-from without_cli import Helped
 from without_cli import Rejected
 from without_cli import Streams
 from without_cli import argument
@@ -17,11 +19,12 @@ from without_cli import count
 from without_cli import default
 from without_cli import flag
 from without_cli import group
+from without_cli import many
 from without_cli import once
 from without_cli import option
+from without_cli import optional
 from without_cli import parse_argv
 from without_cli import render_rejection
-from without_cli import rest
 
 from .helpers import build
 from .helpers import unreached
@@ -116,13 +119,14 @@ class TestSelection:
         assert capture.stdout == "migrate d -> 3\n"
 
     @pytest.mark.parametrize("argv", [["--help"], ["-h"], ["add", "--help"], ["db", "migrate", "--help"]])
-    async def test_help_is_an_outcome_not_an_error(self, argv: list[str]) -> None:
-        assert isinstance(parse_argv(build(), argv=argv), Helped)
+    async def test_an_answered_spelling_is_an_outcome_not_an_error(self, argv: list[str]) -> None:
+        assert isinstance(parse_argv(build(), argv=argv, answered=ANSWERED), Answered)
 
-    async def test_help_wins_over_a_missing_required_option(self) -> None:
+    async def test_an_answered_spelling_wins_over_a_missing_required_option(self) -> None:
         # `--dsn` is required, but asking for help must still answer rather than
-        # complain about the thing you were asking how to spell.
-        assert isinstance(parse_argv(build(), argv=["db", "migrate", "--help"]), Helped)
+        # complain about the thing you were asking how to spell. This is why the
+        # scan stops rather than a token doing the work: extraction has not run.
+        assert isinstance(parse_argv(build(), argv=["db", "migrate", "--help"], answered=ANSWERED), Answered)
 
 
 class TestSources:
@@ -213,7 +217,7 @@ class TestSources:
 
         outcome = parse_argv(app, argv=["show"], env={})
         assert isinstance(outcome, Rejected)
-        assert outcome.message == "--token: expected a value, got none"
+        assert outcome.message == "--token: expected a value"
 
     async def test_a_flag_can_be_turned_off_by_a_source(self) -> None:
         loud = flag("--loud", sources=(FromEnv("LOUD"),))
@@ -288,10 +292,55 @@ class TestPositionals:
 
     async def test_a_missing_required_positional_is_rejected(self) -> None:
         rejected = _rejected(["add"])
-        assert rejected.message == "text: expected a value for TEXT"
+        assert rejected.message == "text: expected a value"
+
+    @pytest.mark.parametrize(
+        ("argv", "expected"),
+        [
+            (["move", "src"], "src->None"),
+            (["move", "src", "dst"], "src->dst"),
+        ],
+    )
+    async def test_an_optional_positional_may_be_omitted(self, argv: list[str], expected: str) -> None:
+        @command("move", argument("source", once(STR)), argument("target", optional(STR)))
+        async def move(state: Streams, source: str, target: str | None) -> int:
+            state.stdout.write(f"{source}->{target}")
+            return 0
+
+        app = group("app", commands=(move,))
+        capture = Streams.captured()
+        outcome = parse_argv(app, argv=argv)
+        assert isinstance(outcome, Bound)
+        await outcome.action(capture.streams)
+        assert capture.stdout == expected
+
+    async def test_a_defaulted_positional_supplies_its_value_when_omitted(self) -> None:
+        @command("serve", argument("port", default(8080, INT)))
+        async def serve(state: Streams, port: int) -> int:
+            state.stdout.write(f"{port}")
+            return 0
+
+        app = group("app", commands=(serve,))
+        capture = Streams.captured()
+        outcome = parse_argv(app, argv=["serve"])
+        assert isinstance(outcome, Bound)
+        await outcome.action(capture.streams)
+        assert capture.stdout == "8080"
+
+    async def test_an_optional_positional_still_parses_what_it_is_given(self) -> None:
+        # Absence is the only thing the cardinality changes: a value that is
+        # present goes through the same converter a required one would.
+        @command("serve", argument("port", optional(INT)))
+        async def serve(state: Streams, port: int | None) -> int:  # pragma: no cover - never reached
+            return 0
+
+        app = group("app", commands=(serve,))
+        outcome = parse_argv(app, argv=["serve", "http"])
+        assert isinstance(outcome, Rejected)
+        assert outcome.message == "port: expected INT, got 'http'"
 
     async def test_positionals_fill_in_declaration_order(self) -> None:
-        @command("pair", argument("first", STR), argument("second", STR), rest("others", STR))
+        @command("pair", argument("first", once(STR)), argument("second", once(STR)), argument("others", many(STR)))
         async def pair(state: Streams, first: str, second: str, others: tuple[str, ...]) -> int:
             state.stdout.write(f"{first}/{second}/{others}")
             return 0
@@ -302,6 +351,59 @@ class TestPositionals:
         assert isinstance(outcome, Bound)
         await outcome.action(capture.streams)
         assert capture.stdout == "a/b/('c', 'd')"
+
+
+def _tree() -> Arm[Streams]:
+    leaf = command("migrate")(unreached)
+    shipped = group("db", commands=(leaf,), version="db-plugin 2.0")
+    return group("app", commands=(command("show")(unreached), shipped), version="app 1.4.2")
+
+
+class TestAnswered:
+    def test_nothing_is_answered_unless_the_caller_asks(self) -> None:
+        # The parser holds no opinion of its own: `--help` is an option nobody
+        # declared until a caller names it.
+        outcome = parse_argv(_tree(), argv=["--help"])
+        assert isinstance(outcome, Rejected)
+        assert outcome.message == "unknown option --help"
+
+    def test_the_spelling_met_comes_back_verbatim(self) -> None:
+        outcome = parse_argv(_tree(), argv=["-h"], answered=ANSWERED)
+        assert isinstance(outcome, Answered)
+        assert outcome.spelling == "-h"
+
+    def test_the_addressed_level_comes_back_with_it(self) -> None:
+        # What lets a shell answer per level: `--version` reads this node's own
+        # value, so an arm shipped by another package reports that package's.
+        outcome = parse_argv(_tree(), argv=["db", "--version"], answered=ANSWERED)
+        assert isinstance(outcome, Answered)
+        assert outcome.node.version == "db-plugin 2.0"
+        assert outcome.usage.path == ("app", "db")
+
+    def test_an_arbitrary_spelling_works_with_no_change_to_the_parser(self) -> None:
+        outcome = parse_argv(_tree(), argv=["--license"], answered=("--license",))
+        assert isinstance(outcome, Answered)
+        assert outcome.spelling == "--license"
+
+    def test_a_declared_option_of_the_same_name_wins(self) -> None:
+        # Shadowing is how a program that wants `--version` to mean something
+        # else keeps it, exactly as it already can for `--help`.
+        @command("show", option("--version", once(STR)))
+        async def show(state: Streams, wanted: str) -> int:
+            state.stdout.write(wanted)
+            return 0
+
+        app = group("app", commands=(show,), version="app 1.4.2")
+        assert isinstance(parse_argv(app, argv=["show", "--version", "3"], answered=ANSWERED), Bound)
+
+    def test_whichever_spelling_is_written_first_answers(self) -> None:
+        # The scan runs left to right and short-circuits, so no spelling has a
+        # standing precedence over another.
+        first = parse_argv(_tree(), argv=["--version", "--help"], answered=ANSWERED)
+        second = parse_argv(_tree(), argv=["--help", "--version"], answered=ANSWERED)
+        assert isinstance(first, Answered)
+        assert isinstance(second, Answered)
+        assert (first.spelling, second.spelling) == ("--version", "--help")
 
 
 class TestCardinalities:

@@ -21,8 +21,6 @@ from without_cli.usage import Usage
 from without_cli.usage import render
 from without_cli.usage import usage
 
-_HELP = ("-h", "--help")
-
 # Shared empty defaults, so `parse_argv` can be called with only an argv while
 # keeping its signature free of a mutable default.
 _NO_ENV: Mapping[str, str] = MappingProxyType({})
@@ -49,10 +47,35 @@ class Bound(Generic[_T_contra]):  # noqa: UP046 - PEP 695 infers a frozen datacl
 
 
 @dataclass(frozen=True, slots=True)
-class Helped:
-    """The invocation asked for help. Not an error: `run` writes it to stdout and exits `0`."""
+class Answered:
+    """
+    The scan met one of the caller's `answered` spellings, so nothing was bound.
 
-    usage: Usage
+    This layer holds no opinion about what any spelling *means*: it reports which
+    one it met and which level it was addressed to, and the shell decides whether
+    `--help` prints usage, `--version` reads `node.version`, or `--license` prints
+    something else entirely. That is why there is one outcome here rather than one
+    per flag, and why adding a flag needs no change below `run`.
+
+    Stopping has to happen in the scan even though deciding does not, because only
+    the scan knows whether a token is a flag or the value of the option before it,
+    and because a level's required options have not been checked yet: that is what
+    lets `prog db migrate --help` answer instead of complaining about the `--dsn`
+    you were asking how to spell.
+    """
+
+    spelling: str
+    path: tuple[Node, ...]
+
+    @property
+    def node(self) -> Node:
+        """The level the spelling was addressed to, whose `version` a shell may read."""
+        return self.path[-1]
+
+    @property
+    def usage(self) -> Usage:
+        """That level's usage, for a shell answering with help."""
+        return usage(self.path)
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +93,7 @@ class Rejected:
     usage: Usage
 
 
-type Outcome[T] = Bound[T] | Helped | Rejected
+type Outcome[T] = Bound[T] | Answered | Rejected
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,14 +108,36 @@ class _Refused:
     message: str
 
 
-def _scan(node: Node, argv: Sequence[str], *, stop_at_positional: bool) -> _Scanned | _Refused | None:
+@dataclass(frozen=True, slots=True)
+class _Answered:
+    """The scan met one of the caller's `answered` spellings."""
+
+    spelling: str
+
+
+type _Scan = _Scanned | _Refused | _Answered
+
+
+def _scan(
+    node: Node,
+    argv: Sequence[str],
+    *,
+    stop_at_positional: bool,
+    answered: Sequence[str],
+) -> _Scan:
     """
     Split one level's argv into option occurrences and bare tokens.
 
-    Returns `None` when help was asked for. A level with subcommands stops at the
-    first bare token (that token is the subcommand's name and everything after it
-    belongs to the child), which is what keeps `prog --verbose sub --flag`
-    unambiguous without either level knowing about the other's options.
+    A spelling in `answered` short-circuits the scan, but only where this level
+    has not declared an option by that name: shadowing is how a program that
+    wants `--version` to mean something of its own takes it back. The scan runs
+    left to right and stops at the first one it meets, so no spelling has a
+    standing precedence over another.
+
+    A level with subcommands stops at the first bare token (that token is the
+    subcommand's name and everything after it belongs to the child), which is what
+    keeps `prog --verbose sub --flag` unambiguous without either level knowing
+    about the other's options.
     """
     by_name = {name: option for option in node.options for name in option.names}
     options: dict[str, list[str]] = {}
@@ -113,8 +158,8 @@ def _scan(node: Node, argv: Sequence[str], *, stop_at_positional: bool) -> _Scan
         elif token == "--":
             literal = True
             index += 1
-        elif token in _HELP and token not in by_name:
-            return None
+        elif token in answered and token not in by_name:
+            return _Answered(token)
         elif token.startswith("--"):
             name, separator, inline = token.partition("=")
             option = by_name.get(name)
@@ -209,14 +254,23 @@ def parse_argv[T](
     argv: Sequence[str],
     env: Mapping[str, str] = _NO_ENV,
     files: Mapping[Path, str] = _NO_FILES,
+    answered: Sequence[str] = (),
 ) -> Outcome[T]:
     """
-    Turn a command line into a valid invocation, a help request, or a rejection.
+    Turn a command line into a valid invocation, a rejection, or a stop the caller
+    asked for.
 
-    A pure, total function of its four values, which is what makes the whole
-    parser testable without a process: no `sys.argv`, no `os.environ`, no
-    filesystem, no exit, no output. `env` and `files` are the already-read
-    contents of an option's fallback sources (see `run`, which reads them).
+    A pure, total function of its values, which is what makes the whole parser
+    testable without a process: no `sys.argv`, no `os.environ`, no filesystem, no
+    exit, no output. `env` and `files` are the already-read contents of an
+    option's fallback sources (see `run`, which reads them).
+
+    Nothing here is magic by default. `answered` is the caller's list of spellings
+    that should stop the scan and come back as an `Answered` rather than being
+    parsed, and it is empty unless asked for, so `--help` means nothing to this
+    function on its own. `run` passes the conventional set and decides what each
+    one does; a program wanting `-?`, a `help` subcommand, or nothing at all
+    passes its own list and this function does not change.
 
     Every value is extracted here, so a `Bound` proves the invocation is good and
     nothing has been opened yet when a `Rejected` comes back.
@@ -227,9 +281,9 @@ def parse_argv[T](
     remaining = list(argv)
 
     while True:
-        scanned = _scan(node, remaining, stop_at_positional=bool(node.children))
-        if scanned is None:
-            return Helped(usage(tuple(path)))
+        scanned = _scan(node, remaining, stop_at_positional=bool(node.children), answered=answered)
+        if isinstance(scanned, _Answered):
+            return Answered(scanned.spelling, tuple(path))
         if isinstance(scanned, _Refused):
             return Rejected(scanned.message, usage(tuple(path)))
         options = _merged(node, scanned.options, env, files)
@@ -279,4 +333,4 @@ def render_rejection(rejected: Rejected) -> str:
     )
 
 
-__all__ = ["Bound", "Helped", "Outcome", "Rejected", "parse_argv", "render", "render_rejection"]
+__all__ = ["Answered", "Bound", "Outcome", "Rejected", "parse_argv", "render", "render_rejection"]

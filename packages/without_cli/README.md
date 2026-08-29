@@ -11,7 +11,7 @@ class Session(Streams):
     client: Client
 
 
-@command("add", argument("text", STR), option(("-t", "--tag"), many(STR)), summary="Add a todo.")
+@command("add", argument("text", once(STR)), option(("-t", "--tag"), many(STR)), summary="Add a todo.")
 async def add(session: Session, text: str, tags: tuple[str, ...]) -> int:
     todo = await session.client.create(text, tags)
     session.stdout.write(f"{todo.id}\n")
@@ -42,4 +42,6 @@ nothing. The streams are injected, so a test asserts on output by passing
 See the
 [`without-cli` guide](https://without.help/without-cli/)
 (with the [API reference](https://without.help/reference/without_cli/))
-for the full surface, including what is deliberately absent.
+for the full surface, including what is deliberately absent, and
+[alternatives](https://without.help/without-cli/alternatives/) for the same
+program written against argparse, click, and typer.

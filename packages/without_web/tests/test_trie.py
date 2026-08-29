@@ -4,6 +4,7 @@ import pytest
 from without_web import INT
 from without_web import PATH
 from without_web import STR
+from without_web import Converter
 from without_web.patterns import CatchAll
 from without_web.patterns import Literal
 from without_web.patterns import Param
@@ -107,3 +108,52 @@ def test_a_duplicate_route_is_a_build_error() -> None:
 def test_a_segment_after_a_catch_all_is_a_build_error() -> None:
     with pytest.raises(ValueError, match=r"^invalid route: a catch-all must be the last segment$"):
         _tree(((CatchAll("rest", PATH), Literal("more")), "unreachable"))
+
+
+def test_a_route_binds_the_value_from_the_converter_it_declared() -> None:
+    # `_insert` keys a param branch on `(name, converter)`, and `Converter`
+    # compares by `name` alone because `parse` and `schema` are `compare=False`.
+    # So two converters that share a name but not a parse merge onto one node,
+    # `setdefault` keeps whichever was inserted first, and the second route's
+    # handler is handed a value its own converter never produced.
+    #
+    # Every shipped converter is a module-level singleton, which is why this has
+    # not bitten: equal names have always meant the same object. A converter
+    # *factory* (one per enum, say) is what breaks that.
+    first = Converter(name="colour", parse=lambda raw: f"first:{raw}", schema={"type": "string"})
+    second = Converter(name="colour", parse=lambda raw: f"second:{raw}", schema={"type": "string"})
+    tree = _tree(
+        ((Literal("x"), Param("c", first), Literal("one")), "route-one"),
+        ((Literal("x"), Param("c", second), Literal("two")), "route-two"),
+    )
+    found = walk(tree, ("x", "red", "two"))
+    assert found is not None
+    assert found.leaf == "route-two"
+    assert found.params == {"c": "second:red"}
+
+
+def test_a_segment_is_converted_once_when_siblings_share_a_converter() -> None:
+    # The *parameter* name is part of the branch key too, so two params that
+    # differ only in what they bind become siblings that match exactly the same
+    # segments. Reaching `/b` then converts "7" against the `id` branch, dead-ends
+    # under it, and converts the identical segment again against `other`.
+    #
+    # Both routes do resolve; the cost is the redundant conversion, which grows
+    # with the number of same-converter siblings. A trie that keyed the branch on
+    # the converter alone and carried parameter names down to the leaf would
+    # convert each segment once.
+    converted: list[str] = []
+
+    def counting(raw: str) -> int:
+        converted.append(raw)
+        return int(raw)
+
+    number = Converter(name="int", parse=counting, schema={"type": "integer"})
+    tree = _tree(
+        ((Literal("u"), Param("id", number), Literal("a")), "leaf-a"),
+        ((Literal("u"), Param("other", number), Literal("b")), "leaf-b"),
+    )
+    found = walk(tree, ("u", "7", "b"))
+    assert found is not None
+    assert found.leaf == "leaf-b"
+    assert converted == ["7"]

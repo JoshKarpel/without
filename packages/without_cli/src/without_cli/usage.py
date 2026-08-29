@@ -35,11 +35,11 @@ class Usage:
 
     @property
     def invocation(self) -> str:
-        """The one-line synopsis, e.g. `todos add [OPTIONS] TEXT [TAGS...]`."""
+        """The one-line synopsis, e.g. `todos add [OPTIONS] TEXT [NOTE] [TAGS...]`."""
         parts = [" ".join(self.path)]
         if self.options or self.inherited:
             parts.append("[OPTIONS]")
-        parts.extend(f"[{p.metavar}...]" if p.variadic else p.metavar for p in self.positionals)
+        parts.extend(_positional_slot(p) for p in self.positionals)
         if self.commands:
             parts.append("COMMAND [ARGS]...")
         return " ".join(parts)
@@ -61,6 +61,18 @@ def usage(path: tuple[Node, ...]) -> Usage:
         inherited=tuple(option for level in ancestors for option in level.options),
         commands=tuple((child.name, child.summary) for child in node.children),
     )
+
+
+def _positional_slot(positional: Positional) -> str:
+    """
+    One positional's place in the synopsis, bracketed when it may be omitted.
+
+    `TEXT` must be given, `[NOTE]` need not be, and `[PATHS...]` takes whatever
+    is left, which is the convention every parser in this space renders.
+    """
+    if positional.variadic:
+        return f"[{positional.metavar}...]"
+    return positional.metavar if positional.required else f"[{positional.metavar}]"
 
 
 def _annotations(option: Option) -> str:

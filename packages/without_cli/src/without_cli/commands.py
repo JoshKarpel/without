@@ -33,12 +33,18 @@ class Node:
     it. Keeping the description separate from the resolver is also what lets a
     group nest arms whose state type differs from its own without an existential
     type Python cannot express.
+
+    `version` is what this level answers `--version` with, and `None` means it
+    answers nothing: the flag is then an unknown option like any other. Per level
+    rather than per program, so an arm shipped by another package reports that
+    package's version wherever it is mounted.
     """
 
     name: str
     summary: str = ""
     parameters: tuple[Parameter, ...] = ()
     children: tuple[Node, ...] = ()
+    version: str | None = None
 
     @property
     def options(self) -> tuple[Option, ...]:
@@ -120,16 +126,46 @@ class DeclarationError(ValueError):
 
 
 def _positional_layout(name: str, parameters: tuple[Parameter, ...]) -> None:
-    """Refuse a positional layout the binder could not assign unambiguously."""
+    """
+    Refuse a positional layout the binder could not assign unambiguously.
+
+    The binder hands bare tokens to positionals in declaration order and greedily,
+    which is what both rules here protect. A `many` argument takes everything
+    left, so anything after it would never be reached; and a required argument
+    after an optional one is unsatisfiable, because the single token in
+    `prog VALUE` would go to the optional and leave the required one empty.
+    """
     positionals = [p for p in parameters if isinstance(p, Positional)]
     variadic = [index for index, p in enumerate(positionals) if p.variadic]
     if len(variadic) > 1:
-        raise DeclarationError(f"command {name!r} declares more than one `rest` token")
+        raise DeclarationError(f"command {name!r} declares more than one `many` argument")
     if variadic and variadic[0] != len(positionals) - 1:
-        raise DeclarationError(f"command {name!r} declares a `rest` token that is not its last positional")
+        raise DeclarationError(f"command {name!r} declares a `many` argument that is not its last positional")
+    optional = next((index for index, p in enumerate(positionals) if not p.required), None)
+    if optional is not None and any(p.required for p in positionals[optional:]):
+        raise DeclarationError(f"command {name!r} declares a required argument after an optional one")
     names = [p.name for p in positionals]
     if len(set(names)) != len(names):
         raise DeclarationError(f"command {name!r} declares two positionals with the same name")
+
+
+def _first_line(docstring: str | None) -> str:
+    """
+    A handler's docstring reduced to the one line `--help` has room for.
+
+    The first non-blank line, which is the summary line
+    [PEP 257](https://peps.python.org/pep-0257/) already asks every docstring to
+    open with, so this reads an existing convention rather than imposing a new
+    one. Blank-line skipping is what makes a docstring opening after its quotes
+    read the same as one opening on them.
+
+    A first line that does not stand alone is not truncated or reflowed here,
+    because guessing where a summary ends is worse than the author saying: that
+    command passes `summary=` instead.
+    """
+    if docstring is None:
+        return ""
+    return next((line.strip() for line in docstring.splitlines() if line.strip()), "")
 
 
 def _child_names(name: str, commands: tuple[Arm[Never], ...]) -> None:
@@ -160,6 +196,7 @@ def command[T](
     /,
     *,
     summary: str = ...,
+    version: str | None = ...,
 ) -> Callable[[Callable[[T], Returned]], Arm[T]]: ...
 
 
@@ -170,6 +207,7 @@ def command[T, A](
     /,
     *,
     summary: str = ...,
+    version: str | None = ...,
 ) -> Callable[[Callable[[T, A], Returned]], Arm[T]]: ...
 
 
@@ -181,6 +219,7 @@ def command[T, A, B](
     /,
     *,
     summary: str = ...,
+    version: str | None = ...,
 ) -> Callable[[Callable[[T, A, B], Returned]], Arm[T]]: ...
 
 
@@ -193,6 +232,7 @@ def command[T, A, B, C](
     /,
     *,
     summary: str = ...,
+    version: str | None = ...,
 ) -> Callable[[Callable[[T, A, B, C], Returned]], Arm[T]]: ...
 
 
@@ -206,6 +246,7 @@ def command[T, A, B, C, D](
     /,
     *,
     summary: str = ...,
+    version: str | None = ...,
 ) -> Callable[[Callable[[T, A, B, C, D], Returned]], Arm[T]]: ...
 
 
@@ -220,6 +261,7 @@ def command[T, A, B, C, D, E](
     /,
     *,
     summary: str = ...,
+    version: str | None = ...,
 ) -> Callable[[Callable[[T, A, B, C, D, E], Returned]], Arm[T]]: ...
 
 
@@ -235,6 +277,7 @@ def command[T, A, B, C, D, E, F](
     /,
     *,
     summary: str = ...,
+    version: str | None = ...,
 ) -> Callable[[Callable[[T, A, B, C, D, E, F], Returned]], Arm[T]]: ...
 
 
@@ -251,6 +294,7 @@ def command[T, A, B, C, D, E, F, G](
     /,
     *,
     summary: str = ...,
+    version: str | None = ...,
 ) -> Callable[[Callable[[T, A, B, C, D, E, F, G], Returned]], Arm[T]]: ...
 
 
@@ -268,6 +312,7 @@ def command[T, A, B, C, D, E, F, G, H](
     /,
     *,
     summary: str = ...,
+    version: str | None = ...,
 ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H], Returned]], Arm[T]]: ...
 
 
@@ -286,6 +331,7 @@ def command[T, A, B, C, D, E, F, G, H, J](
     /,
     *,
     summary: str = ...,
+    version: str | None = ...,
 ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J], Returned]], Arm[T]]: ...
 
 
@@ -305,12 +351,269 @@ def command[T, A, B, C, D, E, F, G, H, J, K](
     /,
     *,
     summary: str = ...,
+    version: str | None = ...,
 ) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J, K], Returned]], Arm[T]]: ...
+
+
+@overload
+def command[T, A, B, C, D, E, F, G, H, J, K, N](
+    name: str,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    /,
+    *,
+    summary: str = ...,
+    version: str | None = ...,
+) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J, K, N], Returned]], Arm[T]]: ...
+
+
+@overload
+def command[T, A, B, C, D, E, F, G, H, J, K, N, P](
+    name: str,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    /,
+    *,
+    summary: str = ...,
+    version: str | None = ...,
+) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J, K, N, P], Returned]], Arm[T]]: ...
+
+
+@overload
+def command[T, A, B, C, D, E, F, G, H, J, K, N, P, Q](
+    name: str,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    /,
+    *,
+    summary: str = ...,
+    version: str | None = ...,
+) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J, K, N, P, Q], Returned]], Arm[T]]: ...
+
+
+@overload
+def command[T, A, B, C, D, E, F, G, H, J, K, N, P, Q, R](
+    name: str,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    r: Extractor[R],
+    /,
+    *,
+    summary: str = ...,
+    version: str | None = ...,
+) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J, K, N, P, Q, R], Returned]], Arm[T]]: ...
+
+
+@overload
+def command[T, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S](
+    name: str,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    r: Extractor[R],
+    s: Extractor[S],
+    /,
+    *,
+    summary: str = ...,
+    version: str | None = ...,
+) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S], Returned]], Arm[T]]: ...
+
+
+@overload
+def command[T, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V](
+    name: str,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    r: Extractor[R],
+    s: Extractor[S],
+    v: Extractor[V],
+    /,
+    *,
+    summary: str = ...,
+    version: str | None = ...,
+) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V], Returned]], Arm[T]]: ...
+
+
+@overload
+def command[T, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W](
+    name: str,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    r: Extractor[R],
+    s: Extractor[S],
+    v: Extractor[V],
+    w: Extractor[W],
+    /,
+    *,
+    summary: str = ...,
+    version: str | None = ...,
+) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W], Returned]], Arm[T]]: ...
+
+
+@overload
+def command[T, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W, X](
+    name: str,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    r: Extractor[R],
+    s: Extractor[S],
+    v: Extractor[V],
+    w: Extractor[W],
+    x: Extractor[X],
+    /,
+    *,
+    summary: str = ...,
+    version: str | None = ...,
+) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W, X], Returned]], Arm[T]]: ...
+
+
+@overload
+def command[T, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W, X, Y](
+    name: str,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    r: Extractor[R],
+    s: Extractor[S],
+    v: Extractor[V],
+    w: Extractor[W],
+    x: Extractor[X],
+    y: Extractor[Y],
+    /,
+    *,
+    summary: str = ...,
+    version: str | None = ...,
+) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W, X, Y], Returned]], Arm[T]]: ...
+
+
+@overload
+def command[T, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W, X, Y, Z](
+    name: str,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    r: Extractor[R],
+    s: Extractor[S],
+    v: Extractor[V],
+    w: Extractor[W],
+    x: Extractor[X],
+    y: Extractor[Y],
+    z: Extractor[Z],
+    /,
+    *,
+    summary: str = ...,
+    version: str | None = ...,
+) -> Callable[[Callable[[T, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W, X, Y, Z], Returned]], Arm[T]]: ...
 # [[[end]]]
 def command(
     name: str,
     *extractors: AnyExtractor,
     summary: str = "",
+    version: str | None = None,
 ) -> Callable[[Callable[..., Returned]], Arm[Never]]:
     """
     Bind a handler to a name and a list of tokens, producing an `Arm` value.
@@ -325,6 +628,14 @@ def command(
     program built. The overloads tie the token types to those parameters, so a
     `argument("id", INT)` paired with a handler expecting a `str` is a mypy error
     with no runtime introspection anywhere.
+
+    `summary` is the one line `--help` shows beside the command's name. Omitting
+    it falls back to the first line of the handler's docstring, so a command
+    documented for the next reader of the code is documented for its user too;
+    passing it explicitly wins, for when those two readers want different words.
+
+    `version`, when given, is what `--version` answers with here. Omitting it
+    means this command has none and `--version` is an unknown option.
     """
     parameters = tuple(p for extractor in extractors for p in extractor.parameters)
     _positional_layout(name, parameters)
@@ -340,7 +651,9 @@ def command(
 
             return cast(Action[Never], action)
 
-        return Arm(node=Node(name=name, summary=summary, parameters=parameters), resolve=resolve)
+        described = summary or _first_line(fn.__doc__)
+        node = Node(name=name, summary=described, parameters=parameters, version=version)
+        return Arm(node=node, resolve=resolve)
 
     return bind
 
@@ -354,6 +667,7 @@ def group[T, U](
     state: Callable[[T], AbstractAsyncContextManager[U]],
     commands: tuple[Arm[U], ...],
     summary: str = ...,
+    version: str | None = ...,
 ) -> Arm[T]: ...
 
 
@@ -366,6 +680,7 @@ def group[T, U, A](
     state: Callable[[T, A], AbstractAsyncContextManager[U]],
     commands: tuple[Arm[U], ...],
     summary: str = ...,
+    version: str | None = ...,
 ) -> Arm[T]: ...
 
 
@@ -379,6 +694,7 @@ def group[T, U, A, B](
     state: Callable[[T, A, B], AbstractAsyncContextManager[U]],
     commands: tuple[Arm[U], ...],
     summary: str = ...,
+    version: str | None = ...,
 ) -> Arm[T]: ...
 
 
@@ -393,6 +709,7 @@ def group[T, U, A, B, C](
     state: Callable[[T, A, B, C], AbstractAsyncContextManager[U]],
     commands: tuple[Arm[U], ...],
     summary: str = ...,
+    version: str | None = ...,
 ) -> Arm[T]: ...
 
 
@@ -408,6 +725,7 @@ def group[T, U, A, B, C, D](
     state: Callable[[T, A, B, C, D], AbstractAsyncContextManager[U]],
     commands: tuple[Arm[U], ...],
     summary: str = ...,
+    version: str | None = ...,
 ) -> Arm[T]: ...
 
 
@@ -424,6 +742,7 @@ def group[T, U, A, B, C, D, E](
     state: Callable[[T, A, B, C, D, E], AbstractAsyncContextManager[U]],
     commands: tuple[Arm[U], ...],
     summary: str = ...,
+    version: str | None = ...,
 ) -> Arm[T]: ...
 
 
@@ -441,6 +760,7 @@ def group[T, U, A, B, C, D, E, F](
     state: Callable[[T, A, B, C, D, E, F], AbstractAsyncContextManager[U]],
     commands: tuple[Arm[U], ...],
     summary: str = ...,
+    version: str | None = ...,
 ) -> Arm[T]: ...
 
 
@@ -459,6 +779,7 @@ def group[T, U, A, B, C, D, E, F, G](
     state: Callable[[T, A, B, C, D, E, F, G], AbstractAsyncContextManager[U]],
     commands: tuple[Arm[U], ...],
     summary: str = ...,
+    version: str | None = ...,
 ) -> Arm[T]: ...
 
 
@@ -478,6 +799,7 @@ def group[T, U, A, B, C, D, E, F, G, H](
     state: Callable[[T, A, B, C, D, E, F, G, H], AbstractAsyncContextManager[U]],
     commands: tuple[Arm[U], ...],
     summary: str = ...,
+    version: str | None = ...,
 ) -> Arm[T]: ...
 
 
@@ -498,6 +820,7 @@ def group[T, U, A, B, C, D, E, F, G, H, J](
     state: Callable[[T, A, B, C, D, E, F, G, H, J], AbstractAsyncContextManager[U]],
     commands: tuple[Arm[U], ...],
     summary: str = ...,
+    version: str | None = ...,
 ) -> Arm[T]: ...
 
 
@@ -519,6 +842,282 @@ def group[T, U, A, B, C, D, E, F, G, H, J, K](
     state: Callable[[T, A, B, C, D, E, F, G, H, J, K], AbstractAsyncContextManager[U]],
     commands: tuple[Arm[U], ...],
     summary: str = ...,
+    version: str | None = ...,
+) -> Arm[T]: ...
+
+
+@overload
+def group[T, U, A, B, C, D, E, F, G, H, J, K, N](
+    name: str,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    /,
+    *,
+    state: Callable[[T, A, B, C, D, E, F, G, H, J, K, N], AbstractAsyncContextManager[U]],
+    commands: tuple[Arm[U], ...],
+    summary: str = ...,
+    version: str | None = ...,
+) -> Arm[T]: ...
+
+
+@overload
+def group[T, U, A, B, C, D, E, F, G, H, J, K, N, P](
+    name: str,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    /,
+    *,
+    state: Callable[[T, A, B, C, D, E, F, G, H, J, K, N, P], AbstractAsyncContextManager[U]],
+    commands: tuple[Arm[U], ...],
+    summary: str = ...,
+    version: str | None = ...,
+) -> Arm[T]: ...
+
+
+@overload
+def group[T, U, A, B, C, D, E, F, G, H, J, K, N, P, Q](
+    name: str,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    /,
+    *,
+    state: Callable[[T, A, B, C, D, E, F, G, H, J, K, N, P, Q], AbstractAsyncContextManager[U]],
+    commands: tuple[Arm[U], ...],
+    summary: str = ...,
+    version: str | None = ...,
+) -> Arm[T]: ...
+
+
+@overload
+def group[T, U, A, B, C, D, E, F, G, H, J, K, N, P, Q, R](
+    name: str,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    r: Extractor[R],
+    /,
+    *,
+    state: Callable[[T, A, B, C, D, E, F, G, H, J, K, N, P, Q, R], AbstractAsyncContextManager[U]],
+    commands: tuple[Arm[U], ...],
+    summary: str = ...,
+    version: str | None = ...,
+) -> Arm[T]: ...
+
+
+@overload
+def group[T, U, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S](
+    name: str,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    r: Extractor[R],
+    s: Extractor[S],
+    /,
+    *,
+    state: Callable[[T, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S], AbstractAsyncContextManager[U]],
+    commands: tuple[Arm[U], ...],
+    summary: str = ...,
+    version: str | None = ...,
+) -> Arm[T]: ...
+
+
+@overload
+def group[T, U, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V](
+    name: str,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    r: Extractor[R],
+    s: Extractor[S],
+    v: Extractor[V],
+    /,
+    *,
+    state: Callable[[T, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V], AbstractAsyncContextManager[U]],
+    commands: tuple[Arm[U], ...],
+    summary: str = ...,
+    version: str | None = ...,
+) -> Arm[T]: ...
+
+
+@overload
+def group[T, U, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W](
+    name: str,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    r: Extractor[R],
+    s: Extractor[S],
+    v: Extractor[V],
+    w: Extractor[W],
+    /,
+    *,
+    state: Callable[[T, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W], AbstractAsyncContextManager[U]],
+    commands: tuple[Arm[U], ...],
+    summary: str = ...,
+    version: str | None = ...,
+) -> Arm[T]: ...
+
+
+@overload
+def group[T, U, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W, X](
+    name: str,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    r: Extractor[R],
+    s: Extractor[S],
+    v: Extractor[V],
+    w: Extractor[W],
+    x: Extractor[X],
+    /,
+    *,
+    state: Callable[[T, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W, X], AbstractAsyncContextManager[U]],
+    commands: tuple[Arm[U], ...],
+    summary: str = ...,
+    version: str | None = ...,
+) -> Arm[T]: ...
+
+
+@overload
+def group[T, U, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W, X, Y](
+    name: str,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    r: Extractor[R],
+    s: Extractor[S],
+    v: Extractor[V],
+    w: Extractor[W],
+    x: Extractor[X],
+    y: Extractor[Y],
+    /,
+    *,
+    state: Callable[[T, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W, X, Y], AbstractAsyncContextManager[U]],
+    commands: tuple[Arm[U], ...],
+    summary: str = ...,
+    version: str | None = ...,
+) -> Arm[T]: ...
+
+
+@overload
+def group[T, U, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W, X, Y, Z](
+    name: str,
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    r: Extractor[R],
+    s: Extractor[S],
+    v: Extractor[V],
+    w: Extractor[W],
+    x: Extractor[X],
+    y: Extractor[Y],
+    z: Extractor[Z],
+    /,
+    *,
+    state: Callable[[T, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W, X, Y, Z], AbstractAsyncContextManager[U]],
+    commands: tuple[Arm[U], ...],
+    summary: str = ...,
+    version: str | None = ...,
 ) -> Arm[T]: ...
 # [[[end]]]
 @overload
@@ -528,6 +1127,7 @@ def group[T](
     *,
     commands: tuple[Arm[T], ...],
     summary: str = ...,
+    version: str | None = ...,
 ) -> Arm[T]: ...
 def group(
     name: str,
@@ -535,6 +1135,7 @@ def group(
     state: Callable[..., AbstractAsyncContextManager[object]] | None = None,
     commands: tuple[Arm[Never], ...],
     summary: str = "",
+    version: str | None = None,
 ) -> Arm[Never]:
     """
     Gather arms under a name, deriving their state from its parent's and this
@@ -559,8 +1160,12 @@ def group(
 
     A group declares options but never positionals: a bare token after a group is
     the name of its subcommand, so the two would be indistinguishable.
+
+    `version`, when given, is what `--version` answers with at this level. It is
+    per level rather than per program, so `prog --version` and `prog db --version`
+    can report the version of whatever package shipped each of them.
     """
-    return _nest(name, extractors, state, commands, summary)
+    return _nest(name, extractors, state, commands, summary, version)
 
 
 def _nest(
@@ -569,6 +1174,7 @@ def _nest(
     state: Callable[..., AbstractAsyncContextManager[object]] | None,
     commands: tuple[Arm[Never], ...],
     summary: str,
+    version: str | None,
 ) -> Arm[Never]:
     """The body of `group`, shared by its stateful and pure-namespacing forms."""
     parameters = tuple(p for extractor in extractors for p in extractor.parameters)
@@ -581,6 +1187,7 @@ def _nest(
         summary=summary,
         parameters=parameters,
         children=tuple(arm.node for arm in commands),
+        version=version,
     )
     by_name = {arm.node.name: arm for arm in commands}
 

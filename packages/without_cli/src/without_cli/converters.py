@@ -4,6 +4,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field
+from enum import Enum
 from pathlib import Path
 from typing import Generic
 from typing import TypeVar
@@ -49,6 +50,32 @@ def parse_boolean(text: str) -> bool:
     if lowered in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"expected a boolean, got {text!r}")
+
+
+def choice[E: Enum](enum: type[E]) -> Converter[E]:
+    """
+    One member of `enum`, spelled on the command line as that member's value.
+
+    Matching on the *value* rather than the member name is what lets the shell
+    spelling and the Python identifier differ, which they usually want to
+    (`--log-level warning` for `LogLevel.WARNING`). Values are compared as text,
+    so a `StrEnum`, an `Enum` with string values, and an `IntEnum` all work.
+
+    The placeholder is the alternation of the values (`[dev|prod]`), so the enum
+    is the single place its members, their spellings, and the way `--help` and a
+    rejection name them are declared.
+    """
+    by_value = {str(member.value): member for member in enum}
+    if len(by_value) != len(tuple(enum)):
+        raise ValueError(f"{enum.__name__} has two members whose values are spelled the same on a command line")
+
+    def parse(raw: str) -> E:
+        try:
+            return by_value[raw]
+        except KeyError as exc:
+            raise ValueError(f"{raw!r} is not one of {', '.join(by_value)}") from exc
+
+    return Converter(metavar=f"[{'|'.join(by_value)}]", parse=parse)
 
 
 STR: Converter[str] = Converter(metavar="STR", parse=str)

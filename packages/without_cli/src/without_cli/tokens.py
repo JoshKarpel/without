@@ -16,15 +16,22 @@ from without_cli.sources import Source
 @dataclass(frozen=True, slots=True)
 class Positional:
     """
-    How an `argument`/`rest` token appears in usage and to the binder.
+    How an `argument` token appears in usage and to the binder.
 
-    The binder assigns bare tokens to these in declaration order, so `variadic`
-    (which takes everything left) is only valid as the last one.
+    Mirrors `Option`'s `variadic`/`required` pair, because both are read off the
+    same `Cardinality`: `once` is required, `optional` and `default` are not, and
+    `many` is the variadic one.
+
+    The binder assigns bare tokens to these in declaration order and greedily, so
+    `variadic` (which takes everything left) is only valid as the last one, and a
+    required positional may not follow an optional one: with one token to hand
+    out, `[A] B` would give it to `A` and leave `B` empty.
     """
 
     name: str
     summary: str = ""
     variadic: bool = False
+    required: bool = True
 
     @property
     def metavar(self) -> str:
@@ -162,7 +169,10 @@ def once[V](converter: Converter[V]) -> Cardinality[V]:
             case (value,):
                 return convert(value)
             case ():
-                raise ValueError("expected a value, got none")
+                # The rejection is already prefixed with the parameter it came
+                # from, so naming the value again ("for TEXT", "got none") only
+                # repeats what the reader has just been told.
+                raise ValueError("expected a value")
             case _:
                 raise ValueError(f"expected one value, got {len(values)}")
 
@@ -347,39 +357,30 @@ def count(
     return Extractor(extract, parameters=(spec,))
 
 
-def argument[V](name: str, converter: Converter[V], *, summary: str = "") -> Extractor[V]:
+def argument[V](name: str, cardinality: Cardinality[V], *, summary: str = "") -> Extractor[V]:
     """
-    One positional argument, parsed into `V`.
+    A positional argument, parsed into `V`.
 
-    Positionals are assigned in the order their tokens are declared, so this
-    value is both the usage entry and the typed read, declared exactly once.
+    Takes the same `cardinality` vocabulary an `option` does, so one set of words
+    describes both halves of a command line: `once` is the required single value,
+    `optional` and `default` say what an omitted one becomes, and `many` takes
+    every remaining token (`prog cp SRC DST` against `prog rm PATHS...`).
+
+    Positionals are assigned in declaration order, so this value is both the usage
+    entry and the typed read, declared exactly once. A `many` argument consumes
+    the rest of the command line, so it is valid only as the last positional, and
+    a required one may not follow an optional one; `command` refuses either
+    layout where it is written.
     """
-    spec = Positional(name=name, summary=summary)
-    convert = _converting(converter)
+    spec = Positional(
+        name=name,
+        summary=summary,
+        variadic=cardinality.repeatable,
+        required=cardinality.required,
+    )
 
     def extract(args: Args) -> V:
-        match args.arguments.get(name, ()):
-            case (value,):
-                return _parsed(name, convert, value)
-            case _:
-                raise ExtractionError(f"expected a value for {spec.metavar}", parameter=name)
-
-    return Extractor(extract, parameters=(spec,))
-
-
-def rest[V](name: str, converter: Converter[V], *, summary: str = "") -> Extractor[tuple[V, ...]]:
-    """
-    Every remaining positional argument, possibly none.
-
-    Consumes the rest of the command line, so it is valid only as the last
-    positional a command declares; `command` refuses any other placement when the
-    command is built.
-    """
-    spec = Positional(name=name, summary=summary, variadic=True)
-    convert = _converting(converter)
-
-    def extract(args: Args) -> tuple[V, ...]:
-        return tuple(_parsed(name, convert, value) for value in args.arguments.get(name, ()))
+        return _parsed(name, cardinality.parse, args.arguments.get(name, ()))
 
     return Extractor(extract, parameters=(spec,))
 
@@ -506,6 +507,231 @@ def into[M, A, B, C, D, E, F, G, H, J, K](
     h: Extractor[H],
     j: Extractor[J],
     k: Extractor[K],
+    /,
+) -> Extractor[M]: ...
+
+
+@overload
+def into[M, A, B, C, D, E, F, G, H, J, K, N](
+    make: Callable[[A, B, C, D, E, F, G, H, J, K, N], M],
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    /,
+) -> Extractor[M]: ...
+
+
+@overload
+def into[M, A, B, C, D, E, F, G, H, J, K, N, P](
+    make: Callable[[A, B, C, D, E, F, G, H, J, K, N, P], M],
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    /,
+) -> Extractor[M]: ...
+
+
+@overload
+def into[M, A, B, C, D, E, F, G, H, J, K, N, P, Q](
+    make: Callable[[A, B, C, D, E, F, G, H, J, K, N, P, Q], M],
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    /,
+) -> Extractor[M]: ...
+
+
+@overload
+def into[M, A, B, C, D, E, F, G, H, J, K, N, P, Q, R](
+    make: Callable[[A, B, C, D, E, F, G, H, J, K, N, P, Q, R], M],
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    r: Extractor[R],
+    /,
+) -> Extractor[M]: ...
+
+
+@overload
+def into[M, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S](
+    make: Callable[[A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S], M],
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    r: Extractor[R],
+    s: Extractor[S],
+    /,
+) -> Extractor[M]: ...
+
+
+@overload
+def into[M, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V](
+    make: Callable[[A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V], M],
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    r: Extractor[R],
+    s: Extractor[S],
+    v: Extractor[V],
+    /,
+) -> Extractor[M]: ...
+
+
+@overload
+def into[M, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W](
+    make: Callable[[A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W], M],
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    r: Extractor[R],
+    s: Extractor[S],
+    v: Extractor[V],
+    w: Extractor[W],
+    /,
+) -> Extractor[M]: ...
+
+
+@overload
+def into[M, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W, X](
+    make: Callable[[A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W, X], M],
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    r: Extractor[R],
+    s: Extractor[S],
+    v: Extractor[V],
+    w: Extractor[W],
+    x: Extractor[X],
+    /,
+) -> Extractor[M]: ...
+
+
+@overload
+def into[M, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W, X, Y](
+    make: Callable[[A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W, X, Y], M],
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    r: Extractor[R],
+    s: Extractor[S],
+    v: Extractor[V],
+    w: Extractor[W],
+    x: Extractor[X],
+    y: Extractor[Y],
+    /,
+) -> Extractor[M]: ...
+
+
+@overload
+def into[M, A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W, X, Y, Z](
+    make: Callable[[A, B, C, D, E, F, G, H, J, K, N, P, Q, R, S, V, W, X, Y, Z], M],
+    a: Extractor[A],
+    b: Extractor[B],
+    c: Extractor[C],
+    d: Extractor[D],
+    e: Extractor[E],
+    f: Extractor[F],
+    g: Extractor[G],
+    h: Extractor[H],
+    j: Extractor[J],
+    k: Extractor[K],
+    n: Extractor[N],
+    p: Extractor[P],
+    q: Extractor[Q],
+    r: Extractor[R],
+    s: Extractor[S],
+    v: Extractor[V],
+    w: Extractor[W],
+    x: Extractor[X],
+    y: Extractor[Y],
+    z: Extractor[Z],
     /,
 ) -> Extractor[M]: ...
 # [[[end]]]

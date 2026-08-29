@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
+from enum import IntEnum
+from enum import StrEnum
 
 import pytest
 from without_cli import BOOL
@@ -17,6 +20,7 @@ from without_cli import Positional
 from without_cli import Rejected
 from without_cli import Streams
 from without_cli import argument
+from without_cli import choice
 from without_cli import command
 from without_cli import flag
 from without_cli import group
@@ -26,6 +30,21 @@ from without_cli import option
 from without_cli import parse_argv
 
 from .helpers import unreached
+
+
+class Profile(StrEnum):
+    DEV = "dev"
+    PROD = "prod"
+
+
+class Colour(Enum):
+    RED = "red"
+    BLUE = "blue"
+
+
+class Level(IntEnum):
+    LOW = 1
+    HIGH = 9
 
 
 class TestConverters:
@@ -53,6 +72,37 @@ class TestConverters:
         with pytest.raises(ValueError, match="expected a boolean"):
             BOOL.parse(raw)
 
+    @pytest.mark.parametrize(
+        ("enum", "raw", "expected"),
+        [
+            (Profile, "prod", Profile.PROD),
+            (Colour, "blue", Colour.BLUE),
+            (Level, "9", Level.HIGH),
+        ],
+    )
+    def test_choice_parses_a_member_by_its_value(self, enum: type[Enum], raw: str, expected: Enum) -> None:
+        # Values, not member names, so the shell spelling and the Python
+        # identifier are free to differ.
+        assert choice(enum).parse(raw) == expected
+
+    def test_choice_names_the_alternation_it_accepts(self) -> None:
+        assert choice(Profile).metavar == "[dev|prod]"
+        assert choice(Level).metavar == "[1|9]"
+
+    def test_choice_refuses_a_value_outside_the_enum(self) -> None:
+        with pytest.raises(ValueError, match="'staging' is not one of dev, prod"):
+            choice(Profile).parse("staging")
+
+    def test_choice_refuses_an_enum_whose_members_share_a_spelling(self) -> None:
+        # `Ambiguous.TEXT` is unreachable from a command line, because the raw
+        # `"1"` that would select it already selects `Ambiguous.NUMBER`.
+        class Ambiguous(Enum):
+            NUMBER = 1
+            TEXT = "1"
+
+        with pytest.raises(ValueError, match="two members whose values are spelled the same"):
+            choice(Ambiguous)
+
     def test_converters_compare_by_their_placeholder(self) -> None:
         # Equality ignores `parse` so a converter can be a dictionary key and a
         # trie-style comparison, matching how `without-web` treats its own.
@@ -76,7 +126,7 @@ class TestRejectionAttribution:
             raise ExtractionError("no such profile", parameter="profile")
 
         profile = Converter(metavar="PROFILE", parse=refuse)
-        app = group("app", commands=(command("show", argument("name", profile))(unreached),))
+        app = group("app", commands=(command("show", argument("name", once(profile)))(unreached),))
         outcome = parse_argv(app, argv=["show", "anything"])
         assert isinstance(outcome, Rejected)
         assert outcome.message == "profile: no such profile"
@@ -88,7 +138,7 @@ class TestRejectionAttribution:
             raise TypeError("a bug, not a bad argument")
 
         broken = Converter(metavar="BROKEN", parse=explode)
-        app = group("app", commands=(command("show", argument("name", broken))(unreached),))
+        app = group("app", commands=(command("show", argument("name", once(broken)))(unreached),))
         with pytest.raises(TypeError, match="a bug"):
             parse_argv(app, argv=["show", "anything"])
 
@@ -102,7 +152,7 @@ class Filter:
 
 class TestInto:
     async def test_tokens_combine_into_one_typed_value(self) -> None:
-        combined = into(Filter, argument("name", STR), option("--limit", once(INT)), flag("--loud"))
+        combined = into(Filter, argument("name", once(STR)), option("--limit", once(INT)), flag("--loud"))
 
         @command("show", combined)
         async def show(state: Streams, value: Filter) -> int:
@@ -117,7 +167,7 @@ class TestInto:
         assert capture.stdout == "Filter(name='widgets', limit=5, loud=True)"
 
     def test_a_combined_token_still_describes_every_part(self) -> None:
-        combined = into(Filter, argument("name", STR), option("--limit", once(INT)), flag("--loud"))
+        combined = into(Filter, argument("name", once(STR)), option("--limit", once(INT)), flag("--loud"))
         # The constituents' usage carries through, so combining changes nothing
         # about how the command is documented.
         named = [p.name if isinstance(p, Positional) else p.canonical for p in combined.parameters]

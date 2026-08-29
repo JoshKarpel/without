@@ -19,7 +19,6 @@ from without_cli import many
 from without_cli import once
 from without_cli import option
 from without_cli import optional
-from without_cli import rest
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,7 +92,7 @@ async def show(state: Session) -> int:
 
 @command(
     "add",
-    argument("text", STR, summary="What to do."),
+    argument("text", once(STR), summary="What to do."),
     option(("-t", "--tag"), many(STR), summary="Repeatable."),
     flag("--loud"),
     summary="Add a todo.",
@@ -104,13 +103,13 @@ async def add(state: Session, text: str, tags: tuple[str, ...], loud: bool) -> i
     return 0
 
 
-@command("done", argument("id", INT), summary="Complete a todo.")
+@command("done", argument("id", once(INT)), summary="Complete a todo.")
 async def done(state: Session, todo_id: int) -> int:
     state.stdout.write(f"done {todo_id}\n")
     return todo_id % 2
 
 
-@command("check", rest("paths", STR), summary="Check paths.")
+@command("check", argument("paths", many(STR)), summary="Check paths.")
 async def check(state: Session, paths: tuple[str, ...]) -> int:
     state.stdout.write(f"{len(paths)}:{'|'.join(paths)}\n")
     return 0

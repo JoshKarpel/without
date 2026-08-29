@@ -17,11 +17,36 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-# Type-parameter letters for the token slots, skipping `I` (ambiguous with
-# `1`/`l`). Arity N uses the first N of these; `T`/`U`/`M` are added per ladder.
-LETTERS = ("A", "B", "C", "D", "E", "F", "G", "H", "J", "K")
+# Type-parameter letters for the token slots. Arity N uses the first N of these.
+# `T`, `U`, and `M` are omitted because each ladder adds them itself. `I`, `L`,
+# and `O` are omitted because ruff's E741 refuses all three spellings as
+# ambiguous, and a slot appears both as the type parameter and as a parameter
+# named for its lowercased letter: `I` and `O` are refused as the type parameter,
+# `l` as the parameter name.
+LETTERS = (
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
+    "H",
+    "J",
+    "K",
+    "N",
+    "P",
+    "Q",
+    "R",
+    "S",
+    "V",
+    "W",
+    "X",
+    "Y",
+    "Z",
+)
 
-MAX_ARITY = 10
+MAX_ARITY = 20
 
 
 def _overload(name: str, typeparams: list[str], params: list[str], return_type: str) -> str:
@@ -53,7 +78,7 @@ def _command_ladder() -> str:
     blocks = []
     for arity in range(MAX_ARITY + 1):
         letters = list(LETTERS[:arity])
-        params = ["name: str,", *_slots(letters), "/,", "*,", "summary: str = ...,"]
+        params = ["name: str,", *_slots(letters), "/,", "*,", "summary: str = ...,", "version: str | None = ...,"]
         # `Returned` is an alias for `Awaitable[int]` rather than the type spelled
         # out, because `Awaitable[int]]]` would close this very cog block.
         handler_params = ", ".join(["T", *letters])
@@ -88,13 +113,14 @@ def _group_ladder() -> str:
             f"state: Callable[[{', '.join(factory_params)}], AbstractAsyncContextManager[U]],",
             "commands: tuple[Arm[U], ...],",
             "summary: str = ...,",
+            "version: str | None = ...,",
         ]
         blocks.append(_overload("group", ["T", "U", *letters], params, "Arm[T]"))
     return "\n\n".join(blocks)
 
 
 def _into_ladder() -> str:
-    """`into`: a `make` constructor whose parameters are the tokens' values (arity 1-10)."""
+    """`into`: a `make` constructor whose parameters are the tokens' values."""
     blocks = []
     for arity in range(1, MAX_ARITY + 1):
         letters = list(LETTERS[:arity])

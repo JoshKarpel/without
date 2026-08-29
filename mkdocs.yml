@@ -104,6 +104,7 @@ nav:
       - Reference: without-web/reference.md
   - without-cli:
       - without-cli/index.md
+      - without-cli/alternatives.md
       - Reference: without-cli/reference.md
   - without-http:
       - without-http/index.md
