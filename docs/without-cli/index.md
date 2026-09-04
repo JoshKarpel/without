@@ -161,6 +161,13 @@ paths the tree names (`source_paths`), reads them, and hands the contents to
 `parse_argv` as a value. So parsing stays pure and a test supplies a mapping
 instead of a filesystem.
 
+That means the _whole_ tree's mounts, on every invocation, including one that
+selects a command sharing none of them: `todos status` reads the password the
+`db` group declares. The paths are known before parsing, but which level the
+command line selects is not, so reading only what an invocation needs would put
+the filesystem back inside the parse. A path named by several options is read
+once.
+
 ## Commands are values; assembly is explicit
 
 `@command(name, *tokens)` returns an `Arm` and registers nothing, exactly as

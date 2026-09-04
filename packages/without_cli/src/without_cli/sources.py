@@ -51,9 +51,12 @@ def read_files(paths: Iterable[Path]) -> Mapping[Path, str]:
     the shell reads once at the boundary and hands the result to `parse_argv` as
     a value, so parsing stays pure and a test supplies a mapping instead of a
     filesystem.
+
+    A path named by several options is read once, so where a mount is shared the
+    number of reads follows the files rather than the tokens declaring them.
     """
     contents = {}
-    for path in paths:
+    for path in dict.fromkeys(paths):
         try:
             contents[path] = path.read_text()
         except FileNotFoundError:

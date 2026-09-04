@@ -35,7 +35,7 @@ class Positional:
 
     @property
     def metavar(self) -> str:
-        return self.name.upper().replace("-", "_")
+        return _metavar_of(self.name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,10 +63,18 @@ class Option:
         `("--verbose", "-v")` agree on `--verbose` and the order aliases are
         declared in stays a presentation choice.
         """
-        return next((name for name in self.names if name.startswith("--")), self.names[0])
+        return _canonical(self.names)
 
 
 type Parameter = Positional | Option
+
+# What one command-line occurrence of a valueless option records, since `Args`
+# carries raw strings and there is no raw value to carry for a bare `--verbose`.
+# Named here, beside the `metavar is None` that declares an option valueless, so
+# the binder that writes it and the `flag`/`count` that read it agree by
+# construction: it must stay a spelling `parse_boolean` reads as true and `int`
+# reads as one, which is what lets `-vv` and `VERBOSE=2` reach a command alike.
+PRESENT = "1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,8 +239,12 @@ def _names_of(names: str | tuple[str, ...]) -> tuple[str, ...]:
     return (names,) if isinstance(names, str) else names
 
 
-def _metavar_of(canonical: str) -> str:
-    return canonical.lstrip("-").replace("-", "_").upper()
+def _canonical(names: tuple[str, ...]) -> str:
+    return next((name for name in names if name.startswith("--")), names[0])
+
+
+def _metavar_of(name: str) -> str:
+    return name.lstrip("-").replace("-", "_").upper()
 
 
 def _converting[V](converter: Converter[V]) -> Callable[[str], V]:
@@ -256,6 +268,10 @@ def _converting[V](converter: Converter[V]) -> Callable[[str], V]:
             raise ValueError(f"expected {converter.metavar}, got {raw!r}") from exc
 
     return convert
+
+
+def _total(values: tuple[str, ...]) -> int:
+    return sum(int(value) for value in values)
 
 
 def _parsed[X, V](parameter: str, parse: Callable[[X], V], value: X) -> V:
@@ -293,13 +309,12 @@ def option[V](
     command line are validated identically.
     """
     spelled = _names_of(names)
-    # From the canonical (long) name, so `("-t", "--tag")` shows `--tag TAG`
-    # rather than `T`: which alias happens to be written first is a presentation
-    # choice and must not leak into the placeholder.
-    canonical = next((name for name in spelled if name.startswith("--")), spelled[0])
     spec = Option(
         names=spelled,
-        metavar=metavar if metavar is not None else _metavar_of(canonical),
+        # From the canonical (long) name, so `("-t", "--tag")` shows `--tag TAG`
+        # rather than `T`: which alias happens to be written first is a
+        # presentation choice and must not leak into the placeholder.
+        metavar=metavar if metavar is not None else _metavar_of(_canonical(spelled)),
         summary=summary,
         sources=sources,
         repeatable=cardinality.repeatable,
@@ -349,10 +364,7 @@ def count(
     spec = Option(names=_names_of(names), metavar=None, summary=summary, sources=sources, repeatable=True)
 
     def extract(args: Args) -> int:
-        def total(values: tuple[str, ...]) -> int:
-            return sum(int(value) for value in values)
-
-        return _parsed(spec.canonical, total, args.options.get(spec.canonical, ()))
+        return _parsed(spec.canonical, _total, args.options.get(spec.canonical, ()))
 
     return Extractor(extract, parameters=(spec,))
 

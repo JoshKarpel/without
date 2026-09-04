@@ -96,6 +96,19 @@ class Capture:
         return self.err.getvalue()
 
 
+def _terminated(line: str) -> bool:
+    r"""
+    Whether one element of a `keepends=True` split ends with a line terminator.
+
+    Asked of `splitlines` rather than of `"\n"`, because it breaks on a dozen
+    characters (`\v`, `\f`, `\x85`, the line and paragraph separators, the file
+    and group separators), and a fragment ending in one of those is a line that
+    *ended*, not one still arriving. Splitting it again is what tells the two
+    apart: a terminator is the only thing `keepends=False` drops.
+    """
+    return line.splitlines()[0] != line
+
+
 def lines(chunks: Iterable[str]) -> Iterator[str]:
     """
     Re-split a stream of arbitrary chunks into lines, keeping the terminators.
@@ -105,22 +118,36 @@ def lines(chunks: Iterable[str]) -> Iterator[str]:
     this rather than assuming its chunks arrived pre-split. A trailing fragment
     with no newline is yielded when the input ends.
     """
-    pending = ""
+    held: list[str] = []
     for chunk in chunks:
         # An empty chunk (a zero-length read, or `Streams.captured("")`) carries no
         # boundary, and `splitlines` on an empty string yields nothing to unpack.
         if not chunk:
             continue
-        pending += chunk
-        *complete, pending = pending.splitlines(keepends=True)
+        # Each chunk is split on its own and only the *first* line it completes is
+        # joined onto what was held, so a line spanning many chunks is copied and
+        # scanned once at its boundary rather than once per chunk. The exception is
+        # a held fragment ending in `\r`, which the next chunk may complete: those
+        # two have to be split together for `\r\n` to read as one terminator.
+        text = chunk
+        if held and held[-1].endswith("\r"):
+            held.append(chunk)
+            text, held = "".join(held), []
+        *complete, tail = text.splitlines(keepends=True)
         # `splitlines` cannot tell a final line that ended from one still arriving,
         # so a terminated tail is a complete line and only an unterminated one is
         # held. A tail ending in `\r` is held even so, because the next chunk may
         # open with the `\n` that completes a `\r\n` split across the boundary; a
         # lone `\r` terminator is then yielded when the input ends.
-        if pending.endswith("\n"):
-            complete.append(pending)
-            pending = ""
-        yield from complete
-    if pending:
-        yield pending
+        if _terminated(tail) and not tail.endswith("\r"):
+            complete.append(tail)
+            tail = ""
+        if complete:
+            held.append(complete[0])
+            yield "".join(held)
+            yield from complete[1:]
+            held = []
+        if tail:
+            held.append(tail)
+    if held:
+        yield "".join(held)

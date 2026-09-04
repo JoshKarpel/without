@@ -12,8 +12,10 @@
 # a pull source ahead of its consumer in a background task, decoupling their pace
 # (read-ahead). `stream_from_blocking` is the same read-ahead for a source that
 # is not async at all, running its iteration on a worker thread so a blocking
-# `next` never parks the loop. `stream_from_iterable` (from a fixed iterable) and
-# `collect` (drain to a list) are the in-memory source and terminal at that edge.
+# `next` never parks the loop. `offload` is its counterpart in the other
+# direction: a blocking *consumer* on one thread, fed by an async `Sink`.
+# `stream_from_iterable` (from a fixed iterable) and `collect` (drain to a list)
+# are the in-memory source and terminal at that edge.
 
 from __future__ import annotations
 
@@ -218,7 +220,7 @@ async def stream_from_blocking[T](values: Iterable[T], *, ahead: int = 1) -> Asy
         raise ValueError(f"ahead must be at least 1, but got {ahead}")
 
     loop = asyncio.get_running_loop()
-    queue: asyncio.Queue[_FromThread[T]] = asyncio.Queue()
+    handoff: asyncio.Queue[_FromThread[T]] = asyncio.Queue()
     room = threading.Semaphore(ahead)
     abandoned = threading.Event()
 
@@ -227,7 +229,7 @@ async def stream_from_blocking[T](values: Iterable[T], *, ahead: int = 1) -> Asy
         # hand this to, which is the ordinary end of an abandoned stream rather
         # than a failure.
         with suppress(RuntimeError):
-            loop.call_soon_threadsafe(queue.put_nowait, item)
+            loop.call_soon_threadsafe(handoff.put_nowait, item)
 
     def drain() -> None:
         iterator = iter(values)
@@ -259,7 +261,7 @@ async def stream_from_blocking[T](values: Iterable[T], *, ahead: int = 1) -> Asy
     threading.Thread(target=drain, name="stream_from_blocking", daemon=True).start()
     try:
         while True:
-            match await queue.get():
+            match await handoff.get():
                 case _Produced(value):
                     room.release()
                     yield value

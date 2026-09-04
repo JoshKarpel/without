@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Awaitable
 from collections.abc import Callable
+from collections.abc import Iterable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from dataclasses import field
@@ -65,6 +66,12 @@ def source_paths(node: Node) -> tuple[Path, ...]:
 
     Recovered from the same `sources` the options parse from, so a secret mount
     is declared exactly once and adding one changes nothing else.
+
+    The *whole* tree, so every mount is read on every invocation, including one
+    that selects a command sharing none of them. That is the price of `parse_argv`
+    being pure: the paths are known before parsing, but which level the command
+    line selects is not, so reading only what the invocation needs would mean
+    putting the filesystem back inside the parse.
     """
     here = file_paths(source for option in node.options for source in option.sources)
     return here + tuple(path for child in node.children for path in source_paths(child))
@@ -126,6 +133,12 @@ class DeclarationError(ValueError):
     """
 
 
+def _repeated(names: Iterable[str]) -> str | None:
+    """The first name declared more than once, or `None` when they are all distinct."""
+    counts = Counter(names)
+    return next((name for name, count in counts.items() if count > 1), None)
+
+
 def _positional_layout(name: str, parameters: tuple[Parameter, ...]) -> None:
     """
     Refuse a positional layout the binder could not assign unambiguously.
@@ -145,9 +158,9 @@ def _positional_layout(name: str, parameters: tuple[Parameter, ...]) -> None:
     optional = next((index for index, p in enumerate(positionals) if not p.required), None)
     if optional is not None and any(p.required for p in positionals[optional:]):
         raise DeclarationError(f"command {name!r} declares a required argument after an optional one")
-    names = [p.name for p in positionals]
-    if len(set(names)) != len(names):
-        raise DeclarationError(f"command {name!r} declares two positionals with the same name")
+    repeated = _repeated(p.name for p in positionals)
+    if repeated is not None:
+        raise DeclarationError(f"command {name!r} declares two positionals with the same name, {repeated!r}")
 
 
 def _option_spellings(name: str, parameters: tuple[Parameter, ...]) -> None:
@@ -159,8 +172,7 @@ def _option_spellings(name: str, parameters: tuple[Parameter, ...]) -> None:
     by `flag("--x")` leaves `--x` taking no value, and `prog --x hi` fails on a
     stray `hi` rather than on the two tokens that disagree.
     """
-    spellings = Counter(spelling for p in parameters if isinstance(p, Option) for spelling in p.names)
-    repeated = next((spelling for spelling, count in spellings.items() if count > 1), None)
+    repeated = _repeated(spelling for p in parameters if isinstance(p, Option) for spelling in p.names)
     if repeated is not None:
         raise DeclarationError(f"{name!r} declares the option {repeated!r} twice")
 
@@ -188,9 +200,9 @@ def _child_names(name: str, commands: tuple[Arm[Never], ...]) -> None:
     """Refuse a level whose children cannot be told apart, or that has none."""
     if not commands:
         raise DeclarationError(f"{name!r} declares no commands")
-    names = [arm.node.name for arm in commands]
-    if len(set(names)) != len(names):
-        raise DeclarationError(f"{name!r} declares two commands with the same name")
+    repeated = _repeated(arm.node.name for arm in commands)
+    if repeated is not None:
+        raise DeclarationError(f"{name!r} declares two commands with the same name, {repeated!r}")
 
 
 def _no_positionals(name: str, parameters: tuple[Parameter, ...]) -> None:
@@ -1182,18 +1194,6 @@ def group(
     per level rather than per program, so `prog --version` and `prog db --version`
     can report the version of whatever package shipped each of them.
     """
-    return _nest(name, extractors, state, commands, summary, version)
-
-
-def _nest(
-    name: str,
-    extractors: tuple[AnyExtractor, ...],
-    state: Callable[..., AbstractAsyncContextManager[object]] | None,
-    commands: tuple[Arm[Never], ...],
-    summary: str,
-    version: str | None,
-) -> Arm[Never]:
-    """The body of `group`, shared by its stateful and pure-namespacing forms."""
     parameters = tuple(p for extractor in extractors for p in extractor.parameters)
     _no_positionals(name, parameters)
     _option_spellings(name, parameters)
@@ -1221,11 +1221,9 @@ def _nest(
 
         if state is None:
             # Pure namespacing: nothing to build, so nothing to enter. The
-            # children see exactly what this level was given.
-            async def passing(parent: object) -> int:
-                return await inner(parent)
-
-            return cast(Action[Never], passing)
+            # children see exactly what this level was given, so the child's own
+            # action *is* this level's.
+            return cast(Action[Never], inner)
 
         async def entering(parent: object) -> int:
             async with state(parent, *own) as built:

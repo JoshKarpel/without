@@ -120,7 +120,7 @@ def render(described: Usage) -> str:
     if described.summary:
         lines.extend(["", described.summary])
     lines.extend(_section("Arguments", [(p.metavar, p.summary) for p in described.positionals]))
-    lines.extend(_section("Commands", [(name, summary) for name, summary in described.commands]))
+    lines.extend(_section("Commands", list(described.commands)))
     lines.extend(
         _section("Options", [(_option_line(o), o.summary + _annotations(o)) for o in described.options]),
     )

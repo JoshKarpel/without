@@ -50,15 +50,17 @@ class Node[L]:
     converter (`int`, `uuid`) before the catch-most `str`. That recovers route
     precedence from the tree's structure rather than from registration order.
 
-    `catchall` holds at most one entry, because a catch-all consumes every
-    remaining segment and so has no more specific sibling to be tried before:
-    whichever of two the walk reached first would answer for both. `build`
-    refuses the second one rather than leaving it silently unreachable.
+    `catchall` is a single slot rather than an ordered collection, because a
+    catch-all consumes every remaining segment and so has no more specific
+    sibling to be tried before it: whichever of two the walk reached first would
+    answer for both. `build` refuses the second one rather than leaving it
+    silently unreachable, and the type says so, so the walk has nothing to order
+    and no sibling to fall back to.
     """
 
     literals: Mapping[str, Node[L]]
     params: tuple[tuple[Converter[object], Node[L]], ...]
-    catchall: tuple[tuple[Converter[object], Node[L]], ...]
+    catchall: tuple[Converter[object], Node[L]] | None
     leaf: _Bound[L] | None
 
 
@@ -66,7 +68,7 @@ class Node[L]:
 class _Builder[L]:
     literals: dict[str, _Builder[L]] = field(default_factory=dict)
     params: dict[Converter[object], _Builder[L]] = field(default_factory=dict)
-    catchall: dict[Converter[object], _Builder[L]] = field(default_factory=dict)
+    catchall: tuple[Converter[object], _Builder[L]] | None = None
     leaf: _Bound[L] | None = None
 
 
@@ -109,9 +111,11 @@ def _insert[L](node: _Builder[L], segments: tuple[Segment, ...], leaf: L, names:
         case CatchAll(name, converter):
             if rest:
                 raise ValueError("invalid route: a catch-all must be the last segment")
-            if node.catchall and converter not in node.catchall:
+            if node.catchall is None:
+                node.catchall = (converter, _Builder())
+            elif node.catchall[0] != converter:
                 raise ValueError("ambiguous route: two catch-alls resolve at the same path")
-            child = node.catchall.setdefault(converter, _Builder())
+            child = node.catchall[1]
             names = (*names, name)
     _insert(child, tuple(rest), leaf, names)
 
@@ -119,8 +123,7 @@ def _insert[L](node: _Builder[L], segments: tuple[Segment, ...], leaf: L, names:
 def _freeze[L](builder: _Builder[L]) -> Node[L]:
     literals = {text: _freeze(child) for text, child in builder.literals.items()}
     params = tuple((converter, _freeze(child)) for converter, child in sorted(builder.params.items(), key=_precedence))
-    # There is at most one catch-all, so nothing to order.
-    catchall = tuple((converter, _freeze(child)) for converter, child in builder.catchall.items())
+    catchall = None if builder.catchall is None else (builder.catchall[0], _freeze(builder.catchall[1]))
     return Node(literals=literals, params=params, catchall=catchall, leaf=builder.leaf)
 
 
@@ -167,15 +170,16 @@ def _walk[L](node: Node[L], segments: tuple[str, ...], values: tuple[object, ...
             continue
         if (found := _walk(child, rest, (*values, value))) is not None:
             return found
-    for converter, child in node.catchall:
-        if child.leaf is None:
-            continue
-        try:
-            value = converter.parse("/".join(segments))
-        except ValueError:
-            continue
-        return _found(child.leaf, (*values, value))
-    return None
+    if node.catchall is None:
+        return None
+    converter, child = node.catchall
+    if child.leaf is None:
+        return None
+    try:
+        value = converter.parse("/".join(segments))
+    except ValueError:
+        return None
+    return _found(child.leaf, (*values, value))
 
 
 def _found[L](bound: _Bound[L], values: tuple[object, ...]) -> Found[L]:

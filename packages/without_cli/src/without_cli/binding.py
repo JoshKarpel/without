@@ -14,11 +14,11 @@ from without_cli.commands import Arm
 from without_cli.commands import Level
 from without_cli.commands import Node
 from without_cli.sources import from_sources
+from without_cli.tokens import PRESENT
 from without_cli.tokens import Args
 from without_cli.tokens import ExtractionError
 from without_cli.tokens import Option
 from without_cli.usage import Usage
-from without_cli.usage import render
 from without_cli.usage import usage
 
 # Shared empty defaults, so `parse_argv` can be called with only an argv while
@@ -98,9 +98,17 @@ type Outcome[T] = Bound[T] | Answered | Rejected
 
 @dataclass(frozen=True, slots=True)
 class _Scanned:
+    """
+    One level's argv, split into option occurrences and the bare tokens left over.
+
+    What `bare` holds is the caller's `stop_at_positional`: a level with children
+    stops at the first bare token, so `bare` is that token and everything after it
+    (the subcommand and its own argv); a level without them consumes the whole
+    line, so `bare` is its positionals.
+    """
+
     options: dict[str, list[str]]
-    positionals: list[str]
-    tail: list[str]
+    bare: list[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,7 +149,7 @@ def _scan(
     """
     by_name = {name: option for option in node.options for name in option.names}
     options: dict[str, list[str]] = {}
-    positionals: list[str] = []
+    bare: list[str] = []
     index = 0
     literal = False
 
@@ -152,8 +160,8 @@ def _scan(
         token = argv[index]
         if literal or token == "-" or not token.startswith("-"):
             if stop_at_positional:
-                return _Scanned(options, positionals, list(argv[index:]))
-            positionals.append(token)
+                return _Scanned(options, list(argv[index:]))
+            bare.append(token)
             index += 1
         elif token == "--":
             literal = True
@@ -168,7 +176,7 @@ def _scan(
             if option.metavar is None:
                 if separator:
                     return _Refused(f"option {name} takes no value")
-                record(option, "1")
+                record(option, PRESENT)
                 index += 1
             elif separator:
                 record(option, inline)
@@ -189,7 +197,7 @@ def _scan(
                 if option is None:
                     return _Refused(f"unknown option {name}")
                 if option.metavar is None:
-                    record(option, "1")
+                    record(option, PRESENT)
                     position += 1
                 elif position + 1 < len(cluster):
                     record(option, cluster[position + 1 :])
@@ -201,7 +209,7 @@ def _scan(
                 else:
                     return _Refused(f"option {name} expects a value")
             index += 1
-    return _Scanned(options, positionals, [])
+    return _Scanned(options, bare)
 
 
 def _merged(
@@ -289,22 +297,22 @@ def parse_argv[T](
         options = _merged(node, scanned.options, env, files)
 
         if not node.children:
-            assigned = _assigned(node, scanned.positionals)
+            assigned = _assigned(node, scanned.bare)
             if isinstance(assigned, _Refused):
                 return Rejected(assigned.message, usage(tuple(path)))
             levels.append(Level(node.name, Args(options=options, arguments=assigned)))
             break
 
-        if not scanned.tail:
+        if not scanned.bare:
             return Rejected("expected a command", usage(tuple(path)))
-        child = node.child(scanned.tail[0])
+        child = node.child(scanned.bare[0])
         if child is None:
             known = ", ".join(sorted(entry.name for entry in node.children))
-            return Rejected(f"unknown command {scanned.tail[0]!r} (expected one of: {known})", usage(tuple(path)))
+            return Rejected(f"unknown command {scanned.bare[0]!r} (expected one of: {known})", usage(tuple(path)))
         levels.append(Level(node.name, Args(options=options, arguments={})))
         node = child
         path.append(child)
-        remaining = scanned.tail[1:]
+        remaining = scanned.bare[1:]
 
     try:
         return Bound(arm.resolve(tuple(levels)))
@@ -333,4 +341,4 @@ def render_rejection(rejected: Rejected) -> str:
     )
 
 
-__all__ = ["Answered", "Bound", "Outcome", "Rejected", "parse_argv", "render", "render_rejection"]
+__all__ = ["Answered", "Bound", "Outcome", "Rejected", "parse_argv", "render_rejection"]

@@ -31,7 +31,7 @@ VERSION = "--version"
 ANSWERED = (*HELP, VERSION)
 
 
-def _answer(answer: Answered, spelling: str, streams: Streams) -> int:
+def _answer(answer: Answered, streams: Streams) -> int:
     """
     Interpret a spelling `run` asked `parse_argv` to stop on.
 
@@ -42,12 +42,12 @@ def _answer(answer: Answered, spelling: str, streams: Streams) -> int:
     option there, and the rejection is built here rather than by the parser
     because it is this shell's rule that produced it.
     """
-    if spelling in HELP:
+    if answer.spelling in HELP:
         streams.stdout.write(render(answer.usage))
         return 0
     version = answer.node.version
     if version is None:
-        streams.stderr.write(render_rejection(Rejected(f"unknown option {spelling}", answer.usage)))
+        streams.stderr.write(render_rejection(Rejected(f"unknown option {answer.spelling}", answer.usage)))
         return USAGE_EXIT
     streams.stdout.write(f"{version}\n")
     return 0
@@ -88,8 +88,8 @@ def run(
 
     try:
         match parse_argv(program, argv=arguments, env=environment, files=contents, answered=ANSWERED):
-            case Answered(spelling) as answer:
-                return _answer(answer, spelling, resolved)
+            case Answered() as answer:
+                return _answer(answer, resolved)
             case Rejected() as rejected:
                 resolved.stderr.write(render_rejection(rejected))
                 return USAGE_EXIT
