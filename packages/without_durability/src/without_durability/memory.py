@@ -15,10 +15,12 @@ from without_durability.codec import JSON
 from without_durability.codec import CheckpointCodec
 from without_durability.interfaces import LEASE
 from without_durability.interfaces import Delivery
+from without_durability.interfaces import Entry
 from without_durability.interfaces import Fenced
 from without_durability.interfaces import Pass
 from without_durability.interfaces import Recorded
 from without_durability.interfaces import check_duration
+from without_durability.interfaces import inbox_key
 
 # Both interfaces over ordinary dicts, shipped rather than kept in a test directory, because
 # the whole design says a store is injected and this is the store a test should inject.
@@ -145,6 +147,27 @@ class MemoryCheckpointer:
     async def supply(self, workflow: str, key: str, value: object) -> object:
         stored = self.hashes.setdefault(workflow, {}).setdefault(key, self.codec.encode(value))
         return self.codec.decode(stored)
+
+    async def append(self, workflow: str, value: object) -> Entry:
+        """
+        File `value` under the next key in this workflow's inbox.
+
+        The position is how many records the workflow already has, which is the same
+        number the Redis store takes from `HLEN` and for the same reasons: nothing here
+        ever removes a record and first-writer-wins means nothing is ever replaced, so the
+        count only rises and a key it yields cannot already be taken. Being synchronous
+        between its `await`s is what makes it atomic, which is this store's version of a
+        Lua script.
+
+        It counts every record rather than only the inbox's, so a workflow's entries are
+        numbered with gaps wherever a step was recorded between two appends. That is
+        exactly what the interface allows: the keys sort into append order, which is the
+        whole of what a consumer reads them for.
+        """
+        recorded = self.hashes.setdefault(workflow, {})
+        key = inbox_key(len(recorded))
+        recorded[key] = self.codec.encode(value)
+        return Entry(key=key, value=self.codec.decode(recorded[key]))
 
     async def release(self, holder: Pass) -> None:
         # The token stays, so the next claim outranks this one: releasing hands the

@@ -1,5 +1,135 @@
 # Changelog
 
+## 0.0.7
+
+### Added
+
+- **`without-durability`**: an append-only inbox, so a workflow can take input it did not
+  name in advance. `Checkpointer.append` is `supply`'s sibling and the only difference
+  between them is who picks the key: `supply` writes under a name the caller brought, and
+  `append` writes under one the store assigns, returning the `Entry` that says where it
+  went. `Durable.deliver` is `arrive`'s sibling in the same way, appending and making the
+  workflow ready in one commit where the two stores are one datastore, since a caller that
+  appends and then separately schedules can die in between and leave a message nobody will
+  wake for. Inside a pass, `Run.receive` reads the inbox past a cursor and suspends when
+  there is nothing new, `Run.pending` reads without suspending, and both take a `limit` so
+  a consumer can take one entry and leave the rest. `Run.awaiting` is untouched and stays
+  the primitive for one named value from outside.
+
+  What this replaces is a queue hand-rolled over a key-value store. A consumer that needed
+  a stream of input had to invent a key per message and allocate out of that space by
+  trying, which is a loop that writes at `n`, discovers it lost, and tries `n + 1`, plus a
+  compare-and-set marker to close a slot against a racing writer. The store already sees
+  every write and already decides where each one sits, so it is the only party that can
+  hand out a name nobody else is about to take.
+
+  An entry is an ordinary checkpoint record, which is what makes it appear in `load`, sort
+  into place among the workflow's other records, and copy into a forked workflow like
+  anything else. Nothing is ever consumed, so nothing is ever moved: what a pass records is
+  a *reference* to the last entry it took, and that replays correctly because
+  first-writer-wins means the entry still holds what it held. The cost is that a workflow's
+  inbox is part of its checkpoint forever, so a long-lived one loads its whole history on
+  every pass.
+
+  Keys are `inbox:` followed by a zero-padded 20-digit number, which is past what a signed
+  64-bit counter reaches, so they sort lexically. `Run.claim` now refuses a step key in that
+  space: a step named `inbox:3` would be read back as a message somebody delivered, and no
+  amount of re-running would reveal it.
+
+### Changed
+
+- **`without-durability`**: `Waiting` is replaced by `Blocked`, which reports **every**
+  branch a pass stopped on rather than one of them, in two sets: `waiting` holds the
+  addresses from `Run.awaiting`, answered with `arrive(workflow, key, value)`, and
+  `listening` holds the read steps from `Run.receive`, answered with
+  `deliver(workflow, value)`. `Outcome` is now `Completed | Sleeping | Blocked`, so **a
+  driver matching over it has a case to rename**, which `assert_never` reports as a type
+  error rather than as a workflow that quietly stops being woken.
+
+  A fan-out suspends in every branch that cannot finish, and the old shape carried one key,
+  so a pass blocked on an approval *and* an empty inbox reported the approval and discarded
+  the inbox: a client was told one way to unblock the workflow when there were two. It was
+  also unstable, which was worse and is what prompted this. Nothing sorted the candidates,
+  so the reported key was whichever branch reached its raise first, and two passes at one
+  suspended workflow could name different keys on scheduling alone. A set has no order to
+  leak, so both problems go away together.
+
+  Two fields rather than two arms because a driver's response to either is identical
+  (acknowledge, schedule nothing) and a pass can be stopped on both at once, while the
+  distinction that *is* load-bearing (an address to write to, versus a step name nobody
+  writes to) survives as the field a key sits in. `InputNeeded` and `MessageNeeded` are
+  unchanged and are what decide which field a key lands in.
+
+  `Sleeping` still wins when a pass has both a deadline and blocked branches, since it
+  alone carries something the driver must act on. That is the one place an outcome still
+  drops information, and it is bounded: the pass the wakeup produces reaches those branches
+  again and reports them then.
+
+- **`without-durability`**: a pass now reports what it *reached* rather than what
+  propagated out of it, so the outcome no longer depends on which combinator a workflow
+  wrapped its waits in. Each wait writes itself onto the `Run` before raising, and
+  `Run.waking` is gone, folded into the one `Run.reached` that all three waits use.
+  `stopped_at` and `unwound` take that list in its place. A `gather` of two `awaiting`
+  calls now reports both keys, where it previously reported one: `asyncio.gather`
+  propagates only the *first* exception, so the siblings never reached `resume` at all.
+
+- **`without-durability`**: **a workflow may no longer catch a `Suspended` at all.** A body
+  that returns normally having reached a suspension raises `Swallowed`, naming the keys,
+  instead of reporting `Completed`. `asyncio.wait` and `gather(return_exceptions=True)`
+  capture exceptions as values rather than raising them, so `Suspended` descending from
+  `BaseException` never protected against them: a pass could report a finished workflow
+  that was still waiting on the world, having in the inbox case already consumed entries it
+  never acted on. Nothing wakes a finished workflow and no record says a wait went
+  unanswered, so this was silent and unrecoverable.
+
+  The cost is that "carry on if it is not there yet" can no longer be written by catching
+  one, and there is no `awaiting` that returns a default; for the inbox, `Run.pending` is
+  that shape. `Fenced` and `Contended` are unaffected and may still be caught by name.
+
+- **`without-durability`**: `Checkpointer.load` now MUST return a workflow's records in the
+  order they were first recorded, and all four stores do. A workflow's records have two
+  independent writers, the pass through `record` and anything outside it through `supply`,
+  and neither can order itself against the other: a counter either side keeps is read from
+  a stale snapshot or observed from the store and then raced, so both reach for the same
+  next number and the tie has to be invented. The store sees every write, so the store is
+  the only thing that can say. First-writer-wins already decided what a key holds; this
+  says the same writer decides where it sits, so a losing write moves neither the value nor
+  the position. Nothing changes in the signature: `load` returns a `dict`, which preserves
+  insertion order, so every existing caller gets the order by iterating and no store owes a
+  sequence number anyone can see. **A third-party `Checkpointer` now owes a guarantee it
+  did not before**, and the requirement is invisible to the type checker, so an
+  implementation that ignores it still satisfies the protocol; the cross-store conformance
+  suite is what holds the shipped four to it.
+- **`without-durability-sqlite`, `without-durability-postgres`**: **the checkpoint schema
+  changed and there is no migration.** `migrate` is `CREATE TABLE IF NOT EXISTS`, so an
+  existing database keeps its old shape and every `load` against it then fails on the
+  missing `seq` column. Drop `workflow_checkpoint` (or the whole database) before running
+  0.0.7. Both stores now carry an explicit `seq` for `load` to order by: SQLite gives up
+  `WITHOUT ROWID` and names the rowid it already assigns as `seq INTEGER PRIMARY KEY`,
+  moving `(workflow, step)` to a `UNIQUE` constraint, and Postgres takes the number from a
+  `workflow_seq` sequence as the column's `DEFAULT`. Declaring the column rather than
+  ordering by the implicit `rowid` is what makes the guarantee survive a `VACUUM`, which
+  SQLite documents as free to renumber the rowids of any table that has no explicit
+  `INTEGER PRIMARY KEY`. Neither store's existing write statements changed, since both
+  counters are assigned on insert and left alone by the conflict update that implements
+  first-writer-wins. Postgres `append` mints its inbox key from that same sequence, in one
+  `nextval` written as both the key and the row's `seq`: it is the one store with genuinely
+  concurrent writers, so a maximum read inside the insert would be a race two callers could
+  both win, and two separate counters would let the keys sort one way while `load` rendered
+  them the other. One number is both, which is also why the column carries a `DEFAULT`
+  rather than being an identity: an identity is a number no statement may supply.
+- **`without-durability-redis`**: a checkpoint hash field now holds `<position>:<encoding>`
+  rather than the encoding alone, which is how this store meets the ordering guarantee. A
+  Redis hash preserves insertion order only while it is listpack-encoded and stops once it
+  grows past `hash-max-listpack-entries` or `hash-max-listpack-value`, so `HGETALL` order
+  could never carry it. Keeping the position in the field keeps it to one key: there is no
+  second structure to expire in step with the first, and no branch that could allocate a
+  position for a write that turned out to lose. The prefix is added and stripped inside the
+  scripts, so `record`, `supply`, and `transact` are unchanged for callers and a `LuaEffect`
+  neither writes a prefix nor sees one. `append` takes its key from the same `HLEN`, so the
+  field's position and the number its name is built from cannot drift apart. Existing
+  checkpoint hashes are not readable by this version; they expire on their own `ttl`.
+
 ## 0.0.6
 
 ### Added

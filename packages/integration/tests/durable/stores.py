@@ -2,19 +2,25 @@ from __future__ import annotations
 
 import os
 from collections.abc import AsyncIterator
+from collections.abc import Awaitable
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from psycopg import AsyncCursor
+from psycopg.rows import TupleRow
 from psycopg_pool import AsyncConnectionPool
 from redis.asyncio import Redis
 from without_durability import Durable
 from without_durability import MemoryCheckpointer
 from without_durability import MemoryScheduler
+from without_durability import Pass
 from without_durability import SplitDurable
 from without_durability_postgres import PostgresCheckpointer
 from without_durability_postgres import PostgresDurable
 from without_durability_postgres import PostgresScheduler
 from without_durability_postgres import migrate as migrate_postgres
+from without_durability_redis import LuaEffect
 from without_durability_redis import RedisCheckpointer
 from without_durability_redis import RedisSetScheduler
 from without_durability_redis import RedisStreamScheduler
@@ -128,3 +134,47 @@ async def durable(request: pytest.FixtureRequest, tmp_path: Path, workflow: str)
             # claiming four-store coverage while proving three. `request.param` is a plain
             # `str` to the type checker, so this is the runtime form of `assert_never`.
             raise ValueError(f"{unknown!r} names no store in this fixture")
+
+
+@pytest.fixture
+def transacting(durable: Durable) -> Callable[[Pass, str, str], Awaitable[object]]:
+    """
+    `transact`, over whichever store the `durable` fixture handed out, recording a string.
+
+    `Effect` is a type parameter with no shared shape, which is the whole reason it is one:
+    a function over the in-memory store's own dict, a callback handed a `sqlite3.Cursor`,
+    an *async* callback handed a psycopg cursor, a Lua script. A test that wants to drive
+    `transact` across every store therefore cannot write one effect, so this writes four
+    and hands back one coroutine function.
+
+    Dispatching on the checkpointer rather than on the fixture's parameter is what keeps
+    this type-checked: each arm narrows to a concrete store, so the effect it builds is
+    checked against that store's own `Effect` rather than against `Never`.
+    """
+    checkpointer = durable.checkpointer
+
+    async def transact(holder: Pass, key: str, value: str) -> object:
+        match checkpointer:
+            case MemoryCheckpointer():
+                return await checkpointer.transact(holder, key, lambda _data: value)
+            case SqliteCheckpointer():
+                return await checkpointer.transact(holder, key, lambda _cursor: value)
+            case PostgresCheckpointer():
+
+                async def effect(_cursor: AsyncCursor[TupleRow]) -> object:
+                    return value
+
+                return await checkpointer.transact(holder, key, effect)
+            case RedisCheckpointer():
+                # The value travels as an argument rather than spliced into the source, so
+                # every call shares one script body and the store's cache of built scripts
+                # holds one entry however many times this runs. `cjson.encode` because what
+                # an effect returns is recorded verbatim, so it has to already be what the
+                # store's codec reads back.
+                return await checkpointer.transact(
+                    holder, key, LuaEffect(source="return cjson.encode(ARGV[1])", args=(value,))
+                )
+            case unknown:  # pragma: no cover - unreachable while the `durable` fixture builds these four
+                raise TypeError(f"{unknown!r} is not a store this fixture can build an effect for")
+
+    return transact

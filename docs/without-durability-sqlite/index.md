@@ -35,8 +35,8 @@ get that, because there readers and writers run concurrently and a statement's
 snapshot can be stale; Redis needs a Lua script. Here the transaction *is* the
 exclusion, and `transact` is a plain sequence of statements inside one.
 
-**There is nothing to co-locate.** The datastore is a file, so `transact` and
-`arrive` reach every table an application keeps in it. On Redis that question is a
+**There is nothing to co-locate.** The datastore is a file, so `transact`, `arrive`,
+and `deliver` reach every table an application keeps in it. On Redis that question is a
 hash tag and on sharded Postgres it is a distribution column; here it has one answer
 and it is yes. What that buys is the guarantee DBOS gets from Postgres (a step's own
 business write committing with its checkpoint) for an application that never needed

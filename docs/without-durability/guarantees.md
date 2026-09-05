@@ -106,7 +106,7 @@ So a family of stores is not one good implementation and one compromise. It is t
 same offer made to several populations, each able to co-commit for the effects that
 live where its checkpoint lives.
 
-## Four notes on the shape that took
+## Six notes on the shape that took
 
 None of these is obvious from the protocol alone.
 
@@ -133,6 +133,72 @@ None of these is obvious from the protocol alone.
   something unequal (a tuple returns as a list under `JsonCodec`), and `run_durably`
   reading that as a lost race would fail a run in which nothing raced. The store is
   the only party holding both encodings, so it answers.
+- **The store says what order they came in, for the same reason.** A workflow's
+  records have two independent writers: the pass, through `record`, and anything
+  outside it, through `supply`. Neither can order itself against the other. A counter
+  either one keeps is read from a stale in-process snapshot or observed from the store
+  and then raced, so the pass writes response N, the handler loads and takes N+1, and
+  the pass's own next write is N+1 too. The store sees every write, so the store is
+  the only thing that can say, and `load` returns its records in the order they were
+  first recorded. First-writer-wins already decides what a key holds; this says the
+  same writer decides where it sits, so a losing write moves neither.
+
+  The order is the guarantee and the number behind it is _not_. `load` returns a
+  `dict`, which preserves insertion order, so a caller reads the order by iterating
+  and no store owes a sequence anyone outside it can see. That leaves the requirement
+  invisible in the signature, which is the cost of keeping it out of the API: nothing
+  but the cross-store conformance suite holds an implementation to it, and a
+  third-party store can satisfy the type while ignoring the contract.
+
+  What each store reaches for differs, and the differences are instructive. SQLite
+  names the `rowid` it already assigns as an explicit `seq INTEGER PRIMARY KEY`,
+  which is why its checkpoint table is the one table there that is not
+  `WITHOUT ROWID`, and why it declares a column it could have left implicit: SQLite
+  reserves the right to renumber the rowids of a table that has no explicit
+  `INTEGER PRIMARY KEY` when the database is `VACUUM`ed. Postgres adds a `seq`
+  column off a sequence, because a heap scan looks like insertion order right up
+  until the no-op conflict update rewrites a tuple and moves it. Redis has the hardest job and the least
+  obvious answer: it packs the position into the hash field in front of the encoded
+  value, because a hash preserves insertion order only while it is listpack-encoded
+  and stops once it converts to a hashtable. Keeping the order _in_ the field is what
+  keeps it to one key, so there is no second structure that has to expire in step with
+  the first.
+- **The store names an inbox key, because only the store can.** `append` is `supply`
+  under a key the store picks, and that is the whole difference between them. It owes
+  three things a caller cannot arrange: two concurrent appends to one workflow get
+  distinct keys and neither value is lost, the keys sort into append order _within_ that
+  workflow, and the entry is an ordinary record that `load` returns in place.
+
+  The keys need not be contiguous and need not order across workflows, and saying so is
+  what makes the requirement implementable. A shared counter with gaps satisfies it and
+  is far easier to make atomic than per-workflow numbering: Postgres takes `nextval` off
+  a sequence, since it is the store with genuinely concurrent writers and a maximum read
+  inside the insert is a race two callers can both win, with the loser's message
+  vanishing into first-writer-wins and no error to show for it. SQLite reads the highest
+  `seq` in one statement, which is atomic there because SQLite admits one writer at a
+  time. Redis and the in-memory double take the count of the workflow's own records.
+
+  What every one of them arrives at, by a different route, is that the key and the load
+  position are _one_ number. Two counters would be two orders, and the second and third
+  requirements above are a claim that those orders agree: under concurrent appends the
+  keys would sort one way and `load` render the other, which is a store meeting each
+  guarantee alone and neither together. Redis and the double get it for free, since the
+  count they name a key from is already the position. Postgres has to arrange it, by
+  drawing one `nextval` in a CTE and writing it as both the key and the row's `seq`,
+  which is why that column takes a `DEFAULT` rather than being an identity: an identity
+  is a number no statement may supply, and this one has to.
+
+  Nothing is ever consumed, which is the load-bearing half. A destructive read would
+  move a value out of the inbox and into the workflow's own records, leaving two copies
+  to keep in step; append-only means the entry _is_ the record and a pass writes a
+  reference to it. That reference replays correctly for exactly the reason the entry is
+  safe to share: first-writer-wins, so the key still holds what it held. Forking is then
+  free, since a consumer copying a prefix of `load` copies entries like anything else
+  and needs no rule about the unread ones.
+
+  What a destructive queue would buy is competing consumers, and that is already
+  answered a layer down: `claim` guarantees one pass per workflow, so there is nobody to
+  distribute the work between.
 
 ## Every step names its parser, and the graph names none
 
@@ -196,9 +262,18 @@ whether _this pass_ may continue, not about the work; an `except Exception` writ
 handle a declined gateway must not absorb one.
 
 `Suspended` is the one a driver never sees, because `resume` catches it and returns a
-`Sleeping` or a `Waiting`. It still descends from `BaseException` for the half of its
+`Sleeping` or a `Blocked`. It still descends from `BaseException` for the half of its
 life that matters: the part where it is travelling up through the workflow author's own
 code, past whatever they wrapped their steps in.
+
+`BaseException` is not enough on its own, though, which is worth stating because it looks
+like it should be. It defeats `except Exception`; it does not defeat `asyncio.wait` or
+`gather(return_exceptions=True)`, which hand exceptions back as values rather than raising
+them, so a suspension can be captured without anyone writing an `except` at all. Each wait
+therefore writes itself onto the `Run` before raising, and a body that returns having
+reached one is refused (`Swallowed`) rather than reported as a finished workflow. That
+also settles a second thing the type could not: `asyncio.gather` propagates only the first
+exception, so a report built from what came out would name one key of a fan-out's several.
 
 The case that forced it is a saga, which is an `except Exception` around a forward run
 that drives a rollback. A `Fenced` forward run is not a failure: it says another pass

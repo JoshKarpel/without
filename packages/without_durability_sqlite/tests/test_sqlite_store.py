@@ -241,6 +241,37 @@ async def test_a_value_arriving_is_recorded_and_queued_in_one_commit(database: D
     assert taken.workflow == WORKFLOW, "recorded and runnable, from one call"
 
 
+async def test_a_message_delivered_is_appended_and_queued_in_one_commit(database: Database) -> None:
+    durable = SqliteDurable(SqliteCheckpointer(database=database), SqliteScheduler(database=database))
+
+    entry = await durable.deliver(WORKFLOW, {"said": "hello"})
+
+    assert entry.value == {"said": "hello"}
+    assert await durable.checkpointer.load(WORKFLOW) == {entry.key: {"said": "hello"}}
+
+    taken = await durable.scheduler.next_ready(BRIEFLY)
+
+    assert taken is not None
+    assert taken.workflow == WORKFLOW, "appended and runnable, from one call"
+
+
+async def test_an_appended_key_is_named_from_the_row_the_insert_is_about_to_take(database: Database) -> None:
+    # The number in the key is the table's own `seq` counter rather than a count of this
+    # workflow's rows, which is what makes `APPEND` a single statement. It is global, so a
+    # second workflow's appends leave gaps in the first one's keys; the contract asks only
+    # that each workflow's own keys sort into append order, which this pins.
+    checkpointer = SqliteCheckpointer(database=database)
+    other = f"{WORKFLOW}-other"
+
+    first = await checkpointer.append(WORKFLOW, "first")
+    theirs = await checkpointer.append(other, "somebody else's")
+    second = await checkpointer.append(WORKFLOW, "second")
+
+    assert [first.key, theirs.key, second.key] == sorted([first.key, theirs.key, second.key])
+    assert list(await checkpointer.load(WORKFLOW)) == [first.key, second.key], "with a gap where theirs took a number"
+    assert list(await checkpointer.load(other)) == [theirs.key]
+
+
 async def test_two_stores_on_different_databases_are_refused_at_construction(
     tmp_path: Path,
     database: Database,

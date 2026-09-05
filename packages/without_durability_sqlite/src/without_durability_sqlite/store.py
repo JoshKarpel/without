@@ -11,7 +11,7 @@
 #     be interleaved with anything. Postgres needs `FOR UPDATE` on the claim row to get
 #     that, because there readers and writers run concurrently and a statement's snapshot
 #     can be stale; Redis needs a Lua script. Here the transaction *is* the exclusion.
-#   - There is nothing to co-locate. `transact` and `arrive` reach the whole datastore
+#   - There is nothing to co-locate. `transact`, `arrive`, and `deliver` reach the whole datastore
 #     because the datastore is a file, so the question the other two stores have to keep
 #     asking (are these two writes in one local commit?) has one answer and it is yes.
 #
@@ -68,8 +68,11 @@ from typing import cast
 from without_async import Milliseconds
 from without_durability.codec import JSON
 from without_durability.codec import CheckpointCodec
+from without_durability.interfaces import INBOX
+from without_durability.interfaces import INBOX_DIGITS
 from without_durability.interfaces import LEASE
 from without_durability.interfaces import Delivery
+from without_durability.interfaces import Entry
 from without_durability.interfaces import Fenced
 from without_durability.interfaces import Pass
 from without_durability.interfaces import Recorded
@@ -89,19 +92,41 @@ BUSY_TIMEOUT = Milliseconds(5_000)
 # `value` is TEXT rather than a richer type, which is the same shape the Redis store's
 # hash field has and leaves the same question open: what goes *in* the text is the
 # store's injected `CheckpointCodec`, defaulting to JSON because that is what makes a
-# checkpoint readable by anything that can open the file. `WITHOUT ROWID` because every
-# one of these tables is addressed by its primary key and never by a rowid, so the extra
-# indirection would be pure overhead.
+# checkpoint readable by anything that can open the file.
 #
 # `NOT NULL` on `value` keeps "no row" and "a row holding JSON null" distinguishable, so
 # a step that legitimately records `None` is not read back as a step that never ran.
+#
+# `seq` is what `load`'s ordering guarantee rests on, and it is the same column Postgres
+# names: assigned on insert, in insertion order, and left alone by the conflict update
+# below, which is exactly the property the guarantee needs. The writer that first recorded
+# a step decides where it sits, and a later write that loses moves neither the value nor
+# the position. Nothing else here is a candidate, since the only other order on offer is
+# the unique index's, which is step name: a different question with a plausible enough
+# answer to pass a careless test.
+#
+# `INTEGER PRIMARY KEY` makes it an alias for the rowid rather than a column beside one,
+# so it costs no storage and needs no sequence. Naming it is not decoration either. SQLite
+# reserves the right to renumber rowids in "any tables that do not have an explicit INTEGER
+# PRIMARY KEY" when a database is `VACUUM`ed, and this store hands an operator a file it
+# invites any tool to open, so the guarantee would otherwise rest on a promise SQLite
+# declines to make. Declaring the column is what puts this table outside that sentence.
+#
+# `(workflow, step)` is `UNIQUE` rather than the primary key because a table gets one
+# primary key and `seq` is now it. Nothing else changes: both columns are `NOT NULL`, so
+# the constraint admits exactly the rows the primary key did, and it is still what the
+# upserts below name as their conflict target.
+#
+# The claim and queue tables stay `WITHOUT ROWID` because each is addressed by its primary
+# key and never by a position, so for those the indirection would be pure overhead.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS workflow_checkpoint (
+    seq INTEGER PRIMARY KEY,
     workflow TEXT NOT NULL,
     step TEXT NOT NULL,
     value TEXT NOT NULL,
-    PRIMARY KEY (workflow, step)
-) WITHOUT ROWID;
+    UNIQUE (workflow, step)
+);
 
 CREATE TABLE IF NOT EXISTS workflow_claim (
     workflow TEXT PRIMARY KEY,
@@ -169,10 +194,36 @@ ON CONFLICT (workflow, step) DO UPDATE SET value = workflow_checkpoint.value
 RETURNING value
 """
 
+# `supply` under a key this statement mints instead of one the caller brought: the append
+# that puts a message in a workflow's inbox.
+#
+# The number is the highest `seq` in the table plus one, which is global rather than per
+# workflow and so leaves gaps in any one workflow's run of keys. That is what the contract
+# allows and what makes this a single statement: a per-workflow count would be a second
+# read, and reading a maximum and then inserting against it is the exact race that would
+# need a transaction to close. There are no concurrent writers here to lose it to, since
+# SQLite admits one, but the store that has them (Postgres) reaches for the same shape and
+# the two are easier to hold in one head this way.
+#
+# There is no `ON CONFLICT` clause and deliberately none: the key is fresh by construction,
+# so a collision means the numbering is broken and a `UNIQUE` violation is the loud version
+# of that. An upsert here would quietly hand back somebody else's message instead.
+APPEND = f"""
+INSERT INTO workflow_checkpoint (workflow, step, value)
+SELECT
+    :workflow,
+    '{INBOX}' || printf('%0{INBOX_DIGITS}d', COALESCE((SELECT MAX(seq) FROM workflow_checkpoint), 0) + 1),
+    :value
+RETURNING step, value
+"""
+
 FENCE = "SELECT token FROM workflow_claim WHERE workflow = ?"
 ALREADY = "SELECT value FROM workflow_checkpoint WHERE workflow = ? AND step = ?"
 WRITE = "INSERT INTO workflow_checkpoint (workflow, step, value) VALUES (?, ?, ?)"
-LOAD = "SELECT step, value FROM workflow_checkpoint WHERE workflow = ?"
+# `ORDER BY seq` is the whole of the ordering guarantee, and it is load-bearing rather
+# than a formality: `WHERE workflow = ?` is served by the unique index on
+# `(workflow, step)`, so without it the rows come back sorted by step name.
+LOAD = "SELECT step, value FROM workflow_checkpoint WHERE workflow = ? ORDER BY seq"
 # Hand the workflow back early, but keep the token, so the next claim gets the next
 # number up and a pass that comes back from the dead still loses.
 RELEASE = "UPDATE workflow_claim SET held_until = unixepoch('now', 'subsec') WHERE workflow = ? AND token = ?"
@@ -485,6 +536,17 @@ class SqliteCheckpointer:
         )
         return self.codec.decode(cast(tuple[str], stored)[0])
 
+    async def append(self, workflow: str, value: object) -> Entry:
+        """File `value` in this workflow's inbox, under the next key in the table."""
+        stored = await self.database.run(
+            lambda connection: connection.execute(
+                APPEND,
+                {"workflow": workflow, "value": self.codec.encode(value)},
+            ).fetchone()
+        )
+        key, encoded = cast(tuple[str, str], stored)
+        return Entry(key=key, value=self.codec.decode(encoded))
+
     async def release(self, holder: Pass) -> None:
         await self.database.run(lambda connection: connection.execute(RELEASE, (holder.workflow, holder.token)))
 
@@ -642,5 +704,23 @@ class SqliteDurable:
                 {"namespace": self.scheduler.namespace, "workflow": workflow, "visible_at": visible_at},
             )
             return self.checkpointer.codec.decode(cast(tuple[str], stored)[0])
+
+        return await self.checkpointer.database.run(lambda connection: transacted(connection, one_commit))
+
+    async def deliver(self, workflow: str, value: object) -> Entry:
+        """Append the message and make the workflow ready, together or not at all."""
+        visible_at = self.scheduler.now().timestamp()
+
+        def one_commit(cursor: sqlite3.Cursor) -> Entry:
+            stored = cursor.execute(
+                APPEND,
+                {"workflow": workflow, "value": self.checkpointer.codec.encode(value)},
+            ).fetchone()
+            cursor.execute(
+                SCHEDULE,
+                {"namespace": self.scheduler.namespace, "workflow": workflow, "visible_at": visible_at},
+            )
+            key, encoded = cast(tuple[str, str], stored)
+            return Entry(key=key, value=self.checkpointer.codec.decode(encoded))
 
         return await self.checkpointer.database.run(lambda connection: transacted(connection, one_commit))

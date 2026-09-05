@@ -10,6 +10,7 @@ from integration.durable.api import MAX_WORKFLOW_ID
 from integration.durable.api import Payments
 from integration.durable.api import payments_app
 from without_asgi import json_content
+from without_durability import Entry
 from without_durability import MemoryCheckpointer
 from without_durability import MemoryScheduler
 from without_durability import Pass
@@ -278,6 +279,9 @@ class BrokenCheckpointer:
         return None
 
     async def supply(self, workflow: str, key: str, value: object) -> object:
+        raise RuntimeError("the store is down")
+
+    async def append(self, workflow: str, value: object) -> Entry:  # pragma: no cover - the API has no inbox
         raise RuntimeError("the store is down")
 
 

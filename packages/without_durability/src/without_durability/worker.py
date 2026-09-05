@@ -3,17 +3,17 @@
 # the whole shape:
 #
 #   deliveries ──▶ pool of N passes ──▶ Sleeping  ──▶ wake_at (a clock)
-#         ▲                          │  Waiting   ──▶ nothing (a confirmation)
+#         ▲                          │  Blocked   ──▶ nothing (a write, from outside)
 #         │                          │  Completed ──▶ nothing
 #         │                          └──▶ done (this wakeup is answered for)
 #   reclaim one, else read one
 #   timer ──▶ wake_due (one move, in the store)
 #
 # The three arms are what one pass can come to, and `resume` hands them back as a sealed
-# union rather than raising two of them: a `Sleeping` is a deadline the workflow chose,
-# so the worker schedules it; a `Waiting` is a value the outside world owes it, so
-# nobody schedules anything and the API's confirmation is what queues it. Nothing polls
-# a workflow to ask whether it can proceed.
+# union rather than raising two of them: a `Sleeping` is a deadline the workflow chose, so
+# the worker schedules it; a `Blocked` is every value and message the outside world owes
+# it, so nobody schedules anything and the write that answers is what queues the workflow.
+# Nothing polls a workflow to ask whether it can proceed.
 #
 # The delivery stream merges two sources, which is where fan-in belongs: new work, and
 # work a dead worker was holding. `reclaim` assigns the latter to *this* worker, so
@@ -58,11 +58,11 @@ from without_durability.interfaces import Durable
 from without_durability.interfaces import Fenced
 from without_durability.interfaces import Scheduler
 from without_durability.interfaces import check_duration
+from without_durability.stepwise import Blocked
 from without_durability.stepwise import Completed
 from without_durability.stepwise import Outcome
 from without_durability.stepwise import Run
 from without_durability.stepwise import Sleeping
-from without_durability.stepwise import Waiting
 from without_durability.stepwise import now_utc
 from without_durability.stepwise import resume
 
@@ -169,11 +169,11 @@ def passes(
             return
         finally:
             await durable.checkpointer.release(holder)
-        # The three things a pass can come to, and the whole of what the worker owes each.
-        # A deadline the workflow chose is the worker's to schedule; a value the outside
-        # world owes it is not, because no clock satisfies that and whoever writes the
-        # value is what queues the workflow. `assert_never` is what makes this exhaustive
-        # statically, so a fourth outcome would be a type error here rather than a
+        # What a pass can come to, and the whole of what the worker owes each. A deadline
+        # the workflow chose is the worker's to schedule; the values and messages the
+        # outside world owes it are not, because no clock satisfies them and whoever
+        # writes is what queues the workflow. `assert_never` is what makes this exhaustive
+        # statically, so a further outcome would be a type error here rather than a
         # workflow that quietly stops being woken.
         #
         # Both arms answer for the delivery, and `wake_at` is one call rather than a
@@ -185,9 +185,9 @@ def passes(
             case Sleeping(key=key, due=due):
                 await durable.scheduler.wake_at(delivery, due)
                 logger.info(f"{delivery.workflow} is sleeping at {key!r} until {due.isoformat()}")
-            case Waiting(key=key):
+            case Blocked() as blocked:
                 await durable.scheduler.done(delivery)
-                logger.info(f"{delivery.workflow} is waiting at {key!r} to be told")
+                logger.info(f"{delivery.workflow} is blocked at {blocked.keys} until something writes")
             case Completed():
                 await durable.scheduler.done(delivery)
             case _ as unreachable:

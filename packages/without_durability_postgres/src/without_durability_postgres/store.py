@@ -62,8 +62,11 @@ from psycopg.rows import TupleRow
 from psycopg_pool import AsyncConnectionPool
 from without_durability.codec import JSON
 from without_durability.codec import CheckpointCodec
+from without_durability.interfaces import INBOX
+from without_durability.interfaces import INBOX_DIGITS
 from without_durability.interfaces import LEASE
 from without_durability.interfaces import Delivery
+from without_durability.interfaces import Entry
 from without_durability.interfaces import Fenced
 from without_durability.interfaces import Pass
 from without_durability.interfaces import Recorded
@@ -96,13 +99,43 @@ POLL = timedelta(milliseconds=50)
 # JSON null" distinguishable, so a step that legitimately records `None` is not read back
 # as a step that never ran.
 #
+# `seq` is what `load`'s ordering guarantee rests on. The default is evaluated on insert
+# and left alone by the conflict update below, which is exactly the property the guarantee
+# needs: the writer that first recorded a step decides where it sits, and a later write
+# that loses moves neither the value nor the position.
+#
+# It is deliberately not scoped to the workflow. Numbering per workflow would mean reading
+# the current maximum on every write, and the contract is only about the order *within* one
+# workflow, which a shared sequence satisfies with gaps.
+#
+# There is no physical order to fall back on, which is worth stating because a heap scan
+# looks like insertion order right up until it is not: the conflict update is a real MVCC
+# update, so it writes a new tuple version and moves the row.
+#
+# `workflow_seq` is a named sequence with a `DEFAULT` rather than an identity column,
+# because `append` has to mint a key from the *same* number that becomes the row's
+# position, and an identity column is a number no statement is allowed to see. Two
+# sequences cannot do it: the inbox key and the position would be drawn separately, so two
+# concurrent appends could take them in opposite orders and `load` would render the pair
+# backwards against keys that sort the other way. One number is both, so the two orders
+# cannot disagree. `nextval` is atomic and never hands the same number out twice, which is
+# what makes an inbox key safe to mint under concurrent writers where `MAX(...) + 1` inside
+# a statement is a race two inserts can both win, with the loser's message vanishing into
+# first-writer-wins and no error to show for it. It is shared across workflows and it skips
+# numbers on rollback, so any one workflow's keys have gaps; the contract asks only that
+# they sort into append order within a workflow, which is exactly what a shared counter
+# gives.
+#
 # The index is the one query that matters for throughput, `next_ready`'s scan for the
 # oldest visible row in a namespace. The other two tables are read by primary key.
 SCHEMA = """
+CREATE SEQUENCE IF NOT EXISTS workflow_seq;
+
 CREATE TABLE IF NOT EXISTS workflow_checkpoint (
     workflow text NOT NULL,
     step text NOT NULL,
     value jsonb NOT NULL,
+    seq bigint NOT NULL DEFAULT nextval('workflow_seq'),
     PRIMARY KEY (workflow, step)
 );
 
@@ -191,6 +224,32 @@ ON CONFLICT (workflow, step) DO UPDATE SET value = recorded.value
 RETURNING recorded.value::text
 """
 
+# `supply` under a key this statement mints instead of one the caller brought: the append
+# that puts a message in a workflow's inbox.
+#
+# The CTE is what draws one number and spends it twice, as the key and as the row's
+# position, which is the whole of why the key order and the load order agree under
+# concurrency. `nextval` in the `SELECT` list is evaluated once for the one row it
+# produces, and both columns then read that value rather than calling the sequence again.
+# Supplying `seq` explicitly is the reason the column carries a `DEFAULT` rather than being
+# an identity: every other insert here leaves it out and takes the default.
+#
+# No `ON CONFLICT` clause, deliberately. `nextval` never repeats, so the key is fresh by
+# construction and a conflict would mean the numbering is broken; a duplicate-key error is
+# the loud version of that, where an upsert would quietly hand back somebody else's
+# message.
+APPEND = f"""
+WITH minted AS (SELECT nextval('workflow_seq') AS seq)
+INSERT INTO workflow_checkpoint AS entry (workflow, step, value, seq)
+SELECT
+    %(workflow)s,
+    '{INBOX}' || lpad(minted.seq::text, {INBOX_DIGITS}, '0'),
+    %(value)s::jsonb,
+    minted.seq
+FROM minted
+RETURNING entry.step, entry.value::text
+"""
+
 # The three statements `transact` runs between `BEGIN` and `COMMIT`, with the effect's own
 # work in the middle. They are separate strings rather than one because the effect is
 # arbitrary application SQL that this store cannot see, which is precisely what makes the
@@ -210,7 +269,7 @@ ON CONFLICT (workflow, step) DO NOTHING
 RETURNING value::text
 """
 
-LOAD = "SELECT step, value::text FROM workflow_checkpoint WHERE workflow = %s"
+LOAD = "SELECT step, value::text FROM workflow_checkpoint WHERE workflow = %s ORDER BY seq"
 # Hand the workflow back early, but keep the token, so the next claim gets the next
 # number up and a pass that comes back from the dead still loses. Conditional on the
 # token for the same reason `release` is in the Redis store: a superseded pass letting go
@@ -245,12 +304,12 @@ class Supplied(Exception):
 
 async def migrate(pool: AsyncConnectionPool) -> None:
     """
-    Create the three tables, from every process, as often as it likes.
+    Create the three tables and the sequence behind `seq`, from every process, as often as it likes.
 
     Idempotent by `IF NOT EXISTS` and safe against itself by the advisory lock, which is
     the part that is easy to skip: concurrent `CREATE TABLE IF NOT EXISTS` is a
-    duplicate-key error on the system catalog rather than a no-op, and a fleet of workers
-    booting together is exactly a race. `pg_advisory_xact_lock` is held to the end of the
+    duplicate-key error on the system catalog rather than a no-op (and `CREATE SEQUENCE IF
+    NOT EXISTS` is the same), and a fleet of workers booting together is exactly a race. `pg_advisory_xact_lock` is held to the end of the
     surrounding transaction and released by the commit, so there is nothing to unlock.
 
     Schema migration as a whole is not what this is. There is no versioning and no path
@@ -431,6 +490,13 @@ class PostgresCheckpointer:
         async with self.pool.connection() as connection, connection.cursor() as cursor:
             await cursor.execute(SUPPLY, {"workflow": workflow, "step": key, "value": self.codec.encode(value)})
             return self.codec.decode(cast(tuple[str], await cursor.fetchone())[0])
+
+    async def append(self, workflow: str, value: object) -> Entry:
+        """File `value` in this workflow's inbox, under the next key the sequence hands out."""
+        async with self.pool.connection() as connection, connection.cursor() as cursor:
+            await cursor.execute(APPEND, {"workflow": workflow, "value": self.codec.encode(value)})
+            key, encoded = cast(tuple[str, str], await cursor.fetchone())
+            return Entry(key=key, value=self.codec.decode(encoded))
 
     async def release(self, holder: Pass) -> None:
         async with self.pool.connection() as connection:
@@ -696,3 +762,15 @@ class PostgresDurable:
                 {"namespace": self.scheduler.namespace, "workflow": workflow, "visible_at": self.scheduler.now()},
             )
             return codec.decode(stored[0])
+
+    async def deliver(self, workflow: str, value: object) -> Entry:
+        """Append the message and make the workflow ready, together or not at all."""
+        codec = self.checkpointer.codec
+        async with self.checkpointer.pool.connection() as connection, connection.cursor() as cursor:
+            await cursor.execute(APPEND, {"workflow": workflow, "value": codec.encode(value)})
+            key, encoded = cast(tuple[str, str], await cursor.fetchone())
+            await cursor.execute(
+                SCHEDULE,
+                {"namespace": self.scheduler.namespace, "workflow": workflow, "visible_at": self.scheduler.now()},
+            )
+            return Entry(key=key, value=codec.decode(encoded))
