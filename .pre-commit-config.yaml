@@ -57,6 +57,12 @@ repos:
         entry: packages/without_dag/tools/regenerate.sh
         files: ^packages/without_dag/(src/without_dag/graph\.py|tools/(dag_ladders\.py|regenerate\.sh))$
         pass_filenames: false
+      - id: generate-cli-ladders
+        name: regenerate without-cli overload ladders (cog + ruff)
+        language: system
+        entry: packages/without_cli/tools/regenerate.sh
+        files: ^packages/without_cli/(src/without_cli/(commands|tokens)\.py|tools/(ladders\.py|regenerate\.sh))$
+        pass_filenames: false
       - id: generate-elements
         name: regenerate without-html element constructors and renderers (cog + ruff)
         language: system

@@ -10,23 +10,33 @@
 # connector between processors but a source adapter that turns a push-based queue
 # into a pull-based stream to feed the rest. `spool` uses that same queue to drive
 # a pull source ahead of its consumer in a background task, decoupling their pace
-# (read-ahead). `stream_from_iterable` (from a fixed iterable) and `collect`
-# (drain to a list) are the in-memory source and terminal at that edge.
+# (read-ahead). `stream_from_blocking` is the same read-ahead for a source that
+# is not async at all, running its iteration on a worker thread so a blocking
+# `next` never parks the loop. `offload` is its counterpart in the other
+# direction: a blocking *consumer* on one thread, fed by an async `Sink`.
+# `stream_from_iterable` (from a fixed iterable) and `collect` (drain to a list)
+# are the in-memory source and terminal at that edge.
 
 from __future__ import annotations
 
 import asyncio
+import queue
+import threading
 from collections.abc import AsyncGenerator
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from collections.abc import Callable
+from collections.abc import Generator
 from collections.abc import Iterable
+from collections.abc import Iterator
 from contextlib import asynccontextmanager
+from contextlib import suppress
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
+from typing import assert_never
 from typing import cast
 from typing import overload
 
@@ -152,6 +162,194 @@ async def spool[T](source: Stream[T], ahead: int) -> AsyncIterator[T]:
     async with background_task(pump()):
         async for item in stream_from_queue(queue):
             yield item
+
+
+@dataclass(frozen=True, slots=True)
+class _Produced[T]:
+    value: T
+
+
+@dataclass(frozen=True, slots=True)
+class _Failed:
+    error: Exception
+
+
+@dataclass(frozen=True, slots=True)
+class _Exhausted:
+    pass
+
+
+type _FromThread[T] = _Produced[T] | _Failed | _Exhausted
+
+
+async def stream_from_blocking[T](values: Iterable[T], *, ahead: int = 1) -> AsyncIterator[T]:
+    """
+    Expose a *blocking* iterable as a `Stream`, without stalling the event loop.
+
+    `stream_from_iterable` is the right adapter for values already in hand, but
+    it pulls each one on the loop's own thread, so a source that blocks between
+    items (a pipe, `sys.stdin`, a driver with no async client, a `Queue.get`)
+    parks every other task while it waits. This runs the whole iteration on one
+    worker thread instead and hands each value across a bounded queue, so the
+    loop stays free and the producer runs ahead by at most `ahead` items before
+    backpressure reaches it. It is `spool`'s counterpart for a source that is not
+    async in the first place.
+
+    Handing the whole loop to the thread, rather than awaiting one `next` at a
+    time, is what makes it pipeline: the producer fetches the next value while
+    the consumer is still working on the last, which per-item offloading cannot
+    do. The cost is the thread being held for the source's whole lifetime rather
+    than one read, which is the right trade for a long-lived source and the wrong
+    one for many short ones.
+
+    Two consequences worth knowing, both from the fact that **a blocked thread
+    cannot be cancelled**:
+
+    - Abandoning the stream stops the handover immediately, but the thread itself
+      lives until its source produces one more item or ends. For `sys.stdin` that
+      can be forever, so the worker is a daemon thread: the process exits without
+      waiting for it, where a pooled thread would hang `asyncio.run`'s shutdown.
+    - The producer's own cleanup runs when that thread unwinds, which may be
+      after the consumer has moved on. A *generator* source is closed explicitly
+      there rather than left to garbage collection, so its `finally` is as prompt
+      as it can be, but a source that must release a resource on a deadline wants
+      an async adapter rather than this one. Anything else is left open, because
+      it belongs to whoever passed it in and may well be read again.
+    """
+    if ahead < 1:
+        raise ValueError(f"ahead must be at least 1, but got {ahead}")
+
+    loop = asyncio.get_running_loop()
+    handoff: asyncio.Queue[_FromThread[T]] = asyncio.Queue()
+    room = threading.Semaphore(ahead)
+    abandoned = threading.Event()
+
+    def hand_over(item: _FromThread[T]) -> None:
+        # A closed loop means the consumer went away and there is nothing left to
+        # hand this to, which is the ordinary end of an abandoned stream rather
+        # than a failure.
+        with suppress(RuntimeError):
+            loop.call_soon_threadsafe(handoff.put_nowait, item)
+
+    def drain() -> None:
+        iterator = iter(values)
+        try:
+            while True:
+                # Wait for room *before* fetching, so an abandoned stream never
+                # pulls one more value out of a source it will not deliver.
+                room.acquire()
+                if abandoned.is_set():
+                    return
+                try:
+                    value = next(iterator)
+                except StopIteration:
+                    hand_over(_Exhausted())
+                    return
+                hand_over(_Produced(value))
+        except Exception as error:  # noqa: BLE001 - whatever the source raised belongs to the consumer, so it is carried across the thread boundary rather than narrowed here
+            hand_over(_Failed(error))
+        finally:
+            # The generator's `finally` runs here rather than whenever the last
+            # reference happens to be dropped, so a source holding a resource
+            # releases it as soon as this thread unwinds. Only a generator is
+            # closed: `iter(f) is f` for a file, so closing whatever has a `close`
+            # would dispose of a source the caller still owns and still reads
+            # (`sys.stdin` being the one this exists to wrap).
+            if isinstance(iterator, Generator):
+                iterator.close()
+
+    threading.Thread(target=drain, name="stream_from_blocking", daemon=True).start()
+    try:
+        while True:
+            match await handoff.get():
+                case _Produced(value):
+                    room.release()
+                    yield value
+                case _Failed(error):
+                    raise error
+                case _Exhausted():
+                    return
+                case _ as unreachable:
+                    assert_never(unreachable)
+    finally:
+        # Tell the producer to stop, then hand it the capacity it may be parked
+        # on, so it wakes to notice rather than waiting on a semaphore nobody
+        # will ever post to.
+        abandoned.set()
+        room.release()
+
+
+@asynccontextmanager
+async def offload[T](work: Callable[[Iterator[list[T]]], None]) -> AsyncIterator[Sink[T]]:
+    """
+    Run a blocking `work` on a dedicated thread, fed by the yielded async `Sink`.
+
+    The async-to-sync direction, and the exact counterpart of
+    `stream_from_blocking`: there a blocking *source* feeds an async consumer,
+    here an async producer feeds a blocking *consumer*. Both put one long-lived
+    thread on the blocking side and bridge with a queue, because the alternative
+    (an async wrapper library hopping to a worker thread *per operation*) pays
+    that round trip on every item. Here a single thread owns the resource and
+    does all the I/O: `work` is plain blocking Python, and the yielded `Sink`
+    drops each item onto a thread-safe queue the worker drains. No per-item
+    thread hop, and the consumer body stays ordinary synchronous code.
+
+    The two are not mirror images, and the asymmetry is real rather than an
+    oversight. A source has to be *pulled*, so `stream_from_blocking` bounds its
+    queue and pushes backpressure into the producer; a sink is *pushed*, so the
+    bound here would have to become a decision about what to do when the worker
+    falls behind (block the async side, or drop). See the note on the queue
+    below: this first cut takes neither, deliberately.
+
+    Items arrive in *bursts*: each element of the iterator is everything available
+    on the queue at that instant (at least one item, blocking for the first). A
+    burst boundary is therefore exactly the moment the worker has caught up, which
+    is where a writer flushes: under load bursts are large and flushes are few, and
+    when idle each burst is a single item flushed at once. So durability needs no
+    flush-frequency knob; it falls out of the queue's own backlog.
+
+    Lifecycle is bounded by the `with` block: the thread starts on entry, and on
+    exit the queue is shut down so the worker drains what remains and then ends,
+    and the thread is joined (so a file is closed before the block returns). If
+    `work` raises, that surfaces when the block exits.
+
+    Nest this *outside* the consumer that drives the sink, so the worker outlives
+    the draining: `async with offload(...) as writer:` around whatever drives
+    `writer`, not the other way round.
+
+    The queue is unbounded in this first cut: the async side never blocks or drops,
+    at the cost of growing memory if the worker cannot keep up with a sustained
+    burst (a stalled disk). A bounded, drop-counting variant is a deliberate
+    follow-up. The bidirectional case (a full `Processor` bridged onto a thread,
+    with an output queue as well) is intentionally out of scope; this covers the
+    terminal-sink need (writing) without that extra state.
+    """
+    items: queue.Queue[T] = queue.Queue()
+
+    def drain() -> Iterator[list[T]]:
+        while True:
+            try:
+                batch = [items.get()]
+            except queue.ShutDown:
+                return
+            # Take everything queued at this instant into the burst. No Empty to catch and no
+            # get_nowait-in-a-try for control flow: the worker is the queue's *only* consumer, so
+            # qsize() is an exact count of items still present to take (a producer may add more,
+            # which simply waits for the next burst; nobody else removes), and each get succeeds.
+            batch.extend(items.get_nowait() for _ in range(items.qsize()))
+            yield batch
+
+    worker = asyncio.create_task(asyncio.to_thread(work, drain()))
+
+    async def sink(inputs: Stream[T]) -> None:
+        async for item in inputs:
+            items.put_nowait(item)
+
+    try:
+        yield sink
+    finally:
+        items.shutdown()
+        await worker
 
 
 async def close_stream(source: Stream[object]) -> None:

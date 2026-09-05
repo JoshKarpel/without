@@ -431,9 +431,11 @@ def _render_segment(segment: Segment, values: Mapping[str, object]) -> str:
 def _render_value(name: str, converter: Converter[object], value: object, *, multi_segment: bool) -> str:
     # The inverse of the trie walk's `converter.parse`: render the value and prove
     # the converter would parse it straight back, so a generated path routes to the
-    # route it came from (parse, don't validate, in reverse). A single-segment
-    # param may not contain `/`, which would silently span segments.
-    rendered = str(value)
+    # route it came from (parse, don't validate, in reverse). The converter owns
+    # both directions, so the spelling comes from its own `render` rather than from
+    # `str`, which is only the *default* inverse. A single-segment param may not
+    # contain `/`, which would silently span segments.
+    rendered = converter.render(value)
     if not multi_segment and "/" in rendered:
         raise ValueError(f"value {value!r} for path parameter {name!r} spans multiple path segments")
     try:

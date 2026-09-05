@@ -5,6 +5,8 @@ from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field
+from enum import Enum
+from functools import cache
 from typing import Generic
 from typing import TypeVar
 
@@ -31,16 +33,88 @@ class Converter(Generic[_V_co]):  # noqa: UP046 - PEP 695 infers a frozen datacl
     that uses this converter: the router owns the path-param schema because it
     owns the converter.
 
-    `name` is the converter's identity (and its OpenAPI parameter style); a
-    typed-token pattern reuses the converter *value* directly
+    `name` is the converter's label, in rejection messages and as its OpenAPI
+    parameter style; a typed-token pattern reuses the converter *value* directly
     (`path_param("id", INT)`), so the name, parse, type, and schema are all
-    declared in one place. Equality and hashing are by `name` alone (a converter
-    is a trie key), so `parse` and `schema` are excluded from comparison.
+    declared in one place.
+
+    `render` is `parse`'s inverse, which `url_for` needs to spell a value back
+    into a segment. It defaults to `str`, which is right wherever a value's text
+    form *is* its URL form, and is a converter's own business wherever it is not:
+    `str(member)` on a plain `Enum` is `"Profile.PROD"`, while the segment
+    `choice` parses is `"prod"`. It takes an `object` because reverse routing is
+    handed whatever the caller passed; a value the converter cannot spell fails
+    the round-trip check `url_for` makes anyway.
+
+    **Equality is `name` and `parse` together, because a converter is a trie
+    key.** Two path-param segments merge into one branch when their converters
+    compare equal, and the merged branch keeps one of them, so converters that
+    compare equal must *behave* identically or a route is handed a value its own
+    converter never produced. Comparing `parse` is what makes that structural:
+    the shipped converters are module-level singletons, so `INT` used by two
+    routes is the same object and merges as it should, while two converters built
+    separately with distinct `parse` functions stay distinct however they are
+    named. A converter *factory* should be `@cache`d on its inputs (see `choice`)
+    so that calling it twice for the same thing returns the same value and merges.
+
+    `schema` and `render` are excluded, and `schema` not merely because a
+    `Mapping` is unhashable and a trie key must not be: neither takes any part in
+    matching, and OpenAPI and `url_for` both read them off the route's own
+    segments rather than through the trie, so two branches merging has never
+    affected a rendered schema or a generated URL.
     """
 
     name: str
-    parse: Callable[[str], _V_co] = field(compare=False)
+    parse: Callable[[str], _V_co]
     schema: Mapping[str, object] = field(compare=False)
+    render: Callable[[object], str] = field(default=str, compare=False)
+
+
+@cache
+def choice[E: Enum](enum: type[E]) -> Converter[E]:
+    """
+    A path segment that must be one of `enum`'s values, parsed to its member.
+
+    Matching on the *value* rather than the member name is what lets the URL
+    spelling and the Python identifier differ (`/logs/warning` for
+    `Level.WARNING`). Values are compared as text, so a `StrEnum`, an `Enum` with
+    string values, and an `IntEnum` all work, and a segment outside the set
+    rejects, which makes that trie branch fail to match rather than 400 later.
+
+    The `schema` is OpenAPI's own `enum`, so documenting the allowed values costs
+    nothing beyond declaring them once on the enum.
+
+    **`@cache` is load-bearing, not an optimization.** A converter is a trie key
+    compared by `name` and `parse` (see `Converter`), and each call would
+    otherwise build a fresh closure, so `path_param("p", choice(Profile))` written
+    in two modules would produce two converters that do not compare equal, and
+    therefore two sibling branches matching identical segments instead of one.
+    Both routes would still resolve, by backtracking, but a genuine duplicate
+    between them would stop being caught at build time. Caching on the enum makes
+    repeated calls return the *same* converter, so they merge as they should.
+    Any converter built by a function wants the same treatment.
+    """
+    by_value = {str(member.value): member for member in enum}
+    if len(by_value) != len(tuple(enum)):
+        raise ValueError(f"{enum.__name__} has two members whose values are spelled the same in a path")
+
+    def parse(raw: str) -> E:
+        try:
+            return by_value[raw]
+        except KeyError as exc:
+            raise ValueError(f"{raw!r} is not one of {', '.join(by_value)}") from exc
+
+    def render(value: object) -> str:
+        # The inverse of matching on the value: `str` on a plain `Enum` member is
+        # `"Level.WARNING"`, which is the Python spelling rather than the URL's.
+        return str(value.value) if isinstance(value, Enum) else str(value)
+
+    return Converter(
+        name=enum.__name__,
+        parse=parse,
+        schema={"type": "string", "enum": list(by_value)},
+        render=render,
+    )
 
 
 STR: Converter[str] = Converter(name="str", parse=str, schema={"type": "string"})

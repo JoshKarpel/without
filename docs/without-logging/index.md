@@ -314,7 +314,10 @@ log stream pays a thread-pool round-trip on every write. The cheaper shape is a
 queue: the async side just enqueues, with no per-write hop.
 
 `offload` is that bridge: a context manager that yields a `Sink`, running a
-blocking `work` function on a dedicated thread. `work` is ordinary synchronous
+blocking `work` function on a dedicated thread. It lives in
+[`without-streams`](../without-streams/index.md) rather than here, because it is
+the substrate's async-to-sync crossing and says nothing about logs; this is just
+its first caller. `work` is ordinary synchronous
 Python that consumes the items; the yielded sink drops each onto a thread-safe
 queue the worker drains. Items arrive in *bursts* (everything queued at that
 instant), so the worker batches writes and flushes at each burst boundary, which
@@ -337,7 +340,8 @@ closes files it owns, while `to_stream` never closes the caller's stream:
 from datetime import timedelta
 
 from without_streams import compose, from_map, from_selector
-from without_logging import Level, at_least, capture, offload, to_rotating_file
+from without_streams import offload
+from without_logging import Level, at_least, capture, to_rotating_file
 
 
 async def render(record):
@@ -430,7 +434,8 @@ data, plus anything `add_fields`/`bind` enriched) as first-class output:
 import sys
 
 from without_streams import compose
-from without_logging import capture, offload, render_console, render_json, to_stream
+from without_streams import offload
+from without_logging import capture, render_console, render_json, to_stream
 
 async with (
     offload(to_stream(sys.stdout)) as out,
@@ -517,7 +522,6 @@ from without_logging import (
     add_fields,
     at_least,
     capture,
-    offload,
     render_console,
     render_json,
     to_rotating_file,

@@ -74,6 +74,35 @@ outlives its consumer by an indeterminate amount. `stack`
 composes middleware (any `(handler, *context) -> handler`) into one, serving both
 server handlers and HTTP clients.
 
+### Crossing the sync boundary
+
+Not everything that has to reach a stream is async, and the two directions across
+that boundary are `stream_from_blocking` and `offload`.
+
+`stream_from_blocking` is the source side: `stream_from_iterable` pulls each value
+on the loop's own thread, so a source that *blocks* between items (a pipe,
+`sys.stdin`, a driver with no async client) parks every other task while it waits.
+This runs the whole iteration on one worker thread and hands values across a
+bounded queue, so the loop stays free and the producer pipelines ahead by at most
+`ahead` items before backpressure reaches it. Handing over the whole loop rather
+than awaiting one `next` at a time is what makes it pipeline, at the cost of
+holding a thread for the source's lifetime.
+
+`offload` is the terminal side: it yields a `Sink` whose items a plain blocking
+`work` function drains on a thread of its own, in bursts of whatever is queued at
+that instant. So a file writer stays ordinary synchronous Python and pays no
+per-item thread hop, which is what an async file library charges.
+
+They share a mechanism (one long-lived thread on the blocking side, a queue
+bridging) and are deliberately *not* mirror images in their interface. A source
+has to be pulled, so `stream_from_blocking` bounds its queue and pushes
+backpressure into the producer; a sink is pushed, so bounding `offload` would mean
+choosing what happens when the worker falls behind (block the async side, or
+drop), and it takes neither yet. Both also inherit the one thing a thread cannot
+do: a blocked thread cannot be cancelled, so `stream_from_blocking`'s worker is a
+daemon thread and abandoning its stream releases the producer's backpressure so it
+wakes to notice, rather than parking on a semaphore nobody will post to.
+
 `ticks` is the clock as a source: a stream of moments, one now and one every
 interval after, so *when* periodic work happens is a stream a caller supplies
 rather than a loop buried inside the work.

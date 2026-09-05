@@ -33,9 +33,10 @@ turns the pushed records into a `Stream`, and runs your pipeline against them fo
 the life of the block. Everything upstream of the sink is pure and testable
 without touching the logging machinery.
 
-To write to a file without paying a thread hop per line, `offload` runs a blocking
-writer on a single dedicated thread, fed by a queue that delivers items in bursts
-(so the writer flushes when it catches up, no flush-frequency knob). Writers are
+To write to a file without paying a thread hop per line, `without-streams`'
+`offload` runs a blocking writer on a single dedicated thread, fed by a queue
+that delivers items in bursts (so the writer flushes when it catches up, with no
+flush-frequency knob). Writers are
 named by destination: `to_rotating_file` writes to a file (owning the byte count and
 clock, rotating on any combination of size (`max_bytes`), a relative interval
 (`max_age`), and absolute wall-clock boundaries (`schedule=at_times(...)`)), and
@@ -46,7 +47,8 @@ closing it. Both take strings (render a `Record` to text with a `from_map` in fr
 from datetime import timedelta
 
 from without_streams import compose, from_map, from_selector
-from without_logging import Level, at_least, offload, to_rotating_file
+from without_streams import offload
+from without_logging import Level, at_least, to_rotating_file
 
 writer = to_rotating_file(lambda i, when: directory / f"app.{i}.log", max_bytes=64 << 20, max_age=timedelta(hours=1))
 async with offload(writer) as sink:

@@ -13,7 +13,6 @@ from without_logging.renderers import iso_timestamp
 from without_logging.renderers import render_console
 from without_logging.renderers import render_json
 from without_logging.sinks import at_times
-from without_logging.sinks import offload
 from without_logging.sinks import to_rotating_file
 from without_logging.sinks import to_stream
 
@@ -30,7 +29,6 @@ __all__ = [
     "exception_to_text",
     "iso_timestamp",
     "merge_context",
-    "offload",
     "parse_record",
     "render_console",
     "render_json",
