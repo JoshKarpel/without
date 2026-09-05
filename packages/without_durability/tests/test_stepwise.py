@@ -13,12 +13,12 @@ from integration.durable import parse_held
 from integration.durable import parse_items
 from integration.durable import parse_reference
 from integration.durable import pay_out
+from without_durability import Blocked
 from without_durability import Completed
 from without_durability import Contended
 from without_durability import Entry
 from without_durability import Fenced
 from without_durability import InputNeeded
-from without_durability import Listening
 from without_durability import MemoryCheckpointer
 from without_durability import MemoryEffect
 from without_durability import MessageNeeded
@@ -28,7 +28,7 @@ from without_durability import Run
 from without_durability import ScheduledWakeup
 from without_durability import Sleeping
 from without_durability import Suspended
-from without_durability import Waiting
+from without_durability import Swallowed
 from without_durability import claimed
 from without_durability import inbox_key
 from without_durability import now_utc
@@ -228,11 +228,11 @@ async def test_a_payout_over_the_threshold_waits_for_an_approval_another_process
     ledger = Ledger(items=dict(BIG_ITEMS))
     checkpointer = MemoryCheckpointer()
 
-    # `Waiting` rather than `Sleeping`: this wait ends when it is told, not when a clock
+    # `Blocked` rather than `Sleeping`: this wait ends when it is told, not when a clock
     # says so, and the type is what says which. There is no deadline on it to schedule.
     suspension = await paying(ledger, checkpointer, Clock())
 
-    assert suspension == Waiting(key="approved-by")
+    assert suspension == Blocked(waiting=frozenset({"approved-by"}))
     assert "pay" not in ledger.calls
 
     # Whoever took the approval writes one field into the workflow's checkpoint. It
@@ -627,46 +627,113 @@ async def test_several_suspensions_at_once_report_the_earliest_deadline() -> Non
     # Asserted on the choice itself rather than through a task group, because a group
     # cancels its siblings the instant one of them raises: which suspensions arrive
     # together is a race, and what to do with the ones that did is not.
-    raised = [
+    reached: list[Suspended] = [
         InputNeeded("approved-by"),
         ScheduledWakeup("settling", due=STARTED_AT + SETTLING),
         ScheduledWakeup("clearing", due=STARTED_AT + timedelta(hours=1)),
     ]
-    recorded = {"settling": STARTED_AT + SETTLING, "clearing": STARTED_AT + timedelta(hours=1)}
 
-    assert stopped_at(raised, recorded) == Sleeping(key="clearing", due=STARTED_AT + timedelta(hours=1))
+    assert stopped_at([], reached) == Sleeping(key="clearing", due=STARTED_AT + timedelta(hours=1))
 
 
-async def test_only_a_wait_for_input_reports_a_waiting_pass() -> None:
+async def test_every_key_a_pass_waits_on_is_reported_rather_than_one_of_them() -> None:
     # The other half of the choice above: with no deadline among them there is nothing to
-    # schedule, and the driver is told to leave the workflow alone until somebody writes
-    # the value.
-    assert stopped_at([InputNeeded("approved-by"), InputNeeded("countersigned-by")], {}) == Waiting(key="approved-by")
+    # schedule, and the driver is told to leave the workflow alone until somebody writes.
+    # *Which* somebody is the whole content of the outcome, so a pass blocked on two keys
+    # reports two: naming one would tell a client the workflow needs an approval when it
+    # needs an approval and a countersignature, and the client would supply one and wait.
+    assert stopped_at([InputNeeded("approved-by"), InputNeeded("countersigned-by")], []) == Blocked(
+        waiting=frozenset({"approved-by", "countersigned-by"})
+    )
 
 
-async def test_a_wait_for_a_message_reports_a_listening_pass() -> None:
-    # The third way of stopping, and the one a driver answers the same way it answers
-    # `Waiting` while telling a *client* something different: this workflow is owed a
-    # `deliver`, where a `Waiting` one is owed a write at a key it named.
-    assert stopped_at([MessageNeeded("heard")], {}) == Listening(key="heard")
+async def test_a_wait_for_a_message_is_reported_apart_from_a_wait_for_a_value() -> None:
+    # Two fields rather than two types, and the distinction they carry is what to *do*: a
+    # `waiting` key is an address a client answers with `arrive`, and a `listening` key
+    # names the read step that stopped, which nobody writes to, so the answer is `deliver`.
+    assert stopped_at([MessageNeeded("heard")], []) == Blocked(listening=frozenset({"heard"}))
 
 
-async def test_a_pass_that_both_waits_and_listens_reports_the_addressed_wait() -> None:
-    # A fan-out can raise one of each, and a pass has one outcome. Neither is scheduled, so
-    # which one wins is arbitrary; what it must not be is unstable, since two passes
-    # reporting different outcomes for one suspended workflow is a difference an operator
-    # would chase. The addressed wait wins because a client can act on it from the outcome
-    # alone, where `Listening` only says "send this workflow something".
-    assert stopped_at([MessageNeeded("heard"), InputNeeded("approved-by")], {}) == Waiting(key="approved-by")
+async def test_a_pass_that_both_waits_and_listens_reports_both() -> None:
+    # The case a type per kind could not express. A fan-out blocked on an approval *and* an
+    # empty inbox is blocked on both at once, and either write advances it, so reporting
+    # one and discarding the other hid a way to unblock the workflow. It was unstable as
+    # well as lossy: the winner was whichever branch reached its raise first.
+    assert stopped_at([MessageNeeded("heard"), InputNeeded("approved-by")], []) == Blocked(
+        waiting=frozenset({"approved-by"}), listening=frozenset({"heard"})
+    )
+
+
+async def test_the_report_does_not_depend_on_which_branch_raised_first() -> None:
+    # The same suspensions in the other order, which is what task scheduling decides. A set
+    # has no order to leak, so this is the property falling out of the shape rather than
+    # being arranged, and it is what stops two passes at one workflow disagreeing.
+    raised = [InputNeeded("zzz"), MessageNeeded("heard"), InputNeeded("aaa")]
+
+    assert stopped_at(raised, []) == stopped_at(list(reversed(raised)), [])
 
 
 async def test_a_deadline_beats_a_wait_for_a_message_too() -> None:
-    # `Listening` is answered by whoever delivers next, which is not this driver; the
+    # A `Blocked` is answered by whoever writes next, which is not this driver; the
     # deadline is answered by this driver and by nobody else, so reporting the wait would
-    # leave a branch that asked for a clock with nothing scheduled.
+    # leave a branch that asked for a clock with nothing scheduled. This is the one place
+    # the outcome still drops information, and it is bounded: the pass the wakeup produces
+    # reaches those branches again.
     raised: list[Suspended] = [MessageNeeded("heard"), ScheduledWakeup("settling", due=STARTED_AT + SETTLING)]
 
-    assert stopped_at(raised, {}) == Sleeping(key="settling", due=STARTED_AT + SETTLING)
+    assert stopped_at(raised, []) == Sleeping(key="settling", due=STARTED_AT + SETTLING)
+
+
+async def test_a_gather_that_propagates_one_suspension_still_reports_them_all() -> None:
+    # `asyncio.gather` raises the *first* exception rather than a group, so the siblings
+    # never reach `resume` at all. Reading the report off what the pass *reached* is what
+    # makes it independent of which combinator the workflow used: written with a
+    # `TaskGroup` this same body reports both keys, and it must not matter which was used.
+    checkpointer = MemoryCheckpointer()
+
+    async def gathered(run: Run) -> None:
+        await asyncio.gather(run.awaiting("aaa", as_text), run.awaiting("zzz", as_text))
+
+    assert await resume(await claimed(checkpointer, ORDER), checkpointer, gathered) == Blocked(
+        waiting=frozenset({"aaa", "zzz"})
+    )
+
+
+async def test_a_workflow_that_catches_a_suspension_and_returns_is_that_workflows_error() -> None:
+    # The failure this makes loud. `asyncio.wait` hands back done futures rather than
+    # raising, so a suspension captured there never reaches `resume`, and the pass would
+    # otherwise report `Completed` for a workflow still waiting on the world: nothing wakes
+    # a finished workflow, and no record says a wait went unanswered.
+    checkpointer = MemoryCheckpointer()
+
+    async def swallowing(run: Run) -> str:
+        waiting = asyncio.ensure_future(run.awaiting("approved-by", as_text))
+        done, pending = await asyncio.wait([waiting], return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:  # pragma: no cover - nothing is pending; the wait suspended at once
+            task.cancel()
+        return f"{len(done)} done"
+
+    with pytest.raises(Swallowed, match=r"caught a suspension at \('approved-by',\)"):
+        await resume(await claimed(checkpointer, ORDER), checkpointer, swallowing)
+
+
+async def test_a_workflow_that_finishes_without_suspending_is_still_completed() -> None:
+    # The control for the check above: `reached` is empty on a pass that never waited, so
+    # an ordinary workflow is unaffected by it. Without this, a `Swallowed` raised on every
+    # pass would look like the check working.
+    checkpointer = MemoryCheckpointer()
+
+    async def straight_through(run: Run) -> str:
+        return await run.step("charged", lambda: answering("ch-1"), as_text)
+
+    assert await resume(await claimed(checkpointer, ORDER), checkpointer, straight_through) == Completed(value="ch-1")
+
+
+async def test_a_pass_blocked_on_nothing_is_not_a_state_that_can_be_built() -> None:
+    # An empty `Blocked` would say a workflow stopped for no reason, and a driver reading
+    # one would park a workflow that nothing will ever wake.
+    with pytest.raises(ValueError, match="blocked on something"):
+        Blocked()
 
 
 async def test_a_receive_takes_what_is_in_the_inbox_and_records_how_far_it_read() -> None:
@@ -794,7 +861,7 @@ def test_a_lost_claim_is_reported_over_a_sibling_that_failed_beside_it() -> None
     lost = Fenced("pass 1 was superseded")
 
     with pytest.raises(Fenced) as raised:
-        unwound(BaseExceptionGroup("fan-out", [RuntimeError("the gateway declined"), lost]), {})
+        unwound(BaseExceptionGroup("fan-out", [RuntimeError("the gateway declined"), lost]), [])
 
     assert raised.value is lost
 
@@ -807,7 +874,7 @@ def test_a_fan_out_that_only_failed_is_re_raised_without_its_suspensions() -> No
     with pytest.raises(ExceptionGroup) as raised:
         unwound(
             BaseExceptionGroup("fan-out", [InputNeeded("approved-by"), RuntimeError("the gateway declined")]),
-            {},
+            [],
         )
 
     assert [type(each) for each in raised.value.exceptions] == [RuntimeError]
@@ -818,7 +885,7 @@ async def test_a_deadline_whose_suspension_was_cancelled_is_still_reported() -> 
     # `sleep` records the deadline and *then* raises, and a task group cancels its other
     # branches the instant one of them raises, so the branch that had just written its
     # deadline can be cancelled in between. The record is durable by then. Without the
-    # deadline being noted on the pass, nothing reports it: the driver hears `Waiting`,
+    # deadline being noted on the pass, nothing reports it: the driver hears `Blocked`,
     # schedules no wakeup, and the workflow waits out a clock that will never fire while
     # its checkpoint holds the deadline that was supposed to end the wait.
     checkpointer = ParkedWrites()
@@ -910,7 +977,7 @@ async def test_a_sleep_cancelled_before_its_deadline_landed_schedules_nothing() 
             group.create_task(run.sleep("timing-out", SETTLING))
             group.create_task(waiting_on_a_person(run))
 
-    assert await resume(holder, checkpointer, body, now=Clock()) == Waiting(key="approved-by")
+    assert await resume(holder, checkpointer, body, now=Clock()) == Blocked(waiting=frozenset({"approved-by"}))
     assert await checkpointer.load(ORDER) == {}
 
 
@@ -935,13 +1002,17 @@ async def test_a_held_payout_stays_held_when_the_threshold_moves_between_passes(
         return await pay_out(run, ORDER, ledger.services(), settling=timedelta(), approval_over=over)
 
     holder = await claimed(checkpointer, ORDER)
-    assert await resume(holder, checkpointer, lambda run: body(run, APPROVAL_OVER)) == Waiting(key="approved-by")
+    assert await resume(holder, checkpointer, lambda run: body(run, APPROVAL_OVER)) == Blocked(
+        waiting=frozenset({"approved-by"})
+    )
     await checkpointer.release(holder)
 
     raised = await claimed(checkpointer, ORDER)
     outcome = await resume(raised, checkpointer, lambda run: body(run, 1_000_000))
 
-    assert outcome == Waiting(key="approved-by"), "the pass that held it decided; a later one abides by that"
+    assert outcome == Blocked(waiting=frozenset({"approved-by"})), (
+        "the pass that held it decided; a later one abides by that"
+    )
     assert "paid" not in await checkpointer.load(ORDER)
 
 

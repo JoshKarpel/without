@@ -70,7 +70,7 @@ Each is worth naming with what it costs.
   `Run.claim` catches two steps sharing a name within one pass, which is the sharpest
   version of the failure, but only within a pass.
 - **A durable timer and an external signal are the same thing.** `Sleeping` and
-  `Waiting` differ only in whether anyone schedules the wakeup, and both are
+  `Blocked` differ only in whether anyone schedules the wakeup, and both are
   satisfied by an entry in the same mapping, which is also why starting a workflow and
   signalling one are the same call in the API. Temporal and DBOS have separate machinery
   for each. What that buys is a smaller vocabulary; what it costs is that the store
@@ -80,9 +80,61 @@ Each is worth naming with what it costs.
   A _stream_ of signals is the same mapping again, and it is the one place the
   vocabulary had to grow: a key holds one value forever, so a workflow reading a
   sequence needs keys it did not name in advance, and only the store can hand those out
-  without two callers racing for the same one. `Listening` is `Waiting` over that
-  stream. This is where the durable-workflow and durable-actor shapes meet, and the
-  meeting costs one method on the store rather than a second execution model: an entry
-  is an ordinary record, so it renders, forks, and expires exactly as a step's result
-  does. What it does not buy is Temporal's competing consumers, and nothing here wants
-  them, since `claim` already admits one pass per workflow.
+  without two callers racing for the same one. `Blocked.listening` is `Blocked.waiting`
+  over that stream. The [inbox section below](#the-inbox-and-why-two-engines-get-it-for-free)
+  is where that sits next to the engines that already have it.
+
+  What Temporal does offer that this does not is `Workflow.await` over a condition, and
+  more generally a race between two waits. Here both branches suspend, so the pass stops
+  on both; a `Blocked` names them all, and any one write advances the workflow, but the
+  workflow cannot proceed on whichever arrives first. That is a real restriction rather
+  than an omission: a race would let a replay take the branch that lost the first time.
+
+## The inbox, and why two engines get it for free
+
+The inbox is not a new idea, and it is worth saying which existing one it is.
+[Temporal's Signals](https://docs.temporal.io/workflows) are this concept essentially
+verbatim: a signal is appended to the workflow's
+[Event History](https://docs.temporal.io/encyclopedia/event-history), "a complete and
+durable log of everything that has happened in the lifecycle of a Workflow Execution".
+Non-destructive, ordered, inspectable, replayed in order rather than re-polled, and
+persisted across a reset, where signals can be copied into the new history whether they
+fall after the reset point or not. Everything the inbox claims, Temporal already does, so
+the semantics here have a reference implementation to be argued against rather than being
+invented.
+
+[DBOS](https://docs.dbos.dev/golang/tutorials/workflow-communication) has the same
+primitive built the other way. `send`/`recv` is durable and database-backed, optionally
+per-topic, and each `recv` waits for and **consumes** the next message, dequeued FIFO.
+Their docs frame the trade from the opposite side of the same choice: consuming from a
+queue avoids accumulating a log that has to be re-read, at the price of the inspectable
+audit trail.
+
+The split is not a matter of taste. It falls out of what each engine's durable record
+*is*:
+
+| The record is | Engines | Input as a stream |
+|---|---|---|
+| An append-only **event history** | Temporal, Cadence | Free: a signal is one more event |
+| A **memo table** keyed by step name | DBOS, `without-durability` | Absent: no order, and no room for two values under one name |
+
+That is the whole explanation for the gap. This repo chose keyed memoization over an event
+log, which is the simpler design and the reason a replay here is a dict lookup rather than
+a command-sequence validation, and a missing input stream is exactly what that choice
+costs. DBOS is in the same camp and bolted a queue onto it; this bolts on a log.
+
+Which lands somewhere neither of them is, and the mechanism that makes it a third position
+rather than a copy is worth being explicit about. **Nothing here replays from the log.**
+Steps are looked up by key in a mapping loaded once, so an inbox entry that is never read
+again costs a row and some load bandwidth and *does not participate in replay* the way
+every Temporal history event does. That is Temporal's inspectability at something much
+nearer DBOS's replay cost.
+
+The price is the one Temporal pays too, arriving by a different route. There, signal
+volume is replay cost, which is why the guidance for a workflow used as a streaming sink
+is batching and Continue-As-New. Here it is storage and read bandwidth: the checkpoint
+grows without bound, and `load` reads all of it on every pass. Those are one cost with two
+symptoms rather than two costs, and the bound for both is the same unbuilt thing, a read
+scoped to a key prefix so a pass can take the tail of an inbox without the whole of it.
+Until that exists, a long-lived workflow pays the full read every pass, which is the
+[gap](index.md#gaps) to weigh before using one as a sink.

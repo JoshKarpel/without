@@ -92,7 +92,7 @@ timer, once D passes
 worker pulls again
   claim             ────────────────────▶ ▪ token=2 until=T₂  (the fence advances)
   awaiting          ─  suspends: "approved-by" is not there
-  Waiting           ── nothing scheduled: only the world can answer this
+  Blocked           ── nothing scheduled: only the world can answer this
   release, XACK     ────────────────────▶ until=0             ▫ 2-0 acked
 POST /confirmation
   supply("approved-by") ▪ approved-by

@@ -146,7 +146,12 @@ class Interruption(BaseException):
     It descends from `BaseException` for the reason `asyncio.CancelledError` does: an
     `except Exception` written to handle a workflow's *own* errors (a gateway declined, a
     row was missing) must not silently absorb a signal about whether this pass may run at
-    all. Catching them is deliberate, by name, or not at all.
+    all.
+
+    `Fenced` and `Contended` may be caught by name, by a driver deciding what to do about
+    losing a workflow. `Suspended` may not be caught at all, by anyone: a pass that
+    handles one and carries on is claiming a wait was answered when it was not, and
+    `resume` refuses it (see `Swallowed`).
     """
 
 

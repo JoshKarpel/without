@@ -254,9 +254,18 @@ whether _this pass_ may continue, not about the work; an `except Exception` writ
 handle a declined gateway must not absorb one.
 
 `Suspended` is the one a driver never sees, because `resume` catches it and returns a
-`Sleeping` or a `Waiting`. It still descends from `BaseException` for the half of its
+`Sleeping` or a `Blocked`. It still descends from `BaseException` for the half of its
 life that matters: the part where it is travelling up through the workflow author's own
 code, past whatever they wrapped their steps in.
+
+`BaseException` is not enough on its own, though, which is worth stating because it looks
+like it should be. It defeats `except Exception`; it does not defeat `asyncio.wait` or
+`gather(return_exceptions=True)`, which hand exceptions back as values rather than raising
+them, so a suspension can be captured without anyone writing an `except` at all. Each wait
+therefore writes itself onto the `Run` before raising, and a body that returns having
+reached one is refused (`Swallowed`) rather than reported as a finished workflow. That
+also settles a second thing the type could not: `asyncio.gather` propagates only the first
+exception, so a report built from what came out would name one key of a fan-out's several.
 
 The case that forced it is a saga, which is an `except Exception` around a forward run
 that drives a rollback. A `Fenced` forward run is not a failure: it says another pass

@@ -36,15 +36,55 @@
   space: a step named `inbox:3` would be read back as a message somebody delivered, and no
   amount of re-running would reveal it.
 
-- **`without-durability`**: `Listening`, a third suspension outcome beside `Sleeping` and
-  `Waiting`, for a pass stopped on an empty inbox. A driver answers it exactly as it answers
-  `Waiting` (acknowledge the delivery, schedule nothing), and it is a separate arm because
-  `Waiting.key` is an *address* a client writes to with `arrive`, where this key names the
-  read step that stopped and the answer is `deliver`, addressed to the workflow. **A driver
-  that matches over `Outcome` now has a case to add**, which `assert_never` reports as a
-  type error rather than as a workflow that quietly stops being woken.
-
 ### Changed
+
+- **`without-durability`**: `Waiting` is replaced by `Blocked`, which reports **every**
+  branch a pass stopped on rather than one of them, in two sets: `waiting` holds the
+  addresses from `Run.awaiting`, answered with `arrive(workflow, key, value)`, and
+  `listening` holds the read steps from `Run.receive`, answered with
+  `deliver(workflow, value)`. `Outcome` is now `Completed | Sleeping | Blocked`, so **a
+  driver matching over it has a case to rename**, which `assert_never` reports as a type
+  error rather than as a workflow that quietly stops being woken.
+
+  A fan-out suspends in every branch that cannot finish, and the old shape carried one key,
+  so a pass blocked on an approval *and* an empty inbox reported the approval and discarded
+  the inbox: a client was told one way to unblock the workflow when there were two. It was
+  also unstable, which was worse and is what prompted this. Nothing sorted the candidates,
+  so the reported key was whichever branch reached its raise first, and two passes at one
+  suspended workflow could name different keys on scheduling alone. A set has no order to
+  leak, so both problems go away together.
+
+  Two fields rather than two arms because a driver's response to either is identical
+  (acknowledge, schedule nothing) and a pass can be stopped on both at once, while the
+  distinction that *is* load-bearing (an address to write to, versus a step name nobody
+  writes to) survives as the field a key sits in. `InputNeeded` and `MessageNeeded` are
+  unchanged and are what decide which field a key lands in.
+
+  `Sleeping` still wins when a pass has both a deadline and blocked branches, since it
+  alone carries something the driver must act on. That is the one place an outcome still
+  drops information, and it is bounded: the pass the wakeup produces reaches those branches
+  again and reports them then.
+
+- **`without-durability`**: a pass now reports what it *reached* rather than what
+  propagated out of it, so the outcome no longer depends on which combinator a workflow
+  wrapped its waits in. Each wait writes itself onto the `Run` before raising, and
+  `Run.waking` is gone, folded into the one `Run.reached` that all three waits use.
+  `stopped_at` and `unwound` take that list in its place. A `gather` of two `awaiting`
+  calls now reports both keys, where it previously reported one: `asyncio.gather`
+  propagates only the *first* exception, so the siblings never reached `resume` at all.
+
+- **`without-durability`**: **a workflow may no longer catch a `Suspended` at all.** A body
+  that returns normally having reached a suspension raises `Swallowed`, naming the keys,
+  instead of reporting `Completed`. `asyncio.wait` and `gather(return_exceptions=True)`
+  capture exceptions as values rather than raising them, so `Suspended` descending from
+  `BaseException` never protected against them: a pass could report a finished workflow
+  that was still waiting on the world, having in the inbox case already consumed entries it
+  never acted on. Nothing wakes a finished workflow and no record says a wait went
+  unanswered, so this was silent and unrecoverable.
+
+  The cost is that "carry on if it is not there yet" can no longer be written by catching
+  one, and there is no `awaiting` that returns a default; for the inbox, `Run.pending` is
+  that shape. `Fenced` and `Contended` are unaffected and may still be caught by name.
 
 - **`without-durability`**: `Checkpointer.load` now MUST return a workflow's records in the
   order they were first recorded, and all four stores do. A workflow's records have two

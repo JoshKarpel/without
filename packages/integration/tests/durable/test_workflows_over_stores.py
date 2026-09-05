@@ -18,12 +18,12 @@ from integration.durable import payments_app
 from integration.durable import submitting
 from integration.durable import unwinding
 from without_dag import CompiledGraph
+from without_durability import Blocked
 from without_durability import Checkpointer
 from without_durability import Completed
 from without_durability import Durable
 from without_durability import Outcome
 from without_durability import Run
-from without_durability import Waiting
 from without_durability import claimed
 from without_durability import now_utc
 from without_durability import resume
@@ -184,7 +184,7 @@ async def test_a_workflow_suspended_on_an_approval_resumes_when_another_process_
 
     suspension = await passing(checkpointer, workflow, body)
 
-    assert suspension == Waiting(key="approved-by")
+    assert suspension == Blocked(waiting=frozenset({"approved-by"}))
     assert set(await checkpointer.load(workflow)) == {
         "items",
         "captured:piano",

@@ -22,9 +22,9 @@ from without_durability.interfaces import inbox_key
 from without_durability.memory import MemoryCheckpointer
 from without_durability.memory import MemoryEffect
 from without_durability.memory import MemoryScheduler
+from without_durability.stepwise import Blocked
 from without_durability.stepwise import Completed
 from without_durability.stepwise import InputNeeded
-from without_durability.stepwise import Listening
 from without_durability.stepwise import MessageNeeded
 from without_durability.stepwise import Outcome
 from without_durability.stepwise import Run
@@ -32,7 +32,7 @@ from without_durability.stepwise import ScheduledWakeup
 from without_durability.stepwise import Sleeping
 from without_durability.stepwise import StepKey
 from without_durability.stepwise import Suspended
-from without_durability.stepwise import Waiting
+from without_durability.stepwise import Swallowed
 from without_durability.stepwise import now_utc
 from without_durability.stepwise import parse_bound
 from without_durability.stepwise import parse_deadline
@@ -47,6 +47,7 @@ __all__ = [
     "INBOX_DIGITS",
     "JSON",
     "LEASE",
+    "Blocked",
     "CheckpointCodec",
     "Checkpointer",
     "Completed",
@@ -58,7 +59,6 @@ __all__ = [
     "InputNeeded",
     "Interruption",
     "JsonCodec",
-    "Listening",
     "MemoryCheckpointer",
     "MemoryEffect",
     "MemoryScheduler",
@@ -73,7 +73,7 @@ __all__ = [
     "SplitDurable",
     "StepKey",
     "Suspended",
-    "Waiting",
+    "Swallowed",
     "check_duration",
     "claimed",
     "inbox_key",

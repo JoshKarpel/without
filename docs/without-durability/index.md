@@ -108,7 +108,7 @@ step per line item a *step* returned, keyed by sku, so a crash resumes item by i
 and a step that cannot finish now stops the pass instead of blocking. That last one is
 what buys a settlement window waited out across crashes (`run.sleep` comes back as a
 `Sleeping` carrying the *deadline* it recorded, so a crash on day two does not restart
-the clock) and a human approval (`run.awaiting` comes back as a `Waiting` until
+the clock) and a human approval (`run.awaiting` comes back as a `Blocked` until
 another process writes one field into the workflow's checkpoint, which is a signal
 without a mailbox: the wait outlives the process that was waiting). What the graph
 keeps in exchange is the eager check, since it knows every key before it runs
@@ -124,7 +124,7 @@ key-value store.
 
 The inbox is that key space, owned by the store instead. `deliver` appends a message and
 makes the workflow ready in one call, `receive` reads past a cursor and suspends when
-there is nothing new, and a workflow that waits on one comes back as a `Listening`:
+there is nothing new, and a workflow that waits on one comes back `Blocked` on it:
 
 ```python
 async def console(run: Run) -> Never:
@@ -154,7 +154,8 @@ limitation: the append made the workflow ready, so the next pass sees it.
 What this costs is that a workflow's inbox is part of its checkpoint forever, so a
 long-lived one loads its whole history on every pass. That is the same bill a
 never-completing stepwise workflow already runs up, and it is the price of this execution
-model rather than something the inbox introduces.
+model rather than something the inbox introduces. It is a real bound on what a workflow
+should be used for, and it has its own [gap](#gaps).
 
 ## The service
 
@@ -178,8 +179,7 @@ vocabulary doing the work:
 
 ```text
 deliveries ──▶ pool of N passes ──▶ Sleeping  ──▶ wake_at (a clock)
-      ▲                         │  Waiting   ──▶ nothing to do
-      │                         │  Listening ──▶ nothing to do
+      ▲                         │  Blocked   ──▶ nothing to do
       │                         │  Completed ──▶ nothing to do
       │                         └─▶ done (this wakeup is answered for)
 reclaim one, else read one
@@ -190,17 +190,70 @@ timer ──▶ wake_due (one move, in the store)
 worker is a `match` over a sealed union closed with `assert_never`: a further outcome
 would be a type error there rather than a workflow that quietly stops being woken. A
 `Sleeping` carries the deadline the workflow chose, so the worker schedules it; a
-`Waiting` and a `Listening` carry nothing to schedule, because only a write from
-outside can queue either. Nothing polls a workflow to ask whether it can proceed.
+`Blocked` carries nothing to schedule, because only a write from outside can queue it.
+Nothing polls a workflow to ask whether it can proceed.
 
-The three are separate types rather than one with nullable fields for the ordinary
-reason: a driver has to branch on them either way, and shapes that differ in what they
-carry should not be one shape that sometimes carries it. `Sleeping` is the clearest
-case, since it alone holds a `due`. `Waiting` and `Listening` differ in what their key
-_means_ instead: a `Waiting`'s is an address a client writes to with `arrive`, and a
-`Listening`'s names the read step that stopped, which nobody writes to, so the answer is
-a `deliver` addressed to the workflow. Folded together they would be one key that is
-sometimes somewhere to write and sometimes a diagnostic. Inside a pass a suspension is
+### What a blocked pass reports
+
+A pass can stop on several things at once, since a fan-out suspends in every branch that
+cannot finish. `Blocked` reports all of them, in two sets:
+
+```python
+Blocked(waiting=frozenset({"approved-by"}), listening=frozenset({"heard"}))
+```
+
+`waiting` holds _addresses_, from `run.awaiting`, which a client answers with
+`arrive(workflow, key, value)`. `listening` names the read steps that stopped, from
+`run.receive`, which nobody writes to and which are answered by `deliver(workflow,
+value)` addressed to the workflow. Two fields rather than two types, because a driver's
+response to both is identical and a pass can be stopped on both at once: a type per kind
+forced a pass blocked on an approval _and_ an inbox to report one and discard the other,
+and a single set would have left a key that is sometimes somewhere to write and sometimes
+a diagnostic.
+
+Reporting all of them is what makes the outcome usable by the second consumer. The driver
+only ever asks "is there a deadline"; a status view asks "what would advance this
+workflow", and a representative answered that both incompletely and _unstably_, since the
+branch that reached its raise first decided which key was named.
+
+`Sleeping` is still separate, and still wins when a pass has both, because it alone
+carries something this driver must act on: reporting the writes instead would leave a
+branch that asked for a clock with nothing scheduled. That is the one place the outcome
+still drops information. It is bounded, since the pass the wakeup produces reaches those
+branches again and reports them then.
+
+Waiting on _either_ of two things is deliberately not expressible. Both branches suspend,
+so the pass stops; and a race would let a replay take the branch that lost the first time,
+which is exactly the nondeterminism the model forbids.
+
+### A suspension may be named, but not handled
+
+What a pass reports is what it _reached_, not what propagated out of it, and the
+difference is not academic. Three ordinary things lose a suspension on the way out:
+
+- a task group cancels its other branches the instant one raises, so a `sleep` can be
+  cancelled between writing its deadline and raising it;
+- `asyncio.gather` propagates only the _first_ exception, so a fan-out's other suspensions
+  never reach `resume`;
+- `asyncio.wait` and `gather(return_exceptions=True)` capture exceptions as values and
+  propagate none at all.
+
+So each wait writes itself onto the `Run` before raising, and the outcome is built from
+that. A `gather` of two `awaiting` calls reports both keys, exactly as a `TaskGroup` does:
+which combinator the workflow used is not something a client should be able to detect.
+
+The third case gets a check rather than a repair, because there is nothing to repair. A
+body that returns normally having reached a suspension has had one caught by the
+workflow's own code, and reporting `Completed` would mark a workflow finished while it is
+still waiting on the world, which is unrecoverable in the quietest possible way: nothing
+wakes a finished workflow, and no record says a wait went unanswered. `resume` raises
+`Swallowed` instead, naming the keys.
+
+That makes `Suspended` un-catchable, which is narrower than "don't catch it by accident".
+`BaseException` already stopped an `except Exception` from absorbing one; it cannot stop a
+combinator that captures exceptions by design. The cost is that there is no way to write
+"carry on if it is not there yet" around a wait, and no `awaiting` that returns a default.
+For the inbox that shape is `run.pending`. Inside a pass a suspension is
 still an exception (`ScheduledWakeup`, `InputNeeded`), because unwinding straight-line
 code needs one; `resume` is the boundary where it becomes a value.
 
@@ -319,6 +372,16 @@ features, expected in something this size:
 - **No history.** The checkpoint is latest-state only: no timestamps, no attempt counts,
   and no record of a failure. From the store, a failed workflow and a suspended one are
   indistinguishable.
+- **A checkpoint is read whole, so an inbox has no bound.** `load` returns everything a
+  workflow has recorded, on every pass, and entries are never consumed. A workflow taking
+  a handful of messages does not notice; one used as a streaming sink pays a read
+  proportional to its whole history to take the next entry, forever. The bound would be a
+  read scoped to a key prefix, so a pass could take the tail of an inbox without the rest
+  of the checkpoint, and nothing here has one. Temporal pays the same cost by a different
+  route, since there signal volume is replay cost rather than read cost, and answers it
+  with batching and Continue-As-New; the equivalent here is to fork a workflow onto a new
+  id with a prefix of its records, which works and is entirely manual. See
+  [the inbox against Temporal and DBOS](alternatives.md#the-inbox-and-why-two-engines-get-it-for-free).
 - **No enumeration, cancellation, or search.** Nothing can terminate or reset a
   workflow, and nothing exposes a list of them. How hard that would be to add differs in
   kind between the stores: Redis checkpoints are keyed with no index over them, so

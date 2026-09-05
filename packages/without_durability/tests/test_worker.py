@@ -144,9 +144,10 @@ async def test_a_workflow_nobody_has_submitted_waits_without_being_scheduled() -
 
 
 async def test_a_workflow_listening_on_an_empty_inbox_is_answered_for_and_left_alone() -> None:
-    # The third outcome, and the worker owes it what it owes a `Waiting`: answer for the
-    # delivery so the wakeup is not redelivered forever, and schedule nothing, because no
-    # clock satisfies an empty inbox. The delivery that wakes it is the next `deliver`.
+    # A `Blocked` reached through the inbox rather than through a named key, and the worker
+    # owes it the same either way: answer for the delivery so the wakeup is not redelivered
+    # forever, and schedule nothing, because no clock fills an inbox. The one thing that
+    # wakes it is the next `deliver`.
     checkpointer = MemoryCheckpointer()
     scheduler = MemoryScheduler()
 

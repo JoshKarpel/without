@@ -6,11 +6,11 @@ from collections.abc import Callable
 
 import pytest
 from without_durability import INBOX
+from without_durability import Blocked
 from without_durability import Checkpointer
 from without_durability import Completed
 from without_durability import Durable
 from without_durability import Entry
-from without_durability import Listening
 from without_durability import Outcome
 from without_durability import Run
 from without_durability import claimed
@@ -173,7 +173,7 @@ async def test_a_receive_with_an_empty_inbox_leaves_the_workflow_listening(
 ) -> None:
     checkpointer = durable.checkpointer
 
-    assert await passing(checkpointer, workflow, reading("heard")) == Listening(key="heard")
+    assert await passing(checkpointer, workflow, reading("heard")) == Blocked(listening=frozenset({"heard"}))
 
     await checkpointer.append(workflow, "at last")
 
@@ -185,9 +185,9 @@ async def test_deliver_makes_the_workflow_ready(
     workflow: str,
 ) -> None:
     # The reason `deliver` exists rather than leaving a caller to append and then schedule:
-    # a workflow parked as `Listening` is woken by nothing but the next message, so an
+    # a workflow parked on an empty inbox is woken by nothing but the next message, so an
     # append that reaches the store without a wakeup is a message nobody will ever read.
-    assert await passing(durable.checkpointer, workflow, reading("heard")) == Listening(key="heard")
+    assert await passing(durable.checkpointer, workflow, reading("heard")) == Blocked(listening=frozenset({"heard"}))
 
     entry = await durable.deliver(workflow, "wake up")
 
@@ -195,6 +195,38 @@ async def test_deliver_makes_the_workflow_ready(
     assert taken is not None, "the delivery did not make the workflow ready"
     assert taken.workflow == workflow
     assert (await durable.checkpointer.load(workflow))[entry.key] == "wake up"
+
+
+async def test_a_pass_blocked_on_a_key_and_an_inbox_reports_both_and_either_advances_it(
+    durable: Durable,  # noqa: F811
+    workflow: str,
+) -> None:
+    # The combination a client is most likely to get wrong if the outcome under-reports:
+    # both writes advance this workflow, so naming one and hiding the other would leave a
+    # caller supplying an approval and waiting for a workflow that also wanted a message.
+    # Answering the *listening* half first is the point of the test, since that is the half
+    # a per-kind precedence used to discard.
+    checkpointer = durable.checkpointer
+
+    async def needs_both(run: Run) -> str:
+        async with asyncio.TaskGroup() as group:
+            approval = group.create_task(run.awaiting("approved-by", str))
+            heard = group.create_task(run.receive("heard"))
+        return f"{approval.result()} + {heard.result()[0].value}"
+
+    assert await passing(checkpointer, workflow, needs_both) == Blocked(
+        waiting=frozenset({"approved-by"}), listening=frozenset({"heard"})
+    )
+
+    await durable.deliver(workflow, "hello")
+
+    assert await passing(checkpointer, workflow, needs_both) == Blocked(waiting=frozenset({"approved-by"})), (
+        "the message landed, so only the approval is still owed"
+    )
+
+    await durable.arrive(workflow, "approved-by", "auditor-7")
+
+    assert await passing(checkpointer, workflow, needs_both) == Completed(value="auditor-7 + hello")
 
 
 async def test_entries_survive_being_copied_into_a_forked_workflow(
