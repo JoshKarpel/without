@@ -106,16 +106,18 @@
   missing `seq` column. Drop `workflow_checkpoint` (or the whole database) before running
   0.0.7. Both stores now carry an explicit `seq` for `load` to order by: SQLite gives up
   `WITHOUT ROWID` and names the rowid it already assigns as `seq INTEGER PRIMARY KEY`,
-  moving `(workflow, step)` to a `UNIQUE` constraint, and Postgres gains an identity
-  column. Declaring the column rather than ordering by the implicit `rowid` is what makes
-  the guarantee survive a `VACUUM`, which SQLite documents as free to renumber the rowids
-  of any table that has no explicit `INTEGER PRIMARY KEY`. Neither store's existing write
-  statements changed, since both counters are assigned on insert and left alone by the
-  conflict update that implements first-writer-wins. Postgres additionally gains a
-  `workflow_inbox` sequence, which is what `append` mints keys from: it is the one store
-  with genuinely concurrent writers, so a maximum read inside the insert would be a race two
-  callers could both win, and the loser's message would vanish into first-writer-wins with
-  no error.
+  moving `(workflow, step)` to a `UNIQUE` constraint, and Postgres takes the number from a
+  `workflow_seq` sequence as the column's `DEFAULT`. Declaring the column rather than
+  ordering by the implicit `rowid` is what makes the guarantee survive a `VACUUM`, which
+  SQLite documents as free to renumber the rowids of any table that has no explicit
+  `INTEGER PRIMARY KEY`. Neither store's existing write statements changed, since both
+  counters are assigned on insert and left alone by the conflict update that implements
+  first-writer-wins. Postgres `append` mints its inbox key from that same sequence, in one
+  `nextval` written as both the key and the row's `seq`: it is the one store with genuinely
+  concurrent writers, so a maximum read inside the insert would be a race two callers could
+  both win, and two separate counters would let the keys sort one way while `load` rendered
+  them the other. One number is both, which is also why the column carries a `DEFAULT`
+  rather than being an identity: an identity is a number no statement may supply.
 - **`without-durability-redis`**: a checkpoint hash field now holds `<position>:<encoding>`
   rather than the encoding alone, which is how this store meets the ordering guarantee. A
   Redis hash preserves insertion order only while it is listpack-encoded and stops once it

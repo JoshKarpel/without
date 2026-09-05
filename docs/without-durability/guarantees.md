@@ -155,9 +155,9 @@ None of these is obvious from the protocol alone.
   which is why its checkpoint table is the one table there that is not
   `WITHOUT ROWID`, and why it declares a column it could have left implicit: SQLite
   reserves the right to renumber the rowids of a table that has no explicit
-  `INTEGER PRIMARY KEY` when the database is `VACUUM`ed. Postgres adds an identity
-  column, because a heap scan looks like insertion order right up until the no-op
-  conflict update rewrites a tuple and moves it. Redis has the hardest job and the least
+  `INTEGER PRIMARY KEY` when the database is `VACUUM`ed. Postgres adds a `seq`
+  column off a sequence, because a heap scan looks like insertion order right up
+  until the no-op conflict update rewrites a tuple and moves it. Redis has the hardest job and the least
   obvious answer: it packs the position into the hash field in front of the encoded
   value, because a hash preserves insertion order only while it is listpack-encoded
   and stops once it converts to a hashtable. Keeping the order _in_ the field is what
@@ -176,9 +176,17 @@ None of these is obvious from the protocol alone.
   inside the insert is a race two callers can both win, with the loser's message
   vanishing into first-writer-wins and no error to show for it. SQLite reads the highest
   `seq` in one statement, which is atomic there because SQLite admits one writer at a
-  time. Redis and the in-memory double take the count of the workflow's own records,
-  which is the same number they already use as the load position, so a key and the
-  position it names cannot drift apart.
+  time. Redis and the in-memory double take the count of the workflow's own records.
+
+  What every one of them arrives at, by a different route, is that the key and the load
+  position are _one_ number. Two counters would be two orders, and the second and third
+  requirements above are a claim that those orders agree: under concurrent appends the
+  keys would sort one way and `load` render the other, which is a store meeting each
+  guarantee alone and neither together. Redis and the double get it for free, since the
+  count they name a key from is already the position. Postgres has to arrange it, by
+  drawing one `nextval` in a CTE and writing it as both the key and the row's `seq`,
+  which is why that column takes a `DEFAULT` rather than being an identity: an identity
+  is a number no statement may supply, and this one has to.
 
   Nothing is ever consumed, which is the load-bearing half. A destructive read would
   move a value out of the inbox and into the workflow's own records, leaving two copies

@@ -99,12 +99,10 @@ POLL = timedelta(milliseconds=50)
 # JSON null" distinguishable, so a step that legitimately records `None` is not read back
 # as a step that never ran.
 #
-# `seq` is what `load`'s ordering guarantee rests on. An identity column is assigned on
-# insert and left alone by the conflict update below, which is exactly the property the
-# guarantee needs: the writer that first recorded a step decides where it sits, and a
-# later write that loses moves neither the value nor the position. `GENERATED ALWAYS`
-# rather than `BY DEFAULT` because no statement here may supply one; every insert names
-# `(workflow, step, value)` and should keep doing so.
+# `seq` is what `load`'s ordering guarantee rests on. The default is evaluated on insert
+# and left alone by the conflict update below, which is exactly the property the guarantee
+# needs: the writer that first recorded a step decides where it sits, and a later write
+# that loses moves neither the value nor the position.
 #
 # It is deliberately not scoped to the workflow. Numbering per workflow would mean reading
 # the current maximum on every write, and the contract is only about the order *within* one
@@ -114,25 +112,30 @@ POLL = timedelta(milliseconds=50)
 # looks like insertion order right up until it is not: the conflict update is a real MVCC
 # update, so it writes a new tuple version and moves the row.
 #
-# `workflow_inbox` is what `append` mints keys from, and it is a sequence rather than a
-# count of the workflow's rows because this store is the one with genuinely concurrent
-# writers: `MAX(...) + 1` computed inside a statement is a race that two inserts can both
-# win, and the loser's message would then vanish into first-writer-wins without an error.
-# `nextval` is atomic and never hands the same number out twice, which is the whole
-# requirement. It is shared across workflows and it skips numbers on rollback, so any one
-# workflow's keys have gaps; the contract asks only that they sort into append order
-# within a workflow, which is exactly what a shared counter gives.
+# `workflow_seq` is a named sequence with a `DEFAULT` rather than an identity column,
+# because `append` has to mint a key from the *same* number that becomes the row's
+# position, and an identity column is a number no statement is allowed to see. Two
+# sequences cannot do it: the inbox key and the position would be drawn separately, so two
+# concurrent appends could take them in opposite orders and `load` would render the pair
+# backwards against keys that sort the other way. One number is both, so the two orders
+# cannot disagree. `nextval` is atomic and never hands the same number out twice, which is
+# what makes an inbox key safe to mint under concurrent writers where `MAX(...) + 1` inside
+# a statement is a race two inserts can both win, with the loser's message vanishing into
+# first-writer-wins and no error to show for it. It is shared across workflows and it skips
+# numbers on rollback, so any one workflow's keys have gaps; the contract asks only that
+# they sort into append order within a workflow, which is exactly what a shared counter
+# gives.
 #
 # The index is the one query that matters for throughput, `next_ready`'s scan for the
 # oldest visible row in a namespace. The other two tables are read by primary key.
 SCHEMA = """
-CREATE SEQUENCE IF NOT EXISTS workflow_inbox;
+CREATE SEQUENCE IF NOT EXISTS workflow_seq;
 
 CREATE TABLE IF NOT EXISTS workflow_checkpoint (
     workflow text NOT NULL,
     step text NOT NULL,
     value jsonb NOT NULL,
-    seq bigint GENERATED ALWAYS AS IDENTITY,
+    seq bigint NOT NULL DEFAULT nextval('workflow_seq'),
     PRIMARY KEY (workflow, step)
 );
 
@@ -224,18 +227,26 @@ RETURNING recorded.value::text
 # `supply` under a key this statement mints instead of one the caller brought: the append
 # that puts a message in a workflow's inbox.
 #
+# The CTE is what draws one number and spends it twice, as the key and as the row's
+# position, which is the whole of why the key order and the load order agree under
+# concurrency. `nextval` in the `SELECT` list is evaluated once for the one row it
+# produces, and both columns then read that value rather than calling the sequence again.
+# Supplying `seq` explicitly is the reason the column carries a `DEFAULT` rather than being
+# an identity: every other insert here leaves it out and takes the default.
+#
 # No `ON CONFLICT` clause, deliberately. `nextval` never repeats, so the key is fresh by
 # construction and a conflict would mean the numbering is broken; a duplicate-key error is
 # the loud version of that, where an upsert would quietly hand back somebody else's
-# message. This is also the one insert here that may leave a gap in `seq` without leaving
-# one in a workflow's records, since both counters advance and only one is rolled back.
+# message.
 APPEND = f"""
-INSERT INTO workflow_checkpoint AS entry (workflow, step, value)
-VALUES (
+WITH minted AS (SELECT nextval('workflow_seq') AS seq)
+INSERT INTO workflow_checkpoint AS entry (workflow, step, value, seq)
+SELECT
     %(workflow)s,
-    '{INBOX}' || lpad(nextval('workflow_inbox')::text, {INBOX_DIGITS}, '0'),
-    %(value)s::jsonb
-)
+    '{INBOX}' || lpad(minted.seq::text, {INBOX_DIGITS}, '0'),
+    %(value)s::jsonb,
+    minted.seq
+FROM minted
 RETURNING entry.step, entry.value::text
 """
 
@@ -293,7 +304,7 @@ class Supplied(Exception):
 
 async def migrate(pool: AsyncConnectionPool) -> None:
     """
-    Create the three tables and the inbox sequence, from every process, as often as it likes.
+    Create the three tables and the sequence behind `seq`, from every process, as often as it likes.
 
     Idempotent by `IF NOT EXISTS` and safe against itself by the advisory lock, which is
     the part that is easy to skip: concurrent `CREATE TABLE IF NOT EXISTS` is a

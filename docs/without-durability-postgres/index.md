@@ -23,10 +23,10 @@ can read.
 
 ```text
 workflow_checkpoint   one row per (workflow, step), the value as jsonb,
-                      an identity column for the order they were recorded in
+                      a `seq` column for the order they were recorded in
 workflow_claim        one row per workflow: whose pass it is, and until when
 workflow_queue        one row per (namespace, workflow), scored by when it is visible
-workflow_inbox        a sequence, which `append` names its keys from
+workflow_seq          the sequence behind `seq`, which `append` also names its keys from
 ```
 
 What is worth reading it for is how little of it is mechanism. Every write that
@@ -53,6 +53,16 @@ into first-writer-wins with no error to show for it. Hence a sequence: `nextval`
 is atomic and never repeats. It is shared across workflows and it skips numbers
 on rollback, which is why the interface asks only that keys sort within one
 workflow rather than that they be contiguous.
+
+It is the *same* sequence that gives the row its `seq`, and that is the part
+worth stating, because the obvious design has two. An inbox key drawn from one
+counter and a load position drawn from another are two orders, and two callers
+appending at once can take them the opposite way round: the keys sort one way and
+`load` renders the other, which is exactly the pair of guarantees `append` owes
+together. So the statement draws one number in a CTE and spends it twice, as the
+key and as the position, and the two orders cannot disagree because there is only
+one. That is also why `seq` carries a `DEFAULT` rather than being an identity
+column: an identity is a number no statement may supply, and this one has to.
 
 The claim is the one to look at, because every clause of the script it replaces
 survives as a clause of the statement:
