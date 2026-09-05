@@ -21,11 +21,15 @@
 - **`without-durability-sqlite`, `without-durability-postgres`**: **the checkpoint schema
   changed and there is no migration.** `migrate` is `CREATE TABLE IF NOT EXISTS`, so an
   existing database keeps its old shape and every `load` against it then fails on the
-  missing column or ordering. Drop `workflow_checkpoint` (or the whole database) before
-  running 0.0.7. SQLite's checkpoint table gives up `WITHOUT ROWID` so that `load` can
-  order by the `rowid` SQLite already assigns; Postgres gains an identity column. Neither
-  store's write statements changed, since both counters are assigned on insert and left
-  alone by the conflict update that implements first-writer-wins.
+  missing `seq` column. Drop `workflow_checkpoint` (or the whole database) before running
+  0.0.7. Both stores now carry an explicit `seq` for `load` to order by: SQLite gives up
+  `WITHOUT ROWID` and names the rowid it already assigns as `seq INTEGER PRIMARY KEY`,
+  moving `(workflow, step)` to a `UNIQUE` constraint, and Postgres gains an identity
+  column. Declaring the column rather than ordering by the implicit `rowid` is what makes
+  the guarantee survive a `VACUUM`, which SQLite documents as free to renumber the rowids
+  of any table that has no explicit `INTEGER PRIMARY KEY`. Neither store's write statements
+  changed, since both counters are assigned on insert and left alone by the conflict update
+  that implements first-writer-wins.
 - **`without-durability-redis`**: a checkpoint hash field now holds `<position>:<encoding>`
   rather than the encoding alone, which is how this store meets the ordering guarantee. A
   Redis hash preserves insertion order only while it is listpack-encoded and stops once it

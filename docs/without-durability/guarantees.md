@@ -151,10 +151,13 @@ None of these is obvious from the protocol alone.
   third-party store can satisfy the type while ignoring the contract.
 
   What each store reaches for differs, and the differences are instructive. SQLite
-  orders by the `rowid` it already assigns, which is why its checkpoint table is the
-  one table there that is not `WITHOUT ROWID`. Postgres adds an identity column,
-  because a heap scan looks like insertion order right up until the no-op conflict
-  update rewrites a tuple and moves it. Redis has the hardest job and the least
+  names the `rowid` it already assigns as an explicit `seq INTEGER PRIMARY KEY`,
+  which is why its checkpoint table is the one table there that is not
+  `WITHOUT ROWID`, and why it declares a column it could have left implicit: SQLite
+  reserves the right to renumber the rowids of a table that has no explicit
+  `INTEGER PRIMARY KEY` when the database is `VACUUM`ed. Postgres adds an identity
+  column, because a heap scan looks like insertion order right up until the no-op
+  conflict update rewrites a tuple and moves it. Redis has the hardest job and the least
   obvious answer: it packs the position into the hash field in front of the encoded
   value, because a hash preserves insertion order only while it is listpack-encoded
   and stops once it converts to a hashtable. Keeping the order _in_ the field is what

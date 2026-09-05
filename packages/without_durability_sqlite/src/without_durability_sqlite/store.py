@@ -94,20 +94,35 @@ BUSY_TIMEOUT = Milliseconds(5_000)
 # `NOT NULL` on `value` keeps "no row" and "a row holding JSON null" distinguishable, so
 # a step that legitimately records `None` is not read back as a step that never ran.
 #
-# The claim and queue tables are `WITHOUT ROWID` because each is addressed by its primary
-# key and never by a rowid, so the extra indirection would be pure overhead. The checkpoint
-# table pays that indirection deliberately, because its rowid is what `load`'s ordering
-# guarantee rests on: rowids are handed out in insertion order and the conflict update
-# below never touches one, so ordering by it is the order the steps were first recorded in.
-# Nothing else here is a candidate. A `WITHOUT ROWID` table has no such column, and the
-# primary key would order by step name, which is a different question with a plausible
-# enough answer to pass a careless test.
+# `seq` is what `load`'s ordering guarantee rests on, and it is the same column Postgres
+# names: assigned on insert, in insertion order, and left alone by the conflict update
+# below, which is exactly the property the guarantee needs. The writer that first recorded
+# a step decides where it sits, and a later write that loses moves neither the value nor
+# the position. Nothing else here is a candidate, since the only other order on offer is
+# the unique index's, which is step name: a different question with a plausible enough
+# answer to pass a careless test.
+#
+# `INTEGER PRIMARY KEY` makes it an alias for the rowid rather than a column beside one,
+# so it costs no storage and needs no sequence. Naming it is not decoration either. SQLite
+# reserves the right to renumber rowids in "any tables that do not have an explicit INTEGER
+# PRIMARY KEY" when a database is `VACUUM`ed, and this store hands an operator a file it
+# invites any tool to open, so the guarantee would otherwise rest on a promise SQLite
+# declines to make. Declaring the column is what puts this table outside that sentence.
+#
+# `(workflow, step)` is `UNIQUE` rather than the primary key because a table gets one
+# primary key and `seq` is now it. Nothing else changes: both columns are `NOT NULL`, so
+# the constraint admits exactly the rows the primary key did, and it is still what the
+# upserts below name as their conflict target.
+#
+# The claim and queue tables stay `WITHOUT ROWID` because each is addressed by its primary
+# key and never by a position, so for those the indirection would be pure overhead.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS workflow_checkpoint (
+    seq INTEGER PRIMARY KEY,
     workflow TEXT NOT NULL,
     step TEXT NOT NULL,
     value TEXT NOT NULL,
-    PRIMARY KEY (workflow, step)
+    UNIQUE (workflow, step)
 );
 
 CREATE TABLE IF NOT EXISTS workflow_claim (
@@ -179,10 +194,10 @@ RETURNING value
 FENCE = "SELECT token FROM workflow_claim WHERE workflow = ?"
 ALREADY = "SELECT value FROM workflow_checkpoint WHERE workflow = ? AND step = ?"
 WRITE = "INSERT INTO workflow_checkpoint (workflow, step, value) VALUES (?, ?, ?)"
-# `ORDER BY rowid` is the whole of the ordering guarantee, and it is load-bearing rather
-# than a formality: `WHERE workflow = ?` is served by the primary key's index, so without
-# it the rows come back sorted by step name.
-LOAD = "SELECT step, value FROM workflow_checkpoint WHERE workflow = ? ORDER BY rowid"
+# `ORDER BY seq` is the whole of the ordering guarantee, and it is load-bearing rather
+# than a formality: `WHERE workflow = ?` is served by the unique index on
+# `(workflow, step)`, so without it the rows come back sorted by step name.
+LOAD = "SELECT step, value FROM workflow_checkpoint WHERE workflow = ? ORDER BY seq"
 # Hand the workflow back early, but keep the token, so the next claim gets the next
 # number up and a pass that comes back from the dead still loses.
 RELEASE = "UPDATE workflow_claim SET held_until = unixepoch('now', 'subsec') WHERE workflow = ? AND token = ?"
