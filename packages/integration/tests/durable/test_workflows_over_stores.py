@@ -7,7 +7,6 @@ from collections.abc import Mapping
 from contextlib import suppress
 from datetime import datetime
 from datetime import timedelta
-from uuid import uuid4
 
 import pytest
 from integration.durable import Order
@@ -58,14 +57,6 @@ class Unwound(Exception):
 
 
 ORDER = Order(order_id="o-42", sku="gizmo", cents=1999)
-
-
-@pytest.fixture
-def workflow() -> str:
-    # Every test gets its own id rather than clearing the store, because the servers are
-    # shared by every worker in the session: clearing would pull another test's
-    # checkpoint out from under it.
-    return f"test-{uuid4().hex}"
 
 
 async def passing[T](checkpointer: Checkpointer, workflow: str, body: Callable[[Run], Awaitable[T]]) -> Outcome[T]:

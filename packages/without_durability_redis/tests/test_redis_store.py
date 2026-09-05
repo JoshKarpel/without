@@ -202,6 +202,32 @@ async def test_a_workflows_two_keys_share_a_slot_so_a_script_may_touch_both(work
     )
 
 
+async def test_the_order_survives_the_hash_leaving_its_listpack_encoding(redis: Redis, workflow: str) -> None:
+    # The cross-store suite asserts what `load` owes; this asserts that the arrangement it
+    # relies on is real. Redis keeps a hash's insertion order only while it is
+    # listpack-encoded, so a store carrying no order at all answers correctly under the
+    # threshold, and a test that never crosses it proves nothing. Crossing it here, and
+    # checking that the crossing happened, is what makes the ordering assertion meaningful.
+    #
+    # The value is the lever rather than the field count: `hash-max-listpack-value` is 64
+    # bytes, so one write converts the hash, where `hash-max-listpack-entries` takes
+    # hundreds and has moved between releases (512 on Redis 8, 128 in older documentation).
+    # A test sized against that second default would quietly stop exercising this path when
+    # the server changed underneath it.
+    checkpointer = RedisCheckpointer(redis=redis)
+    holder = await claimed(checkpointer, workflow)
+    written = [f"step-{index:02d}" for index in range(8)][::-1]
+
+    for step in written:
+        await checkpointer.record(holder, step, "x" * 80)
+
+    steps = checkpointer.hash_key(workflow)
+
+    assert await redis.object("encoding", steps) == "hashtable", "or this test is not reaching the path it exists for"
+    assert list(await redis.hgetall(steps)) != written, "and the server's own field order is no longer insertion order"
+    assert list(await checkpointer.load(workflow)) == written
+
+
 async def test_a_store_error_that_is_not_the_fence_is_not_swallowed(redis: Redis, workflow: str) -> None:
     # `record` forgives exactly one error, the script's own refusal. Anything else is a
     # real problem with the store, and reading it as "another pass took over" would tell

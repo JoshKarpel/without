@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.0.7
+
+### Changed
+
+- **`without-durability`**: `Checkpointer.load` now MUST return a workflow's records in the
+  order they were first recorded, and all four stores do. A workflow's records have two
+  independent writers, the pass through `record` and anything outside it through `supply`,
+  and neither can order itself against the other: a counter either side keeps is read from
+  a stale snapshot or observed from the store and then raced, so both reach for the same
+  next number and the tie has to be invented. The store sees every write, so the store is
+  the only thing that can say. First-writer-wins already decided what a key holds; this
+  says the same writer decides where it sits, so a losing write moves neither the value nor
+  the position. Nothing changes in the signature: `load` returns a `dict`, which preserves
+  insertion order, so every existing caller gets the order by iterating and no store owes a
+  sequence number anyone can see. **A third-party `Checkpointer` now owes a guarantee it
+  did not before**, and the requirement is invisible to the type checker, so an
+  implementation that ignores it still satisfies the protocol; the cross-store conformance
+  suite is what holds the shipped four to it.
+- **`without-durability-sqlite`, `without-durability-postgres`**: **the checkpoint schema
+  changed and there is no migration.** `migrate` is `CREATE TABLE IF NOT EXISTS`, so an
+  existing database keeps its old shape and every `load` against it then fails on the
+  missing column or ordering. Drop `workflow_checkpoint` (or the whole database) before
+  running 0.0.7. SQLite's checkpoint table gives up `WITHOUT ROWID` so that `load` can
+  order by the `rowid` SQLite already assigns; Postgres gains an identity column. Neither
+  store's write statements changed, since both counters are assigned on insert and left
+  alone by the conflict update that implements first-writer-wins.
+- **`without-durability-redis`**: a checkpoint hash field now holds `<position>:<encoding>`
+  rather than the encoding alone, which is how this store meets the ordering guarantee. A
+  Redis hash preserves insertion order only while it is listpack-encoded and stops once it
+  grows past `hash-max-listpack-entries` or `hash-max-listpack-value`, so `HGETALL` order
+  could never carry it. Keeping the position in the field keeps it to one key: there is no
+  second structure to expire in step with the first, and no branch that could allocate a
+  position for a write that turned out to lose. The prefix is added and stripped inside the
+  scripts, so `record`, `supply`, and `transact` are unchanged for callers and a `LuaEffect`
+  neither writes a prefix nor sees one. Existing checkpoint hashes are not readable by this
+  version; they expire on their own `ttl`.
+
 ## 0.0.6
 
 ### Added

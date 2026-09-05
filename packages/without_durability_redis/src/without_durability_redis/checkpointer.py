@@ -4,6 +4,15 @@
 # hash holds. Nothing above this module mentions Redis, and nothing in it mentions the
 # workflow's domain.
 #
+# A field holds `<position>:<encoding>` rather than the encoding alone, which is how this
+# store meets `load`'s ordering guarantee. A hash cannot carry it: Redis preserves field
+# order only while the hash is listpack-encoded and converts to a hashtable past
+# `hash-max-listpack-entries` or `hash-max-listpack-value`, after which `HGETALL` order is
+# unspecified. Since the order has to be recorded somewhere, recording it *in the field*
+# keeps it to one key, so there is no second structure to expire in step with this one and
+# no branch that could allocate a position for a write that turned out to lose. The prefix
+# is added and stripped inside the scripts, so it never reaches the codec or an effect.
+#
 # Every write here is a Lua script, and each is a script for the same reason: what it
 # does is only correct as *one* step. Checking whether a workflow is free and taking it,
 # checking a fencing token and applying the write it guards, testing whether a key is
@@ -34,6 +43,23 @@ from without_durability.interfaces import check_duration
 
 from without_durability_redis.units import milliseconds
 from without_durability_redis.units import seconds
+
+# The one place the packed field format is defined, spliced into every script that writes
+# or reads one so the two halves cannot drift apart.
+#
+# The position handed to `pack_value` is `HLEN` taken immediately before the write, which
+# is the field's insertion index: no field is ever deleted on its own (nothing here calls
+# `HDEL`), first-writer-wins means none is ever replaced, and the hash expires whole, so a
+# reused workflow id starts from zero with no surviving fields to collide with. That first
+# clause is an invariant of this module rather than something Redis enforces, so a future
+# `HDEL` here would silently start handing out positions that are already taken.
+#
+# Splitting on the first colon is safe whatever the codec produces, because the position is
+# always digits and always in front.
+PACKING = """
+local function pack_value(position, encoded) return position .. ':' .. encoded end
+local function bare_value(packed) return string.sub(packed, string.find(packed, ':', 1, true) + 1) end
+"""
 
 # Take the workflow if nobody holds it, and stamp the taking with a number that only
 # ever goes up. It is the store, not the claimant, that decides the ordering, so two
@@ -90,18 +116,25 @@ return token
 #   ARGV[4]  expiry for both hashes, in seconds
 #   returns  {1 if this call's encoding is what is stored else 0, the encoding stored},
 #            or a FENCED error if the pass is superseded
-RECORD = """
+#
+# The comparison is between *bare* encodings, which is what keeps a tie counting as a win
+# for both passes: comparing the packed text instead would find the positions differ and
+# report every tie as a loss.
+RECORD = (
+    PACKING
+    + """
 local fence = tonumber(redis.call('HGET', KEYS[2], 'token') or '0')
 if tonumber(ARGV[3]) < fence then
   return redis.error_reply('FENCED pass ' .. ARGV[3] .. ' superseded by ' .. fence)
 end
-redis.call('HSETNX', KEYS[1], ARGV[1], ARGV[2])
+redis.call('HSETNX', KEYS[1], ARGV[1], pack_value(redis.call('HLEN', KEYS[1]), ARGV[2]))
 redis.call('EXPIRE', KEYS[1], ARGV[4])
 redis.call('EXPIRE', KEYS[2], ARGV[4])
-local stored = redis.call('HGET', KEYS[1], ARGV[1])
+local stored = bare_value(redis.call('HGET', KEYS[1], ARGV[1]))
 if stored == ARGV[2] then return {1, stored} end
 return {0, stored}
 """
+)
 
 # The same conditional write without the fence, for a value that comes from outside any
 # pass. It is deliberately not gated on a claim: an approval must not fail because a
@@ -112,12 +145,15 @@ return {0, stored}
 #   ARGV[2]  the value, encoded
 #   ARGV[3]  expiry for the steps hash, in seconds
 #   returns  the encoding stored after the call, this caller's or the earlier winner's
-SUPPLY = """
-local written = redis.call('HSETNX', KEYS[1], ARGV[1], ARGV[2])
+SUPPLY = (
+    PACKING
+    + """
+local written = redis.call('HSETNX', KEYS[1], ARGV[1], pack_value(redis.call('HLEN', KEYS[1]), ARGV[2]))
 redis.call('EXPIRE', KEYS[1], ARGV[3])
 if written == 1 then return ARGV[2] end
-return redis.call('HGET', KEYS[1], ARGV[1])
+return bare_value(redis.call('HGET', KEYS[1], ARGV[1]))
 """
+)
 
 # Give the workflow back early, but keep the token. Zeroing the deadline rather than
 # deleting the key is what preserves the fence across a clean handover: the next claim
@@ -163,9 +199,11 @@ class LuaEffect:
     reads `KEYS` and `ARGV` from index 1 as if it were the only thing running, because
     `transact` splices it into a wrapper that supplies the fence check and the record and
     rebinds those two tables. It MUST return whatever the store's `CheckpointCodec`
-    decodes, since what it returns is written into the checkpoint verbatim; under the
+    decodes, since what it returns is what the checkpoint comes to hold; under the
     default `JsonCodec` that means JSON text, and `cjson.encode` is the usual way to
-    produce it. That is the one place an effect has to know which codec its store was
+    produce it. The wrapper puts the field's position in front of that on the way in and
+    takes it off on the way out, so an effect neither writes a prefix nor ever sees one.
+    The codec is the one place an effect has to know which one its store was
     built with, and it is unavoidable, because the encoding happens in the server where
     the Python codec cannot reach.
 
@@ -204,7 +242,9 @@ class LuaEffect:
 #   ARGV[4..] the effect's own arguments, which it sees as ARGV[1..]
 #   returns   the encoding stored after the call, the effect's result or an earlier one,
 #             or a FENCED error if the pass is superseded
-TRANSACT = """
+TRANSACT = (
+    PACKING
+    + """
 local outer_keys, outer_args = KEYS, ARGV
 local fence = tonumber(redis.call('HGET', KEYS[2], 'token') or '0')
 if tonumber(ARGV[2]) < fence then
@@ -217,18 +257,23 @@ if already then
   -- transacted would otherwise write nothing, and expire while it was being worked on.
   redis.call('EXPIRE', KEYS[1], ARGV[3])
   redis.call('EXPIRE', KEYS[2], ARGV[3])
-  return already
+  return bare_value(already)
 end
 local result = (function()
   local KEYS = {unpack(outer_keys, 3)}
   local ARGV = {unpack(outer_args, 4)}
   %s
 end)()
-redis.call('HSET', KEYS[1], ARGV[1], result)
+-- The position is read here rather than before the effect, where it would be the same
+-- number: the field is known absent on this branch, so the count is this step's index.
+-- What the effect returns is recorded as it came, with the prefix added on the way in and
+-- taken off on the way out, so an effect never sees one and never writes one.
+redis.call('HSET', KEYS[1], ARGV[1], pack_value(redis.call('HLEN', KEYS[1]), result))
 redis.call('EXPIRE', KEYS[1], ARGV[3])
 redis.call('EXPIRE', KEYS[2], ARGV[3])
 return result
 """
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,7 +287,8 @@ class RedisCheckpointer:
     `codec` to a `CheckpointCodec[str]`: a hash field can hold bytes, but a client
     decoding every reply has already decided this store speaks text.
 
-    `codec` is how a step's result becomes a hash field and comes back, and it defaults
+    `codec` is how a step's result becomes the encoding a hash field carries and comes
+    back, and it defaults
     to the stdlib's JSON. Change it to widen what a step may return or to speed the
     encoding up; what it MUST keep is the round trip, since a resumed pass reads what it
     produced. A `LuaEffect` under `transact` has to agree with it, which is the one thing
@@ -331,10 +377,23 @@ class RedisCheckpointer:
         return f"{self.hash_key(workflow)}:pass"
 
     async def load(self, workflow: str) -> dict[str, object]:
+        """
+        Every step this workflow has recorded, in the order they were first recorded.
+
+        One `HGETALL`, sorted here rather than by the server, because the order is carried
+        by the fields themselves: `HGETALL` order is insertion order only while the hash is
+        small enough to stay listpack-encoded, and is unspecified once it is not.
+
+        `maxsplit=1` matters, since an encoded value has colons of its own. A field with no
+        colon cannot occur, so there is no branch for one: every write path packs, and
+        `int` raising is the right answer if that ever stops being true.
+        """
         # The cast *is* `decode_responses=True`: redis-py types every read as
         # bytes-or-text because the flag is a runtime choice its types cannot see.
         recorded = cast(dict[str, str], await self.redis.hgetall(self.hash_key(workflow)))
-        return {field: self.codec.decode(encoded) for field, encoded in recorded.items()}
+        packed = [(field, *value.split(":", 1)) for field, value in recorded.items()]
+        packed.sort(key=lambda field: int(field[1]))
+        return {field: self.codec.decode(encoded) for field, _position, encoded in packed}
 
     async def claim(self, workflow: str, lease: timedelta) -> Pass | None:
         token = await self.take(
@@ -379,9 +438,11 @@ class RedisCheckpointer:
         """
         Run `effect` and record it as `key`, in one script, so the step happens once.
 
-        Whatever the effect returns is written into the checkpoint verbatim, so it has to
-        already be in the shape this store's codec reads back (JSON text by default). The
-        encoding happens in the server, which is exactly why it cannot be the codec's job.
+        Whatever the effect returns becomes the step's encoding, so it has to already be in
+        the shape this store's codec reads back (JSON text by default). The encoding happens
+        in the server, which is exactly why it cannot be the codec's job. The script puts
+        the field's position in front of it on the way in and takes it off on the way out,
+        so an effect neither writes that prefix nor sees one.
         """
         try:
             stored = await self.transaction(effect.source)(

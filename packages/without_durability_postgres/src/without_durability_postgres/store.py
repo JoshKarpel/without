@@ -96,6 +96,21 @@ POLL = timedelta(milliseconds=50)
 # JSON null" distinguishable, so a step that legitimately records `None` is not read back
 # as a step that never ran.
 #
+# `seq` is what `load`'s ordering guarantee rests on. An identity column is assigned on
+# insert and left alone by the conflict update below, which is exactly the property the
+# guarantee needs: the writer that first recorded a step decides where it sits, and a
+# later write that loses moves neither the value nor the position. `GENERATED ALWAYS`
+# rather than `BY DEFAULT` because no statement here may supply one; every insert names
+# `(workflow, step, value)` and should keep doing so.
+#
+# It is deliberately not scoped to the workflow. Numbering per workflow would mean reading
+# the current maximum on every write, and the contract is only about the order *within* one
+# workflow, which a shared sequence satisfies with gaps.
+#
+# There is no physical order to fall back on, which is worth stating because a heap scan
+# looks like insertion order right up until it is not: the conflict update is a real MVCC
+# update, so it writes a new tuple version and moves the row.
+#
 # The index is the one query that matters for throughput, `next_ready`'s scan for the
 # oldest visible row in a namespace. The other two tables are read by primary key.
 SCHEMA = """
@@ -103,6 +118,7 @@ CREATE TABLE IF NOT EXISTS workflow_checkpoint (
     workflow text NOT NULL,
     step text NOT NULL,
     value jsonb NOT NULL,
+    seq bigint GENERATED ALWAYS AS IDENTITY,
     PRIMARY KEY (workflow, step)
 );
 
@@ -210,7 +226,7 @@ ON CONFLICT (workflow, step) DO NOTHING
 RETURNING value::text
 """
 
-LOAD = "SELECT step, value::text FROM workflow_checkpoint WHERE workflow = %s"
+LOAD = "SELECT step, value::text FROM workflow_checkpoint WHERE workflow = %s ORDER BY seq"
 # Hand the workflow back early, but keep the token, so the next claim gets the next
 # number up and a pass that comes back from the dead still loses. Conditional on the
 # token for the same reason `release` is in the Redis store: a superseded pass letting go

@@ -146,6 +146,17 @@ class Checkpointer[Effect = Never](Protocol):
 
     - `load` MUST return the values recorded for that workflow so far, and an empty
       mapping for one that has never run.
+    - `load` MUST return them in the order they were first recorded. A workflow's records
+      have two independent writers, the pass through `record` and anything outside it
+      through `supply`, and neither can order itself against the other: a counter either
+      side keeps is read from a stale snapshot or observed and then raced, so both reach
+      for the same next number and the tie has to be invented. The store is the only thing
+      that sees every write, which makes it the only thing that can say. First-writer-wins
+      already decides what a key holds; this says the same writer decides where it sits, so
+      a losing write moves neither the value nor the position. The order is the guarantee
+      and the number behind it is not: it is a `dict`, which preserves insertion order, so
+      a caller reads the order by iterating and no implementation owes a sequence anyone
+      can see.
     - `claim` MUST grant at most one live `Pass` per workflow, and MUST issue tokens that
       strictly increase per workflow, so that a later claim always outranks an earlier
       one. It returns `None` when someone else holds the workflow.

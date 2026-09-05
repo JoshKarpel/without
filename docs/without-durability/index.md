@@ -38,9 +38,9 @@ is the application's.
 ## Two mechanisms, one checkpoint
 
 `Checkpointer` (in `interfaces.py`) is the only interface either mechanism talks through:
-`claim` takes the right to run a pass, `load` returns what a workflow has recorded,
-`record` adds to it under that claim, `supply` adds to it from outside one, and
-`release` hands it back. A Redis hash or a Postgres table in production, a plain dict
+`claim` takes the right to run a pass, `load` returns what a workflow has recorded in
+the order it was first recorded, `record` adds to it under that claim, `supply` adds to
+it from outside one, and `release` hands it back. A Redis hash or a Postgres table in production, a plain dict
 in a test. `Scheduler` beside it holds the other half of a workflow's state, its right
 to run, and `Durable` is the pair plus the moves that have to cross both at once.
 

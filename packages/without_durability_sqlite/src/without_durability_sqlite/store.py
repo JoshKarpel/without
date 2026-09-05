@@ -89,19 +89,26 @@ BUSY_TIMEOUT = Milliseconds(5_000)
 # `value` is TEXT rather than a richer type, which is the same shape the Redis store's
 # hash field has and leaves the same question open: what goes *in* the text is the
 # store's injected `CheckpointCodec`, defaulting to JSON because that is what makes a
-# checkpoint readable by anything that can open the file. `WITHOUT ROWID` because every
-# one of these tables is addressed by its primary key and never by a rowid, so the extra
-# indirection would be pure overhead.
+# checkpoint readable by anything that can open the file.
 #
 # `NOT NULL` on `value` keeps "no row" and "a row holding JSON null" distinguishable, so
 # a step that legitimately records `None` is not read back as a step that never ran.
+#
+# The claim and queue tables are `WITHOUT ROWID` because each is addressed by its primary
+# key and never by a rowid, so the extra indirection would be pure overhead. The checkpoint
+# table pays that indirection deliberately, because its rowid is what `load`'s ordering
+# guarantee rests on: rowids are handed out in insertion order and the conflict update
+# below never touches one, so ordering by it is the order the steps were first recorded in.
+# Nothing else here is a candidate. A `WITHOUT ROWID` table has no such column, and the
+# primary key would order by step name, which is a different question with a plausible
+# enough answer to pass a careless test.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS workflow_checkpoint (
     workflow TEXT NOT NULL,
     step TEXT NOT NULL,
     value TEXT NOT NULL,
     PRIMARY KEY (workflow, step)
-) WITHOUT ROWID;
+);
 
 CREATE TABLE IF NOT EXISTS workflow_claim (
     workflow TEXT PRIMARY KEY,
@@ -172,7 +179,10 @@ RETURNING value
 FENCE = "SELECT token FROM workflow_claim WHERE workflow = ?"
 ALREADY = "SELECT value FROM workflow_checkpoint WHERE workflow = ? AND step = ?"
 WRITE = "INSERT INTO workflow_checkpoint (workflow, step, value) VALUES (?, ?, ?)"
-LOAD = "SELECT step, value FROM workflow_checkpoint WHERE workflow = ?"
+# `ORDER BY rowid` is the whole of the ordering guarantee, and it is load-bearing rather
+# than a formality: `WHERE workflow = ?` is served by the primary key's index, so without
+# it the rows come back sorted by step name.
+LOAD = "SELECT step, value FROM workflow_checkpoint WHERE workflow = ? ORDER BY rowid"
 # Hand the workflow back early, but keep the token, so the next claim gets the next
 # number up and a pass that comes back from the dead still loses.
 RELEASE = "UPDATE workflow_claim SET held_until = unixepoch('now', 'subsec') WHERE workflow = ? AND token = ?"

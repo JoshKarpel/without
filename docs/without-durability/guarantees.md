@@ -106,7 +106,7 @@ So a family of stores is not one good implementation and one compromise. It is t
 same offer made to several populations, each able to co-commit for the effects that
 live where its checkpoint lives.
 
-## Four notes on the shape that took
+## Five notes on the shape that took
 
 None of these is obvious from the protocol alone.
 
@@ -133,6 +133,33 @@ None of these is obvious from the protocol alone.
   something unequal (a tuple returns as a list under `JsonCodec`), and `run_durably`
   reading that as a lost race would fail a run in which nothing raced. The store is
   the only party holding both encodings, so it answers.
+- **The store says what order they came in, for the same reason.** A workflow's
+  records have two independent writers: the pass, through `record`, and anything
+  outside it, through `supply`. Neither can order itself against the other. A counter
+  either one keeps is read from a stale in-process snapshot or observed from the store
+  and then raced, so the pass writes response N, the handler loads and takes N+1, and
+  the pass's own next write is N+1 too. The store sees every write, so the store is
+  the only thing that can say, and `load` returns its records in the order they were
+  first recorded. First-writer-wins already decides what a key holds; this says the
+  same writer decides where it sits, so a losing write moves neither.
+
+  The order is the guarantee and the number behind it is _not_. `load` returns a
+  `dict`, which preserves insertion order, so a caller reads the order by iterating
+  and no store owes a sequence anyone outside it can see. That leaves the requirement
+  invisible in the signature, which is the cost of keeping it out of the API: nothing
+  but the cross-store conformance suite holds an implementation to it, and a
+  third-party store can satisfy the type while ignoring the contract.
+
+  What each store reaches for differs, and the differences are instructive. SQLite
+  orders by the `rowid` it already assigns, which is why its checkpoint table is the
+  one table there that is not `WITHOUT ROWID`. Postgres adds an identity column,
+  because a heap scan looks like insertion order right up until the no-op conflict
+  update rewrites a tuple and moves it. Redis has the hardest job and the least
+  obvious answer: it packs the position into the hash field in front of the encoded
+  value, because a hash preserves insertion order only while it is listpack-encoded
+  and stops once it converts to a hashtable. Keeping the order _in_ the field is what
+  keeps it to one key, so there is no second structure that has to expire in step with
+  the first.
 
 ## Every step names its parser, and the graph names none
 

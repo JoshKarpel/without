@@ -22,7 +22,8 @@ stores side by side is what turns that from a design intention into something yo
 can read.
 
 ```text
-workflow_checkpoint   one row per (workflow, step), the value as jsonb
+workflow_checkpoint   one row per (workflow, step), the value as jsonb,
+                      an identity column for the order they were recorded in
 workflow_claim        one row per workflow: whose pass it is, and until when
 workflow_queue        one row per (namespace, workflow), scored by when it is visible
 ```
