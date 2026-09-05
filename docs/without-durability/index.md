@@ -40,7 +40,8 @@ is the application's.
 `Checkpointer` (in `interfaces.py`) is the only interface either mechanism talks through:
 `claim` takes the right to run a pass, `load` returns what a workflow has recorded in
 the order it was first recorded, `record` adds to it under that claim, `supply` adds to
-it from outside one, and `release` hands it back. A Redis hash or a Postgres table in production, a plain dict
+it from outside one under a key the caller names, `append` does the same under a key the
+store names, and `release` hands it back. A Redis hash or a Postgres table in production, a plain dict
 in a test. `Scheduler` beside it holds the other half of a workflow's state, its right
 to run, and `Durable` is the pair plus the moves that have to cross both at once.
 
@@ -113,6 +114,48 @@ without a mailbox: the wait outlives the process that was waiting). What the gra
 keeps in exchange is the eager check, since it knows every key before it runs
 anything, and a structure you can diagram.
 
+### An inbox, for input the workflow cannot name in advance
+
+`run.awaiting` waits on one key, written once, that the workflow named before anyone
+supplied it. That is the shape of an approval or a webhook and the wrong shape for a
+_stream_: a workflow reading a sequence of messages would have to invent a key per
+message and allocate out of that space by trying, which is a queue hand-rolled over a
+key-value store.
+
+The inbox is that key space, owned by the store instead. `deliver` appends a message and
+makes the workflow ready in one call, `receive` reads past a cursor and suspends when
+there is nothing new, and a workflow that waits on one comes back as a `Listening`:
+
+```python
+async def console(run: Run) -> Never:
+    cursor: StepKey | None = None
+    for turn in count():
+        heard = await run.receive(f"heard:{turn}", after=cursor)
+        cursor = heard[-1].key
+        await run.step(f"answer:{turn}", lambda: reply(heard), as_text)
+```
+
+`receive` never returns empty, since with nothing new it suspends instead, so
+`heard[-1]` is total and threading the cursor needs no branch. The cursor is the caller's
+to carry rather than hidden state on the `Run`, which is what lets two independent
+readers work inside one workflow without a rule about it. `limit` bounds the take, for a
+consumer that treats the first new message as opening a unit of work and everything
+behind it as belonging to that unit. `pending` is the same read for a caller that would
+rather fold in whatever is there and carry on.
+
+Reading is a **step**, for the reason everything else here is one: a live read of a log
+somebody is still writing to gives two passes different answers. What is recorded is the
+key of the last entry taken, which is a _reference_ rather than a copy, and that is sound
+because entries are immutable. It costs no store round trip either, since an entry is an
+ordinary record and so is already in the checkpoint the pass loaded at the top. An entry
+appended mid-pass is therefore invisible to that pass, which is right rather than a
+limitation: the append made the workflow ready, so the next pass sees it.
+
+What this costs is that a workflow's inbox is part of its checkpoint forever, so a
+long-lived one loads its whole history on every pass. That is the same bill a
+never-completing stepwise workflow already runs up, and it is the price of this execution
+model rather than something the inbox introduces.
+
 ## The service
 
 `integration.durable.api` and `without_durability.worker` are the piece that notices a
@@ -136,22 +179,28 @@ vocabulary doing the work:
 ```text
 deliveries ──▶ pool of N passes ──▶ Sleeping  ──▶ wake_at (a clock)
       ▲                         │  Waiting   ──▶ nothing to do
+      │                         │  Listening ──▶ nothing to do
       │                         │  Completed ──▶ nothing to do
       │                         └─▶ done (this wakeup is answered for)
 reclaim one, else read one
 timer ──▶ wake_due (one move, in the store)
 ```
 
-`resume` returns what the pass came to rather than raising two of the three, so the
-worker is a `match` over a sealed union closed with `assert_never`: a fourth outcome
+`resume` returns what the pass came to rather than raising the suspensions, so the
+worker is a `match` over a sealed union closed with `assert_never`: a further outcome
 would be a type error there rather than a workflow that quietly stops being woken. A
 `Sleeping` carries the deadline the workflow chose, so the worker schedules it; a
-`Waiting` carries nothing to schedule, because only the API's confirmation can queue
-it. Nothing polls a workflow to ask whether it can proceed.
+`Waiting` and a `Listening` carry nothing to schedule, because only a write from
+outside can queue either. Nothing polls a workflow to ask whether it can proceed.
 
-The two waits are separate types rather than one with a nullable `due` for the ordinary
-reason: a driver has to branch on it either way, and two shapes that differ in what they
-carry should not be one shape that sometimes carries it. Inside a pass a suspension is
+The three are separate types rather than one with nullable fields for the ordinary
+reason: a driver has to branch on them either way, and shapes that differ in what they
+carry should not be one shape that sometimes carries it. `Sleeping` is the clearest
+case, since it alone holds a `due`. `Waiting` and `Listening` differ in what their key
+_means_ instead: a `Waiting`'s is an address a client writes to with `arrive`, and a
+`Listening`'s names the read step that stopped, which nobody writes to, so the answer is
+a `deliver` addressed to the workflow. Folded together they would be one key that is
+sometimes somewhere to write and sometimes a diagnostic. Inside a pass a suspension is
 still an exception (`ScheduledWakeup`, `InputNeeded`), because unwinding straight-line
 code needs one; `resume` is the boundary where it becomes a value.
 
@@ -248,12 +297,15 @@ features, expected in something this size:
   itself, which a payment gateway is not. For everything that crosses a boundary the
   answer is the ordinary one: make the effect idempotent, which is what the workflow id
   is for.
-- **A split store's `arrive` still has a window.** `SplitDurable` records and then
-  queues, so a process that dies between them leaves a workflow holding its value with
-  nothing scheduled to run it. It is the recoverable half by design, and for the API an
-  ordinary client retry under the same idempotency key supplies the missing wakeup, but
-  nothing here retries on the caller's behalf and no sweep looks for workflows in that
-  state. `PostgresDurable` and `SqliteDurable` do not have this gap.
+- **A split store's `arrive` and `deliver` still have a window.** `SplitDurable` records
+  and then queues, so a process that dies between them leaves a workflow holding its
+  value with nothing scheduled to run it. It is the recoverable half by design, and for
+  the API an ordinary client retry under the same idempotency key supplies the missing
+  wakeup, but nothing here retries on the caller's behalf and no sweep looks for
+  workflows in that state. A lost `deliver` wakeup is the worse of the two, since an
+  appended message has no key a retry can address: sending it again appends a *second*
+  entry rather than landing on the first. `PostgresDurable` and `SqliteDurable` do not
+  have this gap.
 - **The lease is a guess, not a bound.** `Scheduler.lease` has to exceed the longest a
   pass can honestly take, and nothing can work that out for you. Set it too short and a
   slow pass is fenced mid-flight and has to be re-run; too long and a crashed worker's

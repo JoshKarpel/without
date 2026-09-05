@@ -36,6 +36,9 @@ from redis.commands.core import AsyncScript
 from redis.exceptions import ResponseError
 from without_durability.codec import JSON
 from without_durability.codec import CheckpointCodec
+from without_durability.interfaces import INBOX
+from without_durability.interfaces import INBOX_DIGITS
+from without_durability.interfaces import Entry
 from without_durability.interfaces import Fenced
 from without_durability.interfaces import Pass
 from without_durability.interfaces import Recorded
@@ -152,6 +155,31 @@ local written = redis.call('HSETNX', KEYS[1], ARGV[1], pack_value(redis.call('HL
 redis.call('EXPIRE', KEYS[1], ARGV[3])
 if written == 1 then return ARGV[2] end
 return bare_value(redis.call('HGET', KEYS[1], ARGV[1]))
+"""
+)
+
+# `SUPPLY` under a field this script mints instead of one the caller brought: the append
+# that puts a message in a workflow's inbox.
+#
+# The position is `HLEN` again, and here it does double duty: it is both the field's place
+# in the load order and the number the key is built from, which is what keeps the two from
+# ever disagreeing. Everything that makes `HLEN` a sound position makes it a sound name as
+# well (nothing here deletes a field, first-writer-wins never replaces one, and the hash
+# expires whole), so the field this writes is known absent and `HSET` cannot land on top
+# of anybody's message. Two appends racing is not a case: the whole script is one step.
+#
+#   KEYS[1]  the workflow's steps hash
+#   ARGV[1]  the message, encoded
+#   ARGV[2]  expiry for the steps hash, in seconds
+#   returns  the field the message was filed under
+APPEND = (
+    PACKING
+    + f"""
+local position = redis.call('HLEN', KEYS[1])
+local key = '{INBOX}' .. string.format('%0{INBOX_DIGITS}d', position)
+redis.call('HSET', KEYS[1], key, pack_value(position, ARGV[1]))
+redis.call('EXPIRE', KEYS[1], ARGV[2])
+return key
 """
 )
 
@@ -349,6 +377,7 @@ class RedisCheckpointer:
     take: AsyncScript = field(init=False, repr=False, compare=False)
     write: AsyncScript = field(init=False, repr=False, compare=False)
     offer: AsyncScript = field(init=False, repr=False, compare=False)
+    file_away: AsyncScript = field(init=False, repr=False, compare=False)
     hand_back: AsyncScript = field(init=False, repr=False, compare=False)
     # The expiry every write re-arms, rendered once rather than per call: `ttl` is fixed
     # at construction and every `record`, `supply`, and `transact` sends it, so computing
@@ -365,6 +394,7 @@ class RedisCheckpointer:
         object.__setattr__(self, "take", self.redis.register_script(CLAIM))
         object.__setattr__(self, "write", self.redis.register_script(RECORD))
         object.__setattr__(self, "offer", self.redis.register_script(SUPPLY))
+        object.__setattr__(self, "file_away", self.redis.register_script(APPEND))
         object.__setattr__(self, "hand_back", self.redis.register_script(RELEASE))
         object.__setattr__(self, "ttl_seconds", seconds(self.ttl))
 
@@ -461,6 +491,21 @@ class RedisCheckpointer:
             args=[key, self.codec.encode(value), self.ttl_seconds],
         )
         return self.codec.decode(cast(str, stored))
+
+    async def append(self, workflow: str, value: object) -> Entry:
+        """
+        File `value` in this workflow's inbox, under the field the script mints for it.
+
+        The encoding goes out and comes back rather than being round-tripped through the
+        store, which is the one place this differs from `supply` and is sound for the
+        reason `supply`'s read-back is not: the field is known absent inside the script,
+        so there is no earlier writer whose value could be what is stored. Decoding what
+        was just encoded still runs, since that is what every other write here promises
+        and what makes a value that cannot survive its own codec fail on the way in.
+        """
+        encoded = self.codec.encode(value)
+        key = await self.file_away(keys=[self.hash_key(workflow)], args=[encoded, self.ttl_seconds])
+        return Entry(key=cast(str, key), value=self.codec.decode(encoded))
 
     async def release(self, holder: Pass) -> None:
         await self.hand_back(keys=[self.pass_key(holder.workflow)], args=[holder.token])

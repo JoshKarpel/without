@@ -11,7 +11,7 @@
 #     be interleaved with anything. Postgres needs `FOR UPDATE` on the claim row to get
 #     that, because there readers and writers run concurrently and a statement's snapshot
 #     can be stale; Redis needs a Lua script. Here the transaction *is* the exclusion.
-#   - There is nothing to co-locate. `transact` and `arrive` reach the whole datastore
+#   - There is nothing to co-locate. `transact`, `arrive`, and `deliver` reach the whole datastore
 #     because the datastore is a file, so the question the other two stores have to keep
 #     asking (are these two writes in one local commit?) has one answer and it is yes.
 #
@@ -68,8 +68,11 @@ from typing import cast
 from without_async import Milliseconds
 from without_durability.codec import JSON
 from without_durability.codec import CheckpointCodec
+from without_durability.interfaces import INBOX
+from without_durability.interfaces import INBOX_DIGITS
 from without_durability.interfaces import LEASE
 from without_durability.interfaces import Delivery
+from without_durability.interfaces import Entry
 from without_durability.interfaces import Fenced
 from without_durability.interfaces import Pass
 from without_durability.interfaces import Recorded
@@ -189,6 +192,29 @@ INSERT INTO workflow_checkpoint (workflow, step, value)
 VALUES (:workflow, :step, :value)
 ON CONFLICT (workflow, step) DO UPDATE SET value = workflow_checkpoint.value
 RETURNING value
+"""
+
+# `supply` under a key this statement mints instead of one the caller brought: the append
+# that puts a message in a workflow's inbox.
+#
+# The number is the highest `seq` in the table plus one, which is global rather than per
+# workflow and so leaves gaps in any one workflow's run of keys. That is what the contract
+# allows and what makes this a single statement: a per-workflow count would be a second
+# read, and reading a maximum and then inserting against it is the exact race that would
+# need a transaction to close. There are no concurrent writers here to lose it to, since
+# SQLite admits one, but the store that has them (Postgres) reaches for the same shape and
+# the two are easier to hold in one head this way.
+#
+# There is no `ON CONFLICT` clause and deliberately none: the key is fresh by construction,
+# so a collision means the numbering is broken and a `UNIQUE` violation is the loud version
+# of that. An upsert here would quietly hand back somebody else's message instead.
+APPEND = f"""
+INSERT INTO workflow_checkpoint (workflow, step, value)
+SELECT
+    :workflow,
+    '{INBOX}' || printf('%0{INBOX_DIGITS}d', COALESCE((SELECT MAX(seq) FROM workflow_checkpoint), 0) + 1),
+    :value
+RETURNING step, value
 """
 
 FENCE = "SELECT token FROM workflow_claim WHERE workflow = ?"
@@ -510,6 +536,17 @@ class SqliteCheckpointer:
         )
         return self.codec.decode(cast(tuple[str], stored)[0])
 
+    async def append(self, workflow: str, value: object) -> Entry:
+        """File `value` in this workflow's inbox, under the next key in the table."""
+        stored = await self.database.run(
+            lambda connection: connection.execute(
+                APPEND,
+                {"workflow": workflow, "value": self.codec.encode(value)},
+            ).fetchone()
+        )
+        key, encoded = cast(tuple[str, str], stored)
+        return Entry(key=key, value=self.codec.decode(encoded))
+
     async def release(self, holder: Pass) -> None:
         await self.database.run(lambda connection: connection.execute(RELEASE, (holder.workflow, holder.token)))
 
@@ -667,5 +704,23 @@ class SqliteDurable:
                 {"namespace": self.scheduler.namespace, "workflow": workflow, "visible_at": visible_at},
             )
             return self.checkpointer.codec.decode(cast(tuple[str], stored)[0])
+
+        return await self.checkpointer.database.run(lambda connection: transacted(connection, one_commit))
+
+    async def deliver(self, workflow: str, value: object) -> Entry:
+        """Append the message and make the workflow ready, together or not at all."""
+        visible_at = self.scheduler.now().timestamp()
+
+        def one_commit(cursor: sqlite3.Cursor) -> Entry:
+            stored = cursor.execute(
+                APPEND,
+                {"workflow": workflow, "value": self.checkpointer.codec.encode(value)},
+            ).fetchone()
+            cursor.execute(
+                SCHEDULE,
+                {"namespace": self.scheduler.namespace, "workflow": workflow, "visible_at": visible_at},
+            )
+            key, encoded = cast(tuple[str, str], stored)
+            return Entry(key=key, value=self.checkpointer.codec.decode(encoded))
 
         return await self.checkpointer.database.run(lambda connection: transacted(connection, one_commit))

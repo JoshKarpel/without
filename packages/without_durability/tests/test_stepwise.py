@@ -15,10 +15,13 @@ from integration.durable import parse_reference
 from integration.durable import pay_out
 from without_durability import Completed
 from without_durability import Contended
+from without_durability import Entry
 from without_durability import Fenced
 from without_durability import InputNeeded
+from without_durability import Listening
 from without_durability import MemoryCheckpointer
 from without_durability import MemoryEffect
+from without_durability import MessageNeeded
 from without_durability import Outcome
 from without_durability import Recorded
 from without_durability import Run
@@ -27,7 +30,9 @@ from without_durability import Sleeping
 from without_durability import Suspended
 from without_durability import Waiting
 from without_durability import claimed
+from without_durability import inbox_key
 from without_durability import now_utc
+from without_durability import parse_bound
 from without_durability import parse_deadline
 from without_durability import resume
 from without_durability.stepwise import stopped_at
@@ -637,6 +642,103 @@ async def test_only_a_wait_for_input_reports_a_waiting_pass() -> None:
     # schedule, and the driver is told to leave the workflow alone until somebody writes
     # the value.
     assert stopped_at([InputNeeded("approved-by"), InputNeeded("countersigned-by")], {}) == Waiting(key="approved-by")
+
+
+async def test_a_wait_for_a_message_reports_a_listening_pass() -> None:
+    # The third way of stopping, and the one a driver answers the same way it answers
+    # `Waiting` while telling a *client* something different: this workflow is owed a
+    # `deliver`, where a `Waiting` one is owed a write at a key it named.
+    assert stopped_at([MessageNeeded("heard")], {}) == Listening(key="heard")
+
+
+async def test_a_pass_that_both_waits_and_listens_reports_the_addressed_wait() -> None:
+    # A fan-out can raise one of each, and a pass has one outcome. Neither is scheduled, so
+    # which one wins is arbitrary; what it must not be is unstable, since two passes
+    # reporting different outcomes for one suspended workflow is a difference an operator
+    # would chase. The addressed wait wins because a client can act on it from the outcome
+    # alone, where `Listening` only says "send this workflow something".
+    assert stopped_at([MessageNeeded("heard"), InputNeeded("approved-by")], {}) == Waiting(key="approved-by")
+
+
+async def test_a_deadline_beats_a_wait_for_a_message_too() -> None:
+    # `Listening` is answered by whoever delivers next, which is not this driver; the
+    # deadline is answered by this driver and by nobody else, so reporting the wait would
+    # leave a branch that asked for a clock with nothing scheduled.
+    raised: list[Suspended] = [MessageNeeded("heard"), ScheduledWakeup("settling", due=STARTED_AT + SETTLING)]
+
+    assert stopped_at(raised, {}) == Sleeping(key="settling", due=STARTED_AT + SETTLING)
+
+
+async def test_a_receive_takes_what_is_in_the_inbox_and_records_how_far_it_read() -> None:
+    checkpointer = MemoryCheckpointer()
+    first = await checkpointer.append(ORDER, "hello")
+    second = await checkpointer.append(ORDER, "again")
+
+    async def body(run: Run) -> tuple[Entry, ...]:
+        return await run.receive("heard")
+
+    assert await resume(await claimed(checkpointer, ORDER), checkpointer, body) == Completed(value=(first, second))
+    # A key rather than a copy of the values, which is what makes the record small and what
+    # makes it correct: entries are immutable, so naming the last one replays exactly.
+    assert (await checkpointer.load(ORDER))["heard"] == second.key
+
+
+async def test_a_pending_read_of_an_empty_inbox_returns_nothing_instead_of_suspending() -> None:
+    checkpointer = MemoryCheckpointer()
+
+    async def body(run: Run) -> tuple[Entry, ...]:
+        return await run.pending("folded")
+
+    assert await resume(await claimed(checkpointer, ORDER), checkpointer, body) == Completed(value=())
+
+
+async def test_a_pending_read_that_took_nothing_still_replays_to_nothing() -> None:
+    # The write is the whole point of `pending` recording an empty read. Left unrecorded, a
+    # replay would re-evaluate against a fuller inbox and hand the second pass entries the
+    # first one never saw, which is the divergence every step here exists to prevent.
+    checkpointer = MemoryCheckpointer()
+
+    async def body(run: Run) -> tuple[Entry, ...]:
+        return await run.pending("folded")
+
+    holder = await claimed(checkpointer, ORDER)
+    first = await resume(holder, checkpointer, body)
+    await checkpointer.release(holder)
+    await checkpointer.append(ORDER, "arrived later")
+
+    assert await resume(await claimed(checkpointer, ORDER), checkpointer, body) == first
+
+
+async def test_a_pending_read_resumes_from_the_cursor_it_was_given() -> None:
+    checkpointer = MemoryCheckpointer()
+    first = await checkpointer.append(ORDER, "hello")
+    second = await checkpointer.append(ORDER, "again")
+
+    async def body(run: Run) -> tuple[tuple[Entry, ...], tuple[Entry, ...]]:
+        opened = await run.pending("opened", limit=1)
+        return opened, await run.pending("rest", after=opened[-1].key)
+
+    assert await resume(await claimed(checkpointer, ORDER), checkpointer, body) == Completed(
+        value=((first,), (second,))
+    )
+
+
+async def test_a_step_may_not_take_a_name_out_of_the_inbox_key_space() -> None:
+    # The collision worth failing on: a step named into the inbox's keys would be read back
+    # by `receive` as a message somebody delivered, silently, and re-running would never
+    # reveal it. The store owns those names.
+    checkpointer = MemoryCheckpointer()
+
+    async def body(run: Run) -> None:
+        await run.step(inbox_key(3), lambda: answering("mine"), as_text)
+
+    with pytest.raises(ValueError, match="is in the inbox key space"):
+        await resume(await claimed(checkpointer, ORDER), checkpointer, body)
+
+
+async def test_a_cursor_recorded_as_something_else_fails_loudly() -> None:
+    with pytest.raises(TypeError, match="is not a cursor this workflow wrote"):
+        parse_bound("heard", 7)
 
 
 async def test_a_transacted_effect_that_fails_leaves_the_stores_data_alone() -> None:

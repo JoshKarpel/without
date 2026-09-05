@@ -62,8 +62,11 @@ from psycopg.rows import TupleRow
 from psycopg_pool import AsyncConnectionPool
 from without_durability.codec import JSON
 from without_durability.codec import CheckpointCodec
+from without_durability.interfaces import INBOX
+from without_durability.interfaces import INBOX_DIGITS
 from without_durability.interfaces import LEASE
 from without_durability.interfaces import Delivery
+from without_durability.interfaces import Entry
 from without_durability.interfaces import Fenced
 from without_durability.interfaces import Pass
 from without_durability.interfaces import Recorded
@@ -111,9 +114,20 @@ POLL = timedelta(milliseconds=50)
 # looks like insertion order right up until it is not: the conflict update is a real MVCC
 # update, so it writes a new tuple version and moves the row.
 #
+# `workflow_inbox` is what `append` mints keys from, and it is a sequence rather than a
+# count of the workflow's rows because this store is the one with genuinely concurrent
+# writers: `MAX(...) + 1` computed inside a statement is a race that two inserts can both
+# win, and the loser's message would then vanish into first-writer-wins without an error.
+# `nextval` is atomic and never hands the same number out twice, which is the whole
+# requirement. It is shared across workflows and it skips numbers on rollback, so any one
+# workflow's keys have gaps; the contract asks only that they sort into append order
+# within a workflow, which is exactly what a shared counter gives.
+#
 # The index is the one query that matters for throughput, `next_ready`'s scan for the
 # oldest visible row in a namespace. The other two tables are read by primary key.
 SCHEMA = """
+CREATE SEQUENCE IF NOT EXISTS workflow_inbox;
+
 CREATE TABLE IF NOT EXISTS workflow_checkpoint (
     workflow text NOT NULL,
     step text NOT NULL,
@@ -207,6 +221,24 @@ ON CONFLICT (workflow, step) DO UPDATE SET value = recorded.value
 RETURNING recorded.value::text
 """
 
+# `supply` under a key this statement mints instead of one the caller brought: the append
+# that puts a message in a workflow's inbox.
+#
+# No `ON CONFLICT` clause, deliberately. `nextval` never repeats, so the key is fresh by
+# construction and a conflict would mean the numbering is broken; a duplicate-key error is
+# the loud version of that, where an upsert would quietly hand back somebody else's
+# message. This is also the one insert here that may leave a gap in `seq` without leaving
+# one in a workflow's records, since both counters advance and only one is rolled back.
+APPEND = f"""
+INSERT INTO workflow_checkpoint AS entry (workflow, step, value)
+VALUES (
+    %(workflow)s,
+    '{INBOX}' || lpad(nextval('workflow_inbox')::text, {INBOX_DIGITS}, '0'),
+    %(value)s::jsonb
+)
+RETURNING entry.step, entry.value::text
+"""
+
 # The three statements `transact` runs between `BEGIN` and `COMMIT`, with the effect's own
 # work in the middle. They are separate strings rather than one because the effect is
 # arbitrary application SQL that this store cannot see, which is precisely what makes the
@@ -261,12 +293,12 @@ class Supplied(Exception):
 
 async def migrate(pool: AsyncConnectionPool) -> None:
     """
-    Create the three tables, from every process, as often as it likes.
+    Create the three tables and the inbox sequence, from every process, as often as it likes.
 
     Idempotent by `IF NOT EXISTS` and safe against itself by the advisory lock, which is
     the part that is easy to skip: concurrent `CREATE TABLE IF NOT EXISTS` is a
-    duplicate-key error on the system catalog rather than a no-op, and a fleet of workers
-    booting together is exactly a race. `pg_advisory_xact_lock` is held to the end of the
+    duplicate-key error on the system catalog rather than a no-op (and `CREATE SEQUENCE IF
+    NOT EXISTS` is the same), and a fleet of workers booting together is exactly a race. `pg_advisory_xact_lock` is held to the end of the
     surrounding transaction and released by the commit, so there is nothing to unlock.
 
     Schema migration as a whole is not what this is. There is no versioning and no path
@@ -447,6 +479,13 @@ class PostgresCheckpointer:
         async with self.pool.connection() as connection, connection.cursor() as cursor:
             await cursor.execute(SUPPLY, {"workflow": workflow, "step": key, "value": self.codec.encode(value)})
             return self.codec.decode(cast(tuple[str], await cursor.fetchone())[0])
+
+    async def append(self, workflow: str, value: object) -> Entry:
+        """File `value` in this workflow's inbox, under the next key the sequence hands out."""
+        async with self.pool.connection() as connection, connection.cursor() as cursor:
+            await cursor.execute(APPEND, {"workflow": workflow, "value": self.codec.encode(value)})
+            key, encoded = cast(tuple[str, str], await cursor.fetchone())
+            return Entry(key=key, value=self.codec.decode(encoded))
 
     async def release(self, holder: Pass) -> None:
         async with self.pool.connection() as connection:
@@ -712,3 +751,15 @@ class PostgresDurable:
                 {"namespace": self.scheduler.namespace, "workflow": workflow, "visible_at": self.scheduler.now()},
             )
             return codec.decode(stored[0])
+
+    async def deliver(self, workflow: str, value: object) -> Entry:
+        """Append the message and make the workflow ready, together or not at all."""
+        codec = self.checkpointer.codec
+        async with self.checkpointer.pool.connection() as connection, connection.cursor() as cursor:
+            await cursor.execute(APPEND, {"workflow": workflow, "value": codec.encode(value)})
+            key, encoded = cast(tuple[str, str], await cursor.fetchone())
+            await cursor.execute(
+                SCHEDULE,
+                {"namespace": self.scheduler.namespace, "workflow": workflow, "visible_at": self.scheduler.now()},
+            )
+            return Entry(key=key, value=codec.decode(encoded))

@@ -7,7 +7,7 @@ resuming means calling it again; each step it reaches hands back what is already
 recorded instead of running.
 
 ```python
-from without_durability import Completed, MemoryCheckpointer, Run, Sleeping, Waiting, claimed, resume
+from without_durability import Completed, Listening, MemoryCheckpointer, Run, Sleeping, Waiting, claimed, resume
 
 
 def as_text(recorded: object) -> str:
@@ -31,12 +31,20 @@ match await resume(await claimed(checkpointer, "order-42"), checkpointer, fulfil
         ...  # schedule a wakeup for `due`
     case Waiting(key=key):
         ...  # nothing to schedule; someone must write `key`
+    case Listening(key=key):
+        ...  # nothing to schedule; someone must `deliver` a message
 ```
 
-A pass comes back as one of those three rather than raising two of them, so what to do
+A pass comes back as one of those rather than raising the suspensions, so what to do
 next is a `match` a type checker can tell you is incomplete. Inside the workflow a
 suspension is still an exception, because that is how you stop in the middle of
 straight-line code; `resume` is the boundary where it becomes a value.
+
+`run.awaiting` is one named value from outside, written once. For input a workflow
+cannot name in advance there is an inbox instead: `deliver` appends a message and makes
+the workflow ready, `run.receive` reads past a cursor and comes back as `Listening` when
+there is nothing new, and an entry is an ordinary checkpoint record, so it renders out of
+`load` and forks by being copied like anything else.
 
 Each read names a parser because a step hands back what the *store* holds, not
 what its effect returned: the value has been through a codec, so a step returning

@@ -7,6 +7,7 @@ from contextlib import suppress
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
+from typing import cast
 from uuid import uuid4
 
 import pytest
@@ -14,6 +15,7 @@ from integration.durable import Order
 from redis.asyncio import Redis
 from redis.crc import key_slot
 from redis.exceptions import ResponseError
+from without_durability import INBOX_DIGITS
 from without_durability import Contended
 from without_durability import Fenced
 from without_durability import Recorded
@@ -226,6 +228,23 @@ async def test_the_order_survives_the_hash_leaving_its_listpack_encoding(redis: 
     assert await redis.object("encoding", steps) == "hashtable", "or this test is not reaching the path it exists for"
     assert list(await redis.hgetall(steps)) != written, "and the server's own field order is no longer insertion order"
     assert list(await checkpointer.load(workflow)) == written
+
+
+async def test_an_appended_entry_carries_the_same_position_its_key_is_built_from(redis: Redis, workflow: str) -> None:
+    # `HLEN` does double duty in `APPEND`: it is the field's place in the load order and
+    # the number the key is built from. Reading them back apart is what says they cannot
+    # drift, since a script that took the position after the write would name the field
+    # from one number and pack it with another, and `load` would then sort the inbox into
+    # an order its own keys contradict.
+    checkpointer = RedisCheckpointer(redis=redis)
+    await checkpointer.record(await claimed(checkpointer, workflow), "a-step", "a value")
+
+    entry = await checkpointer.append(workflow, "a message")
+
+    packed = cast(str, await redis.hget(checkpointer.hash_key(workflow), entry.key))
+    position, _encoded = packed.split(":", 1)
+    assert entry.key.endswith(position.zfill(INBOX_DIGITS))
+    assert int(position) == 1, "the step written first took position zero"
 
 
 async def test_a_store_error_that_is_not_the_fence_is_not_swallowed(redis: Redis, workflow: str) -> None:

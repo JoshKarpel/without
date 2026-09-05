@@ -41,10 +41,13 @@ from dataclasses import field
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
+from itertools import islice
 from typing import Never
 
+from without_durability.interfaces import INBOX
 from without_durability.interfaces import Checkpointer
 from without_durability.interfaces import Contended
+from without_durability.interfaces import Entry
 from without_durability.interfaces import Fenced
 from without_durability.interfaces import Interruption
 from without_durability.interfaces import Pass
@@ -79,9 +82,9 @@ class Suspended(Interruption):
     remember, and it is why these stay public despite `resume` absorbing them: a
     workflow author needs to know what must not be caught.
 
-    Public to *name*, then, and not to raise. The two ways of waiting are its
-    subclasses, and each carries what a driver needs to answer it; this base carries
-    only the fact that a pass stopped, which no driver can act on. `resume` turns one
+    Public to *name*, then, and not to raise. The ways of waiting are its subclasses, and
+    each carries what a driver needs to answer it; this base carries only the fact that a
+    pass stopped, which no driver can act on. `resume` turns one
     raised directly into an ordinary failure of that workflow rather than letting it
     through (see there for why that is the kinder of the two).
     """
@@ -101,6 +104,24 @@ class InputNeeded(Suspended):
 
     def __init__(self, key: StepKey) -> None:
         super().__init__(key, "to be told")
+
+
+class MessageNeeded(Suspended):
+    """
+    The pass is waiting on the workflow's inbox having something new in it (`Run.receive`).
+
+    Nobody schedules a wakeup for this either, and for `InputNeeded`'s reason: no clock
+    satisfies it, and whoever delivers the next message is what makes the workflow ready.
+    What differs is how it is answered. `InputNeeded`'s key is an *address*, so a client
+    holding it calls `arrive(workflow, key, value)`; this one's key names the read step
+    that stopped, which nobody writes to, and the answer is `deliver(workflow, value)`.
+    Sharing a type would mean a key that is sometimes somewhere to write and sometimes a
+    diagnostic, which is exactly the shape `Sleeping` and `Waiting` are kept apart to
+    avoid.
+    """
+
+    def __init__(self, key: StepKey) -> None:
+        super().__init__(key, "to be sent something")
 
 
 class ScheduledWakeup(Suspended):
@@ -205,6 +226,17 @@ class Run[Effect = Never]:
         to keep. The wait is still bounded by the store, not by the workflow.
         """
         self.claim(key)
+        return await self.perform(key, effect, parse)
+
+    async def perform[T](self, key: StepKey, effect: Callable[[], Awaitable[object]], parse: Parse[T]) -> T:
+        """
+        `step` once the name has been claimed: the lookup, the effect, and the write.
+
+        Split out for `receive`, which has to claim its key *before* it knows whether it
+        will run an effect at all, since a pass that suspends on an empty inbox should
+        still have reported a duplicate step name. Claiming inside here instead would
+        make that either a double claim or no claim.
+        """
         if key in self.recorded:
             return parse(self.recorded[key])
         recording = asyncio.ensure_future(self.checkpointer.record(self.holder, key, await effect()))
@@ -308,6 +340,108 @@ class Run[Effect = Never]:
             raise InputNeeded(key)
         return parse(self.recorded[key])
 
+    async def receive(
+        self,
+        key: StepKey,
+        *,
+        after: StepKey | None = None,
+        limit: int | None = None,
+    ) -> tuple[Entry, ...]:
+        """
+        The entries delivered to this workflow after `after`, suspending until there are any.
+
+        `awaiting`'s role over a stream. Where that waits on one named value written once,
+        this waits on a log the outside world appends to (`Durable.deliver`), and the
+        workflow reads it with a cursor of its own rather than naming each message in
+        advance.
+
+        `after` is that cursor, and it is the caller's to carry: pass the key of the last
+        entry you took, and the next call picks up behind it. Threading it explicitly is
+        what makes two independent readers inside one workflow work without a rule about
+        it, and what keeps the cursor a value rather than hidden state on the `Run`.
+
+        It never returns empty. With nothing new it raises `MessageNeeded`, so the pass
+        ends as `Listening` and whoever delivers next re-queues the workflow, which means
+        `received[-1].key` is total and threading the cursor needs no branch. `pending` is
+        the variant for a caller that wants whatever is there and would rather carry on.
+
+        `limit` bounds the take, and is how a workflow consumes *part* of what has
+        arrived: a consumer that treats the first new message as opening a unit of work
+        and everything behind it as belonging to that unit cannot advance its cursor past
+        the lot, so it takes one and leaves the rest for the next call.
+
+        Reading the inbox is a **step**, and for the reason everything else here is one: a
+        live read of a log somebody is still writing to gives two passes different
+        answers. What gets recorded is the key of the last entry taken, so a replay hands
+        back the same entries rather than whatever has arrived since. It is a *reference*
+        rather than a copy, which is sound precisely because entries are immutable: the
+        keys it names still hold what they held.
+
+        No store round trip is needed to read them, either. Entries are ordinary records,
+        so they are already in `recorded`, which is the snapshot this pass loaded at the
+        top. An entry appended mid-pass is therefore invisible to this pass, which is
+        correct rather than a limitation: the append made the workflow ready, so the next
+        pass sees it.
+        """
+        self.claim(key)
+        available = self.delivered(after, limit)
+        if not available and key not in self.recorded:
+            raise MessageNeeded(key)
+
+        # Only reached when `available` is non-empty: a recorded bound was written by a
+        # pass that took at least one entry, and nothing removes an entry, so a replay
+        # under the same cursor sees at least what that pass saw.
+        async def last_taken() -> object:
+            return available[-1].key
+
+        return through(available, await self.perform(key, last_taken, parsing_bound(key)))
+
+    async def pending(
+        self,
+        key: StepKey,
+        *,
+        after: StepKey | None = None,
+        limit: int | None = None,
+    ) -> tuple[Entry, ...]:
+        """
+        The entries delivered after `after`, or nothing at all, without suspending.
+
+        `receive` for a workflow that wants to fold in anything waiting and carry on
+        regardless: a long-running unit of work checking for a cancellation, a reducer
+        draining what has piled up since its last turn.
+
+        It records how far it read exactly as `receive` does, including when it read
+        nothing, and that write is the point rather than bookkeeping. Left unrecorded, a
+        replay would re-evaluate against a fuller inbox and hand this pass entries the
+        first one never saw, which is the divergence the whole step mechanism exists to
+        prevent.
+        """
+        self.claim(key)
+        available = self.delivered(after, limit)
+
+        async def last_taken() -> object:
+            return available[-1].key if available else after
+
+        return through(available, await self.perform(key, last_taken, parsing_bound(key)))
+
+    def delivered(self, after: StepKey | None, limit: int | None) -> tuple[Entry, ...]:
+        """
+        The inbox past `after`, as this pass sees it, in the order the entries were appended.
+
+        Two guarantees carry the order, and both are the store's. The records arrive from
+        `load` in the order they were first recorded, which is what puts these in append
+        order among everything else the workflow has done; and `append` mints keys that
+        sort, which is what makes the `>` against a cursor mean "later than". A store
+        meeting one and not the other is a store this reads wrongly, which is why the
+        conformance suite pins both.
+        """
+        unread = (
+            Entry(key=key, value=value)
+            for key, value in self.recorded.items()
+            if key.startswith(INBOX) and (after is None or key > after)
+        )
+        return tuple(islice(unread, limit))
+
     def claim(self, key: StepKey) -> None:
         """
         Reserve `key` for this pass, refusing a name already used in it.
@@ -317,7 +451,15 @@ class Run[Effect = Never]:
         reveals it. The graph rejects a duplicate node key when the graph is built;
         the closest thing available here is to reject it the moment the second one is
         reached, which happens on every pass rather than only after a crash.
+
+        The `INBOX` prefix is refused here for the same reason and at the same moment. A
+        step named `inbox:3` would be read back by `receive` as a message somebody
+        delivered, silently, and no amount of re-running would reveal it. The store owns
+        that key space, so a workflow reaching into it is a collision worth failing on
+        rather than a naming style.
         """
+        if key.startswith(INBOX):
+            raise ValueError(f"{key!r} is in the inbox key space the store assigns; name the step something else")
         if key in self.claimed:
             raise ValueError(f"{key!r} was already used in this pass; two steps cannot share a name")
         self.claimed.add(key)
@@ -328,6 +470,37 @@ def parse_deadline(key: StepKey, recorded: object) -> datetime:
     if not isinstance(recorded, str):
         raise TypeError(f"{key!r} holds {recorded!r}, which is not a deadline this workflow wrote")
     return datetime.fromisoformat(recorded)
+
+
+def through(available: tuple[Entry, ...], bound: StepKey | None) -> tuple[Entry, ...]:
+    """
+    The entries a read took, given everything in front of its cursor and how far it went.
+
+    One rule covers both the pass that read and every pass that replays it, because the
+    bound is a key rather than a count: `None` is a read that took nothing and had nothing
+    before it, a bound equal to the caller's own cursor is a read that took nothing, and
+    anything else names the last entry taken. A replay sees a fuller inbox and is cut back
+    to exactly the same entries by the same comparison.
+    """
+    if bound is None:
+        return ()
+    return tuple(entry for entry in available if entry.key <= bound)
+
+
+def parse_bound(key: StepKey, recorded: object) -> StepKey | None:
+    """How far a read got, or a loud failure if the store holds something else."""
+    if recorded is not None and not isinstance(recorded, str):
+        raise TypeError(f"{key!r} holds {recorded!r}, which is not a cursor this workflow wrote")
+    return recorded
+
+
+def parsing_bound(key: StepKey) -> Parse[StepKey | None]:
+    """`parse_bound` as the one-argument parser `perform` takes, closed over its key."""
+
+    def parse(recorded: object) -> StepKey | None:
+        return parse_bound(key, recorded)
+
+    return parse
 
 
 def parsing_deadline(key: StepKey) -> Parse[datetime]:
@@ -373,10 +546,29 @@ class Waiting:
     key: StepKey
 
 
+@dataclass(frozen=True, slots=True)
+class Listening:
+    """
+    The pass stopped on the workflow's inbox, with nothing new in it.
+
+    A driver does exactly what it does for `Waiting`, and that is not a reason to make
+    them one type. `Waiting.key` is an *address*: a client holding it answers with
+    `arrive(workflow, key, value)`. `key` here names the read step that stopped, which
+    nobody writes to, and the answer is `deliver(workflow, value)`, addressed to the
+    workflow rather than to any key. Folding the two together would leave a key that is
+    sometimes somewhere to write and sometimes a diagnostic, which is the denormalized
+    shape `Sleeping` and `Waiting` are already kept apart to avoid, and would leave a
+    consumer asking "is this workflow waiting to be *told* something or waiting to be
+    *sent* something" with nothing but its own step names to answer from.
+    """
+
+    key: StepKey
+
+
 # What one pass at a workflow came to. It is a sealed union rather than one type with
-# nullable fields because the three answers have genuinely different shapes, and a driver
-# that matches over them is told by the type checker when it has missed one.
-type Outcome[T] = Completed[T] | Sleeping | Waiting
+# nullable fields because the answers have genuinely different shapes, and a driver that
+# matches over them is told by the type checker when it has missed one.
+type Outcome[T] = Completed[T] | Sleeping | Waiting | Listening
 
 
 async def resume[T, Effect](
@@ -468,7 +660,9 @@ def leaves(group: BaseException) -> Iterator[BaseException]:
         yield group
 
 
-def unwound(group: BaseExceptionGroup[BaseException], waking: dict[StepKey, datetime]) -> Sleeping | Waiting:
+def unwound(
+    group: BaseExceptionGroup[BaseException], waking: dict[StepKey, datetime]
+) -> Sleeping | Waiting | Listening:
     """
     What a pass came to when its fan-out raised, or the failure re-raised without its
     suspensions.
@@ -496,7 +690,7 @@ def unwound(group: BaseExceptionGroup[BaseException], waking: dict[StepKey, date
     return stopped_at([each for each in leaves(group) if isinstance(each, Suspended)], waking)
 
 
-def stopped_at(suspensions: list[Suspended], waking: dict[StepKey, datetime]) -> Sleeping | Waiting:
+def stopped_at(suspensions: list[Suspended], waking: dict[StepKey, datetime]) -> Sleeping | Waiting | Listening:
     """
     What a pass that stopped came to, given every suspension that reached its edge and
     every deadline it wrote on the way.
@@ -524,11 +718,19 @@ def stopped_at(suspensions: list[Suspended], waking: dict[StepKey, datetime]) ->
     if deadlines:
         key, due = min(deadlines.items(), key=lambda waiting: (waiting[1], waiting[0]))
         return Sleeping(key=key, due=due)
+    # The two ways of waiting on the outside world are answered identically by a driver
+    # (schedule nothing), so which one a fan-out reports when it produced both is
+    # arbitrary; what it must not be is unstable, since two passes reporting different
+    # outcomes for the same suspended workflow is a difference an operator would chase.
+    # Addressed first, because it is the one a client can act on from the outcome alone.
     for each in suspensions:
         if isinstance(each, InputNeeded):
             return Waiting(key=each.key)
+    for each in suspensions:
+        if isinstance(each, MessageNeeded):
+            return Listening(key=each.key)
     unreportable = suspensions[0]
     raise TypeError(
         f"{type(unreportable).__name__} is not a suspension a pass can report: "
-        f"a workflow waits with `Run.sleep` or `Run.awaiting`"
+        f"a workflow waits with `Run.sleep`, `Run.awaiting`, or `Run.receive`"
     ) from unreportable

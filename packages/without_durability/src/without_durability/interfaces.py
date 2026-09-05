@@ -30,6 +30,44 @@ from typing import Protocol
 # follows it.
 LEASE = timedelta(minutes=1)
 
+# The key space `append` assigns out of, and the one piece of the inbox that every layer
+# has to agree on: the stores mint these keys, `Run.receive` picks them out of a
+# checkpoint by this prefix, and `Run.claim` refuses a step that would collide with one.
+#
+# Declared here and spliced into each store's own language (a SQL expression, a Lua
+# `string.format`) rather than restated in four dialects, because a width that disagrees
+# between two stores is a key space that sorts correctly in one of them.
+#
+# Fixed-width and zero-padded so the keys sort lexically, which is what lets a consumer
+# order an inbox by key alone and lets `receive` compare a cursor with `<`. Twenty digits
+# is past what a signed 64-bit counter can reach, so the silent failure a narrower width
+# would have (`inbox:10` sorting before `inbox:7`) is not reachable rather than merely
+# unlikely.
+INBOX = "inbox:"
+INBOX_DIGITS = 20
+
+
+def inbox_key(position: int) -> str:
+    """The key an entry at `position` in a workflow's inbox is stored under."""
+    return f"{INBOX}{position:0{INBOX_DIGITS}d}"
+
+
+@dataclass(frozen=True, slots=True)
+class Entry:
+    """
+    One value delivered to a workflow's inbox, and the key the store filed it under.
+
+    Both halves, because the key is the part the caller could not have known: it is the
+    store that assigns it, and it is what a workflow records to say how far it has read.
+    A pass carries the key rather than a copy of the value for the same reason the entry
+    is never consumed: entries are immutable and first-writer-wins, so "I took entries 7
+    and 8" replays to the same two values, where a copy would be a second thing to keep
+    in step with the first.
+    """
+
+    key: str
+    value: object
+
 
 def check_duration(name: str, duration: timedelta) -> None:
     """
@@ -166,6 +204,14 @@ class Checkpointer[Effect = Never](Protocol):
       ran an effect at least agree on its result rather than diverging, and whether that
       value is this pass's own.
     - `record` and `supply` MUST make the value durable before returning.
+    - `append` MUST file `value` under a key it assigns out of the `INBOX` space, MUST
+      assign a distinct key to every concurrent append to one workflow without losing
+      either value, and MUST assign keys that sort into append order *within* that
+      workflow. They need not be contiguous and need not order across workflows, which is
+      why a shared counter with gaps is a sound implementation and usually the easiest one
+      to make atomic. The entry it writes is an ordinary record: it MUST appear in `load`
+      like any other, since a consumer renders a workflow from `load` and forks one by
+      copying what `load` returns, and an entry invisible there neither renders nor forks.
     - Every value MUST cross the store's `CheckpointCodec` in both directions, so that
       what `load` and `record` hand back is what a later pass will read rather than what
       this one happened to pass in. A store that skips the round trip on the way out is a
@@ -197,6 +243,19 @@ class Checkpointer[Effect = Never](Protocol):
     result to that node's dependents by the time it writes. `supply` is called from
     outside any pass by a client that wants the stored value and nothing else, and
     `transact` runs at most once by construction, so neither has a race to report.
+
+    `append` is `supply`'s sibling, and the only difference between them is who picks the
+    key. `supply` is a value from outside a pass under a key *the caller* names, which is
+    the shape of an approval or a webhook: one named answer, written once, read by the
+    `Run.awaiting` that named it in advance. `append` is a value under a key *the store*
+    names, which is the shape of a stream: a caller with a message and no place to put it
+    is told where it went. Neither is gated on a claim, for the same reason, since input
+    must not fail because a worker happens to be mid-pass.
+
+    What that buys is a workflow that takes input it did not name in advance, without
+    inventing a key space and allocating out of it by trying. The store already sees every
+    write and already decides where each one sits (`load`'s ordering), so it is the only
+    party that can hand out a name nobody else is about to take.
     """
 
     async def load(self, workflow: str) -> dict[str, object]: ...
@@ -208,6 +267,8 @@ class Checkpointer[Effect = Never](Protocol):
     async def transact(self, holder: Pass, key: str, effect: Effect) -> object: ...
 
     async def supply(self, workflow: str, key: str, value: object) -> object: ...
+
+    async def append(self, workflow: str, value: object) -> Entry: ...
 
     async def release(self, holder: Pass) -> None: ...
 
@@ -329,6 +390,14 @@ class Durable[Effect = Never](Protocol):
       failures are not symmetric: recorded-and-unqueued is a workflow waiting for a
       wakeup that a resubmission supplies, and queued-with-nothing-recorded is a pass
       that wakes, finds nothing to do, and drops the value on the floor.
+    - `deliver` MUST append `value` to the workflow's inbox exactly as
+      `Checkpointer.append` does, and MUST make the workflow ready, under all three of the
+      clauses above. It returns the `Entry` the append wrote.
+
+    `deliver` is to `append` what `arrive` is to `supply`, and it exists for the same
+    reason rather than for symmetry's sake: a caller that appends and then separately
+    schedules can die between the two and leave a message nobody will ever wake for. One
+    call with no ordering to get right is the whole of what this interface adds.
 
     `Effect` is `Checkpointer`'s, threaded through so that a caller holding a `Durable`
     can still reach a store's `transact`, and defaulting to `Never` for the same reason.
@@ -341,6 +410,8 @@ class Durable[Effect = Never](Protocol):
     def scheduler(self) -> Scheduler: ...
 
     async def arrive(self, workflow: str, key: str, value: object) -> object: ...
+
+    async def deliver(self, workflow: str, value: object) -> Entry: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,6 +429,12 @@ class SplitDurable[Effect = Never]:
     wakeup, which anything asking again supplies. The reverse would queue a pass that
     wakes to find nothing recorded and answers for the delivery, losing the value
     outright.
+
+    That repair is weaker for `deliver` than for `arrive`, and the difference is the key.
+    A resubmitted `arrive` names the key it named before, so first-writer-wins makes it
+    the same write and the retry costs nothing; a resent message has no key to name, so
+    it appends a *second* entry beside the first and the workflow reads both. A caller
+    that cannot tolerate that wants a store whose `deliver` is one commit.
     """
 
     checkpointer: Checkpointer[Effect]
@@ -367,6 +444,11 @@ class SplitDurable[Effect = Never]:
         stored = await self.checkpointer.supply(workflow, key, value)
         await self.scheduler.make_ready(workflow)
         return stored
+
+    async def deliver(self, workflow: str, value: object) -> Entry:
+        entry = await self.checkpointer.append(workflow, value)
+        await self.scheduler.make_ready(workflow)
+        return entry
 
 
 async def claimed(checkpointer: Checkpointer, workflow: str, lease: timedelta = LEASE) -> Pass:

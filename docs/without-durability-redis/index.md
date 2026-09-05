@@ -133,6 +133,11 @@ with it. The scripts add the prefix on the way in and strip it on the way out, s
 a caller reads bare values through `load` and a `LuaEffect` never sees one, but an
 operator reading fields with `redis-cli` directly will.
 
+That same position is what `append` names an inbox field from, so this store needs
+no counter beyond the one it already keeps: the number in the key and the number
+packed in front of the value are one `HLEN` read inside one script, and cannot
+drift apart.
+
 **The claim** is born on the first `claim` and has a fixed two-field shape.
 `token` only rises, `until` moves forward on a claim and to zero on a release. It
 shares the checkpoint's TTL and is re-armed alongside it.

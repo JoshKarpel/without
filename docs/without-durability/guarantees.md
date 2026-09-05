@@ -106,7 +106,7 @@ So a family of stores is not one good implementation and one compromise. It is t
 same offer made to several populations, each able to co-commit for the effects that
 live where its checkpoint lives.
 
-## Five notes on the shape that took
+## Six notes on the shape that took
 
 None of these is obvious from the protocol alone.
 
@@ -163,6 +163,34 @@ None of these is obvious from the protocol alone.
   and stops once it converts to a hashtable. Keeping the order _in_ the field is what
   keeps it to one key, so there is no second structure that has to expire in step with
   the first.
+- **The store names an inbox key, because only the store can.** `append` is `supply`
+  under a key the store picks, and that is the whole difference between them. It owes
+  three things a caller cannot arrange: two concurrent appends to one workflow get
+  distinct keys and neither value is lost, the keys sort into append order _within_ that
+  workflow, and the entry is an ordinary record that `load` returns in place.
+
+  The keys need not be contiguous and need not order across workflows, and saying so is
+  what makes the requirement implementable. A shared counter with gaps satisfies it and
+  is far easier to make atomic than per-workflow numbering: Postgres takes `nextval` off
+  a sequence, since it is the store with genuinely concurrent writers and a maximum read
+  inside the insert is a race two callers can both win, with the loser's message
+  vanishing into first-writer-wins and no error to show for it. SQLite reads the highest
+  `seq` in one statement, which is atomic there because SQLite admits one writer at a
+  time. Redis and the in-memory double take the count of the workflow's own records,
+  which is the same number they already use as the load position, so a key and the
+  position it names cannot drift apart.
+
+  Nothing is ever consumed, which is the load-bearing half. A destructive read would
+  move a value out of the inbox and into the workflow's own records, leaving two copies
+  to keep in step; append-only means the entry _is_ the record and a pass writes a
+  reference to it. That reference replays correctly for exactly the reason the entry is
+  safe to share: first-writer-wins, so the key still holds what it held. Forking is then
+  free, since a consumer copying a prefix of `load` copies entries like anything else
+  and needs no rule about the unread ones.
+
+  What a destructive queue would buy is competing consumers, and that is already
+  answered a layer down: `claim` guarantees one pass per workflow, so there is nobody to
+  distribute the work between.
 
 ## Every step names its parser, and the graph names none
 

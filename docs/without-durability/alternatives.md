@@ -76,3 +76,13 @@ Each is worth naming with what it costs.
   for each. What that buys is a smaller vocabulary; what it costs is that the store
   cannot tell an awaited value from a recorded result, so an approval written for a
   workflow that never asked for one simply sits there unread.
+
+  A _stream_ of signals is the same mapping again, and it is the one place the
+  vocabulary had to grow: a key holds one value forever, so a workflow reading a
+  sequence needs keys it did not name in advance, and only the store can hand those out
+  without two callers racing for the same one. `Listening` is `Waiting` over that
+  stream. This is where the durable-workflow and durable-actor shapes meet, and the
+  meeting costs one method on the store rather than a second execution model: an entry
+  is an ordinary record, so it renders, forks, and expires exactly as a step's result
+  does. What it does not buy is Temporal's competing consumers, and nothing here wants
+  them, since `claim` already admits one pass per workflow.
