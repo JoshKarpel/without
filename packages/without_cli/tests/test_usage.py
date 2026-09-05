@@ -31,6 +31,13 @@ def _usage_for(argv: list[str]) -> str:
     return render(outcome.usage)
 
 
+# Deliberately carries no docstring, where `unreached` does: a command's summary
+# falls back to its handler's docstring, so a command with *no* summary can only be
+# built from a handler that has none. That is also why this explanation is a comment.
+async def _undescribed(state: object, *values: object) -> int:
+    raise AssertionError("a command that should not have run was invoked")  # pragma: no cover - never runs
+
+
 class TestSynopsis:
     def test_a_group_lists_a_command_placeholder(self) -> None:
         assert usage((build().node,)).invocation == "todos [OPTIONS] COMMAND [ARGS]..."
@@ -117,9 +124,9 @@ class TestRendering:
         assert not any(line != line.rstrip() for line in rendered.splitlines())
 
     def test_a_command_with_no_summary_renders_without_a_description(self) -> None:
-        app = group("app", commands=(command("show", argument("things", many(STR)))(unreached),))
+        app = group("app", commands=(command("show", argument("things", many(STR)))(_undescribed),))
         rendered = render(usage((app.node, app.node.children[0])))
-        assert rendered.startswith("usage: app show [THINGS...]\n")
+        assert rendered.startswith("usage: app show [THINGS...]\n\nArguments:\n")
 
     @pytest.mark.parametrize(
         ("cardinality", "slot"),

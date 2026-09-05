@@ -385,7 +385,7 @@ class TestAnswered:
         assert isinstance(outcome, Answered)
         assert outcome.spelling == "--license"
 
-    def test_a_declared_option_of_the_same_name_wins(self) -> None:
+    async def test_a_declared_option_of_the_same_name_wins(self) -> None:
         # Shadowing is how a program that wants `--version` to mean something
         # else keeps it, exactly as it already can for `--help`.
         @command("show", option("--version", once(STR)))
@@ -394,7 +394,13 @@ class TestAnswered:
             return 0
 
         app = group("app", commands=(show,), version="app 1.4.2")
-        assert isinstance(parse_argv(app, argv=["show", "--version", "3"], answered=ANSWERED), Bound)
+        capture = Streams.captured()
+        outcome = parse_argv(app, argv=["show", "--version", "3"], answered=ANSWERED)
+        assert isinstance(outcome, Bound)
+        # Running it is what proves the declared option won: the built-in would
+        # have answered with "app 1.4.2" instead of handing "3" to the handler.
+        await outcome.action(capture.streams)
+        assert capture.stdout == "3"
 
     def test_whichever_spelling_is_written_first_answers(self) -> None:
         # The scan runs left to right and short-circuits, so no spelling has a

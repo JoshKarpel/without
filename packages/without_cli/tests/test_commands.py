@@ -125,7 +125,7 @@ class TestArmsAreValues:
     def test_a_command_with_no_summary_describes_itself_from_its_docstring(self) -> None:
         async def handler(streams: Streams) -> int:
             """Trim the backlog."""
-            return 0
+            return 0  # pragma: no cover - the docstring is the subject, not the body
 
         assert command("prune")(handler).node.summary == "Trim the backlog."
 
@@ -137,21 +137,21 @@ class TestArmsAreValues:
             The rest of the docstring is for whoever reads the code, not for
             `--help`, so only the first line crosses.
             """
-            return 0
+            return 0  # pragma: no cover - the docstring is the subject, not the body
 
         assert command("prune")(handler).node.summary == "Trim the backlog."
 
     def test_an_explicit_summary_beats_the_docstring(self) -> None:
         async def handler(streams: Streams) -> int:
             """Words for the next reader of the code."""
-            return 0
+            return 0  # pragma: no cover - the docstring is the subject, not the body
 
         arm = command("prune", summary="Words for the person running it.")(handler)
         assert arm.node.summary == "Words for the person running it."
 
     def test_a_command_with_neither_has_no_summary(self) -> None:
         async def handler(streams: Streams) -> int:
-            return 0
+            return 0  # pragma: no cover - the absent docstring is the subject, not the body
 
         assert command("prune")(handler).node.summary == ""
 

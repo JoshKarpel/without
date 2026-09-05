@@ -36,6 +36,71 @@
   space: a step named `inbox:3` would be read back as a message somebody delivered, and no
   amount of re-running would reveal it.
 
+- **`without-cli`**: command-line parsing as values, the CLI sibling of `without-web`'s
+  extractors. A token (`argument`, `option`, `flag`, `count`) is one declaration that
+  is the parse, the usage entry, and the typed read at once, so a command's help, its arity
+  table, and the value its handler receives cannot disagree; positionals and options take the
+  same cardinality vocabulary (`once`, `optional`, `default`, `many`), so an optional positional
+  and a variadic one need no vocabulary of their own; `@command` returns an `Arm` value
+  and registers nothing, so a package can ship one and a consumer place it anywhere in a single
+  edit. An `@overload` ladder ties each token's type to the handler parameter it fills, with no
+  runtime introspection of a function signature, which is the mechanism that gives `typer` its
+  ceiling. `group` takes an async-context-manager `state` entered only when
+  something beneath it is selected, so a command receives a live client it did not open and does
+  not close, typed and checked in both directions (a command wanting one state cannot sit under
+  a group building another, and two commands wanting different states cannot be siblings), which
+  is what `click`'s ambient `Context.obj` is for. There is no separate root concept: a tree's top
+  level is an ordinary group whose parent is the shell, which supplies the `Streams` it derives
+  from, so a CLI with no shared resource declares no `state` and its commands receive that
+  `Streams` directly rather than an ignored parameter. A state that writes output carries the
+  streams onward by extending `Streams` or holding one, and forgetting is a static error. An option names where else its value may come
+  from with `sources=(FromFile(...), FromEnv(...))`, covering Kubernetes and Docker secret mounts
+  through the same validation the command line goes through, with the files read by the shell and
+  handed to the parser as a value. `parse_argv` is a total, pure function of argv, environment,
+  and file contents returning `Bound | Answered | Rejected`: it never exits, never prints, and
+  extracts *every* value up front, so a `Bound` proves the invocation is valid and nothing is
+  opened for a command line that was never going to run. It holds no opinion about which flags
+  are magic either: `answered` is the caller's list of spellings that stop the scan, and `run`
+  is the only place that names `-h`, `--help`, and `--version` or decides what they mean, so a
+  program wanting `-?`, a `help` subcommand, or none of it writes its own shell and changes
+  nothing below. Help is a `Usage` value that plain text
+  is merely one rendering of, so no styling library sits on the path every program crosses and
+  the package depends on nothing. The streams are injected, so output is asserted on by passing
+  `Streams.captured()` rather than by capturing a process.
+- **`without-streams`**: `offload` moves here from `without-logging`, whose signature named only
+  `Sink`, `Stream`, and standard library types, so it belonged in the substrate rather than in a
+  leaf package. It now sits beside its new counterpart and the pair covers both directions across
+  the sync/async boundary. Import it from `without_streams`; `without_logging` no longer
+  re-exports it, so there is one home rather than two paths to the same function.
+- **`without-streams`**: `stream_from_blocking`, read-ahead for a source that is not async at
+  all. `stream_from_iterable` pulls each value on the loop's own thread, so a source that blocks
+  between items (a pipe, `sys.stdin`, a driver with no async client) parks every other task;
+  this runs the whole iteration on one worker thread and hands values across a bounded queue, so
+  the loop stays free and the producer pipelines ahead by at most `ahead` items before
+  backpressure reaches it. Handing over the whole loop rather than awaiting one `next` at a time
+  is what makes it pipeline, at the cost of holding a thread for the source's lifetime. Because a
+  blocked thread cannot be cancelled, the worker is a daemon thread (a pooled one would hang
+  `asyncio.run`'s shutdown) and abandoning the stream releases the producer's backpressure so it
+  wakes to notice, rather than parking on a semaphore nobody will post to. A generator source is
+  closed as that thread unwinds, so its `finally` runs promptly instead of waiting on garbage
+  collection; anything else is left open, since a file is its own iterator and closing it would
+  dispose of a source the caller still owns (`sys.stdin` being the one this exists to wrap).
+  It and `offload` share a mechanism and deliberately differ in interface: a source has to be
+  pulled, so this one bounds its queue and pushes backpressure into the producer, while a sink is
+  pushed, so bounding `offload` would mean choosing between blocking the async side and dropping,
+  which it does not yet do.
+- **`without-web`**: `choice(SomeEnum)`, a converter matching a path segment against an enum's
+  values and parsing it to the member (`path_param("profile", choice(Profile))`). A segment
+  outside the set rejects, so the trie branch simply fails to match and the walk backtracks
+  rather than the request reaching a handler and 400-ing, and the enum's values become
+  OpenAPI's own `enum` for that parameter, declared once on the enum itself. It is `@cache`d
+  per enum so two call sites share one converter and therefore one trie branch, which is the
+  pattern any converter built by a function should follow. Both directions read the member's
+  *value*, so `url_for` renders `/deploy/prod` for a plain `Enum` as much as for a `StrEnum`,
+  where `str(member)` would have spelled the Python identifier. That is `Converter`'s new
+  `render`, `parse`'s inverse: it defaults to `str`, which is right wherever a value's text
+  form is its URL form, and is the converter's own business wherever it is not.
+
 ### Changed
 
 - **`without-durability`**: `Waiting` is replaced by `Blocked`, which reports **every**
@@ -129,64 +194,30 @@
   neither writes a prefix nor sees one. `append` takes its key from the same `HLEN`, so the
   field's position and the number its name is built from cannot drift apart. Existing
   checkpoint hashes are not readable by this version; they expire on their own `ttl`.
+- **`without-web`**: two routes that differ only in what they *name* a path parameter are now
+  the build-time `duplicate route` error they always were in substance. No request can tell
+  `/u/{id:int}` from `/u/{other:int}`, and both used to be reachable, with whichever was
+  registered first silently winning.
+
+### Fixed
+
+- **`without-web`**: a route is no longer handed a value some *other* route's converter
+  produced. A converter is the routing trie's branch key, and it compared by `name` alone, so
+  two converters sharing a name but not a `parse` merged onto one branch and whichever was
+  registered first supplied the parse for both. That was invisible while every converter was
+  a module-level singleton (equal names meant the same object) and became reachable as soon as
+  one was built by a function. Equality is now `name` and `parse` together; `schema` stays out
+  of it, along with `render`, since neither takes part in matching and OpenAPI and `url_for`
+  read them off the route's own segments.
+  A converter built by a factory should be `@cache`d on its inputs, as `choice` is, so that
+  two call sites for the same thing still share one branch.
+- **`without-web`**: a path segment is converted once per branch rather than once per route
+  passing through it. Trie branches are keyed on the converter alone, with each route's
+  parameter names carried to its own leaf.
 
 ## 0.0.6
 
 ### Added
-
-- **`without-cli`**: command-line parsing as values, the CLI sibling of `without-web`'s
-  extractors. A token (`argument`, `option`, `flag`, `count`) is one declaration that
-  is the parse, the usage entry, and the typed read at once, so a command's help, its arity
-  table, and the value its handler receives cannot disagree; positionals and options take the
-  same cardinality vocabulary (`once`, `optional`, `default`, `many`), so an optional positional
-  and a variadic one need no vocabulary of their own; `@command` returns an `Arm` value
-  and registers nothing, so a package can ship one and a consumer place it anywhere in a single
-  edit. An `@overload` ladder ties each token's type to the handler parameter it fills, with no
-  runtime introspection of a function signature, which is the mechanism that gives `typer` its
-  ceiling. `group` takes an async-context-manager `state` entered only when
-  something beneath it is selected, so a command receives a live client it did not open and does
-  not close, typed and checked in both directions (a command wanting one state cannot sit under
-  a group building another, and two commands wanting different states cannot be siblings), which
-  is what `click`'s ambient `Context.obj` is for. There is no separate root concept: a tree's top
-  level is an ordinary group whose parent is the shell, which supplies the `Streams` it derives
-  from, so a CLI with no shared resource declares no `state` and its commands receive that
-  `Streams` directly rather than an ignored parameter. A state that writes output carries the
-  streams onward by extending `Streams` or holding one, and forgetting is a static error. An option names where else its value may come
-  from with `sources=(FromFile(...), FromEnv(...))`, covering Kubernetes and Docker secret mounts
-  through the same validation the command line goes through, with the files read by the shell and
-  handed to the parser as a value. `parse_argv` is a total, pure function of argv, environment,
-  and file contents returning `Bound | Answered | Rejected`: it never exits, never prints, and
-  extracts *every* value up front, so a `Bound` proves the invocation is valid and nothing is
-  opened for a command line that was never going to run. It holds no opinion about which flags
-  are magic either: `answered` is the caller's list of spellings that stop the scan, and `run`
-  is the only place that names `-h`, `--help`, and `--version` or decides what they mean, so a
-  program wanting `-?`, a `help` subcommand, or none of it writes its own shell and changes
-  nothing below. Help is a `Usage` value that plain text
-  is merely one rendering of, so no styling library sits on the path every program crosses and
-  the package depends on nothing. The streams are injected, so output is asserted on by passing
-  `Streams.captured()` rather than by capturing a process.
-- **`without-streams`**: `offload` moves here from `without-logging`, whose signature named only
-  `Sink`, `Stream`, and standard library types, so it belonged in the substrate rather than in a
-  leaf package. It now sits beside its new counterpart and the pair covers both directions across
-  the sync/async boundary. Import it from `without_streams`; `without_logging` no longer
-  re-exports it, so there is one home rather than two paths to the same function.
-- **`without-streams`**: `stream_from_blocking`, read-ahead for a source that is not async at
-  all. `stream_from_iterable` pulls each value on the loop's own thread, so a source that blocks
-  between items (a pipe, `sys.stdin`, a driver with no async client) parks every other task;
-  this runs the whole iteration on one worker thread and hands values across a bounded queue, so
-  the loop stays free and the producer pipelines ahead by at most `ahead` items before
-  backpressure reaches it. Handing over the whole loop rather than awaiting one `next` at a time
-  is what makes it pipeline, at the cost of holding a thread for the source's lifetime. Because a
-  blocked thread cannot be cancelled, the worker is a daemon thread (a pooled one would hang
-  `asyncio.run`'s shutdown) and abandoning the stream releases the producer's backpressure so it
-  wakes to notice, rather than parking on a semaphore nobody will post to. A generator source is
-  closed as that thread unwinds, so its `finally` runs promptly instead of waiting on garbage
-  collection; anything else is left open, since a file is its own iterator and closing it would
-  dispose of a source the caller still owns (`sys.stdin` being the one this exists to wrap).
-  It and `offload` share a mechanism and deliberately differ in interface: a source has to be
-  pulled, so this one bounds its queue and pushes backpressure into the producer, while a sink is
-  pushed, so bounding `offload` would mean choosing between blocking the async side and dropping,
-  which it does not yet do.
 
 - **`without-asgi`**: Server-Sent Events, as the two pure transforms the format actually is.
   `encode_event` renders one frame to bytes and `parse_events` is
@@ -335,26 +366,8 @@
 - **`without-durability-sqlite`**: `connect` takes `timeout` as a count of `Milliseconds`,
   the unit `PRAGMA busy_timeout` carries, so a duration finer than the pragma can express is
   no longer silently truncated into it.
-- **`without-web`**: two routes that differ only in what they *name* a path parameter are now
-  the build-time `duplicate route` error they always were in substance. No request can tell
-  `/u/{id:int}` from `/u/{other:int}`, and both used to be reachable, with whichever was
-  registered first silently winning.
 
 ### Fixed
-
-- **`without-web`**: a route is no longer handed a value some *other* route's converter
-  produced. A converter is the routing trie's branch key, and it compared by `name` alone, so
-  two converters sharing a name but not a `parse` merged onto one branch and whichever was
-  registered first supplied the parse for both. That was invisible while every converter was
-  a module-level singleton (equal names meant the same object) and became reachable as soon as
-  one was built by a function. Equality is now `name` and `parse` together; `schema` stays out
-  of it, along with `render`, since neither takes part in matching and OpenAPI and `url_for`
-  read them off the route's own segments.
-  A converter built by a factory should be `@cache`d on its inputs, as `choice` is, so that
-  two call sites for the same thing still share one branch.
-- **`without-web`**: a path segment is converted once per branch rather than once per route
-  passing through it. Trie branches are keyed on the converter alone, with each route's
-  parameter names carried to its own leaf.
 
 - **`without-asgi`**: `make_asgi_app` closes a handler's outbound stream when the connection
   ends, as it already did for the inbound one. A client that goes away mid-response ends the
@@ -471,17 +484,6 @@
   prefix does not match, which is correct rather than a gap, since a request for a directory
   is a listing request. A single-page app's entry point is the router's `fallback` instead,
   the one place that also sees the client-side deep links no asset matches.
-- **`without-web`**: `choice(SomeEnum)`, a converter matching a path segment against an enum's
-  values and parsing it to the member (`path_param("profile", choice(Profile))`). A segment
-  outside the set rejects, so the trie branch simply fails to match and the walk backtracks
-  rather than the request reaching a handler and 400-ing, and the enum's values become
-  OpenAPI's own `enum` for that parameter, declared once on the enum itself. It is `@cache`d
-  per enum so two call sites share one converter and therefore one trie branch, which is the
-  pattern any converter built by a function should follow. Both directions read the member's
-  *value*, so `url_for` renders `/deploy/prod` for a plain `Enum` as much as for a `StrEnum`,
-  where `str(member)` would have spelled the Python identifier. That is `Converter`'s new
-  `render`, `parse`'s inverse: it defaults to `str`, which is right wherever a value's text
-  form is its URL form, and is the converter's own business wherever it is not.
 - **`without-html`**: a new package. HTML as immutable Python values: build a node tree with
   plain constructors (`div(cls=..., attrs=..., children=...)`), render it with a pure
   `render(node) -> str`. It depends on nothing else in the workspace, so it is usable from any
