@@ -1,7 +1,8 @@
 # without-durability-postgres
 
 [`without-durability`](https://pypi.org/project/without-durability/)'s two
-interfaces over one Postgres: three tables, and no mechanism of its own.
+interfaces over one Postgres: three tables and a sequence, and no mechanism of its
+own.
 
 ```python
 from psycopg_pool import AsyncConnectionPool

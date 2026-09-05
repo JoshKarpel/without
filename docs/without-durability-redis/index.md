@@ -92,7 +92,7 @@ timer, once D passes
 worker pulls again
   claim             ────────────────────▶ ▪ token=2 until=T₂  (the fence advances)
   awaiting          ─  suspends: "approved-by" is not there
-  Waiting           ── nothing scheduled: only the world can answer this
+  Blocked           ── nothing scheduled: only the world can answer this
   release, XACK     ────────────────────▶ until=0             ▫ 2-0 acked
 POST /confirmation
   supply("approved-by") ▪ approved-by
@@ -119,9 +119,24 @@ still there when the workflow is done, waiting for `trimming` to take them.
 **The checkpoint** is born on the first write, which is usually the API's
 `supply("order")` rather than anything the workflow did. It gains one field per
 completed step and loses none. Its TTL is re-armed by every write, so a workflow
-making progress keeps itself alive and one that stops does not. This is the key
-whose contents are entirely the user's vocabulary: no engine field lives in it,
-which is what lets `GET /orders/{id}` be `HGETALL` with no filtering.
+making progress keeps itself alive and one that stops does not. Its *field names*
+are entirely the user's vocabulary, with no engine field among them, which is what
+lets `GET /orders/{id}` return the whole hash without filtering anything out.
+
+Each field's value carries one piece of engine bookkeeping, in front of the
+encoding: the position the step was first recorded at, which is how this store
+meets `load`'s ordering guarantee. A hash cannot carry that order itself, since
+Redis preserves field order only while the hash is listpack-encoded and stops once
+it converts to a hashtable. Keeping the position in the field is what keeps the
+checkpoint to one key, with no second structure that would have to expire in step
+with it. The scripts add the prefix on the way in and strip it on the way out, so
+a caller reads bare values through `load` and a `LuaEffect` never sees one, but an
+operator reading fields with `redis-cli` directly will.
+
+That same position is what `append` names an inbox field from, so this store needs
+no counter beyond the one it already keeps: the number in the key and the number
+packed in front of the value are one `HLEN` read inside one script, and cannot
+drift apart.
 
 **The claim** is born on the first `claim` and has a fixed two-field shape.
 `token` only rises, `until` moves forward on a claim and to zero on a release. It

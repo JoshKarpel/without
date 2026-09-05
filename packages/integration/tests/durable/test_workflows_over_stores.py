@@ -7,7 +7,6 @@ from collections.abc import Mapping
 from contextlib import suppress
 from datetime import datetime
 from datetime import timedelta
-from uuid import uuid4
 
 import pytest
 from integration.durable import Order
@@ -19,12 +18,12 @@ from integration.durable import payments_app
 from integration.durable import submitting
 from integration.durable import unwinding
 from without_dag import CompiledGraph
+from without_durability import Blocked
 from without_durability import Checkpointer
 from without_durability import Completed
 from without_durability import Durable
 from without_durability import Outcome
 from without_durability import Run
-from without_durability import Waiting
 from without_durability import claimed
 from without_durability import now_utc
 from without_durability import resume
@@ -58,14 +57,6 @@ class Unwound(Exception):
 
 
 ORDER = Order(order_id="o-42", sku="gizmo", cents=1999)
-
-
-@pytest.fixture
-def workflow() -> str:
-    # Every test gets its own id rather than clearing the store, because the servers are
-    # shared by every worker in the session: clearing would pull another test's
-    # checkpoint out from under it.
-    return f"test-{uuid4().hex}"
 
 
 async def passing[T](checkpointer: Checkpointer, workflow: str, body: Callable[[Run], Awaitable[T]]) -> Outcome[T]:
@@ -193,7 +184,7 @@ async def test_a_workflow_suspended_on_an_approval_resumes_when_another_process_
 
     suspension = await passing(checkpointer, workflow, body)
 
-    assert suspension == Waiting(key="approved-by")
+    assert suspension == Blocked(waiting=frozenset({"approved-by"}))
     assert set(await checkpointer.load(workflow)) == {
         "items",
         "captured:piano",

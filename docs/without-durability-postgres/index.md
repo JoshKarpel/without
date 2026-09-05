@@ -22,9 +22,11 @@ stores side by side is what turns that from a design intention into something yo
 can read.
 
 ```text
-workflow_checkpoint   one row per (workflow, step), the value as jsonb
+workflow_checkpoint   one row per (workflow, step), the value as jsonb,
+                      a `seq` column for the order they were recorded in
 workflow_claim        one row per workflow: whose pass it is, and until when
 workflow_queue        one row per (namespace, workflow), scored by when it is visible
+workflow_seq          the sequence behind `seq`, which `append` also names its keys from
 ```
 
 What is worth reading it for is how little of it is mechanism. Every write that
@@ -39,8 +41,28 @@ came from*, and here it came with the database:
 | Claim the workflow | the `CLAIM` script: read the lease, compare, write, expire | one upsert whose `DO UPDATE` carries a `WHERE` |
 | Record under the fence | the `RECORD` script: read the token, refuse or `HSETNX`, read back | one statement: a `FOR UPDATE` CTE feeding an upsert |
 | Supply from outside a pass | the `SUPPLY` script: `HSETNX`, read back | the same upsert without the CTE |
+| Append under a key the store names | the `APPEND` script: `HLEN`, then `HSET` under it | one insert naming its key from `nextval` |
 | Step and checkpoint together | the `TRANSACT` script, a wrapper the effect is spliced into | `BEGIN` ... `COMMIT`, with the effect's own SQL in the middle |
 | Take the next ready workflow | the `TAKE` script, serialized against itself | `FOR UPDATE SKIP LOCKED` |
+
+The append is the one row where SQL is not simply the shorter answer. Redis and
+SQLite can count what is already there, because a Lua script and a SQLite write
+each run alone; Postgres admits concurrent writers, so a maximum read inside the
+insert is a race two callers can both win, and the loser's message would vanish
+into first-writer-wins with no error to show for it. Hence a sequence: `nextval`
+is atomic and never repeats. It is shared across workflows and it skips numbers
+on rollback, which is why the interface asks only that keys sort within one
+workflow rather than that they be contiguous.
+
+It is the *same* sequence that gives the row its `seq`, and that is the part
+worth stating, because the obvious design has two. An inbox key drawn from one
+counter and a load position drawn from another are two orders, and two callers
+appending at once can take them the opposite way round: the keys sort one way and
+`load` renders the other, which is exactly the pair of guarantees `append` owes
+together. So the statement draws one number in a CTE and spends it twice, as the
+key and as the position, and the two orders cannot disagree because there is only
+one. That is also why `seq` carries a `DEFAULT` rather than being an identity
+column: an identity is a number no statement may supply, and this one has to.
 
 The claim is the one to look at, because every clause of the script it replaces
 survives as a clause of the statement:
@@ -112,7 +134,10 @@ actually make, and `PostgresDurable.arrive` is where it stops being an
 architecture diagram and becomes a guarantee. The Redis deployment is one server
 holding two structures that are deliberately in different slots; this is one
 database holding three tables, so recording an order and queueing the workflow is
-two statements between one `BEGIN` and one `COMMIT`. That is the strongest thing
+two statements between one `BEGIN` and one `COMMIT`. `deliver` is the same move
+for a message rather than a named value, and it matters more there: a lost `arrive`
+wakeup is repaired by asking again under the same key, where asking again with a
+message appends a second one. That is the strongest thing
 here that Redis cannot do at all, and it is the same reason `transact` works:
 both things live in one datastore.
 

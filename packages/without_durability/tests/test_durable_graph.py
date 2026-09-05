@@ -24,12 +24,14 @@ from without_durability import LEASE
 from without_durability import Checkpointer
 from without_durability import Contended
 from without_durability import Delivery
+from without_durability import Entry
 from without_durability import Fenced
 from without_durability import MemoryCheckpointer
 from without_durability import Pass
 from without_durability import Recorded
 from without_durability import SplitDurable
 from without_durability import claimed
+from without_durability import inbox_key
 from without_durability import run_durably
 from without_durability.graph import survives
 from without_durability.graph import written
@@ -315,6 +317,11 @@ class Preempted:
 
     async def supply(self, workflow: str, key: str, value: object) -> object:  # pragma: no cover - unused here
         return self.already.setdefault(key, value)
+
+    async def append(self, workflow: str, value: object) -> Entry:  # pragma: no cover - a graph has no inbox
+        key = inbox_key(len(self.already))
+        self.already[key] = value
+        return Entry(key=key, value=value)
 
     async def release(self, holder: Pass) -> None:
         return None

@@ -143,6 +143,27 @@ async def test_a_workflow_nobody_has_submitted_waits_without_being_scheduled() -
     assert list(scheduler.queue) == []
 
 
+async def test_a_workflow_listening_on_an_empty_inbox_is_answered_for_and_left_alone() -> None:
+    # A `Blocked` reached through the inbox rather than through a named key, and the worker
+    # owes it the same either way: answer for the delivery so the wakeup is not redelivered
+    # forever, and schedule nothing, because no clock fills an inbox. The one thing that
+    # wakes it is the next `deliver`.
+    checkpointer = MemoryCheckpointer()
+    scheduler = MemoryScheduler()
+
+    async def listening(run: Run) -> None:
+        await run.receive("heard")
+
+    await passes(SplitDurable(checkpointer, scheduler), listening)(as_stream(WORKFLOW))
+
+    assert scheduler.sleeping == {}, "nothing to schedule: no clock fills an inbox"
+    assert scheduler.outstanding == {}, "and the wakeup was answered for rather than left to be redelivered"
+
+    await SplitDurable(checkpointer, scheduler).deliver(WORKFLOW, "hello")
+
+    assert list(scheduler.queue) == [WORKFLOW], "the delivery is what makes it runnable again"
+
+
 async def test_a_submitted_order_runs_to_its_first_wait_and_schedules_the_wakeup() -> None:
     checkpointer = MemoryCheckpointer()
     scheduler = MemoryScheduler()
