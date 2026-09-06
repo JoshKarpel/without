@@ -4,14 +4,21 @@
 # hash holds. Nothing above this module mentions Redis, and nothing in it mentions the
 # workflow's domain.
 #
-# A field holds `<position>:<encoding>` rather than the encoding alone, which is how this
-# store meets `load`'s ordering guarantee. A hash cannot carry it: Redis preserves field
-# order only while the hash is listpack-encoded and converts to a hashtable past
-# `hash-max-listpack-entries` or `hash-max-listpack-value`, after which `HGETALL` order is
-# unspecified. Since the order has to be recorded somewhere, recording it *in the field*
-# keeps it to one key, so there is no second structure to expire in step with this one and
-# no branch that could allocate a position for a write that turned out to lose. The prefix
-# is added and stripped inside the scripts, so it never reaches the codec or an effect.
+# A field holds `<position>:<written at>:<encoding>` rather than the encoding alone, which
+# is how this store meets `load`'s ordering guarantee and carries `history`'s times. A hash
+# cannot carry either: Redis preserves field order only while the hash is listpack-encoded
+# and converts to a hashtable past `hash-max-listpack-entries` or `hash-max-listpack-value`,
+# after which `HGETALL` order is unspecified, and a field has no metadata to hang a
+# timestamp off at all. Since both have to be recorded somewhere, recording them *in the
+# field* keeps them to one key, so there is no second structure to expire in step with this
+# one and no branch that could allocate a position for a write that turned out to lose. The
+# prefix is added and stripped inside the scripts, so it never reaches the codec or an
+# effect.
+#
+# Both halves come from the server rather than from a caller, and the time for the reason
+# the claim's clock is the server's: the writer is a different machine, so a moment stamped
+# by whichever process happened to record it is only as good as the agreement between the
+# two.
 #
 # Every write here is a Lua script, and each is a script for the same reason: what it
 # does is only correct as *one* step. Checking whether a workflow is free and taking it,
@@ -28,6 +35,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import field
+from datetime import UTC
+from datetime import datetime
 from datetime import timedelta
 from typing import cast
 
@@ -42,6 +51,7 @@ from without_durability.interfaces import Entry
 from without_durability.interfaces import Fenced
 from without_durability.interfaces import Pass
 from without_durability.interfaces import Recorded
+from without_durability.interfaces import Written
 from without_durability.interfaces import check_duration
 
 from without_durability_redis.units import milliseconds
@@ -51,17 +61,26 @@ from without_durability_redis.units import seconds
 # or reads one so the two halves cannot drift apart.
 #
 # The position handed to `pack_value` is `HLEN` taken immediately before the write, which
-# is the field's insertion index: no field is ever deleted on its own (nothing here calls
-# `HDEL`), first-writer-wins means none is ever replaced, and the hash expires whole, so a
+# is the field's insertion index: no field is ever deleted on its own, first-writer-wins
+# means none is ever replaced, and the hash goes away whole (an expiry, or `DISCARD`), so a
 # reused workflow id starts from zero with no surviving fields to collide with. That first
-# clause is an invariant of this module rather than something Redis enforces, so a future
-# `HDEL` here would silently start handing out positions that are already taken.
+# clause is an invariant of this module rather than something Redis enforces, so an `HDEL`
+# here would silently start handing out positions that are already taken; `DISCARD` calls
+# `DEL` for exactly that reason, since removing the key resets the count along with the
+# fields.
 #
-# Splitting on the first colon is safe whatever the codec produces, because the position is
-# always digits and always in front.
+# Splitting on the first two colons is safe whatever the codec produces, because both
+# numbers are digits and both are in front.
 PACKING = """
-local function pack_value(position, encoded) return position .. ':' .. encoded end
-local function bare_value(packed) return string.sub(packed, string.find(packed, ':', 1, true) + 1) end
+local function now_ms()
+  local now = redis.call('TIME')
+  return tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+end
+local function pack_value(position, at, encoded) return position .. ':' .. at .. ':' .. encoded end
+local function bare_value(packed)
+  local past_position = string.find(packed, ':', 1, true) + 1
+  return string.sub(packed, string.find(packed, ':', past_position, true) + 1)
+end
 """
 
 # Take the workflow if nobody holds it, and stamp the taking with a number that only
@@ -130,7 +149,7 @@ local fence = tonumber(redis.call('HGET', KEYS[2], 'token') or '0')
 if tonumber(ARGV[3]) < fence then
   return redis.error_reply('FENCED pass ' .. ARGV[3] .. ' superseded by ' .. fence)
 end
-redis.call('HSETNX', KEYS[1], ARGV[1], pack_value(redis.call('HLEN', KEYS[1]), ARGV[2]))
+redis.call('HSETNX', KEYS[1], ARGV[1], pack_value(redis.call('HLEN', KEYS[1]), now_ms(), ARGV[2]))
 redis.call('EXPIRE', KEYS[1], ARGV[4])
 redis.call('EXPIRE', KEYS[2], ARGV[4])
 local stored = bare_value(redis.call('HGET', KEYS[1], ARGV[1]))
@@ -151,7 +170,7 @@ return {0, stored}
 SUPPLY = (
     PACKING
     + """
-local written = redis.call('HSETNX', KEYS[1], ARGV[1], pack_value(redis.call('HLEN', KEYS[1]), ARGV[2]))
+local written = redis.call('HSETNX', KEYS[1], ARGV[1], pack_value(redis.call('HLEN', KEYS[1]), now_ms(), ARGV[2]))
 redis.call('EXPIRE', KEYS[1], ARGV[3])
 if written == 1 then return ARGV[2] end
 return bare_value(redis.call('HGET', KEYS[1], ARGV[1]))
@@ -177,9 +196,47 @@ APPEND = (
     + f"""
 local position = redis.call('HLEN', KEYS[1])
 local key = '{INBOX}' .. string.format('%0{INBOX_DIGITS}d', position)
-redis.call('HSET', KEYS[1], key, pack_value(position, ARGV[1]))
+redis.call('HSET', KEYS[1], key, pack_value(position, now_ms(), ARGV[1]))
 redis.call('EXPIRE', KEYS[1], ARGV[2])
 return key
+"""
+)
+
+# Forget every field this workflow has, and take its fencing token *up* rather than away.
+#
+# `DEL` on the steps hash rather than `HDEL` per field, which is what keeps the position
+# invariant above intact: removing the key resets `HLEN` to zero along with the fields, so
+# the next write to this id starts from a count nothing has taken, where deleting fields
+# out of a surviving hash would hand out positions that are.
+#
+# The pass hash is the opposite move, and it is the whole reason this is a script rather
+# than a `DEL` of two keys. A pass in flight keeps its `Pass` and believes it still owns
+# the workflow, so the deletion has to outrank it: the token goes to `max(now, previous +
+# 1)`, exactly as `CLAIM` stamps one and for the same hazard, and that pass's next `record`
+# is refused. Deleting the pass hash instead would leave the token to be seeded from the
+# clock on the next claim, which is *usually* higher and is not a guarantee anything rests
+# on. The deadline goes to zero, so the workflow is claimable again at once: what is being
+# kept is the ordering, not the claim.
+#
+# A hash with no token is left alone rather than created, because a `Pass` exists only
+# where `CLAIM` wrote one: no token means no pass to fence, and writing one would leave a
+# key behind for a workflow nobody ever claimed.
+#
+#   KEYS[1]  the workflow's steps hash
+#   KEYS[2]  the workflow's pass hash
+#   ARGV[1]  expiry for the pass hash, in seconds
+#   returns  how many records were removed
+DISCARD = (
+    PACKING
+    + """
+local removed = redis.call('HLEN', KEYS[1])
+redis.call('DEL', KEYS[1])
+local previous = tonumber(redis.call('HGET', KEYS[2], 'token') or '0')
+if previous > 0 then
+  redis.call('HSET', KEYS[2], 'token', math.max(now_ms(), previous + 1), 'until', 0)
+  redis.call('EXPIRE', KEYS[2], ARGV[1])
+end
+return removed
 """
 )
 
@@ -201,6 +258,28 @@ return 0
 # The prefix `RECORD` and `TRANSACT` refuse a superseded pass with, and the one thing
 # `record` and `transact` read out of an error before deciding it is not theirs.
 FENCED = "FENCED "
+
+
+def unpacked(recorded: dict[str, str]) -> list[tuple[str, int, str]]:
+    """
+    Every field as its key, the millisecond it was written, and its encoding, in load order.
+
+    Sorted here rather than by the server, because the order is carried by the fields
+    themselves: `HGETALL` order is insertion order only while the hash is small enough to
+    stay listpack-encoded, and is unspecified once it is not.
+
+    `maxsplit=2` matters, since an encoded value has colons of its own. A field with fewer
+    than two cannot occur, so there is no branch for one: every write path packs, and `int`
+    raising is the right answer if that ever stops being true.
+    """
+    fields = [(key, *packed.split(":", 2)) for key, packed in recorded.items()]
+    fields.sort(key=lambda held: int(held[1]))
+    return [(key, int(at), encoded) for key, _position, at, encoded in fields]
+
+
+def moment(at: int) -> datetime:
+    """A millisecond off the server's `TIME`, as the aware `datetime` `Written` carries."""
+    return datetime.fromtimestamp(at / 1000, UTC)
 
 
 def fenced(error: ResponseError) -> bool:
@@ -293,10 +372,13 @@ local result = (function()
   %s
 end)()
 -- The position is read here rather than before the effect, where it would be the same
--- number: the field is known absent on this branch, so the count is this step's index.
--- What the effect returns is recorded as it came, with the prefix added on the way in and
--- taken off on the way out, so an effect never sees one and never writes one.
-redis.call('HSET', KEYS[1], ARGV[1], pack_value(redis.call('HLEN', KEYS[1]), result))
+-- number: the field is known absent on this branch, so the count is this step's index. The
+-- time is read here for a different reason, since the effect is the work: stamping after it
+-- returns is what makes the record's time the moment the step *landed* rather than the
+-- moment the script started. What the effect returns is recorded as it came, with the
+-- prefix added on the way in and taken off on the way out, so an effect never sees one and
+-- never writes one.
+redis.call('HSET', KEYS[1], ARGV[1], pack_value(redis.call('HLEN', KEYS[1]), now_ms(), result))
 redis.call('EXPIRE', KEYS[1], ARGV[3])
 redis.call('EXPIRE', KEYS[2], ARGV[3])
 return result
@@ -378,6 +460,7 @@ class RedisCheckpointer:
     write: AsyncScript = field(init=False, repr=False, compare=False)
     offer: AsyncScript = field(init=False, repr=False, compare=False)
     file_away: AsyncScript = field(init=False, repr=False, compare=False)
+    forget: AsyncScript = field(init=False, repr=False, compare=False)
     hand_back: AsyncScript = field(init=False, repr=False, compare=False)
     # The expiry every write re-arms, rendered once rather than per call: `ttl` is fixed
     # at construction and every `record`, `supply`, and `transact` sends it, so computing
@@ -395,6 +478,7 @@ class RedisCheckpointer:
         object.__setattr__(self, "write", self.redis.register_script(RECORD))
         object.__setattr__(self, "offer", self.redis.register_script(SUPPLY))
         object.__setattr__(self, "file_away", self.redis.register_script(APPEND))
+        object.__setattr__(self, "forget", self.redis.register_script(DISCARD))
         object.__setattr__(self, "hand_back", self.redis.register_script(RELEASE))
         object.__setattr__(self, "ttl_seconds", seconds(self.ttl))
 
@@ -407,23 +491,18 @@ class RedisCheckpointer:
         return f"{self.hash_key(workflow)}:pass"
 
     async def load(self, workflow: str) -> dict[str, object]:
-        """
-        Every step this workflow has recorded, in the order they were first recorded.
-
-        One `HGETALL`, sorted here rather than by the server, because the order is carried
-        by the fields themselves: `HGETALL` order is insertion order only while the hash is
-        small enough to stay listpack-encoded, and is unspecified once it is not.
-
-        `maxsplit=1` matters, since an encoded value has colons of its own. A field with no
-        colon cannot occur, so there is no branch for one: every write path packs, and
-        `int` raising is the right answer if that ever stops being true.
-        """
+        """Every step this workflow has recorded, in the order they were first recorded."""
         # The cast *is* `decode_responses=True`: redis-py types every read as
         # bytes-or-text because the flag is a runtime choice its types cannot see.
         recorded = cast(dict[str, str], await self.redis.hgetall(self.hash_key(workflow)))
-        packed = [(field, *value.split(":", 1)) for field, value in recorded.items()]
-        packed.sort(key=lambda field: int(field[1]))
-        return {field: self.codec.decode(encoded) for field, _position, encoded in packed}
+        return {key: self.codec.decode(encoded) for key, _at, encoded in unpacked(recorded)}
+
+    async def history(self, workflow: str) -> dict[str, Written]:
+        """The same records, each with the moment the server stamped it as it was written."""
+        recorded = cast(dict[str, str], await self.redis.hgetall(self.hash_key(workflow)))
+        return {
+            key: Written(value=self.codec.decode(encoded), at=moment(at)) for key, at, encoded in unpacked(recorded)
+        }
 
     async def claim(self, workflow: str, lease: timedelta) -> Pass | None:
         token = await self.take(
@@ -506,6 +585,23 @@ class RedisCheckpointer:
         encoded = self.codec.encode(value)
         key = await self.file_away(keys=[self.hash_key(workflow)], args=[encoded, self.ttl_seconds])
         return Entry(key=cast(str, key), value=self.codec.decode(encoded))
+
+    async def discard(self, workflow: str) -> int:
+        """
+        Delete this workflow's steps hash, and raise the token in its pass hash above
+        anyone still holding one.
+
+        What is left behind is the pass hash, carrying a token and nothing else, and it
+        goes away on its own: every write here re-arms `ttl`, so a workflow nothing writes
+        to again is forgotten entirely once the expiry elapses. That is this store's answer
+        to the tombstone the SQL stores leave for a sweep, and it is the same expiry that
+        already collects a finished workflow.
+        """
+        removed = await self.forget(
+            keys=[self.hash_key(workflow), self.pass_key(workflow)],
+            args=[self.ttl_seconds],
+        )
+        return int(cast(int, removed))
 
     async def release(self, holder: Pass) -> None:
         await self.hand_back(keys=[self.pass_key(holder.workflow)], args=[holder.token])

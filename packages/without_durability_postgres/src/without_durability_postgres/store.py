@@ -70,6 +70,7 @@ from without_durability.interfaces import Entry
 from without_durability.interfaces import Fenced
 from without_durability.interfaces import Pass
 from without_durability.interfaces import Recorded
+from without_durability.interfaces import Written
 from without_durability.interfaces import check_duration
 from without_durability.stepwise import now_utc
 
@@ -112,6 +113,18 @@ POLL = timedelta(milliseconds=50)
 # looks like insertion order right up until it is not: the conflict update is a real MVCC
 # update, so it writes a new tuple version and moves the row.
 #
+# `written_at` is what `history` reads, and its `DEFAULT` is doing the same work `seq`'s
+# does: evaluated on insert, and left alone by every conflict update below, so a losing
+# write moves the value, the position, and the time equally not at all. The clock is
+# `clock_timestamp()` and not the `now()` every other statement here reads, which is the
+# one place this file wants a time that is not the transaction's start: `transact` runs
+# its effect *inside* the transaction, so a step that spent ten seconds at a gateway would
+# be stamped ten seconds before it landed, and could carry an earlier time than a `supply`
+# that committed while it ran and took a lower `seq`, which is `history` returning its
+# records in one order and their times in another. Both are the *server's* clock, which is
+# what makes two records' times comparable across the machines that wrote them, and is the
+# same clock the claim's lease is measured by.
+#
 # `workflow_seq` is a named sequence with a `DEFAULT` rather than an identity column,
 # because `append` has to mint a key from the *same* number that becomes the row's
 # position, and an identity column is a number no statement is allowed to see. Two
@@ -136,6 +149,7 @@ CREATE TABLE IF NOT EXISTS workflow_checkpoint (
     step text NOT NULL,
     value jsonb NOT NULL,
     seq bigint NOT NULL DEFAULT nextval('workflow_seq'),
+    written_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (workflow, step)
 );
 
@@ -270,6 +284,21 @@ RETURNING value::text
 """
 
 LOAD = "SELECT step, value::text FROM workflow_checkpoint WHERE workflow = %s ORDER BY seq"
+HISTORY = "SELECT step, value::text, written_at FROM workflow_checkpoint WHERE workflow = %s ORDER BY seq"
+
+# Forget every record a workflow has. Paired with `SUPERSEDE` below and never run without
+# it, which is what the transaction in `discard` is for.
+DISCARD = "DELETE FROM workflow_checkpoint WHERE workflow = %s"
+
+# Take the fencing token *up*, so a pass still holding one is refused at its next write.
+#
+# An `UPDATE` rather than the upsert `CLAIM` is, and the difference is what it declines to
+# do: a workflow with no claim row has no `Pass` outstanding, since a `Pass` is only ever
+# handed out by a `claim` that wrote one, so there is nothing to fence and a row minted
+# here would be a tombstone for a workflow nobody ever claimed. `held_until = now()` hands
+# the workflow back at the same time, so it is claimable again immediately: what is kept is
+# the ordering, not the claim.
+SUPERSEDE = "UPDATE workflow_claim SET token = token + 1, held_until = now() WHERE workflow = %s"
 # Hand the workflow back early, but keep the token, so the next claim gets the next
 # number up and a pass that comes back from the dead still loses. Conditional on the
 # token for the same reason `release` is in the Redis store: a superseded pass letting go
@@ -390,6 +419,15 @@ class PostgresCheckpointer:
             await cursor.execute(LOAD, (workflow,))
             return {step: self.codec.decode(encoded) for step, encoded in await cursor.fetchall()}
 
+    async def history(self, workflow: str) -> dict[str, Written]:
+        """The same records `load` returns, each with the moment the server wrote it."""
+        async with self.pool.connection() as connection, connection.cursor() as cursor:
+            await cursor.execute(HISTORY, (workflow,))
+            return {
+                step: Written(value=self.codec.decode(encoded), at=written_at)
+                for step, encoded, written_at in await cursor.fetchall()
+            }
+
     async def claim(self, workflow: str, lease: timedelta) -> Pass | None:
         async with self.pool.connection() as connection, connection.cursor() as cursor:
             await cursor.execute(CLAIM, {"workflow": workflow, "lease": lease})
@@ -498,6 +536,24 @@ class PostgresCheckpointer:
             key, encoded = cast(tuple[str, str], await cursor.fetchone())
             return Entry(key=key, value=self.codec.decode(encoded))
 
+    async def discard(self, workflow: str) -> int:
+        """
+        Forget every record this workflow has, and raise its fence, in one transaction.
+
+        One commit rather than two statements, because the two are only right together: a
+        crash between them either leaves the records deleted with the fence unraised, so
+        the pass that was mid-flight writes them back one at a time, or the reverse, which
+        fences a live pass for a deletion that never happened.
+
+        What is left behind is one claim row carrying a number. Nothing here sweeps it, in
+        keeping with the rest of this store, where nothing expires and a control-plane
+        sweep is the deployment's homework.
+        """
+        async with self.pool.connection() as connection, connection.cursor() as cursor:
+            await cursor.execute(SUPERSEDE, (workflow,))
+            await cursor.execute(DISCARD, (workflow,))
+            return cursor.rowcount
+
     async def release(self, holder: Pass) -> None:
         async with self.pool.connection() as connection:
             await connection.execute(RELEASE, (holder.workflow, holder.token))
@@ -560,6 +616,11 @@ ON CONFLICT (namespace, workflow) DO UPDATE SET visible_at = EXCLUDED.visible_at
 # Finish, but only if nothing asked for another pass in the meantime. Anything that did
 # wrote a different `visible_at`, so the equality is the whole check.
 FINISH = "DELETE FROM workflow_queue WHERE namespace = %s AND workflow = %s AND visible_at = %s"
+
+# Withdraw the workflow's right to run, whatever its row currently means. Unconditional
+# where `FINISH` compares the receipt, which is the difference between finishing a pass
+# (leave anything that asked for another) and cancelling the workflow (leave nothing).
+CANCEL = "DELETE FROM workflow_queue WHERE namespace = %s AND workflow = %s"
 
 # Suspend until a deadline, under the same comparison and for the same reason. A workflow
 # holds one row here, so writing the deadline unconditionally would land on top of a
@@ -698,6 +759,23 @@ class PostgresScheduler:
         """Nothing to take over by hand: an abandoned workflow becomes visible on its own."""
         return None
 
+    async def cancel(self, workflow: str) -> None:
+        """
+        Drop the workflow's row, whichever of the three things its `visible_at` means.
+
+        One `DELETE` covers queued, sleeping, and out with a worker, because this table
+        holds one row per workflow and the visibility is the only thing that differs
+        between them. That is the same collapse that leaves `wake_due` and `reclaim` with
+        nothing to do.
+
+        The half of `cancel` a queue sweep cannot reach comes free with it: a pass still in
+        flight answers with `wake_at`, which is an `UPDATE` conditional on the visibility
+        still being the one it took, and a deleted row has none. So the deadline it was
+        about to write updates nothing and a deleted workflow is not put back to sleep.
+        """
+        async with self.pool.connection() as connection:
+            await connection.execute(CANCEL, (self.namespace, workflow))
+
     async def done(self, delivery: Delivery) -> None:
         """
         Drop the workflow, unless something asked for another pass while this one ran.
@@ -774,3 +852,19 @@ class PostgresDurable:
                 {"namespace": self.scheduler.namespace, "workflow": workflow, "visible_at": self.scheduler.now()},
             )
             return Entry(key=key, value=codec.decode(encoded))
+
+    async def delete(self, workflow: str) -> int:
+        """
+        Cancel the workflow's wakeups and forget its records, together or not at all.
+
+        Three statements in one commit, so the ordering `SplitDurable` has to reason about
+        does not arise: there is no window in which the records are gone and a wakeup is
+        not, and none in which the fence has been raised for a deletion that did not
+        happen. Which is the same thing `arrive` gets from this store and for the same
+        reason, one datastore.
+        """
+        async with self.checkpointer.pool.connection() as connection, connection.cursor() as cursor:
+            await cursor.execute(CANCEL, (self.scheduler.namespace, workflow))
+            await cursor.execute(SUPERSEDE, (workflow,))
+            await cursor.execute(DISCARD, (workflow,))
+            return cursor.rowcount

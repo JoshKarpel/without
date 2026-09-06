@@ -87,6 +87,40 @@ end
 return due
 """
 
+# Put the workflow among the sleepers and answer for the delivery that got it there,
+# unless that delivery has been cancelled since it was taken.
+#
+# There is nothing to compare about *freshness* here, which is the sorted set's problem
+# rather than the stream's: a wakeup that arrived mid-pass is a new entry, so a deadline
+# written into the sleepers cannot overwrite it. What is compared is whether the delivery
+# still exists, and the stream answers that on its own: `cancel` removes a workflow's
+# entries with `XDEL`, an unacknowledged entry is the one thing `trim` will not remove
+# (`ACKED` stops at the first entry somebody has not answered for), so an empty `XRANGE`
+# over this one id means it was cancelled rather than trimmed.
+#
+# Without it a delete loses to the pass it interrupted. The queue is swept clean, the pass
+# reaches its `wake_at` a moment later, and the workflow whose records have just been
+# discarded is put back among the sleepers to be woken and run from the top.
+#
+# The acknowledgement is unconditional, since acknowledging an entry that is gone is not an
+# error and leaving it pending would keep a cancelled delivery in the pending list for
+# `reclaim` to sweep forever.
+#
+#   KEYS[1]  the ready stream
+#   KEYS[2]  the sleeping sorted set
+#   ARGV[1]  the group
+#   ARGV[2]  the workflow
+#   ARGV[3]  the receipt, which is the stream entry this pass took
+#   ARGV[4]  when the workflow should next be visible, as a unix timestamp in seconds
+#   returns  1 if the deadline was written, 0 if the delivery had been cancelled
+SUSPEND = """
+local present = #redis.call('XRANGE', KEYS[1], ARGV[3], ARGV[3])
+redis.call('XACK', KEYS[1], ARGV[1], ARGV[3])
+if present == 0 then return 0 end
+redis.call('ZADD', KEYS[2], tonumber(ARGV[4]), ARGV[2])
+return 1
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class RedisStreamScheduler:
@@ -125,10 +159,16 @@ class RedisStreamScheduler:
     # and for the reason the interface gives: it also bounds the checkpoint claim, and the two
     # drift the moment they are set in two places.
     lease: timedelta = LEASE
-    # Registered at construction: this precomputes the digest and holds the client, so a
+    # How many stream entries `cancel` reads per round trip while it looks for a
+    # workflow's. A bound on this call's memory rather than on its work, since it keeps
+    # going until the stream is exhausted; batching from here rather than looping inside a
+    # script is what keeps a long scan from holding the server for its whole duration.
+    scan: int = 500
+    # Registered at construction: this precomputes each digest and holds the client, so a
     # call sends the digest and falls back to the source only when the server has not
     # seen it.
     move: AsyncScript = field(init=False, repr=False, compare=False)
+    suspend: AsyncScript = field(init=False, repr=False, compare=False)
     # Where this worker's sweep of the pending list got to, as a one-element list because
     # the rest of this is a value and a cursor is not: it is the one thing here that
     # carries from one call to the next. See `reclaim` for why the sweep is resumed rather
@@ -138,6 +178,7 @@ class RedisStreamScheduler:
     def __post_init__(self) -> None:
         check_duration("a lease", self.lease)
         object.__setattr__(self, "move", self.redis.register_script(WAKE_DUE))
+        object.__setattr__(self, "suspend", self.redis.register_script(SUSPEND))
 
     # The braces are Redis Cluster's hash tag, exactly as they are on `RedisCheckpointer`'s
     # pair, and for a reason that is stronger here: `wake_due` is a script over *both* of
@@ -181,13 +222,19 @@ class RedisStreamScheduler:
         """
         Put the workflow among the sleepers, and answer for the delivery that got it there.
 
-        Nothing to compare here, which is the sorted set's problem rather than the
-        stream's: a wakeup that arrived mid-pass is a *new entry* in the stream, so
+        Nothing to compare about *freshness*, which is the sorted set's problem rather than
+        the stream's: a wakeup that arrived mid-pass is a *new entry* in the stream, so
         writing a deadline into the sleepers cannot overwrite it and acknowledging this
         delivery cannot remove it.
+
+        What is compared is whether the delivery still exists, which is what a `cancel`
+        needs and what makes this a script rather than the two commands it reads as. See
+        `SUSPEND`.
         """
-        await self.redis.zadd(self.sleeping_key, {delivery.workflow: when.timestamp()})
-        await self.done(delivery)
+        await self.suspend(
+            keys=[self.ready_key, self.sleeping_key],
+            args=[self.group, delivery.workflow, delivery.receipt, when.timestamp()],
+        )
 
     async def wake_due(self, now: datetime) -> tuple[str, ...]:
         woken = await self.move(keys=[self.sleeping_key, self.ready_key], args=[now.timestamp(), self.batch])
@@ -265,6 +312,44 @@ class RedisStreamScheduler:
         self.scanned[0] = cursor
         taken = deliveries(entries)
         return taken[0] if taken else None
+
+    async def cancel(self, workflow: str) -> None:
+        """
+        Drop the workflow from the sleepers, and delete every entry it has in the stream.
+
+        The sleepers are one `ZREM`. The stream is the expensive half and there is no
+        cheaper way to do it: a stream is addressed by entry id, and an id says when an
+        entry was appended rather than what is in it, so finding a workflow's entries means
+        reading them. The sorted-set queue answers the same call with a single `ZREM`
+        because it holds one entry per workflow, which is the trade that whole design makes
+        (see `RedisSetScheduler`), and this is where the stream pays it back.
+
+        What bounds the scan is the trimmer rather than the design. `trim` removes
+        everything every group has acknowledged, so the stream a healthy deployment carries
+        is the backlog nobody has run yet, not its history. On a deployment that never
+        trims, this reads every entry ever appended.
+
+        Read in batches from here rather than looped inside a script, because a script runs
+        to completion with the server to itself: a scan of a large backlog would hold every
+        other client out for its whole duration, where batching costs a round trip per
+        `scan` entries and lets everything else through in between. That leaves the call
+        non-atomic, which costs nothing: entries appended *after* it starts are a
+        `make_ready` racing a delete, and every entry present when it starts is passed over
+        exactly once, since ids only go up and nothing else removes them.
+        """
+        await self.redis.zrem(self.sleeping_key, workflow)
+        start = "-"
+        while True:
+            batch = cast(Entries, await self.redis.xrange(self.ready_key, min=start, max="+", count=self.scan))
+            if not batch:
+                return
+            doomed = [entry for entry, fields in batch if fields["workflow"] == workflow]
+            if doomed:
+                await self.redis.xdel(self.ready_key, *doomed)
+            # Exclusive, so the next batch starts past the last entry read rather than on
+            # top of it, which would make no progress once a batch ended on an entry this
+            # workflow does not own.
+            start = f"({batch[-1][0]}"
 
     async def done(self, delivery: Delivery) -> None:
         await self.redis.xack(self.ready_key, self.group, delivery.receipt)

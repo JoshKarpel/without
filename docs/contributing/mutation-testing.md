@@ -27,6 +27,14 @@ a final ok/FAILED summary table.
 The `mutate` recipe writes the per-run mutmut `setup.cfg`; its comments explain each setting
 (why `-n0`, the `no_mutation` marker filter, the `assert_never` skip pattern).
 
+A re-run after *adding tests* has to start from a cold cache. mutmut keeps each mutant's
+result in `mutants/<source path>.meta`, keyed on the source it was generated from, and skips
+any mutant whose source has not changed since. Tests are not part of that key, so a run that
+follows nothing but new tests replays the previous verdicts in a few seconds and reports the
+same survivors however good the tests are. `rm -rf packages/<pkg>/mutants` before the
+confirming run, having extracted the diffs first, since `mutmut show` reads the same
+directory.
+
 A package whose source is pure pass-through generates no mutants at all (`without-env`, whose
 `EnvContext` has no operators, literals, or branches to mutate). mutmut hardcodes `exit(1)` in
 that case with no config knob to allow it, so the `mutate` recipe absorbs it: a run that mutates
@@ -60,6 +68,10 @@ match event:
 Dropping the arm changes behavior only for input that "cannot happen", so it is equivalent. (The
 `assert_never` *expression* mutation — `assert_never(unreachable)` → `assert_never(None)` — is
 suppressed by the recipe's skip pattern; only the whole-case *drop* survives.)
+
+`without-durability`'s worker contributes one of these: `passes`'s `advance` matches an
+`Outcome` over its three arms and closes with `assert_never`, and the dropped case leaves
+every valid outcome matching an arm above it.
 
 Dropping a *redundant* case is likewise equivalent when the fallthrough does the same thing: a
 trailing case whose body is a no-op (a bare `continue` at the bottom of a loop) behaves identically
@@ -137,6 +149,12 @@ stdlib encoder reads `allow_nan` for truthiness and `None` rejects `nan` exactly
 (verified empirically); and `_with_release`'s `fully_read = False -> None` in `without-http`, whose
 value reaches only `if not fully_read` and a boolean conjunction.
 
+`without-durability-sqlite`'s `connect` contributes one more: `check_same_thread=False` survives
+as `None`, since the flag reaches the driver as a truthiness. Verified against its own control,
+which is what makes the probe worth anything here: `True` refuses a call made from a thread other
+than the one that opened the connection, and `False` and `None` both admit it, which is what this
+store needs because every call hops to a pool thread.
+
 `without-http`'s in-memory `_PipeTransport` contributes three more of the same shape:
 `_closing`, `_paused`, and `_eof_sent` each start `False` and are read only as conditions
 (`if self._closing`, `if not self._paused`, `if self._eof_sent or ...`), so `None` behaves
@@ -199,6 +217,57 @@ identical. That leaves one survivor per constant, in `h11_wire`, `h2_wire`, `ws_
 `client` (`without-http`) and `files`, `selection`, and `assets` (`without-asgi`). Hoisting the name
 is what keeps this to one documented survivor per module instead of a `# pragma: no mutate` on every
 call site (which would also blind the killable `LookupError`/`TypeError` mutants).
+
+### SQL the database reads case-insensitively
+
+The same swap one layer along, and the reason is the same: SQL keywords, pragma names, and the
+values a pragma takes are all case-insensitive, so a statement mutmut re-cases is the statement
+the database was already going to run. The `XX`-wrapped variants are not equivalent and are
+killed by any test that opens the store, since a wrapped statement is a syntax error.
+
+That leaves one survivor per literal, in `without-durability-sqlite`'s `connect`
+(`PRAGMA journal_mode = WAL` and `PRAGMA synchronous = FULL`, each surviving both a
+lower-cased whole and an upper-cased pragma name) and its `transacted`
+(`BEGIN IMMEDIATE`, `COMMIT`, `ROLLBACK`), and in `without-durability-postgres`'s `migrate`
+(`SELECT pg_advisory_xact_lock(%s)`). Verified against a file-backed database rather than
+`:memory:`, where every journal mode reads back as `memory` and the check proves nothing:
+`pragma journal_mode = wal` leaves the file in WAL exactly as the upper-cased form does.
+
+These are the statements that happen to be written at the point of use, and that is the whole
+list because of a limit worth stating plainly: mutmut mutates function bodies, so a
+module-level constant is copied into the mutant tree verbatim and never mutated. Every other
+statement in the two SQL stores lives in one, and so does every Lua script in
+`without-durability-redis`, which is where those stores keep their exclusion. A mutation score
+for a store says nothing about the SQL or the Lua it runs; what covers those is the
+cross-store conformance suite in `packages/integration`, which drives each store against a
+real server.
+
+### `cast`'s type argument
+
+`typing.cast(T, x)` returns `x` without looking at `T`, so the `cast(None, x)` mutant is
+equivalent wherever a cast appears: `without-durability`'s `run_durably`
+(`cast(Out, checkpoint[run.output])`) and both arms of `without-durability-redis`'s
+`read_entries`. A `# pragma: no mutate` is the wrong answer here, because it would also blind
+the *other* mutation of the same line, which is the value expression and a real change.
+
+### Conjunctions an earlier guard makes redundant
+
+`without-durability`'s `survives` compares two values' types before it decides how to walk
+them, which makes each `isinstance` pair a conjunction whose operands cannot disagree:
+
+```python
+if type(one) is not type(other):
+    return False
+if isinstance(one, Mapping) and isinstance(other, Mapping):  # mutant: and -> or
+```
+
+Past the type check the two operands are the same question asked twice, so `or` admits exactly
+what `and` admits. Both pairs (`Mapping` and `AbstractSet`) survive that way. The second
+`isinstance` is not redundant to *delete*, since it is what narrows `other` for the type
+checker, so this is a survivor to explain rather than a line to simplify.
+
+It is the same shape as the flow-control guard below, where neither clause can be false while
+the other is true, reached by a check above rather than by a library's own invariants.
 
 ### Header names read through a case-insensitive lookup
 
@@ -268,6 +337,21 @@ prose itself would freeze wording that should stay editable.
 The two boundary mutants in the same function are *not* in this class and are killed:
 `rest > 0` decides whether a count is appended at all, so `>= 0` says "and 0 more" and
 `> 1` drops a real count of one.
+
+`without-durability`'s worker is where the split between prose and content is sharpest,
+because its log is the only trace some paths leave: a pass that defers, blocks, or fails
+writes nothing to the queue that says so afterwards. So each line is pinned on what it must
+*name* rather than on how it reads, and those assertions kill every `logger.info(None)`
+mutant: the workflow on all four lines, the deadline on the sleeping one, the keys on the
+blocked one, the error on the failure, and the interval on the deferral. What is left is the
+one literal that carries no such value, `"is held by another pass"`, which survives all three
+of its mutations because the line still names the workflow and the interval either way.
+
+The `waiting` phrase each `Suspended` subclass hands its base is the same class of survivor:
+`"to be told"`, `"to be sent something"`, and `f"until {due.isoformat()}"` reach only the
+message. What a subclass must do is carry the kind of wait as a *type*, which every driver
+matches on and the tests assert, and for `ScheduledWakeup` to carry the deadline as `due`,
+which the worker schedules from.
 
 ### Policy boundaries no fixture can sit exactly on
 

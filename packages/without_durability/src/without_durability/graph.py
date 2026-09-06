@@ -117,7 +117,7 @@ def survives(sent: object, restored: object) -> bool:
         if isinstance(one, Sequence) and isinstance(other, Sequence) and not isinstance(one, str | bytes):
             if len(one) != len(other):
                 return False
-            pending.extend(zip(one, other, strict=True))
+            pending.extend(zip(one, other, strict=True))  # pragma: no mutate - lengths compared just above
             continue
         if not bool(one == other):
             return False

@@ -16,12 +16,14 @@ from without_durability.interfaces import Pass
 from without_durability.interfaces import Recorded
 from without_durability.interfaces import Scheduler
 from without_durability.interfaces import SplitDurable
+from without_durability.interfaces import Written
 from without_durability.interfaces import check_duration
 from without_durability.interfaces import claimed
 from without_durability.interfaces import inbox_key
 from without_durability.memory import MemoryCheckpointer
 from without_durability.memory import MemoryEffect
 from without_durability.memory import MemoryScheduler
+from without_durability.memory import Stored
 from without_durability.stepwise import Blocked
 from without_durability.stepwise import Completed
 from without_durability.stepwise import InputNeeded
@@ -72,8 +74,10 @@ __all__ = [
     "Sleeping",
     "SplitDurable",
     "StepKey",
+    "Stored",
     "Suspended",
     "Swallowed",
+    "Written",
     "check_duration",
     "claimed",
     "inbox_key",

@@ -111,6 +111,27 @@ class Pass:
 
 
 @dataclass(frozen=True, slots=True)
+class Written:
+    """
+    One record as `history` reads it back: what the store holds, and when it landed there.
+
+    `at` is the store's own clock read at the write, which is the same clock every lease
+    here is measured by and for the same reason: the writer is a different machine, and a
+    moment stamped by whichever process happened to record it is only as good as the
+    agreement between the two. So the times across one workflow's records are comparable
+    with each other, which is what a duration between two steps is read off, and are
+    *not* comparable with a `datetime.now()` taken here.
+
+    It is the moment of the *winning* write, since first-writer-wins decides what a key
+    holds and where it sits, and a time that moved under a losing write would say a step
+    ran when it was merely replayed.
+    """
+
+    value: object
+    at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class Recorded:
     """
     What a store holds under a step's key after a write, and whether this pass put it there.
@@ -209,6 +230,13 @@ class Checkpointer[Effect = Never](Protocol):
       ran an effect at least agree on its result rather than diverging, and whether that
       value is this pass's own.
     - `record` and `supply` MUST make the value durable before returning.
+    - `history` MUST return the records `load` returns, in the same order, each carried
+      with the moment the store wrote it. That moment is the store's own clock read at the
+      *winning* write, so a losing write moves the value, the position, and the time
+      equally not at all.
+    - `discard` MUST remove every record a workflow has, and MUST raise its fence rather
+      than lowering it: a `Pass` outstanding when it runs MUST find its writes `Fenced`.
+      It returns how many records it removed.
     - `append` MUST file `value` under a key it assigns out of the `INBOX` space, MUST
       assign a distinct key to every concurrent append to one workflow without losing
       either value, and MUST assign keys that sort into append order *within* that
@@ -261,9 +289,35 @@ class Checkpointer[Effect = Never](Protocol):
     inventing a key space and allocating out of it by trying. The store already sees every
     write and already decides where each one sits (`load`'s ordering), so it is the only
     party that can hand out a name nobody else is about to take.
+
+    `history` is `load`'s other reading, and it is a second method rather than a richer
+    return because the two have different readers. Every pass calls `load` at its top and
+    wants what a step recorded; nothing inside a pass has any use for when a step
+    recorded it, and a mapping of wrappers on that path would cost a construction per key
+    per pass to carry a field the runners would immediately drop. What wants the times is
+    a status view, an operator asking how long a settlement actually took, a sweep
+    deciding which workflows are old enough to forget: all outside a pass, all reading one
+    workflow at a time. So the write path stamps every record and the read path splits.
+
+    `discard` and the fence are the reason deletion is a store method rather than a
+    caller's loop over `load`'s keys. Removing a workflow's records is easy; removing them
+    *safely* is not, because a pass in flight holds a `Pass` and is about to write. Doing
+    it as a caller can (delete the records, delete the claim) hands the next claim token 1
+    on the stores whose tokens are a counter, so the pass still holding token 7 outranks
+    it and writes its remaining steps back into a workflow that has been deleted, one row
+    at a time and with nothing to show that it happened.
+
+    So a `discard` raises the token and keeps the claim row rather than removing it, which
+    fences that pass on its next write and leaves the workflow claimable by anything new.
+    What is left behind is one number per deleted workflow: a Redis pass hash carries a
+    `ttl` and expires on its own, and a SQL claim row stays until something sweeps it,
+    which is the same homework those stores already have (see
+    docs/without-durability/index.md).
     """
 
     async def load(self, workflow: str) -> dict[str, object]: ...
+
+    async def history(self, workflow: str) -> dict[str, Written]: ...
 
     async def claim(self, workflow: str, lease: timedelta) -> Pass | None: ...
 
@@ -274,6 +328,8 @@ class Checkpointer[Effect = Never](Protocol):
     async def supply(self, workflow: str, key: str, value: object) -> object: ...
 
     async def append(self, workflow: str, value: object) -> Entry: ...
+
+    async def discard(self, workflow: str) -> int: ...
 
     async def release(self, holder: Pass) -> None: ...
 
@@ -315,9 +371,23 @@ class Scheduler(Protocol):
       removes a deadline and then queues the workflow loses it whenever it dies in
       between (an implementation with nothing to move satisfies this trivially);
     - `wake_at` answers for its delivery and sets the workflow's next pass in one step,
-      and MUST NOT overwrite a wakeup that arrived since that delivery was taken.
+      and MUST NOT overwrite a wakeup that arrived since that delivery was taken;
+    - `cancel` removes every wakeup the store holds for a workflow, so nothing it has
+      cancelled reaches a later `next_ready` or `reclaim` until something makes the
+      workflow ready again;
+    - `wake_at` MUST NOT reinstate a workflow whose wakeups have been cancelled since its
+      delivery was taken.
 
-    That last one is why `wake_at` takes a `Delivery` rather than a workflow id, and it
+    The last two are one requirement seen from both ends, and the second half is what
+    makes the first half worth anything. A worker holding a delivery answers for it
+    *after* the pass, so a `cancel` that swept the queue clean is undone a moment later by
+    the `wake_at` that pass reaches: the workflow whose records have just been discarded
+    is queued again, wakes with nothing recorded, and runs from the top. Which is the
+    resurrection deleting a workflow is supposed to rule out, arriving through the one
+    door a queue sweep cannot close. So it is closed at the other end, where the store
+    still holds the receipt and can tell a live delivery from a cancelled one.
+
+    The overwrite clause is why `wake_at` takes a `Delivery` rather than a workflow id, and it
     is the same move `wake_due` and `Durable.arrive` make. Scheduling and acknowledging
     were two calls with a rule about their order, which a protocol cannot enforce and a
     caller can get wrong; worse, on a store that holds one entry per workflow they are a
@@ -364,6 +434,8 @@ class Scheduler(Protocol):
 
     async def reclaim(self, idle: timedelta) -> Delivery | None: ...
 
+    async def cancel(self, workflow: str) -> None: ...
+
     async def done(self, delivery: Delivery) -> None: ...
 
 
@@ -398,11 +470,29 @@ class Durable[Effect = Never](Protocol):
     - `deliver` MUST append `value` to the workflow's inbox exactly as
       `Checkpointer.append` does, and MUST make the workflow ready, under all three of the
       clauses above. It returns the `Entry` the append wrote.
+    - `delete` MUST cancel the workflow's wakeups and discard its records, exactly as
+      `Scheduler.cancel` and `Checkpointer.discard` do, returning the count `discard`
+      reports. It SHOULD be a single commit where the two stores are one datastore, and
+      where they are not it MUST cancel before it discards.
 
     `deliver` is to `append` what `arrive` is to `supply`, and it exists for the same
     reason rather than for symmetry's sake: a caller that appends and then separately
     schedules can die between the two and leave a message nobody will ever wake for. One
     call with no ordering to get right is the whole of what this interface adds.
+
+    `delete` is the third of those, and its ordering is the reverse of `arrive`'s for the
+    reason `arrive`'s is what it is: the two halves fail asymmetrically, and the order
+    puts the survivable failure in the window. Cancelled-but-not-discarded is a workflow
+    holding records nothing will wake, which asking again finishes. Discarded-but-not-
+    cancelled is a wakeup for a workflow with nothing recorded, which a worker answers by
+    running the body from the top: the deleted workflow starts over, performing every
+    effect again. So the wakeup goes first, and a crash in the window costs a second call
+    rather than a second run.
+
+    What no ordering reaches is a pass that is *already* in flight, and that is the
+    `Checkpointer`'s half rather than this one's: `discard` raises the fence, so the pass
+    is refused at its next write, and `Scheduler.wake_at` declines to queue a workflow
+    whose delivery was cancelled underneath it. Both are stated as requirements there.
 
     `Effect` is `Checkpointer`'s, threaded through so that a caller holding a `Durable`
     can still reach a store's `transact`, and defaulting to `Never` for the same reason.
@@ -417,6 +507,8 @@ class Durable[Effect = Never](Protocol):
     async def arrive(self, workflow: str, key: str, value: object) -> object: ...
 
     async def deliver(self, workflow: str, value: object) -> Entry: ...
+
+    async def delete(self, workflow: str) -> int: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -440,6 +532,11 @@ class SplitDurable[Effect = Never]:
     the same write and the retry costs nothing; a resent message has no key to name, so
     it appends a *second* entry beside the first and the workflow reads both. A caller
     that cannot tolerate that wants a store whose `deliver` is one commit.
+
+    `delete` runs the other way round, and the reversal is the same reasoning rather than
+    an exception to it: the order puts the recoverable failure in the crash window. Here
+    that is a workflow left with records nothing will wake, which asking again finishes,
+    against a wakeup for a workflow with nothing recorded, which runs it from the top.
     """
 
     checkpointer: Checkpointer[Effect]
@@ -454,6 +551,10 @@ class SplitDurable[Effect = Never]:
         entry = await self.checkpointer.append(workflow, value)
         await self.scheduler.make_ready(workflow)
         return entry
+
+    async def delete(self, workflow: str) -> int:
+        await self.scheduler.cancel(workflow)
+        return await self.checkpointer.discard(workflow)
 
 
 async def claimed(checkpointer: Checkpointer, workflow: str, lease: timedelta = LEASE) -> Pass:

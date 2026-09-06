@@ -310,6 +310,20 @@ async def test_a_claim_outranks_every_claim_before_it() -> None:
     assert second.token > first.token, "releasing hands the workflow back, it does not rewind the fence"
 
 
+@pytest.mark.parametrize("lease", [timedelta(), timedelta(seconds=-1)])
+async def test_claiming_refuses_a_lease_that_is_not_a_positive_duration(lease: timedelta) -> None:
+    # Checked before the store is asked, and named, because a lease is one of several
+    # durations a deployment sets from configuration and they all fail the same way: a zero
+    # arrives from an unset setting, and "must be a positive duration" without saying which
+    # one sends the operator through every timing they have.
+    checkpointer = MemoryCheckpointer()
+
+    with pytest.raises(ValueError, match=r"^a lease must be a positive duration"):
+        await claimed(checkpointer, ORDER, lease)
+
+    assert checkpointer.tokens == {}, "and nothing was claimed on the way to finding out"
+
+
 async def test_a_write_from_a_superseded_pass_is_refused_rather_than_applied() -> None:
     # A lease alone cannot do this: a pass that stalls past its lease still believes it
     # holds the workflow, and only the store knows better. The token is what tells it.
@@ -636,6 +650,32 @@ async def test_several_suspensions_at_once_report_the_earliest_deadline() -> Non
     assert stopped_at([], reached) == Sleeping(key="clearing", due=STARTED_AT + timedelta(hours=1))
 
 
+async def test_the_earliest_deadline_wins_even_when_its_step_name_sorts_last() -> None:
+    # Which of the two the pair is ordered by, and the test above cannot say, because there
+    # the earliest deadline is also the first name. Ordering by the name instead sleeps the
+    # workflow past the deadline it asked for: the branch that wanted a minute waits the
+    # hour, and nothing wakes it in between.
+    soon = STARTED_AT + timedelta(minutes=1)
+    reached: list[Suspended] = [
+        ScheduledWakeup("clearing", due=STARTED_AT + timedelta(hours=1)),
+        ScheduledWakeup("zeroing", due=soon),
+    ]
+
+    assert stopped_at([], reached) == Sleeping(key="zeroing", due=soon)
+
+
+async def test_two_deadlines_maturing_together_are_broken_by_the_step_name() -> None:
+    # Nothing chooses between two waits that mature at the same moment, so the name is what
+    # makes the answer a property of the pass rather than of the order its branches happened
+    # to reach their raises in. Left to the order they arrived, two passes at one suspended
+    # workflow report different keys for the same pair of deadlines.
+    together = STARTED_AT + timedelta(minutes=1)
+    reached: list[Suspended] = [ScheduledWakeup("zeroing", due=together), ScheduledWakeup("clearing", due=together)]
+
+    assert stopped_at([], reached) == Sleeping(key="clearing", due=together)
+    assert stopped_at([], list(reversed(reached))) == Sleeping(key="clearing", due=together)
+
+
 async def test_every_key_a_pass_waits_on_is_reported_rather_than_one_of_them() -> None:
     # The other half of the choice above: with no deadline among them there is nothing to
     # schedule, and the driver is told to leave the workflow alone until somebody writes.
@@ -808,6 +848,34 @@ async def test_a_cursor_recorded_as_something_else_fails_loudly() -> None:
         parse_bound("heard", 7)
 
 
+async def test_a_read_names_the_step_whose_cursor_the_store_holds_wrongly() -> None:
+    # The parser a read hands to `perform` carries its own key, and the key is the whole of
+    # what the message is for: a workflow reading two logs has two cursors, and "the store
+    # holds a number where a cursor should be" names neither of them. Reached through
+    # `receive` rather than by calling the parser, since the closure is where the key could
+    # go missing.
+    checkpointer = MemoryCheckpointer()
+    run = Run(
+        holder=await claimed(checkpointer, ORDER),
+        checkpointer=checkpointer,
+        recorded={inbox_key(0): "a message", "heard": 7},
+    )
+
+    with pytest.raises(TypeError, match=r"^'heard' holds 7,"):
+        await run.receive("heard")
+
+
+async def test_a_sleep_names_the_step_whose_deadline_the_store_holds_wrongly() -> None:
+    # The same, for the parser `sleep` hands to `step`. A workflow waits at several
+    # deadlines, so which one the checkpoint holds something else under is what an operator
+    # needs before anything can be done about it.
+    checkpointer = MemoryCheckpointer()
+    run = Run(holder=await claimed(checkpointer, ORDER), checkpointer=checkpointer, recorded={"settling": 17})
+
+    with pytest.raises(TypeError, match=r"^'settling' holds 17,"):
+        await run.sleep("settling", SETTLING)
+
+
 async def test_a_transacted_effect_that_fails_leaves_the_stores_data_alone() -> None:
     # `transact` MUST NOT leave the effect applied without its record, and an effect that
     # moves the data and *then* raises is the way to reach that state: without a rollback
@@ -879,6 +947,16 @@ def test_a_fan_out_that_only_failed_is_re_raised_without_its_suspensions() -> No
 
     assert [type(each) for each in raised.value.exceptions] == [RuntimeError]
     assert isinstance(raised.value, Exception), "a driver's `except Exception` has to be able to see it"
+
+
+def test_a_suspension_the_workflow_raised_itself_is_read_out_of_the_group() -> None:
+    # What the pass *reached* covers every wait a `Run` method noted, and nothing else. A
+    # workflow that raises a suspension of its own inside a fan-out noted nothing, so the
+    # group is the only place that wait exists: read past it, the pass is stopped on a set
+    # of nothing, which is not an outcome any driver can be handed.
+    assert unwound(BaseExceptionGroup("fan-out", [InputNeeded("approved-by")]), []) == Blocked(
+        waiting=frozenset({"approved-by"})
+    )
 
 
 async def test_a_deadline_whose_suspension_was_cancelled_is_still_reported() -> None:

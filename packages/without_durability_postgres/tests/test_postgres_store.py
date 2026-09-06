@@ -5,6 +5,7 @@ import os
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from collections.abc import Callable
+from datetime import datetime
 from datetime import timedelta
 from uuid import uuid4
 
@@ -559,6 +560,37 @@ async def test_an_effect_that_writes_its_own_step_row_is_told_what_it_did(
     assert await reserved(pool, workflow) is None
 
 
+async def test_a_step_that_took_time_is_stamped_when_it_landed_and_not_when_it_began(
+    pool: AsyncConnectionPool,
+    workflow: str,
+) -> None:
+    # The one call where the two clocks Postgres offers give different answers, and the
+    # reason `written_at` defaults to `clock_timestamp()`: `transact` runs its effect inside
+    # the transaction that records it, so `now()` would stamp a slow step with the moment it
+    # started rather than the moment it landed, which is the reading `history` exists to
+    # refuse. The effect reads the server's clock on its way out and records that, so this
+    # holds one clock against itself and needs nothing about the agreement between this
+    # machine's and the database's. The sleep is the slow step, not a wait for one.
+    checkpointer = PostgresCheckpointer(pool=pool)
+    holder = await claimed(checkpointer, workflow)
+
+    async def slowly(cursor: AsyncCursor[TupleRow]) -> object:
+        await asyncio.sleep(0.05)
+        await cursor.execute("SELECT clock_timestamp()")
+        finished = await cursor.fetchone()
+        assert finished is not None
+        return str(finished[0].isoformat())
+
+    recorded = await checkpointer.transact(holder, "slow", slowly)
+    assert isinstance(recorded, str)
+
+    written = (await checkpointer.history(workflow))["slow"]
+
+    assert written.at >= datetime.fromisoformat(recorded), (
+        "the step is stamped no earlier than the moment its effect finished"
+    )
+
+
 async def test_a_wakeup_that_arrived_during_a_pass_is_not_overwritten_by_its_deadline(
     pool: AsyncConnectionPool,
     workflow: str,
@@ -576,3 +608,27 @@ async def test_a_wakeup_that_arrived_during_a_pass_is_not_overwritten_by_its_dea
     await queue.wake_at(held, now_utc() + timedelta(days=3))
 
     assert await queue.next_ready(BRIEFLY) is not None, "the wakeup that arrived is still due now"
+
+
+async def test_a_split_deployment_reaches_the_two_halves_of_a_delete_separately(
+    pool: AsyncConnectionPool,
+    workflow: str,
+) -> None:
+    # `PostgresDurable.delete` is one commit because both stores are one database. A
+    # deployment keeping this checkpoint beside a queue in something else holds a
+    # `SplitDurable` instead and reaches the halves one at a time, so each has to stand on
+    # its own: the queue row goes whatever its visibility currently means, and the discard
+    # both forgets the records and raises the fence over the pass that was mid-flight.
+    checkpointer = PostgresCheckpointer(pool=pool)
+    queue = scheduled(pool, workflow)
+    holder = await claimed(checkpointer, workflow)
+    await checkpointer.record(holder, "charged", "ch-1")
+    await queue.make_ready(workflow)
+
+    await queue.cancel(workflow)
+
+    assert await checkpointer.discard(workflow) == 1
+    assert await checkpointer.load(workflow) == {}
+    assert await queue.next_ready(BRIEFLY) is None
+    with pytest.raises(Fenced):
+        await checkpointer.record(holder, "shipped", "sh-1")

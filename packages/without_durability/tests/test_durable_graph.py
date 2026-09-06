@@ -30,8 +30,10 @@ from without_durability import MemoryCheckpointer
 from without_durability import Pass
 from without_durability import Recorded
 from without_durability import SplitDurable
+from without_durability import Written
 from without_durability import claimed
 from without_durability import inbox_key
+from without_durability import now_utc
 from without_durability import run_durably
 from without_durability.graph import survives
 from without_durability.graph import written
@@ -323,6 +325,14 @@ class Preempted:
         self.already[key] = value
         return Entry(key=key, value=value)
 
+    async def history(self, workflow: str) -> dict[str, Written]:  # pragma: no cover - unused here
+        return {key: Written(value=value, at=now_utc()) for key, value in self.already.items()}
+
+    async def discard(self, workflow: str) -> int:  # pragma: no cover - unused here
+        removed = len(self.already)
+        self.already.clear()
+        return removed
+
     async def release(self, holder: Pass) -> None:
         return None
 
@@ -528,6 +538,9 @@ class UnreachableQueue:
     async def reclaim(self, idle: timedelta) -> Delivery | None:  # pragma: no cover - unused here
         return None
 
+    async def cancel(self, workflow: str) -> None:  # pragma: no cover - unused here
+        return None
+
     async def done(self, delivery: Delivery) -> None:  # pragma: no cover - unused here
         return None
 
@@ -615,6 +628,17 @@ def test_a_value_that_reaches_itself_is_answered_rather_than_walked_forever() ->
     assert survives(tree, {"name": "root", "parent": {"name": "root"}}) is False
 
 
+def test_a_pair_already_compared_is_skipped_rather_than_ending_the_walk() -> None:
+    # The memo answers one pair and nothing else: everything still queued behind it has yet
+    # to be compared. Treating a repeat as the end of the walk reports that a value survived
+    # its store while a difference sits unexamined one entry further down, which is the one
+    # failure this check exists to catch and the quietest way to miss it.
+    #
+    # The shared member has to come *after* the difference, because the queue is a stack:
+    # the second sighting of it is popped while the mismatched pair is still waiting.
+    assert survives((1, "shared", "shared"), (2, "shared", "shared")) is False
+
+
 def test_a_value_reachable_by_many_paths_is_compared_once() -> None:
     # The same memo, doing the other half of its job: a value shared by many paths through
     # a structure would otherwise be walked once per path, which is exponential in the
@@ -651,17 +675,52 @@ async def test_a_node_record_cancelled_in_flight_still_lands() -> None:
     # effect has already happened when the record is written, so cancelling the write does
     # not undo the parcel, it drops the record of it and the pass that takes the workflow
     # over ships again. Cancellation here is a rolling deploy rather than a crash.
+    #
+    # The wait is what is being asserted rather than the record, which is why the run is
+    # checked for being still in flight before the write is let through: a runner that
+    # unwound at once would leave the same record behind a moment later, so reading the
+    # store afterwards says nothing about whether anything was held.
     checkpointer = ParkedWrites()
     holder = await claimed(checkpointer, "wf-held")
     recording = asyncio.ensure_future(written(checkpointer, holder, "shipped", "tr-1"))
     await checkpointer.writing.wait()
 
     recording.cancel()
+    await asyncio.sleep(0)
+
+    assert not recording.done(), "the cancellation is taken, and then waited out"
+
     checkpointer.proceed.set()
     with pytest.raises(asyncio.CancelledError):
         await recording
 
-    assert await checkpointer.load("wf-held") == {"shipped": "tr-1"}, "the effect happened, so its record has to land"
+    assert checkpointer.hashes["wf-held"].keys() == {"shipped"}, "the effect happened, so its record has to land"
+    assert await checkpointer.load("wf-held") == {"shipped": "tr-1"}
+
+
+async def test_a_node_record_cancelled_twice_still_lands() -> None:
+    # One cancelled run delivers two cancellations, which is ordinary rather than
+    # pathological: a fan-out gathered under `asyncio.gather` cancels its children when the
+    # run is cancelled, and the gather returns as soon as the first child answers, so the
+    # caller's own teardown cancels the rest a second time. Honouring the second one drops a
+    # write whose parcel is already in the air.
+    checkpointer = ParkedWrites()
+    holder = await claimed(checkpointer, "wf-held-twice")
+    recording = asyncio.ensure_future(written(checkpointer, holder, "shipped", "tr-2"))
+    await checkpointer.writing.wait()
+
+    recording.cancel()
+    await asyncio.sleep(0)
+    recording.cancel()
+    await asyncio.sleep(0)
+
+    assert not recording.done(), "the second cancellation is waited out like the first"
+
+    checkpointer.proceed.set()
+    with pytest.raises(asyncio.CancelledError):
+        await recording
+
+    assert checkpointer.hashes["wf-held-twice"].keys() == {"shipped"}
 
 
 async def test_a_compensated_workflow_is_not_resumed_under_its_own_id() -> None:

@@ -59,6 +59,7 @@ from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass
 from dataclasses import field
+from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
 from pathlib import Path
@@ -76,6 +77,7 @@ from without_durability.interfaces import Entry
 from without_durability.interfaces import Fenced
 from without_durability.interfaces import Pass
 from without_durability.interfaces import Recorded
+from without_durability.interfaces import Written
 from without_durability.interfaces import check_duration
 from without_durability.stepwise import now_utc
 
@@ -112,6 +114,13 @@ BUSY_TIMEOUT = Milliseconds(5_000)
 # invites any tool to open, so the guarantee would otherwise rest on a promise SQLite
 # declines to make. Declaring the column is what puts this table outside that sentence.
 #
+# `written_at` is what `history` reads, and its `DEFAULT` does the same work `seq` does:
+# evaluated on insert, and left alone by every conflict update below, so a losing write
+# moves the value, the position, and the time equally not at all. The clock is SQL's for
+# the reason the claim's is, which here is consistency with the other two stores rather
+# than a guarantee: SQLite *is* the caller's machine, so there are no two clocks to
+# disagree.
+#
 # `(workflow, step)` is `UNIQUE` rather than the primary key because a table gets one
 # primary key and `seq` is now it. Nothing else changes: both columns are `NOT NULL`, so
 # the constraint admits exactly the rows the primary key did, and it is still what the
@@ -125,6 +134,7 @@ CREATE TABLE IF NOT EXISTS workflow_checkpoint (
     workflow TEXT NOT NULL,
     step TEXT NOT NULL,
     value TEXT NOT NULL,
+    written_at REAL NOT NULL DEFAULT (unixepoch('now', 'subsec')),
     UNIQUE (workflow, step)
 );
 
@@ -224,9 +234,28 @@ WRITE = "INSERT INTO workflow_checkpoint (workflow, step, value) VALUES (?, ?, ?
 # than a formality: `WHERE workflow = ?` is served by the unique index on
 # `(workflow, step)`, so without it the rows come back sorted by step name.
 LOAD = "SELECT step, value FROM workflow_checkpoint WHERE workflow = ? ORDER BY seq"
+HISTORY = "SELECT step, value, written_at FROM workflow_checkpoint WHERE workflow = ? ORDER BY seq"
 # Hand the workflow back early, but keep the token, so the next claim gets the next
 # number up and a pass that comes back from the dead still loses.
 RELEASE = "UPDATE workflow_claim SET held_until = unixepoch('now', 'subsec') WHERE workflow = ? AND token = ?"
+
+# Forget every record a workflow has. Paired with `SUPERSEDE` below and never run without
+# it, which is what the transaction in `discard` is for.
+DISCARD = "DELETE FROM workflow_checkpoint WHERE workflow = ?"
+
+# Take the fencing token *up*, so a pass still holding one is refused at its next write.
+#
+# An `UPDATE` rather than the upsert `CLAIM` is, and the difference is what it declines to
+# do: a workflow with no claim row has no `Pass` outstanding, since a `Pass` is only ever
+# handed out by a `claim` that wrote one, so there is nothing to fence and a row minted
+# here would be a tombstone for a workflow nobody ever claimed. The deadline is moved to
+# now at the same time, so the workflow is claimable again immediately: what is kept is the
+# ordering, not the claim.
+SUPERSEDE = """
+UPDATE workflow_claim
+SET token = token + 1, held_until = unixepoch('now', 'subsec')
+WHERE workflow = ?
+"""
 
 # Take the oldest visible workflow and push it a lease into the future. There is no
 # `SKIP LOCKED` here and none is wanted: it exists so one poller does not queue behind
@@ -254,6 +283,11 @@ ON CONFLICT (namespace, workflow) DO UPDATE SET visible_at = excluded.visible_at
 # Finish, but only if nothing asked for another pass meanwhile. Anything that did wrote a
 # different `visible_at`, so the equality is the whole check.
 FINISH = "DELETE FROM workflow_queue WHERE namespace = ? AND workflow = ? AND visible_at = ?"
+
+# Withdraw the workflow's right to run, whatever its row currently means. Unconditional
+# where `FINISH` compares the receipt, which is the difference between finishing a pass
+# (leave anything that asked for another) and cancelling the workflow (leave nothing).
+CANCEL = "DELETE FROM workflow_queue WHERE namespace = ? AND workflow = ?"
 
 # Suspend until a deadline, under the same comparison and for the same reason. A workflow
 # holds one row here, so writing the deadline unconditionally would land on top of a
@@ -467,6 +501,14 @@ class SqliteCheckpointer:
         rows = await self.database.run(lambda connection: connection.execute(LOAD, (workflow,)).fetchall())
         return {step: self.codec.decode(encoded) for step, encoded in rows}
 
+    async def history(self, workflow: str) -> dict[str, Written]:
+        """The same records `load` returns, each with the moment it was written."""
+        rows = await self.database.run(lambda connection: connection.execute(HISTORY, (workflow,)).fetchall())
+        return {
+            step: Written(value=self.codec.decode(encoded), at=datetime.fromtimestamp(written_at, UTC))
+            for step, encoded, written_at in rows
+        }
+
     async def claim(self, workflow: str, lease: timedelta) -> Pass | None:
         taken = await self.database.run(
             lambda connection: connection.execute(
@@ -546,6 +588,26 @@ class SqliteCheckpointer:
         )
         key, encoded = cast(tuple[str, str], stored)
         return Entry(key=key, value=self.codec.decode(encoded))
+
+    async def discard(self, workflow: str) -> int:
+        """
+        Forget every record this workflow has, and raise its fence, in one transaction.
+
+        One commit rather than two statements, because the two are only right together: a
+        crash between them either leaves the records deleted with the fence unraised, so
+        the pass that was mid-flight writes them back one at a time, or the reverse, which
+        fences a live pass for a deletion that never happened.
+
+        What is left behind is one claim row carrying a number. Nothing here sweeps it, in
+        keeping with the rest of this store, where nothing expires and tidying the file is
+        the deployment's homework.
+        """
+
+        def one_commit(cursor: sqlite3.Cursor) -> int:
+            cursor.execute(SUPERSEDE, (workflow,))
+            return cursor.execute(DISCARD, (workflow,)).rowcount
+
+        return await self.database.run(lambda connection: transacted(connection, one_commit))
 
     async def release(self, holder: Pass) -> None:
         await self.database.run(lambda connection: connection.execute(RELEASE, (holder.workflow, holder.token)))
@@ -655,6 +717,22 @@ class SqliteScheduler:
         """Nothing to take over by hand: an abandoned workflow becomes visible on its own."""
         return None
 
+    async def cancel(self, workflow: str) -> None:
+        """
+        Drop the workflow's row, whichever of the three things its `visible_at` means.
+
+        One `DELETE` covers queued, sleeping, and out with a worker, because this table
+        holds one row per workflow and the visibility is the only thing that differs
+        between them. That is the same collapse that leaves `wake_due` and `reclaim` with
+        nothing to do.
+
+        The half of `cancel` a queue sweep cannot reach comes free with it: a pass still in
+        flight answers with `wake_at`, which is an `UPDATE` conditional on the visibility
+        still being the one it took, and a deleted row has none. So the deadline it was
+        about to write updates nothing and a deleted workflow is not put back to sleep.
+        """
+        await self.database.run(lambda connection: connection.execute(CANCEL, (self.namespace, workflow)))
+
     async def done(self, delivery: Delivery) -> None:
         """
         Drop the workflow, unless something asked for another pass while this one ran.
@@ -722,5 +800,23 @@ class SqliteDurable:
             )
             key, encoded = cast(tuple[str, str], stored)
             return Entry(key=key, value=self.checkpointer.codec.decode(encoded))
+
+        return await self.checkpointer.database.run(lambda connection: transacted(connection, one_commit))
+
+    async def delete(self, workflow: str) -> int:
+        """
+        Cancel the workflow's wakeups and forget its records, together or not at all.
+
+        Three statements in one commit, so the ordering `SplitDurable` has to reason about
+        does not arise: there is no window in which the records are gone and a wakeup is
+        not, and none in which the fence has been raised for a deletion that did not
+        happen. Which is the same thing `arrive` gets from this store and for the same
+        reason, one file.
+        """
+
+        def one_commit(cursor: sqlite3.Cursor) -> int:
+            cursor.execute(CANCEL, (self.scheduler.namespace, workflow))
+            cursor.execute(SUPERSEDE, (workflow,))
+            return cursor.execute(DISCARD, (workflow,)).rowcount
 
         return await self.checkpointer.database.run(lambda connection: transacted(connection, one_commit))

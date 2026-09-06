@@ -16,6 +16,7 @@ from without_durability import MemoryScheduler
 from without_durability import Pass
 from without_durability import Recorded
 from without_durability import SplitDurable
+from without_durability import Written
 from without_http import Client
 from without_http import request
 from without_http.testing import loopback_client
@@ -264,6 +265,9 @@ class BrokenCheckpointer:
     async def load(self, workflow: str) -> dict[str, object]:  # pragma: no cover - present to satisfy the protocol
         return {}
 
+    async def history(self, workflow: str) -> dict[str, Written]:  # pragma: no cover - same
+        return {}
+
     async def claim(self, workflow: str, lease: timedelta) -> Pass | None:  # pragma: no cover - same
         return Pass(workflow=workflow, token=1)
 
@@ -282,6 +286,9 @@ class BrokenCheckpointer:
         raise RuntimeError("the store is down")
 
     async def append(self, workflow: str, value: object) -> Entry:  # pragma: no cover - the API has no inbox
+        raise RuntimeError("the store is down")
+
+    async def discard(self, workflow: str) -> int:  # pragma: no cover - same
         raise RuntimeError("the store is down")
 
 
