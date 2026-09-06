@@ -23,11 +23,18 @@ can read.
 
 ```text
 workflow_checkpoint   one row per (workflow, step), the value as jsonb,
-                      a `seq` column for the order they were recorded in
+                      a `seq` column for the order they were recorded in,
+                      a `written_at` column for when each one landed
 workflow_claim        one row per workflow: whose pass it is, and until when
 workflow_queue        one row per (namespace, workflow), scored by when it is visible
 workflow_seq          the sequence behind `seq`, which `append` also names its keys from
 ```
+
+`written_at` is what `history` reads, and its `DEFAULT now()` does the same work
+`seq`'s default does: evaluated on insert, left alone by every conflict update, so
+a losing write moves the value, the position, and the time equally not at all. The
+clock is the server's, which is what makes two records' times comparable across
+the machines that wrote them.
 
 What is worth reading it for is how little of it is mechanism. Every write that
 had to be a Lua script is one statement here, or one transaction, and neither is
@@ -153,10 +160,13 @@ Beyond [the ones every store carries](../without-durability/index.md#gaps):
 
 - **The sweep is homework.** Redis's TTL is a control plane you get for free. Here
   a finished workflow's rows stay until something deletes them, and nothing here
-  does, so a long-running deployment needs a job that deletes checkpoints and
-  claims past some age. That job is also the only way to bring back the reused-id
-  hazard the plain counter avoids, so it should delete a workflow's claim and its
-  checkpoint together or neither.
+  runs on a schedule, so a long-running deployment needs a job that calls
+  `delete` for workflows past some age (`written_at` is what it reads to find
+  them). `delete` leaves the claim row behind on purpose, since that row is the
+  fence a pass in flight is measured against, so the sweep is also what eventually
+  collects those. Deleting a claim row while its workflow's records survive is the
+  one thing to avoid: that is the reused-id hazard the plain counter otherwise
+  avoids, arriving by the back door.
 - **There is still no blocking read.** `PostgresScheduler` polls, exactly as the
   sorted-set queue does, so the poll interval is a floor under how fast anything
   starts. Postgres can close this where a sorted set cannot (`LISTEN`/`NOTIFY` on a

@@ -245,6 +245,22 @@ class RedisSetScheduler:
         """Nothing to take over by hand: an abandoned workflow becomes visible on its own."""
         return None
 
+    async def cancel(self, workflow: str) -> None:
+        """
+        Drop the workflow's entry, whichever of the three things its score currently means.
+
+        One `ZREM` covers queued, sleeping, and out with a worker, because this set holds
+        one entry per workflow and the score is the only thing that differs between them.
+        That is the same collapse that leaves `wake_due` and `reclaim` with nothing to do.
+
+        The half of `cancel` that a queue sweep cannot reach comes free here as well: a
+        pass still in flight answers with `wake_at`, which is conditional on the score
+        still being the one it took, and a removed entry has no score at all. So the
+        deadline it was about to write is declined and a deleted workflow is not put back
+        among the sleepers.
+        """
+        await self.redis.zrem(self.schedule_key, workflow)
+
     async def done(self, delivery: Delivery) -> None:
         """
         Drop the workflow, unless something asked for another pass while this one ran.

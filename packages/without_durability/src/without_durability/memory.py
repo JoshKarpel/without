@@ -19,8 +19,10 @@ from without_durability.interfaces import Entry
 from without_durability.interfaces import Fenced
 from without_durability.interfaces import Pass
 from without_durability.interfaces import Recorded
+from without_durability.interfaces import Written
 from without_durability.interfaces import check_duration
 from without_durability.interfaces import inbox_key
+from without_durability.stepwise import now_utc
 
 # Both interfaces over ordinary dicts, shipped rather than kept in a test directory, because
 # the whole design says a store is injected and this is the store a test should inject.
@@ -32,7 +34,8 @@ from without_durability.interfaces import inbox_key
 # directly, so encoding into it looks like ceremony; but then a step's result comes back
 # by identity here and through a round trip everywhere else, and every property that
 # depends on the round trip passes in the suite and fails in production. So `hashes`
-# holds *encoded* values, exactly as a Redis hash or a `TEXT` column does.
+# holds `Stored`, which carries the *encoding* exactly as a Redis hash field or a `TEXT`
+# column does.
 #
 # What that buys is a suite with no container in it. What it costs is the one thing a
 # single process cannot stand in for: nothing here says whether a *second* process would
@@ -43,6 +46,21 @@ from without_durability.interfaces import inbox_key
 # callback over an open transaction's cursor. Nothing is shared between them but the
 # position in `transact`.
 type MemoryEffect = Callable[[dict[str, object]], object]
+
+
+@dataclass(frozen=True, slots=True)
+class Stored:
+    """
+    One record as this store keeps it: the encoding, and when the winning write landed.
+
+    A value per record rather than a second mapping beside `hashes`, because two mappings
+    kept in step are a state that can be wrong and this cannot: a key either has a record
+    or has none, and the record carries its own time. It is the row the SQL stores keep,
+    with the column names spelled out.
+    """
+
+    encoded: str
+    at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,10 +85,16 @@ class MemoryCheckpointer:
     # on the first write, which is a store the type says you may build and the code says
     # you may not. What the default lookup bought was two characters at each read, and
     # what it cost was that every read of an unknown workflow silently grew the mapping.
-    hashes: dict[str, dict[str, str]] = field(default_factory=dict)
+    hashes: dict[str, dict[str, Stored]] = field(default_factory=dict)
     tokens: dict[str, int] = field(default_factory=dict)
     held_until: dict[str, float] = field(default_factory=dict)
     codec: CheckpointCodec[str] = JSON
+    # The clock every record is stamped with. The other two stores read their server's,
+    # which here would be `datetime.now(UTC)`; taking it as an argument is what lets a test
+    # stamp records from a clock it moves rather than waiting out a real interval, and it
+    # is deliberately *not* the clock a claim is measured by, which stays `monotonic` for
+    # the reason every lease does.
+    now: Callable[[], datetime] = now_utc
     # This store's *other* data, standing in for the application tables that live
     # alongside a checkpoint. `transact` is only meaningful over something like it, and
     # it holds ordinary values rather than encoded ones: it stands in for the
@@ -81,7 +105,13 @@ class MemoryCheckpointer:
     async def load(self, workflow: str) -> dict[str, object]:
         # Reading a workflow is not creating one, and this is the call a status endpoint
         # makes for an id nobody has ever submitted.
-        return {key: self.codec.decode(encoded) for key, encoded in self.hashes.get(workflow, {}).items()}
+        return {key: self.codec.decode(held.encoded) for key, held in self.hashes.get(workflow, {}).items()}
+
+    async def history(self, workflow: str) -> dict[str, Written]:
+        return {
+            key: Written(value=self.codec.decode(held.encoded), at=held.at)
+            for key, held in self.hashes.get(workflow, {}).items()
+        }
 
     async def claim(self, workflow: str, lease: timedelta) -> Pass | None:
         if self.held_until.get(workflow, 0.0) > monotonic():
@@ -101,9 +131,12 @@ class MemoryCheckpointer:
         # `setdefault` is the whole of first-writer-wins, and it reports the winner by
         # handing back what is now stored: ours when we won, and the earlier writer's
         # when we did not. Comparing encodings rather than values is what makes a tie
-        # (two passes that ran the same effect) count as winning for both.
-        stored = self.hashes.setdefault(holder.workflow, {}).setdefault(key, encoded)
-        return Recorded(value=self.codec.decode(stored), first=stored == encoded)
+        # (two passes that ran the same effect) count as winning for both, and comparing
+        # the *encoding* rather than the whole `Stored` is what keeps it a tie: the
+        # earlier writer's time is not this call's, so the records would never compare
+        # equal and every tie would be reported as a loss.
+        stored = self.hashes.setdefault(holder.workflow, {}).setdefault(key, Stored(encoded=encoded, at=self.now()))
+        return Recorded(value=self.codec.decode(stored.encoded), first=stored.encoded == encoded)
 
     async def transact(self, holder: Pass, key: str, effect: MemoryEffect) -> object:
         """
@@ -141,12 +174,14 @@ class MemoryCheckpointer:
                 self.data.clear()
                 self.data.update(before)
                 raise
-            recorded[key] = encoded
-        return self.codec.decode(recorded[key])
+            recorded[key] = Stored(encoded=encoded, at=self.now())
+        return self.codec.decode(recorded[key].encoded)
 
     async def supply(self, workflow: str, key: str, value: object) -> object:
-        stored = self.hashes.setdefault(workflow, {}).setdefault(key, self.codec.encode(value))
-        return self.codec.decode(stored)
+        stored = self.hashes.setdefault(workflow, {}).setdefault(
+            key, Stored(encoded=self.codec.encode(value), at=self.now())
+        )
+        return self.codec.decode(stored.encoded)
 
     async def append(self, workflow: str, value: object) -> Entry:
         """
@@ -166,8 +201,34 @@ class MemoryCheckpointer:
         """
         recorded = self.hashes.setdefault(workflow, {})
         key = inbox_key(len(recorded))
-        recorded[key] = self.codec.encode(value)
-        return Entry(key=key, value=self.codec.decode(recorded[key]))
+        recorded[key] = Stored(encoded=self.codec.encode(value), at=self.now())
+        return Entry(key=key, value=self.codec.decode(recorded[key].encoded))
+
+    async def discard(self, workflow: str) -> int:
+        """
+        Forget every record this workflow has, and raise its fence so a live pass cannot
+        write more.
+
+        The token is taken *up* rather than removed, which is the whole of what makes this
+        safe against a pass in flight: that pass keeps its `Pass` and believes it still
+        owns the workflow, and the number it carries is now below the fence, so its next
+        `record` raises `Fenced`. Deleting the token instead would hand the next claim a 1
+        that a pass holding 7 outranks, and the deleted workflow would fill back up.
+
+        The lease goes with it, so the workflow is claimable again immediately: what is
+        being kept is the ordering, not the claim.
+
+        Only a workflow that *has* a token gets one, so discarding an id nobody has claimed
+        writes nothing: a `Pass` exists only because `claim` wrote a token, so where there
+        is no token there is no pass to fence, and minting one would leave a tombstone for
+        a workflow that never ran.
+        """
+        removed = self.hashes.pop(workflow, {})
+        superseded = self.tokens.get(workflow)
+        if superseded is not None:
+            self.tokens[workflow] = superseded + 1
+            self.held_until[workflow] = 0.0
+        return len(removed)
 
     async def release(self, holder: Pass) -> None:
         # The token stays, so the next claim outranks this one: releasing hands the
@@ -211,11 +272,17 @@ class MemoryScheduler:
         self.arrived.set()
 
     async def wake_at(self, delivery: Delivery, when: datetime) -> None:
-        # Two structures, so there is nothing to compare: a wakeup that arrived while the
-        # pass was running is in `queue`, and this writes to `sleeping`. Answering for the
-        # delivery is the whole of what it shares with `done`.
-        self.sleeping[delivery.workflow] = when
-        self.outstanding.pop(delivery.receipt, None)
+        # Two structures, so there is nothing to compare about *freshness*: a wakeup that
+        # arrived while the pass was running is in `queue`, and this writes to `sleeping`.
+        #
+        # What is compared is whether the delivery is still live at all, which is the other
+        # requirement on this call and the one a `cancel` needs: a delivery this store no
+        # longer holds was cancelled underneath its worker, so writing the deadline would
+        # put a deleted workflow back among the sleepers to be woken and run from the top.
+        # Answering for the delivery is what it shares with `done`, and is unconditional
+        # because acknowledging something already gone is not an error anywhere.
+        if self.outstanding.pop(delivery.receipt, None) is not None:
+            self.sleeping[delivery.workflow] = when
 
     async def wake_due(self, now: datetime) -> tuple[str, ...]:
         # No `await` between the removal and the enqueue, which is this double's
@@ -249,6 +316,27 @@ class MemoryScheduler:
             # this worker is now holding is not immediately reclaimable again.
             self.outstanding[taken.receipt] = (taken, monotonic())
         return taken
+
+    async def cancel(self, workflow: str) -> None:
+        """
+        Drop every wakeup this store holds for the workflow, whichever structure it is in.
+
+        All three, because a workflow can be in any of them and the caller has no way to
+        know which: waiting in the queue, waiting on a clock, or out with a worker that
+        has not answered for it yet. That last one is why `wake_at` checks `outstanding`,
+        since dropping the delivery here is what tells the pass still running that its
+        workflow is gone.
+        """
+        self.sleeping.pop(workflow, None)
+        stale = [receipt for receipt, (delivery, _since) in self.outstanding.items() if delivery.workflow == workflow]
+        for receipt in stale:
+            del self.outstanding[receipt]
+        # Rebuilt rather than filtered in place: `deque` has no bulk removal, and removing
+        # by value while iterating is the shape that silently skips a duplicate, which one
+        # workflow queued twice is.
+        queued = [queued for queued in self.queue if queued != workflow]
+        self.queue.clear()
+        self.queue.extend(queued)
 
     async def done(self, delivery: Delivery) -> None:
         # Silent about a receipt it never issued, as `XACK` is: acknowledging twice, or

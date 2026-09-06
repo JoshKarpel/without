@@ -97,10 +97,25 @@ async def paid(workflow: str, total: int) -> str:
 BODY = settling_body()
 
 
-async def as_stream(*workflows: str) -> AsyncIterator[Delivery]:
-    """The deliveries a queue would hand over, receipts and all."""
-    for number, workflow in enumerate(workflows):
-        yield Delivery(workflow=workflow, receipt=f"receipt-{number}")
+async def as_stream(scheduler: MemoryScheduler, *workflows: str) -> AsyncIterator[Delivery]:
+    """
+    The deliveries a queue would hand over, taken from the queue rather than invented.
+
+    Minted by the scheduler rather than constructed here, because a receipt is the store's
+    to issue and every shipped store compares it back: `wake_at` declines a delivery the
+    store is no longer holding, which is what stops a cancelled workflow being put back to
+    sleep by the pass a delete interrupted. A hand-written receipt is a delivery no real
+    queue would honour, so a test driving one would watch the worker schedule nothing and
+    read that as the worker's behaviour rather than as the double's.
+
+    One at a time, and lazily, which is also how the worker pulls: the second workflow is
+    made ready only once the pass over the first has finished with it.
+    """
+    for workflow in workflows:
+        await scheduler.make_ready(workflow)
+        delivery = await scheduler.next_ready(timedelta(seconds=1))
+        assert delivery is not None, f"the queue was handed {workflow} and did not hand it back"
+        yield delivery
 
 
 def recording(ran: list[str]) -> Callable[[Run], Awaitable[None]]:
@@ -129,7 +144,7 @@ async def one_pass(
     straight through, schedules nothing, and the test reads it as a workflow that never
     waited. A clock the test moves has no such budget.
     """
-    await passes(SplitDurable(checkpointer, scheduler), BODY, now=now)(as_stream(workflow))
+    await passes(SplitDurable(checkpointer, scheduler), BODY, now=now)(as_stream(scheduler, workflow))
 
 
 async def test_a_workflow_nobody_has_submitted_waits_without_being_scheduled() -> None:
@@ -154,7 +169,7 @@ async def test_a_workflow_listening_on_an_empty_inbox_is_answered_for_and_left_a
     async def listening(run: Run) -> None:
         await run.receive("heard")
 
-    await passes(SplitDurable(checkpointer, scheduler), listening)(as_stream(WORKFLOW))
+    await passes(SplitDurable(checkpointer, scheduler), listening)(as_stream(scheduler, WORKFLOW))
 
     assert scheduler.sleeping == {}, "nothing to schedule: no clock fills an inbox"
     assert scheduler.outstanding == {}, "and the wakeup was answered for rather than left to be redelivered"
@@ -226,7 +241,7 @@ async def test_a_workflow_whose_step_raises_does_not_take_the_worker_down() -> N
 
     # Both workflows are consumed: the first one's failure is this service's data, so
     # the loop logs it and takes the next id rather than ending the worker.
-    await passes(SplitDurable(checkpointer, scheduler), declining)(as_stream("wf-doomed", "wf-fine"))
+    await passes(SplitDurable(checkpointer, scheduler), declining)(as_stream(scheduler, "wf-doomed", "wf-fine"))
 
     assert reached == ["wf-doomed", "wf-fine"]
 
@@ -242,7 +257,7 @@ async def test_a_wakeup_for_a_workflow_someone_else_is_passing_over_is_deferred_
 
     held = await claimed(checkpointer, WORKFLOW)
     try:
-        await passes(SplitDurable(checkpointer, scheduler), recording(ran), now=clock)(as_stream(WORKFLOW))
+        await passes(SplitDurable(checkpointer, scheduler), recording(ran), now=clock)(as_stream(scheduler, WORKFLOW))
     finally:
         await checkpointer.release(held)
 
@@ -267,7 +282,7 @@ async def test_a_pass_whose_claim_lapsed_mid_run_is_deferred_rather_than_logged_
         await claimed(checkpointer, run.workflow)
         await run.step("charged", lambda: paid(run.workflow, 1), as_text)
 
-    await passes(SplitDurable(checkpointer, scheduler), overtaken, now=clock)(as_stream(WORKFLOW))
+    await passes(SplitDurable(checkpointer, scheduler), overtaken, now=clock)(as_stream(scheduler, WORKFLOW))
 
     assert await checkpointer.load(WORKFLOW) == {}, "the superseded pass wrote nothing"
     assert scheduler.sleeping == {WORKFLOW: STARTED_AT + CONTENDED}, "and asked to look again shortly"
@@ -279,7 +294,7 @@ async def test_a_deferred_wakeup_runs_once_the_claim_is_free() -> None:
     scheduler = MemoryScheduler()
     ran: list[str] = []
 
-    await passes(SplitDurable(checkpointer, scheduler), recording(ran))(as_stream(WORKFLOW))
+    await passes(SplitDurable(checkpointer, scheduler), recording(ran))(as_stream(scheduler, WORKFLOW))
 
     assert ran == [WORKFLOW]
     assert scheduler.sleeping == {}, "nothing was deferred, because nothing else held the workflow"
@@ -546,7 +561,7 @@ async def test_the_worker_measures_a_workflows_deadlines_on_the_clock_it_was_giv
     scheduler = MemoryScheduler()
     await checkpointer.supply(WORKFLOW, "order", SMALL)
 
-    await passes(SplitDurable(checkpointer, scheduler), BODY, now=Clock())(as_stream(WORKFLOW))
+    await passes(SplitDurable(checkpointer, scheduler), BODY, now=Clock())(as_stream(scheduler, WORKFLOW))
 
     assert scheduler.sleeping == {WORKFLOW: STARTED_AT + SETTLING}
     assert (await checkpointer.load(WORKFLOW))["settling"] == (STARTED_AT + SETTLING).isoformat()

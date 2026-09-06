@@ -30,8 +30,10 @@ from without_durability import MemoryCheckpointer
 from without_durability import Pass
 from without_durability import Recorded
 from without_durability import SplitDurable
+from without_durability import Written
 from without_durability import claimed
 from without_durability import inbox_key
+from without_durability import now_utc
 from without_durability import run_durably
 from without_durability.graph import survives
 from without_durability.graph import written
@@ -323,6 +325,14 @@ class Preempted:
         self.already[key] = value
         return Entry(key=key, value=value)
 
+    async def history(self, workflow: str) -> dict[str, Written]:  # pragma: no cover - unused here
+        return {key: Written(value=value, at=now_utc()) for key, value in self.already.items()}
+
+    async def discard(self, workflow: str) -> int:  # pragma: no cover - unused here
+        removed = len(self.already)
+        self.already.clear()
+        return removed
+
     async def release(self, holder: Pass) -> None:
         return None
 
@@ -526,6 +536,9 @@ class UnreachableQueue:
         return None
 
     async def reclaim(self, idle: timedelta) -> Delivery | None:  # pragma: no cover - unused here
+        return None
+
+    async def cancel(self, workflow: str) -> None:  # pragma: no cover - unused here
         return None
 
     async def done(self, delivery: Delivery) -> None:  # pragma: no cover - unused here

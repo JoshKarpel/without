@@ -242,9 +242,34 @@ async def test_an_appended_entry_carries_the_same_position_its_key_is_built_from
     entry = await checkpointer.append(workflow, "a message")
 
     packed = cast(str, await redis.hget(checkpointer.hash_key(workflow), entry.key))
-    position, _encoded = packed.split(":", 1)
+    position, _at, _encoded = packed.split(":", 2)
     assert entry.key.endswith(position.zfill(INBOX_DIGITS))
     assert int(position) == 1, "the step written first took position zero"
+
+
+async def test_a_field_carries_its_position_and_its_time_in_front_of_the_encoding(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # The packed format, read raw, because it is the one thing a hash cannot carry for
+    # itself: a field has no metadata and `HGETALL` order is unspecified past the listpack
+    # threshold, so both the position and the time have to be *in* the value. Reading the
+    # field back apart is what says the two numbers are there and in that order, where
+    # `history` alone would pass against a store that had guessed the time in Python.
+    checkpointer = RedisCheckpointer(redis=redis)
+    holder = await claimed(checkpointer, workflow)
+
+    await checkpointer.record(holder, "charged", "ch-1")
+
+    packed = cast(str, await redis.hget(checkpointer.hash_key(workflow), "charged"))
+    position, at, encoded = packed.split(":", 2)
+    stamped = datetime.fromtimestamp(int(at) / 1000, UTC)
+    assert int(position) == 0
+    assert encoded == checkpointer.codec.encode("ch-1"), "and the codec's own text is what is left after the two"
+    # Loosely, because this is the server's clock rather than this process's: what is being
+    # asserted is that the number is a moment now, not that two machines agree.
+    assert abs(stamped - now_utc()) < timedelta(minutes=5)
+    assert (await checkpointer.history(workflow))["charged"].at == stamped
 
 
 async def test_a_store_error_that_is_not_the_fence_is_not_swallowed(redis: Redis, workflow: str) -> None:
@@ -567,6 +592,108 @@ async def test_a_sleeping_workflow_is_moved_to_the_stream_when_it_comes_due(
 
     assert delivered is not None
     assert delivered.workflow == "wf-sleeping"
+
+
+async def test_a_discarded_workflow_loses_its_hash_and_keeps_a_token_that_outranks_it(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # The two keys go opposite ways, which is why `discard` is a script and not a `DEL` of
+    # both. The steps hash goes entirely, so the next write to this id starts from a count
+    # nothing has taken; the pass hash stays with its token raised, so a pass still holding
+    # one is refused rather than outranking the workflow that takes the id next.
+    checkpointer = RedisCheckpointer(redis=redis)
+    holder = await claimed(checkpointer, workflow)
+    await checkpointer.record(holder, "charged", "ch-1")
+
+    assert await checkpointer.discard(workflow) == 1
+
+    assert await redis.exists(checkpointer.hash_key(workflow)) == 0, "the fields are gone with the key, not one by one"
+    superseded = int(cast(str, await redis.hget(checkpointer.pass_key(workflow), "token")))
+    assert superseded > holder.token
+    assert int(cast(str, await redis.hget(checkpointer.pass_key(workflow), "until"))) == 0, "and it is claimable again"
+    assert await redis.ttl(checkpointer.pass_key(workflow)) > 0, "so the tombstone expires rather than being swept"
+
+
+async def test_a_workflow_nobody_claimed_leaves_no_tombstone_when_it_is_discarded(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # A `Pass` is only ever handed out by a `claim` that wrote a token, so where there is no
+    # token there is no pass to fence. Minting one here would leave a key behind for a
+    # workflow that never ran, which is what an operator sweeping ids it is unsure about
+    # would do to every one of them.
+    checkpointer = RedisCheckpointer(redis=redis)
+    await checkpointer.supply(workflow, "approved", True)
+
+    assert await checkpointer.discard(workflow) == 1
+
+    assert await redis.exists(checkpointer.pass_key(workflow)) == 0
+
+
+async def test_cancelling_walks_the_stream_past_the_entries_it_is_not_looking_for(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # The expensive half of `cancel` on this queue, driven at a batch size of one so the
+    # scan takes several round trips and lands on entries belonging to other workflows. A
+    # stream is addressed by entry id and an id says only *when* an entry was appended, so
+    # finding a workflow's entries means reading them; what this pins is that the walk makes
+    # progress past a batch it deletes nothing from, which is where a cursor that was
+    # inclusive rather than exclusive would loop forever.
+    scheduler = RedisStreamScheduler(redis=redis, namespace=workflow, scan=1)
+    await scheduler.prepare()
+    for turn in range(3):
+        await scheduler.make_ready("wf-doomed")
+        await scheduler.make_ready(f"wf-spared-{turn}")
+
+    await scheduler.cancel("wf-doomed")
+
+    left = cast(list[tuple[str, dict[str, str]]], await redis.xrange(scheduler.ready_key))
+    assert [fields["workflow"] for _entry, fields in left] == ["wf-spared-0", "wf-spared-1", "wf-spared-2"]
+
+
+async def test_cancelling_takes_a_workflow_off_the_sleepers_as_well_as_the_stream(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # Two structures here where every other queue has one, so a cancel has to reach both: a
+    # workflow waiting on a clock is in the sorted set and nowhere near the stream, and
+    # leaving it there is a deleted workflow that wakes up on schedule.
+    scheduler = RedisStreamScheduler(redis=redis, namespace=workflow)
+    await scheduler.prepare()
+    await scheduler.make_ready("wf-sleeping")
+    held = await scheduler.next_ready(BRIEFLY)
+    assert held is not None
+    await scheduler.wake_at(held, now_utc() + timedelta(seconds=30))
+    assert await redis.zcard(scheduler.sleeping_key) == 1
+
+    await scheduler.cancel("wf-sleeping")
+
+    assert await redis.zcard(scheduler.sleeping_key) == 0
+    assert await scheduler.wake_due(now_utc() + timedelta(minutes=1)) == ()
+
+
+async def test_cancelling_a_sorted_set_entry_removes_every_meaning_its_score_could_have(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # One `ZREM` where the stream needs a scan, which is the sorted set's side of the trade
+    # that whole design makes: a workflow appears once, so queued, sleeping, and out with a
+    # worker are one entry differing only in its score.
+    queue = scheduled(redis, workflow)
+    await queue.make_ready(workflow)
+    held = await queue.next_ready(BRIEFLY)
+    assert held is not None
+
+    await queue.cancel(workflow)
+
+    assert await redis.zcard(queue.schedule_key) == 0
+    # And the pass still running cannot put it back, since the score it took is no longer
+    # there to compare against.
+    await queue.wake_at(held, now_utc() - timedelta(seconds=1))
+    assert await redis.zcard(queue.schedule_key) == 0
+    assert await queue.next_ready(timedelta(milliseconds=50)) is None
 
 
 async def test_a_delivery_a_dead_worker_never_answered_for_is_taken_over(

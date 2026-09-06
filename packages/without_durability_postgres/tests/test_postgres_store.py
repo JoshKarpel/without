@@ -576,3 +576,27 @@ async def test_a_wakeup_that_arrived_during_a_pass_is_not_overwritten_by_its_dea
     await queue.wake_at(held, now_utc() + timedelta(days=3))
 
     assert await queue.next_ready(BRIEFLY) is not None, "the wakeup that arrived is still due now"
+
+
+async def test_a_split_deployment_reaches_the_two_halves_of_a_delete_separately(
+    pool: AsyncConnectionPool,
+    workflow: str,
+) -> None:
+    # `PostgresDurable.delete` is one commit because both stores are one database. A
+    # deployment keeping this checkpoint beside a queue in something else holds a
+    # `SplitDurable` instead and reaches the halves one at a time, so each has to stand on
+    # its own: the queue row goes whatever its visibility currently means, and the discard
+    # both forgets the records and raises the fence over the pass that was mid-flight.
+    checkpointer = PostgresCheckpointer(pool=pool)
+    queue = scheduled(pool, workflow)
+    holder = await claimed(checkpointer, workflow)
+    await checkpointer.record(holder, "charged", "ch-1")
+    await queue.make_ready(workflow)
+
+    await queue.cancel(workflow)
+
+    assert await checkpointer.discard(workflow) == 1
+    assert await checkpointer.load(workflow) == {}
+    assert await queue.next_ready(BRIEFLY) is None
+    with pytest.raises(Fenced):
+        await checkpointer.record(holder, "shipped", "sh-1")

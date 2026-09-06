@@ -466,3 +466,24 @@ async def test_a_failure_after_the_transaction_is_already_gone_is_reported_as_it
     assert await checkpointer.record(holder, "charged", "ch-1") == Recorded(value="ch-1", first=True), (
         "and the connection is usable, rather than stuck in a transaction nobody can end"
     )
+
+
+async def test_a_split_deployment_reaches_the_two_halves_of_a_delete_separately(database: Database) -> None:
+    # `SqliteDurable.delete` is one commit because both stores are one file. A deployment
+    # keeping this checkpoint beside a queue in something else holds a `SplitDurable`
+    # instead and reaches the halves one at a time, so each has to stand on its own: the
+    # queue row goes whatever its visibility currently means, and the discard both forgets
+    # the records and raises the fence over the pass that was mid-flight.
+    checkpointer = SqliteCheckpointer(database=database)
+    queue = SqliteScheduler(database=database)
+    holder = await claimed(checkpointer, WORKFLOW)
+    await checkpointer.record(holder, "charged", "ch-1")
+    await queue.make_ready(WORKFLOW)
+
+    await queue.cancel(WORKFLOW)
+
+    assert await checkpointer.discard(WORKFLOW) == 1
+    assert await checkpointer.load(WORKFLOW) == {}
+    assert await queue.next_ready(BRIEFLY) is None
+    with pytest.raises(Fenced):
+        await checkpointer.record(holder, "shipped", "sh-1")

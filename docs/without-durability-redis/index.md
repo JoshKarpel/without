@@ -123,13 +123,16 @@ making progress keeps itself alive and one that stops does not. Its *field names
 are entirely the user's vocabulary, with no engine field among them, which is what
 lets `GET /orders/{id}` return the whole hash without filtering anything out.
 
-Each field's value carries one piece of engine bookkeeping, in front of the
-encoding: the position the step was first recorded at, which is how this store
-meets `load`'s ordering guarantee. A hash cannot carry that order itself, since
-Redis preserves field order only while the hash is listpack-encoded and stops once
-it converts to a hashtable. Keeping the position in the field is what keeps the
-checkpoint to one key, with no second structure that would have to expire in step
-with it. The scripts add the prefix on the way in and strip it on the way out, so
+Each field's value carries two pieces of engine bookkeeping, in front of the
+encoding, so a field reads `<position>:<written at>:<encoding>`. The position is
+how this store meets `load`'s ordering guarantee, and the millisecond is what
+`history` reads back. A hash can carry neither for itself: Redis preserves field
+order only while the hash is listpack-encoded and stops once it converts to a
+hashtable, and a field has no metadata to hang a timestamp off at all. Keeping
+both in the field is what keeps the checkpoint to one key, with no second
+structure that would have to expire in step with it. Both numbers come from the
+server rather than from a caller, the time for the reason the claim's clock is the
+server's. The scripts add the prefix on the way in and strip it on the way out, so
 a caller reads bare values through `load` and a `LuaEffect` never sees one, but an
 operator reading fields with `redis-cli` directly will.
 
@@ -137,6 +140,14 @@ That same position is what `append` names an inbox field from, so this store nee
 no counter beyond the one it already keeps: the number in the key and the number
 packed in front of the value are one `HLEN` read inside one script, and cannot
 drift apart.
+
+`discard` is the one thing that removes fields, and it removes the key rather than
+the fields: `DEL` rather than `HDEL`, because `HLEN` is the position counter and
+deleting fields out of a surviving hash would hand out positions that are already
+taken. The pass key goes the other way, keeping its token and raising it, so a
+pass still holding one is refused rather than outranking whatever takes the id
+next. That leaves a two-field tombstone which the TTL collects on its own, which
+is the same expiry that already collects a finished workflow.
 
 **The claim** is born on the first `claim` and has a fixed two-field shape.
 `token` only rises, `until` moves forward on a claim and to zero on a release. It
@@ -216,12 +227,21 @@ other:
 | Moving parts | consumer group, pending list, `XAUTOCLAIM`, a deadline-scored sorted set, a timer, a Lua script to move between them, and a trimmer | one sorted set and two small scripts |
 | Losing a wakeup | impossible by construction: every `make_ready` appends a new entry | prevented by the receipt, since the score a pass took is what `done` compares |
 | Taking over a dead worker | `reclaim`, off the pending list | nothing to do; the lease elapses and the row becomes visible |
+| Cancelling a workflow's wakeups | reads the stream to find its entries, so the cost is the untrimmed backlog | one `ZREM`, since the workflow appears once |
 
 Two rows are worth reading together. The stream's whole advantage is the first
 one, and its whole cost is the fourth, so the question is whether the latency
 floor matters to what you are building. For a workflow whose steps are network
 calls, one poll interval is noise; for a submit-to-first-pass path a user is
 watching, it is the whole budget.
+
+The last row is the same trade seen from a third side. A stream is addressed by
+entry id, and an id says *when* an entry was appended rather than what is in it,
+so cancelling a workflow means reading the stream to find its entries;
+`RedisStreamScheduler.cancel` does that in batches of `scan`, from the client
+rather than inside a script, since a script would hold the server for the whole
+walk. What bounds it is the trimmer rather than the design, so a deployment that
+runs `trimming` scans its backlog and one that does not scans its history.
 
 The `Scheduler` protocol carries `prepare`, `wake_due`, and `reclaim` only because
 the stream needs them, and they are no-ops in every other implementation this

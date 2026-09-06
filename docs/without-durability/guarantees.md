@@ -199,6 +199,34 @@ None of these is obvious from the protocol alone.
   What a destructive queue would buy is competing consumers, and that is already
   answered a layer down: `claim` guarantees one pass per workflow, so there is nobody to
   distribute the work between.
+- **The store says when each record landed, for the third time and the same reason.**
+  `history` returns what `load` returns, in the same order, each with the moment it was
+  written. The clock is the _store's_, read at the winning write, which is the same clock
+  every lease here is measured by and for the same argument: the writer is a different
+  machine, so a moment stamped by whichever process happened to record it is only as good
+  as the agreement between the two. First-writer-wins already decides what a key holds and
+  where it sits; this says it decides when the key was written too, so a store stamping on
+  every write would report a replayed step as having run at the moment of the replay.
+
+  It is a second read rather than a richer `load` because the two have different readers.
+  A pass calls `load` at its top and has no use for the times; what wants them is outside
+  a pass, reading one workflow at a time, so the write path stamps every record and the
+  read path splits.
+- **Deleting a workflow raises its fence rather than removing it.** `discard` forgets every
+  record and takes the fencing token _up_, keeping the claim row. That is the whole
+  difference between a delete a caller could write for itself and one that is safe: a pass
+  in flight holds a `Pass` and is about to write, and deleting the claim hands the next
+  claim token 1 on the stores whose tokens are a counter, so the pass holding 7 outranks
+  it and fills the deleted workflow back up one step at a time. Raising it instead refuses
+  that pass at its next write and leaves the id claimable immediately, since what is kept
+  is the ordering rather than the claim.
+
+  The queue closes the same race from its own end, and it has to: a worker answers for its
+  delivery _after_ the pass, so `Scheduler.cancel` sweeping the queue is undone a moment
+  later by the deadline that pass chose. So `wake_at` MUST NOT reinstate a workflow whose
+  delivery has been cancelled since it was taken, which the visibility-scored queues get
+  for free (the receipt is a score, and a removed entry has none) and the Redis stream
+  answers by asking whether its entry is still there.
 
 ## Every step names its parser, and the graph names none
 
@@ -251,8 +279,8 @@ where a pydantic `TypeAdapter` can be as exact as it likes while still presentin
 is exactly what makes a double lie. A dict can hold a value directly, so encoding into
 it looks like ceremony, but then a step's result comes back by identity in the suite
 and through a round trip in production, and every property that depends on the round
-trip passes in tests and fails in deployment. So it holds encoded values, and reading
-a checkpoint means `load`.
+trip passes in tests and fails in deployment. So its `Stored` carries the encoding, as a
+hash field and a `TEXT` column do, and reading a checkpoint means `load`.
 
 ## Losing the workflow is not the workflow failing
 

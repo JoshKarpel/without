@@ -1,5 +1,81 @@
 # Changelog
 
+## 0.0.8
+
+### Added
+
+- **`without-durability`**: every checkpoint record now carries the moment it was written,
+  read back with `Checkpointer.history`. It returns the records `load` returns, in the same
+  order, each as a `Written` carrying the decoded value and an aware `at`. The clock is the
+  *store's*, read at the winning write, so a workflow's records are comparable with each
+  other across the machines that wrote them and are not comparable with a local
+  `datetime.now()`; a losing write moves the value, the position, and the time equally not
+  at all, so a replayed step still reads as having run when it first ran.
+
+  A second method rather than a richer `load`, because the two have different readers.
+  Every pass calls `load` at its top and wants what a step recorded; nothing inside a pass
+  has any use for when a step recorded it, so a mapping of wrappers there would cost a
+  construction per key per pass to carry a field the runners immediately drop. What wants
+  the times is a status view, an operator asking how long a settlement actually took, or a
+  sweep deciding which workflows are old enough to forget, all of them outside a pass and
+  reading one workflow at a time.
+
+- **`without-durability`**: a workflow can be deleted outright. `Durable.delete` cancels its
+  wakeups and forgets its records, `Checkpointer.discard` and `Scheduler.cancel` are the two
+  halves for a deployment holding the stores separately, and `delete` returns how many
+  records went, so a caller sweeping ids it is unsure about reads zero rather than an error.
+  `PostgresDurable` and `SqliteDurable` do the whole thing in one commit; `SplitDurable`
+  cancels before it discards, which is the reverse of `arrive`'s order for `arrive`'s
+  reason, since the survivable failure belongs in the crash window: records left with
+  nothing to wake them are finished by asking again, where a wakeup left for a workflow with
+  nothing recorded runs it from the top and performs every effect a second time.
+
+  The hard half is not removing the records but doing it under a pass that is still running,
+  and there are two doors. `discard` takes the fencing token *up* and keeps the claim row
+  rather than deleting it, so the pass still holding one is refused at its next write:
+  deleting the row instead hands the next claim token 1 on the stores whose tokens are a
+  counter, and a pass holding 7 then writes its remaining steps back into a deleted workflow
+  one at a time with nothing to show for it. And `Scheduler.wake_at` now declines to
+  reschedule a workflow whose delivery has been cancelled underneath it, because a worker
+  answers for its delivery *after* the pass: written unconditionally, the deadline that pass
+  chose queues the workflow whose records have just been discarded, and the next worker runs
+  it from nothing. What is left behind is one claim row per deleted workflow, which Redis
+  expires on its own `ttl` and the SQL stores leave for the same sweep everything else there
+  waits for.
+
+### Changed
+
+- **`without-durability-redis`**: a checkpoint hash field now holds
+  `<position>:<written at>:<encoding>` where it held `<position>:<encoding>`, since a hash
+  field has no metadata to hang a timestamp off. **A checkpoint written by an earlier
+  version does not parse**, so a workflow in flight across the upgrade fails on its next
+  `load`. Let workflows drain before upgrading, or delete their checkpoints.
+
+- **`without-durability-postgres`** and **`without-durability-sqlite`**: the
+  `workflow_checkpoint` table takes a `written_at` column. `CREATE TABLE IF NOT EXISTS`
+  leaves an existing table alone, so **an existing database needs the column added** before
+  it will serve this version:
+
+  ```sql
+  ALTER TABLE workflow_checkpoint ADD COLUMN written_at timestamptz NOT NULL DEFAULT now();
+  ```
+
+  and, on SQLite, `... ADD COLUMN written_at REAL NOT NULL DEFAULT (unixepoch('now', 'subsec'))`.
+  Rows that predate the column take the moment of the migration rather than the moment they
+  were written, which is the honest answer: nothing recorded the real one. `migrate` is
+  still not a migration tool and still owns no versioning; a deployment that needs one uses
+  the ordinary tool.
+
+- **`without-durability`**: `MemoryScheduler.wake_at` now declines a delivery the store is
+  no longer holding, which every shipped store already did by comparing its receipt. A test
+  driving the double with a hand-written `Delivery` was relying on the double being more
+  permissive than the stores it stands in for, and now gets what a real queue would give it:
+  nothing scheduled. Take deliveries from `next_ready`.
+
+- **`without-durability`**: `MemoryCheckpointer.hashes` holds `Stored` (the encoding and
+  when it landed) rather than the encoding alone, and the store takes a `now` argument, so a
+  test can stamp records from a clock it moves rather than waiting out an interval.
+
 ## 0.0.7
 
 ### Added

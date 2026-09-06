@@ -46,7 +46,10 @@ The clock is a third. Redis and Postgres read their *server's* clock because the
 claimant is a different machine, and a lease compared against the caller's own clock
 is only as good as the agreement between the two. SQLite is the caller's machine, so
 that argument does not apply. `unixepoch('now', 'subsec')` stays in the SQL anyway,
-because it costs nothing and keeps the three stores reading the same.
+because it costs nothing and keeps the three stores reading the same. That covers the
+`written_at` column `history` reads as well as the leases: it takes its default from
+the same expression, evaluated on insert and left alone by every conflict update, so
+a losing write moves the value, the position, and the time equally not at all.
 
 ## The statements
 
@@ -126,7 +129,9 @@ than a duration that would be truncated on its way into the statement.
   this one, and the reason it has not been paid for is that a single node running one
   worker rarely notices.
 - **Nothing sweeps.** Rows stay until something deletes them, so a long-running
-  deployment needs a job that removes finished workflows. Nothing here is that job.
+  deployment needs a job that calls `delete` for finished workflows (`written_at` is
+  what it reads to find them) and eventually collects the claim rows `delete` leaves
+  behind as fences. Nothing here is that job.
 - **`migrate` is not a migration tool.** It runs the schema under SQLite's own
   exclusive transaction, which is enough to boot concurrently and nothing like enough
   to change the shape of these tables later. `user_version` is where SQLite keeps

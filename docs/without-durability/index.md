@@ -39,9 +39,11 @@ is the application's.
 
 `Checkpointer` (in `interfaces.py`) is the only interface either mechanism talks through:
 `claim` takes the right to run a pass, `load` returns what a workflow has recorded in
-the order it was first recorded, `record` adds to it under that claim, `supply` adds to
+the order it was first recorded, `history` returns the same records with the moment the
+store wrote each one, `record` adds to it under that claim, `supply` adds to
 it from outside one under a key the caller names, `append` does the same under a key the
-store names, and `release` hands it back. A Redis hash or a Postgres table in production, a plain dict
+store names, `discard` forgets the lot, and `release` hands it back. A Redis hash or a
+Postgres table in production, a plain dict
 in a test. `Scheduler` beside it holds the other half of a workflow's state, its right
 to run, and `Durable` is the pair plus the moves that have to cross both at once.
 
@@ -156,6 +158,38 @@ long-lived one loads its whole history on every pass. That is the same bill a
 never-completing stepwise workflow already runs up, and it is the price of this execution
 model rather than something the inbox introduces. It is a real bound on what a workflow
 should be used for, and it has its own [gap](#gaps).
+
+### Deleting a workflow, and the pass that was running when you did
+
+`durable.delete(workflow)` cancels the workflow's wakeups and forgets its records,
+returning how many went. `Checkpointer.discard` and `Scheduler.cancel` are the two halves,
+for a deployment holding the stores separately; `PostgresDurable` and `SqliteDurable` do
+the whole thing in one commit, and `SplitDurable` cancels before it discards.
+
+The order is the reverse of `arrive`'s, for `arrive`'s reason: the survivable failure goes
+in the crash window. Records left with nothing to wake them are finished by asking again,
+where a wakeup left for a workflow with nothing recorded runs it from the top and performs
+every effect a second time.
+
+The hard part is not removing the records. It is that a pass may be running, holding a
+`Pass` and about to write, and there are two doors it comes back through:
+
+- `discard` takes the fencing token _up_ and keeps the claim row rather than deleting it,
+  so that pass is refused at its next write. Deleting the row hands the next claim token 1
+  on the stores whose tokens are a counter, and a pass holding 7 outranks it: the deleted
+  workflow fills back up one step at a time, with nothing to show that it happened.
+- `Scheduler.wake_at` declines to reschedule a workflow whose delivery has been cancelled
+  underneath it. A worker answers for its delivery _after_ the pass, so the deadline that
+  pass chose arrives a moment behind the delete; written unconditionally it queues the
+  workflow whose records have just gone, and the next worker runs it from nothing.
+
+What that leaves behind is one claim row per deleted workflow, carrying a number. Redis
+expires it on the checkpoint's own `ttl`; the SQL stores keep it until something sweeps
+them, which is the homework they already have.
+
+There is no compensation in any of this. Deleting a half-run workflow abandons whatever it
+had already done in the outside world, so a workflow whose steps need undoing wants the
+rollback run first (see [Sagas](#sagas-are-not-a-feature-here)) and the delete afterwards.
 
 ## The service
 
@@ -369,9 +403,11 @@ features, expected in something this size:
 - **No retries, backoff, or timeouts.** A step that raises is logged and acknowledged,
   and the workflow stops until something else wakes it. There is no dead-letter and no
   heartbeat.
-- **No history.** The checkpoint is latest-state only: no timestamps, no attempt counts,
-  and no record of a failure. From the store, a failed workflow and a suspended one are
-  indistinguishable.
+- **No history beyond when each record landed.** `history` carries the moment the store
+  wrote each record, which is enough to say how long a workflow spent between two steps and
+  when it last moved. What it is not is a log: the checkpoint is still latest-state only,
+  with no attempt counts and no record of a failure, so from the store a failed workflow and
+  a suspended one remain indistinguishable.
 - **A checkpoint is read whole, so an inbox has no bound.** `load` returns everything a
   workflow has recorded, on every pass, and entries are never consumed. A workflow taking
   a handful of messages does not notice; one used as a streaming sink pays a read
@@ -382,12 +418,23 @@ features, expected in something this size:
   with batching and Continue-As-New; the equivalent here is to fork a workflow onto a new
   id with a prefix of its records, which works and is entirely manual. See
   [the inbox against Temporal and DBOS](alternatives.md#the-inbox-and-why-two-engines-get-it-for-free).
-- **No enumeration, cancellation, or search.** Nothing can terminate or reset a
-  workflow, and nothing exposes a list of them. How hard that would be to add differs in
-  kind between the stores: Redis checkpoints are keyed with no index over them, so
-  listing means `SCAN`, where a table answers "which workflows are suspended" with an
-  ordinary query. That is the clearest thing a SQL store offers that this does not yet
-  spend.
+- **No enumeration or search.** `delete` terminates a workflow and forgets it, and nothing
+  else asks a question *across* workflows: there is no list, no filter, and no "which of
+  these are suspended". How hard that would be to add differs in kind between the stores,
+  which is why it is not here yet: Redis checkpoints are keyed with no index over them, so
+  listing means `SCAN`, where a table answers with an ordinary query over a column it
+  already has. That is the clearest thing a SQL store offers that this does not yet spend.
+- **Deleting is not compensating.** `delete` removes a workflow's record of what it did; it
+  does not undo any of it. A half-run workflow abandoned this way leaves its charges made
+  and its stock reserved, so a rollback (which is [another workflow](#sagas-are-not-a-feature-here))
+  has to run first, and nothing here sequences the two.
+- **Cancelling a queued wakeup costs a scan on `RedisStreamScheduler`.** A stream is
+  addressed by entry id, and an id says when an entry was appended rather than what is in
+  it, so `cancel` reads the stream to find a workflow's entries. What bounds that is the
+  trimmer rather than the design, since `trim` removes everything every group has
+  acknowledged; on a deployment that never trims, a delete reads every entry ever appended.
+  Every other queue here answers the same call with one `ZREM` or one `DELETE`, because it
+  holds one entry per workflow.
 - **Determinism is documented, not enforced.** Nothing stops a workflow calling out to
   the network between two steps. `Run` does take its clock as an argument, which covers
   the most common case. The failure mode is milder than Temporal's, since keying by name
