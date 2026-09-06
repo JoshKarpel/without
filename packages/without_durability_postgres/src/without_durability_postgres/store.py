@@ -115,10 +115,15 @@ POLL = timedelta(milliseconds=50)
 #
 # `written_at` is what `history` reads, and its `DEFAULT` is doing the same work `seq`'s
 # does: evaluated on insert, and left alone by every conflict update below, so a losing
-# write moves the value, the position, and the time equally not at all. `now()` is the
-# transaction's start time on the *server*, which is what makes two records' times
-# comparable across the machines that wrote them, and is the same clock the claim's lease
-# is measured by.
+# write moves the value, the position, and the time equally not at all. The clock is
+# `clock_timestamp()` and not the `now()` every other statement here reads, which is the
+# one place this file wants a time that is not the transaction's start: `transact` runs
+# its effect *inside* the transaction, so a step that spent ten seconds at a gateway would
+# be stamped ten seconds before it landed, and could carry an earlier time than a `supply`
+# that committed while it ran and took a lower `seq`, which is `history` returning its
+# records in one order and their times in another. Both are the *server's* clock, which is
+# what makes two records' times comparable across the machines that wrote them, and is the
+# same clock the claim's lease is measured by.
 #
 # `workflow_seq` is a named sequence with a `DEFAULT` rather than an identity column,
 # because `append` has to mint a key from the *same* number that becomes the row's
@@ -144,7 +149,7 @@ CREATE TABLE IF NOT EXISTS workflow_checkpoint (
     step text NOT NULL,
     value jsonb NOT NULL,
     seq bigint NOT NULL DEFAULT nextval('workflow_seq'),
-    written_at timestamptz NOT NULL DEFAULT now(),
+    written_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (workflow, step)
 );
 

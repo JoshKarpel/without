@@ -57,7 +57,7 @@
   it will serve this version:
 
   ```sql
-  ALTER TABLE workflow_checkpoint ADD COLUMN written_at timestamptz NOT NULL DEFAULT now();
+  ALTER TABLE workflow_checkpoint ADD COLUMN written_at timestamptz NOT NULL DEFAULT clock_timestamp();
   ```
 
   and, on SQLite, `... ADD COLUMN written_at REAL NOT NULL DEFAULT (unixepoch('now', 'subsec'))`.

@@ -5,6 +5,7 @@ import os
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
 from collections.abc import Callable
+from datetime import datetime
 from datetime import timedelta
 from uuid import uuid4
 
@@ -557,6 +558,37 @@ async def test_an_effect_that_writes_its_own_step_row_is_told_what_it_did(
 
     assert await checkpointer.load(workflow) == {}, "the effect went back with the record it could not write"
     assert await reserved(pool, workflow) is None
+
+
+async def test_a_step_that_took_time_is_stamped_when_it_landed_and_not_when_it_began(
+    pool: AsyncConnectionPool,
+    workflow: str,
+) -> None:
+    # The one call where the two clocks Postgres offers give different answers, and the
+    # reason `written_at` defaults to `clock_timestamp()`: `transact` runs its effect inside
+    # the transaction that records it, so `now()` would stamp a slow step with the moment it
+    # started rather than the moment it landed, which is the reading `history` exists to
+    # refuse. The effect reads the server's clock on its way out and records that, so this
+    # holds one clock against itself and needs nothing about the agreement between this
+    # machine's and the database's. The sleep is the slow step, not a wait for one.
+    checkpointer = PostgresCheckpointer(pool=pool)
+    holder = await claimed(checkpointer, workflow)
+
+    async def slowly(cursor: AsyncCursor[TupleRow]) -> object:
+        await asyncio.sleep(0.05)
+        await cursor.execute("SELECT clock_timestamp()")
+        finished = await cursor.fetchone()
+        assert finished is not None
+        return str(finished[0].isoformat())
+
+    recorded = await checkpointer.transact(holder, "slow", slowly)
+    assert isinstance(recorded, str)
+
+    written = (await checkpointer.history(workflow))["slow"]
+
+    assert written.at >= datetime.fromisoformat(recorded), (
+        "the step is stamped no earlier than the moment its effect finished"
+    )
 
 
 async def test_a_wakeup_that_arrived_during_a_pass_is_not_overwritten_by_its_deadline(

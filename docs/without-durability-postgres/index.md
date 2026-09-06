@@ -30,11 +30,14 @@ workflow_queue        one row per (namespace, workflow), scored by when it is vi
 workflow_seq          the sequence behind `seq`, which `append` also names its keys from
 ```
 
-`written_at` is what `history` reads, and its `DEFAULT now()` does the same work
-`seq`'s default does: evaluated on insert, left alone by every conflict update, so
-a losing write moves the value, the position, and the time equally not at all. The
+`written_at` is what `history` reads, and its `DEFAULT` does the same work `seq`'s
+default does: evaluated on insert, left alone by every conflict update, so a
+losing write moves the value, the position, and the time equally not at all. The
 clock is the server's, which is what makes two records' times comparable across
-the machines that wrote them.
+the machines that wrote them, and it is `clock_timestamp()` rather than the
+`now()` every other statement here reads: `now()` is the transaction's _start_,
+and `transact` runs its effect inside the transaction, so a step that spent ten
+seconds at a gateway would be stamped ten seconds before it landed.
 
 What is worth reading it for is how little of it is mechanism. Every write that
 had to be a Lua script is one statement here, or one transaction, and neither is
