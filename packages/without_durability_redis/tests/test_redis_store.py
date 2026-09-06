@@ -272,6 +272,27 @@ async def test_a_field_carries_its_position_and_its_time_in_front_of_the_encodin
     assert (await checkpointer.history(workflow))["charged"].at == stamped
 
 
+async def test_a_value_whose_encoding_holds_colons_comes_back_whole(redis: Redis, workflow: str) -> None:
+    # The packed field is `position:at:encoding`, and the encoding is the one part that may
+    # hold colons of its own: every JSON object does, and so does an ISO deadline, which is
+    # what `Run.sleep` records. So the split has to take the first two separators and leave
+    # the rest alone. Taking one more, or taking them from the right, hands the position
+    # parse a fragment of somebody's value and every read of the workflow fails.
+    checkpointer = RedisCheckpointer(redis=redis)
+    holder = await claimed(checkpointer, workflow)
+    items = {"piano": 90_000, "stool": 4_500}
+    deadline = "2026-03-14T09:30:00+00:00"
+
+    await checkpointer.record(holder, "items", items)
+    await checkpointer.record(holder, "settling", deadline)
+
+    assert await checkpointer.load(workflow) == {"items": items, "settling": deadline}
+    assert {key: written.value for key, written in (await checkpointer.history(workflow)).items()} == {
+        "items": items,
+        "settling": deadline,
+    }
+
+
 async def test_a_store_error_that_is_not_the_fence_is_not_swallowed(redis: Redis, workflow: str) -> None:
     # `record` forgives exactly one error, the script's own refusal. Anything else is a
     # real problem with the store, and reading it as "another pass took over" would tell
