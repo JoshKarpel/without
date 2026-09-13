@@ -20,6 +20,7 @@ from without_durability import Fenced
 from without_durability import Recorded
 from without_durability import Run
 from without_durability import claimed
+from without_durability import extending
 from without_durability import now_utc
 from without_durability_postgres import PostgresCheckpointer
 from without_durability_postgres import PostgresDurable
@@ -130,7 +131,9 @@ async def test_only_one_of_many_processes_racing_for_a_workflow_gets_to_pass_ove
     # elapsed fails it, so no row comes back and that claimant lost.
     racing = [PostgresCheckpointer(pool=pool) for _ in range(8)]
 
-    claims = await asyncio.gather(*(store.claim(workflow, timedelta(minutes=1)) for store in racing))
+    claims = await asyncio.gather(
+        *(store.claim(workflow, timedelta(minutes=5), timedelta(minutes=1)) for store in racing)
+    )
     won = [holder for holder in claims if holder is not None]
 
     assert len(won) == 1, "a claim is exclusive no matter how many clients ask at once"
@@ -250,8 +253,12 @@ async def test_an_effect_in_this_postgres_is_performed_and_recorded_in_one_commi
     holder = await claimed(checkpointer, workflow)
     reserve = reserving(workflow, 1)
 
-    first = await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("reserved", reserve, as_count)
-    again = await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("reserved", reserve, as_count)
+    first = await Run(holder=holder, checkpointer=checkpointer, recorded={}, extend=extending(checkpointer)).transact(
+        "reserved", reserve, as_count
+    )
+    again = await Run(holder=holder, checkpointer=checkpointer, recorded={}, extend=extending(checkpointer)).transact(
+        "reserved", reserve, as_count
+    )
 
     assert (first, again) == (1, 1), "the second pass read the record rather than reserving again"
     assert await reserved(pool, workflow) == 1, "the stock moved once, however many passes reached the step"
@@ -269,7 +276,7 @@ async def test_a_transacted_effect_is_refused_from_a_superseded_pass(
     await claimed(checkpointer, workflow)
 
     with pytest.raises(Fenced):
-        await Run(holder=stalled, checkpointer=checkpointer, recorded={}).transact(
+        await Run(holder=stalled, checkpointer=checkpointer, recorded={}, extend=extending(checkpointer)).transact(
             "reserved", reserving(workflow, 1), as_count
         )
 
@@ -292,7 +299,9 @@ async def test_an_effect_that_fails_leaves_neither_the_work_nor_the_record(
         raise RuntimeError("the warehouse said no")
 
     with pytest.raises(RuntimeError, match="the warehouse said no"):
-        await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("reserved", half_way, as_count)
+        await Run(holder=holder, checkpointer=checkpointer, recorded={}, extend=extending(checkpointer)).transact(
+            "reserved", half_way, as_count
+        )
 
     assert await reserved(pool, workflow) is None
     assert await checkpointer.load(workflow) == {}, "and the step is unrecorded, so the next pass may retry it"

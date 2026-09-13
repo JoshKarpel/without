@@ -30,10 +30,12 @@ Two questions the other stores answer carefully do not arise.
 
 **There is one writer at a time, by construction.** `BEGIN IMMEDIATE` takes the
 write lock for the whole transaction, so the fence check and the write it guards
-cannot be interleaved with anything. Postgres needs `FOR UPDATE` on the claim row to
+cannot be interleaved with anything. Postgres needs a row lock on the claim row to
 get that, because there readers and writers run concurrently and a statement's
 snapshot can be stale; Redis needs a Lua script. Here the transaction *is* the
-exclusion, and `transact` is a plain sequence of statements inside one.
+exclusion, and `transact` is a plain sequence of statements inside one. It is also
+why a write can note itself as a sign of life in a second statement where Postgres
+has to fold that into the statement already holding the lock.
 
 **There is nothing to co-locate.** The datastore is a file, so `transact`, `arrive`,
 and `deliver` reach every table an application keeps in it. On Redis that question is a

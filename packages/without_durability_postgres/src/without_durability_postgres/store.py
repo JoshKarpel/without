@@ -156,7 +156,17 @@ CREATE TABLE IF NOT EXISTS workflow_checkpoint (
 CREATE TABLE IF NOT EXISTS workflow_claim (
     workflow text PRIMARY KEY,
     token bigint NOT NULL,
-    held_until timestamptz NOT NULL
+    -- The budget: the latest this claim can lapse at, whatever its holder does.
+    held_until timestamptz NOT NULL,
+    -- When it lapses if nothing more is heard, which is what `CLAIM` tests. Every statement
+    -- that writes it holds it at or below `held_until` with a `LEAST`, so a sign of life
+    -- cannot carry a pass past its budget or take a workflow back after a `RELEASE`.
+    alive_until timestamptz NOT NULL,
+    -- What one sign of life is worth, carried on the row because `RECORD` is one of them
+    -- and is not told: a write is the plainest word from a pass there is, and the statement
+    -- making it has only the workflow to go on. On the row rather than in a store-wide
+    -- setting so a workflow claimed with a short window cannot quietly renew on a long one.
+    alive_for interval NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS workflow_queue (
@@ -189,21 +199,64 @@ MIGRATION_LOCK = 0x77_0F_10_2026
 # only as good as the agreement between the two, which is exactly what fails when a
 # machine is unhealthy enough to stall mid-pass.
 CLAIM = """
-INSERT INTO workflow_claim AS held (workflow, token, held_until)
-VALUES (%(workflow)s, 1, now() + %(lease)s)
+INSERT INTO workflow_claim AS held (workflow, token, held_until, alive_until, alive_for)
+VALUES (
+    %(workflow)s, 1,
+    now() + %(budget)s, LEAST(now() + %(alive)s, now() + %(budget)s), %(alive)s
+)
 ON CONFLICT (workflow) DO UPDATE
-    SET token = held.token + 1, held_until = now() + %(lease)s
-    WHERE held.held_until <= now()
+    SET token = held.token + 1,
+        held_until = now() + %(budget)s,
+        alive_until = LEAST(now() + %(alive)s, now() + %(budget)s),
+        alive_for = %(alive)s
+    WHERE held.alive_until <= now()
 RETURNING token
+"""
+
+# A fresh budget, and a sign of life with it: what a step that declared a `within` spends
+# before it runs its effect.
+#
+# Conditional on the token rather than on the deadline, because a claim that has *lapsed*
+# but not been taken is still this pass's to stretch: nobody else has raised the fence, so
+# nothing has gone wrong that refusing here would repair. The token is the only thing that
+# says somebody else owns the workflow now.
+EXTEND = """
+UPDATE workflow_claim
+SET held_until = now() + %(budget)s,
+    alive_until = LEAST(now() + %(alive)s, now() + %(budget)s),
+    alive_for = %(alive)s
+WHERE workflow = %(workflow)s AND token <= %(token)s
+"""
+
+# A sign of life and nothing else: the worker's tick, which says this pass is still running
+# without saying it may run any longer than it was already granted. `LEAST` against the
+# budget is what makes that true rather than merely intended.
+RENEW = """
+UPDATE workflow_claim
+SET alive_until = LEAST(now() + %(alive)s, held_until), alive_for = %(alive)s
+WHERE workflow = %(workflow)s AND token <= %(token)s
 """
 
 # The fenced, conditional write, and the whole of `record` in one statement.
 #
-# The `FOR UPDATE` is doing real work rather than being belt-and-braces. Without it the
-# fence is read from the statement's snapshot, so a claim committing a microsecond after
-# the statement began would go unseen and a superseded pass's write would land. Taking
-# the row lock makes this statement queue behind any claim in flight and then re-read the
-# row it locked, so the token compared against is the newest one.
+# The fence CTE is an `UPDATE` because the write is also a sign of life, and the cheapest
+# place to say so is the statement that was already taking a row lock on the claim. That is
+# what makes a workflow of ordinary short steps renew itself for nothing, and leaves the
+# worker's tick with the case it is really for: one step long enough that no write falls
+# inside a whole lease.
+#
+# The lock is doing real work rather than being belt-and-braces. Without it the fence is
+# read from the statement's snapshot, so a claim committing a microsecond after the
+# statement began would go unseen and a superseded pass's write would land. Taking the row
+# lock makes this statement queue behind any claim in flight and then re-read the row it
+# locked, so the token compared against is the newest one. An `UPDATE` gives that the same
+# way `SELECT ... FOR UPDATE` did, re-evaluating against the committed row version and
+# returning what it re-read; confirmed against a real server rather than assumed, since the
+# whole fence rests on it.
+#
+# It renews unconditionally rather than only for the winner, and the `LEAST` is what makes
+# that safe: after a `RELEASE` the budget is already `now()`, so a write still in flight
+# renews to `now()` and takes nothing back from whoever has claimed the workflow since.
 #
 # The rest is `HSETNX` and its read-back, as one upsert. `DO UPDATE SET value = the value
 # already there` is a write that changes nothing and therefore returns the row that was
@@ -220,7 +273,10 @@ RETURNING token
 #            all when the pass is fenced
 RECORD = """
 WITH fence AS (
-    SELECT token FROM workflow_claim WHERE workflow = %(workflow)s FOR UPDATE
+    UPDATE workflow_claim
+    SET alive_until = LEAST(now() + alive_for, held_until)
+    WHERE workflow = %(workflow)s
+    RETURNING token
 )
 INSERT INTO workflow_checkpoint AS recorded (workflow, step, value)
 SELECT %(workflow)s, %(step)s, %(value)s::jsonb FROM fence WHERE fence.token <= %(token)s
@@ -268,7 +324,13 @@ RETURNING entry.step, entry.value::text
 # work in the middle. They are separate strings rather than one because the effect is
 # arbitrary application SQL that this store cannot see, which is precisely what makes the
 # transaction worth having.
-FENCE = "SELECT token FROM workflow_claim WHERE workflow = %s FOR UPDATE"
+# `transact`'s fence, which renews for the reason `RECORD` does: a co-committed step is a
+# write like any other, and this is the statement already locking the claim row.
+FENCE = """
+UPDATE workflow_claim SET alive_until = LEAST(now() + alive_for, held_until)
+WHERE workflow = %s
+RETURNING token
+"""
 ALREADY = "SELECT value::text FROM workflow_checkpoint WHERE workflow = %s AND step = %s"
 # `ON CONFLICT DO NOTHING` rather than a plain insert, because `supply` is deliberately not
 # gated on the claim and so is the one writer this transaction's fence does not exclude. An
@@ -298,12 +360,23 @@ DISCARD = "DELETE FROM workflow_checkpoint WHERE workflow = %s"
 # here would be a tombstone for a workflow nobody ever claimed. `held_until = now()` hands
 # the workflow back at the same time, so it is claimable again immediately: what is kept is
 # the ordering, not the claim.
-SUPERSEDE = "UPDATE workflow_claim SET token = token + 1, held_until = now() WHERE workflow = %s"
+SUPERSEDE = """
+UPDATE workflow_claim SET token = token + 1, held_until = now(), alive_until = now()
+WHERE workflow = %s
+"""
 # Hand the workflow back early, but keep the token, so the next claim gets the next
 # number up and a pass that comes back from the dead still loses. Conditional on the
 # token for the same reason `release` is in the Redis store: a superseded pass letting go
 # must not hand away a claim someone else is holding.
-RELEASE = "UPDATE workflow_claim SET held_until = now() WHERE workflow = %s AND token = %s"
+#
+# Both deadlines, and the budget is the load-bearing one: a write this pass had already
+# started is entitled to land (it keeps its token), and bringing `held_until` down to now
+# is what stops that write's own renewal from claiming the workflow straight back, since
+# every renewal is a `LEAST` against it.
+RELEASE = """
+UPDATE workflow_claim SET held_until = now(), alive_until = now()
+WHERE workflow = %s AND token = %s
+"""
 
 # What an effect is for a store whose datastore is a Postgres database: an async callback
 # handed a cursor that is already inside `transact`'s transaction. The Redis store's is a
@@ -428,13 +501,28 @@ class PostgresCheckpointer:
                 for step, encoded, written_at in await cursor.fetchall()
             }
 
-    async def claim(self, workflow: str, lease: timedelta) -> Pass | None:
+    async def claim(self, workflow: str, budget: timedelta, alive: timedelta) -> Pass | None:
         async with self.pool.connection() as connection, connection.cursor() as cursor:
-            await cursor.execute(CLAIM, {"workflow": workflow, "lease": lease})
+            await cursor.execute(CLAIM, {"workflow": workflow, "budget": budget, "alive": alive})
             taken = await cursor.fetchone()
         if taken is None:
             return None
         return Pass(workflow=workflow, token=cast(int, taken[0]))
+
+    async def extend(self, holder: Pass, budget: timedelta, alive: timedelta) -> bool:
+        async with self.pool.connection() as connection, connection.cursor() as cursor:
+            await cursor.execute(
+                EXTEND,
+                {"workflow": holder.workflow, "token": holder.token, "budget": budget, "alive": alive},
+            )
+            # No row touched means the `WHERE` refused the token, which is the only way
+            # this misses: a `Pass` exists because a `claim` wrote the row it names.
+            return cursor.rowcount == 1
+
+    async def renew(self, holder: Pass, alive: timedelta) -> bool:
+        async with self.pool.connection() as connection, connection.cursor() as cursor:
+            await cursor.execute(RENEW, {"workflow": holder.workflow, "token": holder.token, "alive": alive})
+            return cursor.rowcount == 1
 
     async def record(self, holder: Pass, key: str, value: object) -> Recorded:
         async with self.pool.connection() as connection, connection.cursor() as cursor:
@@ -633,6 +721,23 @@ UPDATE workflow_queue SET visible_at = %(when)s
 WHERE namespace = %(namespace)s AND workflow = %(workflow)s AND visible_at = %(receipt)s
 """
 
+# Keep a delivery this worker's for another `within`, under the same comparison as
+# `SUSPEND` and for the same reason: a `make_ready` that landed since would have written a
+# different `visible_at`, and pushing the visibility out on top of it would bury a wakeup
+# that has already arrived.
+#
+# It returns the new visibility because that *is* the new receipt, which is the price of
+# the trick that makes this table a queue. A worker that went on holding the old one would
+# find its own `FINISH` refused by the equality above and the workflow redelivered for
+# nothing, so the rename is reported rather than left to be discovered.
+#
+#   returns  the new receipt, or no row when this delivery is no longer this worker's
+RENEW_DELIVERY = """
+UPDATE workflow_queue SET visible_at = now() + %(within)s
+WHERE namespace = %(namespace)s AND workflow = %(workflow)s AND visible_at = %(receipt)s
+RETURNING visible_at
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class PostgresScheduler:
@@ -758,6 +863,35 @@ class PostgresScheduler:
     async def reclaim(self, idle: timedelta) -> Delivery | None:
         """Nothing to take over by hand: an abandoned workflow becomes visible on its own."""
         return None
+
+    async def extend(self, delivery: Delivery, within: timedelta) -> Delivery:
+        """
+        Push this delivery's visibility out, and say what it is called now.
+
+        The new visibility is the new receipt, since this table's receipt *is* its
+        visibility, so the caller is handed a delivery to use from here rather than left to
+        work out that the one it holds has been renamed.
+
+        No row means this delivery is no longer this worker's: taken over, cancelled, or
+        rescheduled by a wakeup that arrived mid-pass, all of which wrote a `visible_at`
+        that is not the one it took. The answer to every one of them is to hand back what
+        came in and let whoever now owns the row have it, exactly as `wake_at` and `done`
+        already do.
+        """
+        async with self.pool.connection() as connection, connection.cursor() as cursor:
+            await cursor.execute(
+                RENEW_DELIVERY,
+                {
+                    "namespace": self.namespace,
+                    "workflow": delivery.workflow,
+                    "receipt": datetime.fromisoformat(delivery.receipt),
+                    "within": within,
+                },
+            )
+            renewed = await cursor.fetchone()
+        if renewed is None:
+            return delivery
+        return Delivery(workflow=delivery.workflow, receipt=cast(datetime, renewed[0]).isoformat())
 
     async def cancel(self, workflow: str) -> None:
         """

@@ -12,6 +12,7 @@ from datetime import timedelta
 from time import monotonic
 
 import pytest
+from without_durability import BUDGET
 from without_durability import LEASE
 from without_durability import Delivery
 from without_durability import MemoryCheckpointer
@@ -20,6 +21,7 @@ from without_durability import Run
 from without_durability import SplitDurable
 from without_durability import Suspended
 from without_durability import claimed
+from without_durability import extending
 from without_durability.worker import CONTENDED
 from without_durability.worker import halves
 from without_durability.worker import passes
@@ -375,7 +377,7 @@ async def test_a_deferred_wakeup_runs_once_the_claim_is_free() -> None:
 
     assert ran == [WORKFLOW]
     assert scheduler.sleeping == {}, "nothing was deferred, because nothing else held the workflow"
-    assert await checkpointer.claim(WORKFLOW, LEASE) is not None, "the pass let go of its claim on the way out"
+    assert await checkpointer.claim(WORKFLOW, BUDGET, LEASE) is not None, "the pass let go of its claim on the way out"
 
 
 async def test_the_pool_pulls_exactly_as_many_workflows_as_it_can_work_on() -> None:
@@ -481,6 +483,74 @@ async def test_the_ready_stream_takes_over_a_delivery_a_dead_worker_never_answer
     assert taken.receipt == abandoned.receipt, "the same delivery, taken over rather than duplicated"
 
 
+async def test_the_worker_keeps_a_long_pass_alive_rather_than_letting_it_be_fenced() -> None:
+    # The whole point of renewing. A pass that outruns the liveness window is ordinary, not a
+    # mistake: the window is sized for how fast a *dead* worker should be noticed, and a step
+    # that takes a gateway four minutes is neither dead nor doing anything wrong. Without the
+    # tick, the claim lapses underneath it and the step it was in the middle of runs twice.
+    lease = BRIEF * 3
+    checkpointer = MemoryCheckpointer()
+    scheduler = MemoryScheduler(lease=lease)
+    holding = asyncio.Event()
+    releasing = asyncio.Event()
+
+    async def slow(run: Run) -> None:
+        holding.set()
+        await releasing.wait()
+
+    await scheduler.make_ready(WORKFLOW)
+    worker = asyncio.create_task(work(SplitDurable(checkpointer, scheduler), slow, tick=BRIEF))
+    try:
+        async with asyncio.timeout(3):
+            await holding.wait()
+        # Comfortably past the window the claim was taken under, so a claim still standing is
+        # one something renewed rather than one that simply has not expired yet.
+        await asyncio.sleep(lease.total_seconds() * 2)
+        still_held = await checkpointer.claim(WORKFLOW, BUDGET, lease) is None
+        outstanding = list(scheduler.outstanding.values())
+    finally:
+        releasing.set()
+        worker.cancel()
+
+    assert still_held, "the pass is still running, so the worker has kept saying so"
+    assert [delivery.workflow for delivery, _since in outstanding] == [WORKFLOW], (
+        "and its delivery went with it, rather than being reclaimable while it still held the claim"
+    )
+
+
+async def test_a_worker_that_has_lost_the_workflow_stops_the_pass_it_is_running() -> None:
+    # Discovered at the renewal rather than at the pass's next write, which is the difference
+    # between noticing in one tick and noticing in however long the current step takes. A step
+    # with an hour left to run would otherwise spend it on work that is already refused.
+    lease = BRIEF * 3
+    checkpointer = MemoryCheckpointer()
+    scheduler = MemoryScheduler(lease=lease)
+    holding = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def slow(run: Run) -> None:
+        holding.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            finished.set()
+
+    await scheduler.make_ready(WORKFLOW)
+    worker = asyncio.create_task(work(SplitDurable(checkpointer, scheduler), slow, tick=BRIEF))
+    try:
+        async with asyncio.timeout(3):
+            await holding.wait()
+            # Take the workflow away underneath the running pass, exactly as a worker that
+            # decided this one was dead would. The token goes up, so the next renewal is
+            # refused and the pass has nothing left it may do.
+            await checkpointer.discard(WORKFLOW)
+            await finished.wait()
+    finally:
+        worker.cancel()
+
+    assert finished.is_set(), "the pass was ended rather than left running against a claim it had lost"
+
+
 async def test_the_worker_claims_a_workflow_for_the_lease_its_queue_hands_out() -> None:
     # The two windows that have to agree, and why the lease is the scheduler's rather than
     # an argument to `work`: a delivery that becomes reclaimable before its holder's claim
@@ -502,16 +572,19 @@ async def test_the_worker_claims_a_workflow_for_the_lease_its_queue_hands_out() 
     try:
         async with asyncio.timeout(3):
             await holding.wait()
-        held_for = timedelta(seconds=checkpointer.held_until[WORKFLOW] - monotonic())
+        claim = checkpointer.claims[WORKFLOW]
+        alive_for = timedelta(seconds=claim.alive_until - monotonic())
+        budget_for = timedelta(seconds=claim.held_until - monotonic())
     finally:
         releasing.set()
         worker.cancel()
 
     # Whatever the runner spends between the worker writing the claim and this read comes
-    # off `held_for`, and a loaded one spends far more than a tick there. The slack only has
+    # off `alive_for`, and a loaded one spends far more than a tick there. The slack only has
     # to stay well short of the gap between the windows being told apart, so it is generous.
     slack = lease / 2
-    assert lease - slack <= held_for <= lease, f"the claim runs to the queue's lease, not to {LEASE}"
+    assert lease - slack <= alive_for <= lease, f"the liveness window runs to the queue's lease, not to {LEASE}"
+    assert budget_for > lease, "and the budget is the worker's own number, not the queue's"
 
 
 async def test_the_worker_bounds_each_pull_by_the_windows_it_was_given() -> None:
@@ -742,10 +815,12 @@ async def test_a_body_driven_without_the_worker_suspends_the_same_way() -> None:
     # turns it into a `Sleeping`, which is what every driver above it matches on.
     checkpointer = MemoryCheckpointer()
     await checkpointer.supply(WORKFLOW, "order", SMALL)
+    holder = await claimed(checkpointer, WORKFLOW)
     run = Run(
-        holder=await claimed(checkpointer, WORKFLOW),
+        holder=holder,
         checkpointer=checkpointer,
         recorded=await checkpointer.load(WORKFLOW),
+        extend=extending(checkpointer),
         now=Clock(),
     )
 

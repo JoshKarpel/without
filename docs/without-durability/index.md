@@ -325,33 +325,55 @@ durable = PostgresDurable(PostgresCheckpointer(pool=pool), PostgresScheduler(poo
 
 ### How the timings relate
 
-How long a pass may honestly take is the one timing a deployment usually has to
-change, and it is a single number on the scheduler:
-`PostgresScheduler(pool=pool, lease=timedelta(minutes=5))` keeps a taken workflow
-invisible for five minutes, and `work` reads that back and claims the workflow for five
-minutes to match. It sits on the store rather than being an argument to `work` because
-the queue is where half of it is already written (a visibility-scored store puts it in
-the row it takes), and because the two halves disagreeing is a quiet failure rather
-than a loud one: a delivery that becomes reclaimable before its holder's claim lapses
-goes to a worker that cannot write to it yet, which spends a whole pass discovering
-that.
+A claim carries two deadlines, and separating them is what makes either one answerable.
 
-There are six durations across the stores and the worker, and the natural worry is that
+`lease` is how long one sign of life is good for. A pass renews inside it for as long as
+it runs, so what it measures is how quickly a *dead* worker's workflow is picked up by
+somebody else, and it has nothing to do with how long the work takes. It lives on the
+scheduler (`PostgresScheduler(pool=pool, lease=timedelta(seconds=30))`) because the queue
+is where half of it is already written: a visibility-scored store puts it in the row it
+takes, `work` reads it back, and the worker renews claim and delivery together on one
+tick. The two halves disagreeing is a quiet failure rather than a loud one, which is why
+they come from one place.
+
+`budget` is how long a single pass may hold a workflow however alive it looks, and it is
+a `work` argument rather than the scheduler's because the queue has no opinion about it.
+It is the deadline renewal cannot lift, which is what stops a pass wedged on a step that
+will never return from holding its workflow for ever: a hung pass goes on answering the
+renewal perfectly well, since its loop is free and it is simply not going to finish. The
+default has to cover the steps nobody annotated, and a step that knows better says so:
+
+```python
+await run.step("transcode", lambda: transcode(source), as_path, within=timedelta(hours=2))
+```
+
+That claim is stretched before the effect runs, so a two-hour step is never fenced, and a
+worker that dies inside one still loses the workflow within a `lease`. Annotating cheap
+steps costs nothing: the extension is skipped whenever the outstanding budget already
+covers what the step asked for, so the store is only asked when the answer changes.
+
+There are eight durations across the stores, the worker, and a step, and the natural worry is that
 they form a hierarchy nobody has written down. They mostly do not, and where one
 relation would have had teeth it was designed out rather than documented:
 
 | Duration | Where it is set | What it depends on |
 |---|---|---|
-| `lease` | the scheduler | how long a pass can honestly take, which is a property of the *workflow*, not of any other setting |
-| `poll` | the scheduler | nothing; above `within` it merely stops having an effect |
+| `lease` | the scheduler | how fast a dead worker should be noticed; nothing about the workflow |
+| `budget` | `work` | how long a step can honestly take, for the steps that name no window of their own |
+| `within` | `Run.step` and `Run.transact` | how long *that* step can honestly take, which only its own code knows |
+| `poll` | the scheduler | nothing; above `work`'s `within` it merely stops having an effect |
 | `within` | `work` | nothing; it is a shutdown bound, not a rate |
 | `tick` | `work` | nothing; it is the granularity a slept-out workflow wakes at |
 | `contended` | `work` | nothing; a preference about how eagerly to re-look |
 | `ttl` | `RedisCheckpointer` | the longest a workflow may *wait*, which is again the workflow's property |
 
-Two of those are worth spelling out. `poll` and `within` interact but cannot conflict,
-because `next_ready` sleeps for `min(poll, remaining)`: a poll interval longer than the
-read budget costs one extra attempt and nothing else, so the pair needs no rule. And
+One word does duty for two of those: a step's `within` is how long that step may take,
+and `work`'s is how long a pull may block. They sit on different calls and never meet,
+but the table lists both, so what follows says which it means.
+
+Two pairs are worth spelling out. `poll` and `work`'s `within` interact but cannot
+conflict, because `next_ready` sleeps for `min(poll, remaining)`: a poll interval longer
+than the read budget costs one extra attempt and nothing else, so the pair needs no rule. And
 `ttl` looks like it must exceed `lease`, since a checkpoint that expires under a live
 claim would take the fencing token with it, but it does not: the Redis `CLAIM` script
 stamps each token `max(now_ms, previous + 1)`, a hybrid logical clock, precisely so
@@ -360,13 +382,17 @@ it. The dependency was removed rather than left for an operator to respect, whic
 the shape to prefer whenever it is available.
 
 What that leaves is one relation with real teeth, and it is the one no check can reach:
-a `lease` has to exceed the longest a pass takes, and a Redis `ttl` has to exceed the
+a `budget` has to exceed the longest a step takes, and a Redis `ttl` has to exceed the
 longest sleep or approval a workflow can sit in. Both right-hand sides are facts about
 the workflow body rather than about any configured value, so they are stated as
-requirements and guessed at by whoever deploys. What *is* enforced is the floor: every
-one of these is refused at construction unless it is a positive duration, since none of
-them has a meaningful zero and a duration read from an unset setting is how one
-arrives.
+requirements and guessed at by whoever deploys. What shrank it is `within`, which moves
+the guess from one number covering every workflow a worker runs to a statement by the
+code that knows; what is left is a default for the steps nobody annotated. What *is*
+enforced is the floor: every one of these is refused unless it is a positive duration,
+since none of them has a meaningful zero and a duration read from an unset setting is how
+one arrives. For the seven that are configured that check happens at construction; a
+step's `within` arrives per call, so it is checked there, which is also the only place it
+could be.
 
 ## Gaps
 
@@ -393,16 +419,25 @@ features, expected in something this size:
   appended message has no key a retry can address: sending it again appends a *second*
   entry rather than landing on the first. `PostgresDurable` and `SqliteDurable` do not
   have this gap.
-- **The lease is a guess, not a bound.** `Scheduler.lease` has to exceed the longest a
-  pass can honestly take, and nothing can work that out for you. Set it too short and a
-  slow pass is fenced mid-flight and has to be re-run; too long and a crashed worker's
-  workflow waits that long. Nothing renews it while a pass runs, deliberately: the fence
-  makes an overrun safe rather than corrupting, so renewal would buy throughput, not
-  correctness. What is *not* left to a guess is the two windows agreeing, since the
-  worker takes both from this one number.
+- **The budget is a guess, not a bound.** It has to exceed the longest a step can
+  honestly take, and nothing can work that out for you. Set it too short and a slow pass
+  is fenced mid-flight, which is not merely a re-run: the step it was in the middle of has
+  already performed its effect, so the pass that takes over performs it again, on a
+  perfectly healthy system. A step that knows its own worst case says so with `within`,
+  which leaves the default covering only the steps nobody annotated, and the renewal
+  means an undersized guess is the only way to reach that failure. What is *not* left to
+  a guess is the two windows agreeing, since the worker takes both from the scheduler's
+  `lease`.
+- **A hung step holds its workflow for its whole budget.** Renewal cannot tell a step
+  that is slow from one that will never return, so the budget is the only thing that ends
+  it, and nothing here times an effect out or interrupts one. A `within` sized for the
+  worst case is therefore also how long a wedged pass sits on a workflow before anything
+  else may touch it.
 - **No retries, backoff, or timeouts.** A step that raises is logged and acknowledged,
-  and the workflow stops until something else wakes it. There is no dead-letter and no
-  heartbeat.
+  and the workflow stops until something else wakes it. There is no dead-letter, and
+  nothing bounds how long an effect may run: the worker's heartbeat says a pass is still
+  *there*, which is not the same as saying it is getting anywhere, and the budget is a
+  deadline on the claim rather than on the work.
 - **No history beyond when each record landed.** `history` carries the moment the store
   wrote each record, which is enough to say how long a workflow spent between two steps and
   when it last moved. What it is not is a log: the checkpoint is still latest-state only,

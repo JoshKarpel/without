@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`without-durability`**: a claim now carries two deadlines instead of one, so a slow
+  pass is no longer fenced for being slow. `Checkpointer.claim` takes a `budget` and an
+  `alive` window and lapses at whichever comes first: one `alive` past its holder's last
+  sign of life, or its budget running out. The worker renews on a tick
+  (`Checkpointer.renew` alongside `Scheduler.extend`, both on the scheduler's `lease`), so
+  a pass that is still running keeps its workflow however short that window is, and
+  `work(..., budget=...)` caps how long any one pass may hold a workflow however alive it
+  looks.
+
+  One number was answering two questions that pull opposite ways. A single lease had to
+  exceed the longest a pass could honestly take, or a healthy-but-slow pass was fenced
+  mid-flight; and it had to be short, or a crashed worker's workflow waited that long
+  before anyone could touch it. Being fenced was not merely a re-run, either: the step in
+  flight had already performed its effect, so the pass that took over performed it again,
+  on a system where nothing had gone wrong. Splitting the deadlines makes each one
+  answerable, since the liveness window measures how fast a death is noticed and has
+  nothing to do with how long the work takes.
+
+  `Run.step`, `Run.transact`, and `Run.perform` take a `within`, which is the budget that
+  step says it needs, granted before its effect runs. That moves the guess from one number
+  covering every workflow a worker runs to a statement by the code that knows, and leaves
+  the deployment-wide default covering only the steps nobody annotated. Annotating a cheap
+  step costs nothing: the extension is skipped whenever the outstanding budget already
+  covers the request, and a step that is already recorded never reaches it at all. How a
+  pass buys that time is an injected `Extend` (`extending` builds the ordinary one), so a
+  test hands in a function rather than a store.
+
+  A write counts as a sign of life, folded into the statement or script that already
+  fences it, so a workflow of ordinary short steps renews itself with no extra round trip
+  and the tick is left with the case it is really for: one step long enough that no write
+  falls inside a whole window. Every renewal is capped at the budget, which is what stops a
+  hung pass from holding a workflow for ever and what stops a write still in flight after a
+  `release` from taking the workflow back.
+
+### Changed
+
+- **`without-durability`**: `Scheduler.extend` returns the delivery to use from then on
+  rather than nothing. Three of the four schedulers make the visibility a delivery was
+  taken under *be* its receipt, so renewing renames it, and a worker still holding the old
+  name would find its own `done` silently declined and the workflow redelivered for
+  nothing.
+- **`without-durability`**: `Run` takes an `extend`, and `Checkpointer.claim` takes two
+  durations where it took one. A store or a hand-built `Run` from 0.0.8 needs updating;
+  the SQL claim tables gain two columns and a Redis pass hash two fields, so an existing
+  database has to be recreated.
+
 ## 0.0.8
 
 ### Added

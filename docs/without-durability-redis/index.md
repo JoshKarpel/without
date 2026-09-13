@@ -47,7 +47,7 @@ rather than anything wrong with a single structure.
 | Key | Type | Written by | Grows | Ends |
 |---|---|---|---|---|
 | `workflow:{id}` | HASH | `supply` from the API, `record` from a pass | one field per completed step | TTL, re-armed on every write |
-| `workflow:{id}:pass` | HASH, 2 fields | `claim` and `release` | never (fixed shape) | TTL, re-armed with the checkpoint |
+| `workflow:{id}:pass` | HASH, 4 fields | `claim`, `extend`, `renew`, and `release` | never (fixed shape) | TTL, re-armed with the checkpoint |
 | `{ns}:ready` | STREAM + group | `make_ready`, and the timer | one entry per wakeup | `trimming`, behind what every group acknowledged |
 | `{ns}:sleeping` | ZSET | `wake_at`, drained by `wake_due` | one member per sleeping workflow | removed when it comes due |
 
@@ -79,32 +79,33 @@ POST /orders
   make_ready        ─────────────────────────────────────────▶ ▪ 1-0
 worker pulls
   XREADGROUP        ───────────────────────────────────────── ▫ 1-0 pending
-  claim             ────────────────────▶ ▪ token=1 until=T₁
-  step "items"      ─▶ ▪ items
+  claim             ────────────────────▶ ▪ token=1 until=B₁ alive=A₁
+  step "items"      ─▶ ▪ items              (a write is itself a sign of life)
   step "captured:*" ─▶ ▪ captured:piano
                     ─▶ ▪ captured:stool
+  renew, on a tick  ────────────────────▶ ▪ alive=A₁′  (never past until)
   sleep "settling"  ─▶ ▪ settling=D            (the deadline, not the duration)
   Sleeping(D)       ─────────────────────────────────────────────────────────▶ ▪ score=D
-  release           ────────────────────▶ ▪ token=1 until=0
+  release           ────────────────────▶ ▪ token=1 until=0 alive=0
   XACK              ───────────────────────────────────────── ▫ 1-0 acked, still in the stream
 timer, once D passes
   wake_due (Lua)    ─────────────────────────────────────────▶ ▪ 2-0        ◀── ▪ removed
 worker pulls again
-  claim             ────────────────────▶ ▪ token=2 until=T₂  (the fence advances)
+  claim             ────────────────────▶ ▪ token=2 until=B₂ alive=A₂  (the fence advances)
   awaiting          ─  suspends: "approved-by" is not there
   Blocked           ── nothing scheduled: only the world can answer this
-  release, XACK     ────────────────────▶ until=0             ▫ 2-0 acked
+  release, XACK     ────────────────────▶ until=0 alive=0     ▫ 2-0 acked
 POST /confirmation
   supply("approved-by") ▪ approved-by
   make_ready        ─────────────────────────────────────────▶ ▪ 3-0
 worker pulls again
-  claim             ────────────────────▶ ▪ token=3 until=T₃
+  claim             ────────────────────▶ ▪ token=3 until=B₃ alive=A₃
   step "paid"       ─▶ ▪ paid
-  release, XACK     ────────────────────▶ until=0             ▫ 3-0 acked
+  release, XACK     ────────────────────▶ until=0 alive=0     ▫ 3-0 acked
                        ▲                  ▲                    ▲               ▲
-                    5 fields, TTL       reset to token=0     3 entries,      empty
-                    re-armed each write   only when the       acked and       again
-                                          workflow expires    trimmable
+                    5 fields, TTL       4 fields; token      3 entries,      empty
+                    re-armed each write   resets only when    acked and       again
+                                          the workflow expires trimmable
 ```
 
 Two things the diagram is meant to make obvious. The checkpoint only ever grows,
@@ -146,12 +147,17 @@ the fields: `DEL` rather than `HDEL`, because `HLEN` is the position counter and
 deleting fields out of a surviving hash would hand out positions that are already
 taken. The pass key goes the other way, keeping its token and raising it, so a
 pass still holding one is refused rather than outranking whatever takes the id
-next. That leaves a two-field tombstone which the TTL collects on its own, which
+next. That leaves a four-field tombstone which the TTL collects on its own, which
 is the same expiry that already collects a finished workflow.
 
-**The claim** is born on the first `claim` and has a fixed two-field shape.
-`token` only rises, `until` moves forward on a claim and to zero on a release. It
-shares the checkpoint's TTL and is re-armed alongside it.
+**The claim** is born on the first `claim` and has a fixed four-field shape.
+`token` only rises. `until` is the budget, moving forward on a claim or an `extend`
+and to zero on a release. `alive` is when the claim lapses if nothing more is heard,
+which is the field `CLAIM` actually tests, and every script that writes it takes
+`math.min` against `until`, so a sign of life can neither carry a pass past its
+budget nor take a workflow back after a release has zeroed it. `for` is what one
+sign of life is worth, kept here because `RECORD` is one and has only the keys to go
+on. It shares the checkpoint's TTL and is re-armed alongside it.
 
 Sharing that lifetime is what makes the token's arithmetic worth a second look.
 Both keys expire together, so a workflow quiet for longer than the TTL is

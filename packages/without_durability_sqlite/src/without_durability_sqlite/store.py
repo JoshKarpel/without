@@ -141,7 +141,15 @@ CREATE TABLE IF NOT EXISTS workflow_checkpoint (
 CREATE TABLE IF NOT EXISTS workflow_claim (
     workflow TEXT PRIMARY KEY,
     token INTEGER NOT NULL,
-    held_until REAL NOT NULL
+    -- The budget: the latest this claim can lapse at, whatever its holder does.
+    held_until REAL NOT NULL,
+    -- When it lapses if nothing more is heard, which is what `CLAIM` tests. Every write of
+    -- it is a `MIN` against `held_until`, so a sign of life cannot carry a pass past its
+    -- budget or take a workflow back after a `RELEASE`.
+    alive_until REAL NOT NULL,
+    -- What one sign of life is worth, carried here because `RECORD` is one and is not told:
+    -- the statement making a write has only the workflow to go on.
+    alive_for REAL NOT NULL
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS workflow_queue (
@@ -165,12 +173,49 @@ CREATE INDEX IF NOT EXISTS workflow_queue_visible_at ON workflow_queue (namespac
 # between the two. SQLite *is* the caller's machine, so that argument does not apply;
 # keeping the clock in SQL anyway costs nothing and keeps the three stores reading alike.
 CLAIM = """
-INSERT INTO workflow_claim (workflow, token, held_until)
-VALUES (:workflow, 1, unixepoch('now', 'subsec') + :lease)
+INSERT INTO workflow_claim (workflow, token, held_until, alive_until, alive_for)
+VALUES (
+    :workflow, 1,
+    unixepoch('now', 'subsec') + :budget,
+    unixepoch('now', 'subsec') + MIN(:alive, :budget),
+    :alive
+)
 ON CONFLICT (workflow) DO UPDATE
-    SET token = workflow_claim.token + 1, held_until = unixepoch('now', 'subsec') + :lease
-    WHERE workflow_claim.held_until <= unixepoch('now', 'subsec')
+    SET token = workflow_claim.token + 1,
+        held_until = unixepoch('now', 'subsec') + :budget,
+        alive_until = unixepoch('now', 'subsec') + MIN(:alive, :budget),
+        alive_for = :alive
+    WHERE workflow_claim.alive_until <= unixepoch('now', 'subsec')
 RETURNING token
+"""
+
+# A fresh budget and a sign of life with it: what a step that declared a `within` spends
+# before running its effect. Conditional on the token rather than on the deadline, since a
+# claim that has lapsed without being taken is still this pass's to stretch.
+EXTEND = """
+UPDATE workflow_claim
+SET held_until = unixepoch('now', 'subsec') + :budget,
+    alive_until = unixepoch('now', 'subsec') + MIN(:alive, :budget),
+    alive_for = :alive
+WHERE workflow = :workflow AND token <= :token
+"""
+
+# A sign of life and nothing else: the worker's tick. The `MIN` against the budget is what
+# makes "this does not buy more time" true rather than merely intended.
+RENEW = """
+UPDATE workflow_claim
+SET alive_until = MIN(unixepoch('now', 'subsec') + :alive, held_until), alive_for = :alive
+WHERE workflow = :workflow AND token <= :token
+"""
+
+# A write is a sign of life, so `record` and `transact` note one in the same transaction
+# they write in. Postgres folds this into the fence CTE its `RECORD` already locks with;
+# SQLite admits one writer at a time, so a second statement inside the same transaction is
+# the same atomicity by a plainer route.
+WROTE = """
+UPDATE workflow_claim
+SET alive_until = MIN(unixepoch('now', 'subsec') + alive_for, held_until)
+WHERE workflow = :workflow
 """
 
 # The fenced, conditional write, as one statement. The Postgres version wraps its fence
@@ -237,7 +282,15 @@ LOAD = "SELECT step, value FROM workflow_checkpoint WHERE workflow = ? ORDER BY 
 HISTORY = "SELECT step, value, written_at FROM workflow_checkpoint WHERE workflow = ? ORDER BY seq"
 # Hand the workflow back early, but keep the token, so the next claim gets the next
 # number up and a pass that comes back from the dead still loses.
-RELEASE = "UPDATE workflow_claim SET held_until = unixepoch('now', 'subsec') WHERE workflow = ? AND token = ?"
+# Both deadlines, and the budget is the load-bearing one: a write this pass had already
+# started is entitled to land, since releasing keeps the token, and bringing `held_until`
+# down to now is what stops that write's own `WROTE` from claiming the workflow straight
+# back, since every renewal is a `MIN` against it.
+RELEASE = """
+UPDATE workflow_claim
+SET held_until = unixepoch('now', 'subsec'), alive_until = unixepoch('now', 'subsec')
+WHERE workflow = ? AND token = ?
+"""
 
 # Forget every record a workflow has. Paired with `SUPERSEDE` below and never run without
 # it, which is what the transaction in `discard` is for.
@@ -253,7 +306,9 @@ DISCARD = "DELETE FROM workflow_checkpoint WHERE workflow = ?"
 # ordering, not the claim.
 SUPERSEDE = """
 UPDATE workflow_claim
-SET token = token + 1, held_until = unixepoch('now', 'subsec')
+SET token = token + 1,
+    held_until = unixepoch('now', 'subsec'),
+    alive_until = unixepoch('now', 'subsec')
 WHERE workflow = ?
 """
 
@@ -295,6 +350,19 @@ CANCEL = "DELETE FROM workflow_queue WHERE namespace = ? AND workflow = ?"
 # deadline that may be days away. The deadline is in the checkpoint either way, so the
 # pass that runs sooner writes it again.
 SUSPEND = "UPDATE workflow_queue SET visible_at = ? WHERE namespace = ? AND workflow = ? AND visible_at = ?"
+
+# Keep a delivery this worker's for another `within`, under the same comparison as `SUSPEND`
+# and for the same reason: a `make_ready` that landed since wrote a different `visible_at`,
+# and pushing the visibility out on top of it would bury a wakeup that already arrived.
+#
+# The new visibility is returned because it *is* the new receipt, which is the price of the
+# trick that makes this table a queue: a worker still holding the old one would find its own
+# `FINISH` refused by that equality and the workflow redelivered for nothing.
+RENEW_DELIVERY = """
+UPDATE workflow_queue SET visible_at = unixepoch('now', 'subsec') + :within
+WHERE namespace = :namespace AND workflow = :workflow AND visible_at = :receipt
+RETURNING visible_at
+"""
 
 # What an effect is for a store whose datastore is a SQLite file: a callback handed a
 # cursor already inside `transact`'s transaction.
@@ -509,30 +577,65 @@ class SqliteCheckpointer:
             for step, encoded, written_at in rows
         }
 
-    async def claim(self, workflow: str, lease: timedelta) -> Pass | None:
+    async def claim(self, workflow: str, budget: timedelta, alive: timedelta) -> Pass | None:
         taken = await self.database.run(
             lambda connection: connection.execute(
                 CLAIM,
-                {"workflow": workflow, "lease": lease.total_seconds()},
+                {
+                    "workflow": workflow,
+                    "budget": budget.total_seconds(),
+                    "alive": alive.total_seconds(),
+                },
             ).fetchone()
         )
         if taken is None:
             return None
         return Pass(workflow=workflow, token=int(taken[0]))
 
+    async def extend(self, holder: Pass, budget: timedelta, alive: timedelta) -> bool:
+        changed = await self.database.run(
+            lambda connection: (
+                connection.execute(
+                    EXTEND,
+                    {
+                        "workflow": holder.workflow,
+                        "token": holder.token,
+                        "budget": budget.total_seconds(),
+                        "alive": alive.total_seconds(),
+                    },
+                ).rowcount
+            )
+        )
+        # No row touched means the `WHERE` refused the token, which is the only way this
+        # misses: a `Pass` exists because a `claim` wrote the row it names.
+        return changed == 1
+
+    async def renew(self, holder: Pass, alive: timedelta) -> bool:
+        changed = await self.database.run(
+            lambda connection: (
+                connection.execute(
+                    RENEW,
+                    {"workflow": holder.workflow, "token": holder.token, "alive": alive.total_seconds()},
+                ).rowcount
+            )
+        )
+        return changed == 1
+
     async def record(self, holder: Pass, key: str, value: object) -> Recorded:
         encoded = self.codec.encode(value)
-        stored = await self.database.run(
-            lambda connection: connection.execute(
+
+        # The encoding stored, and whether it is this call's, which SQLite answers with 0/1.
+        def write(cursor: sqlite3.Cursor) -> tuple[str, int] | None:
+            # The write and the sign of life it counts as, in one transaction, so a crash
+            # between them cannot leave a record whose writer looks dead.
+            stored = cursor.execute(
                 RECORD,
-                {
-                    "workflow": holder.workflow,
-                    "step": key,
-                    "value": encoded,
-                    "token": holder.token,
-                },
+                {"workflow": holder.workflow, "step": key, "value": encoded, "token": holder.token},
             ).fetchone()
-        )
+            cursor.execute(WROTE, {"workflow": holder.workflow})
+            return stored
+
+        stored = await self.database.run(lambda connection: transacted(connection, write))
         if stored is None:
             # The statement wrote nothing, which happens for exactly one reason: the
             # `WHERE` that guards the insert compared this pass's token against the fence
@@ -565,6 +668,7 @@ class SqliteCheckpointer:
                 return self.codec.decode(recorded[0])
             written = self.codec.encode(effect(cursor))
             cursor.execute(WRITE, (holder.workflow, key, written))
+            cursor.execute(WROTE, {"workflow": holder.workflow})
             return self.codec.decode(written)
 
         return await self.database.run(lambda connection: transacted(connection, one_commit))
@@ -716,6 +820,34 @@ class SqliteScheduler:
     async def reclaim(self, idle: timedelta) -> Delivery | None:
         """Nothing to take over by hand: an abandoned workflow becomes visible on its own."""
         return None
+
+    async def extend(self, delivery: Delivery, within: timedelta) -> Delivery:
+        """
+        Push this delivery's visibility out, and say what it is called now.
+
+        The new visibility is the new receipt, since this table's receipt *is* its
+        visibility, so the caller is handed a delivery to use from here rather than left to
+        discover that the one it holds has been renamed.
+
+        No row means this delivery is no longer this worker's: cancelled, or rescheduled by
+        a wakeup that arrived mid-pass, either of which wrote a `visible_at` that is not the
+        one it took. The answer to both is to hand back what came in, exactly as `wake_at`
+        and `done` already do.
+        """
+        renewed = await self.database.run(
+            lambda connection: connection.execute(
+                RENEW_DELIVERY,
+                {
+                    "namespace": self.namespace,
+                    "workflow": delivery.workflow,
+                    "receipt": float(delivery.receipt),
+                    "within": within.total_seconds(),
+                },
+            ).fetchone()
+        )
+        if renewed is None:
+            return delivery
+        return Delivery(workflow=delivery.workflow, receipt=repr(float(renewed[0])))
 
     async def cancel(self, workflow: str) -> None:
         """

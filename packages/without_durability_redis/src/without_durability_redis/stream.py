@@ -313,6 +313,37 @@ class RedisStreamScheduler:
         taken = deliveries(entries)
         return taken[0] if taken else None
 
+    async def extend(self, delivery: Delivery, within: timedelta) -> Delivery:
+        """
+        Reset this delivery's idle clock, so `reclaim` stops counting it as abandoned.
+
+        The only scheduler here whose delivery keeps its name across a renewal, because it
+        is the only one whose receipt is an identity rather than a deadline: a stream entry
+        id says when the entry was appended, which no amount of renewing changes. So the
+        delivery comes back exactly as it went in, and the `Delivery` this returns is the
+        argument.
+
+        `XCLAIM` with `JUSTID` is what says it, and the reset is the point rather than a
+        side effect: idle time is what `reclaim` measures, so claiming an entry this
+        consumer already holds sets it back to zero without moving the entry anywhere.
+        `min_idle_time=0` because this worker is asking about its own delivery rather than
+        hunting for an abandoned one, and `within` therefore has nothing to say here: the
+        clock is reset to now either way, and how long that buys is whatever `idle` the next
+        `reclaim` measures against.
+
+        Silent about an entry the group no longer holds, since `XCLAIM` on an acknowledged
+        or deleted id returns nothing rather than failing.
+        """
+        await self.redis.xclaim(
+            self.ready_key,
+            self.group,
+            self.consumer,
+            min_idle_time=0,
+            message_ids=[delivery.receipt],
+            justid=True,
+        )
+        return delivery
+
     async def cancel(self, workflow: str) -> None:
         """
         Drop the workflow from the sleepers, and delete every entry it has in the stream.

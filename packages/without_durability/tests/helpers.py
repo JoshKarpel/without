@@ -7,11 +7,35 @@ from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
 
+from without_durability import Checkpointer
 from without_durability import MemoryCheckpointer
 from without_durability import Pass
 from without_durability import Recorded
+from without_durability import Run
+from without_durability import StepKey
+from without_durability import extending
 
 STARTED_AT = datetime(2026, 3, 14, 9, 30, tzinfo=UTC)
+
+
+def passing[Effect](
+    holder: Pass,
+    checkpointer: Checkpointer[Effect],
+    recorded: dict[StepKey, object] | None = None,
+) -> Run[Effect]:
+    """
+    A `Run` wired as `resume` wires one, for a test driving a single method rather than a body.
+
+    The wiring is here rather than at each call site so that a test says what it is about
+    (this holder, this checkpointer, these records) instead of restating how a pass is
+    assembled. Anything testing the assembly itself builds its own.
+    """
+    return Run(
+        holder=holder,
+        checkpointer=checkpointer,
+        recorded=recorded if recorded is not None else {},
+        extend=extending(checkpointer),
+    )
 
 
 @dataclass(slots=True)
