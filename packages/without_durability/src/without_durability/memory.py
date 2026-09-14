@@ -168,13 +168,18 @@ class MemoryCheckpointer:
         held = self.claims[holder.workflow]
         if holder.token < held.token:
             return False
-        granted = replace(held, held_until=monotonic() + budget.total_seconds())
+        # The later of the two, so a step naming a window shorter than what is left takes
+        # nothing away from the steps behind it.
+        granted = replace(held, held_until=max(held.held_until, monotonic() + budget.total_seconds()))
         self.claims[holder.workflow] = granted.heard_from(monotonic(), alive)
         return True
 
     async def renew(self, holder: Pass, alive: timedelta) -> bool:
         held = self.claims[holder.workflow]
-        if holder.token < held.token:
+        # Past the budget as well as below the fence, because the answer is what the worker
+        # acts on: a renewal that reported success on a lapsed claim would keep a hung pass
+        # running, and the workflow with it, for as long as nothing else happened to take it.
+        if holder.token < held.token or held.held_until <= monotonic():
             return False
         self.claims[holder.workflow] = held.heard_from(monotonic(), alive)
         return True

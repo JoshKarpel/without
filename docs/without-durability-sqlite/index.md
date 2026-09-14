@@ -60,7 +60,7 @@ The same shapes as the Postgres store, minus what SQLite makes unnecessary:
 | | Postgres | SQLite |
 |---|---|---|
 | Claim | upsert whose `DO UPDATE` carries a `WHERE` | the same |
-| Record under the fence | a `FOR UPDATE` CTE feeding an upsert | the upsert alone; the statement is its own transaction and there is one writer |
+| Record under the fence | an `UPDATE ... RETURNING` CTE on the claim row feeding an upsert | the upsert and the sign of life as two statements under `BEGIN IMMEDIATE`; there is one writer |
 | Take the next ready workflow | `FOR UPDATE SKIP LOCKED` | a plain `UPDATE ... RETURNING`; there is no concurrent writer to step over |
 | Step and checkpoint together | `BEGIN` ... `COMMIT` | `BEGIN IMMEDIATE` ... `COMMIT` |
 

@@ -5,6 +5,7 @@ from datetime import timedelta
 
 import pytest
 from without_durability import Durable
+from without_durability import Fenced
 from without_durability import claimed
 
 from .stores import durable  # noqa: F401 - the parametrized fixture every test here takes
@@ -74,16 +75,60 @@ async def test_renewing_cannot_carry_a_claim_past_its_budget(
     workflow: str,
 ) -> None:
     # What stops a hung pass from holding a workflow for ever. A step that will never return
-    # goes on answering the renewal perfectly well, since its loop is free and it is simply
-    # not going to finish, so the budget has to be a deadline renewal cannot lift.
+    # goes on asking for the renewal perfectly well, since its loop is free and it is simply
+    # not going to finish, so the budget has to be a deadline renewal cannot lift, and the
+    # renewal has to *say* the budget is gone: the worker acts on the answer, and a renewal
+    # that reported success on a lapsed claim would leave the hung pass running, holding
+    # the only delivery its workflow has.
     checkpointer = durable.checkpointer
     holder = await claimed(checkpointer, workflow, BRIEF, BRIEF)
 
     await asyncio.sleep(BRIEF.total_seconds() * 3)
-    assert await checkpointer.renew(holder, AMPLE), "the token is still this pass's, so the renewal is not refused"
+
+    assert not await checkpointer.renew(holder, AMPLE), "the budget has run out, so the renewal reports the claim gone"
+    assert await checkpointer.claim(workflow, AMPLE, BRIEF) is not None, "and the workflow is free"
+
+
+async def test_a_window_shorter_than_what_is_left_takes_nothing_away(
+    durable: Durable,  # noqa: F811 - the fixture imported above, taken by name
+    workflow: str,
+) -> None:
+    # A step naming a small `within` late in a pass, with most of the pass's budget still
+    # standing. Setting the budget to the window would cut the unannotated steps behind it
+    # down to that window, and a renewal could not lift it again; the budget a pass runs
+    # under can only ever be too generous, which is the promise `extending` skips round
+    # trips on.
+    checkpointer = durable.checkpointer
+    holder = await claimed(checkpointer, workflow, AMPLE, AMPLE)
+
+    assert await checkpointer.extend(holder, BRIEF, AMPLE)
+    await asyncio.sleep(BRIEF.total_seconds() * 3)
+
+    assert await checkpointer.claim(workflow, AMPLE, BRIEF) is None, (
+        "the budget it was claimed for still stands, so the workflow is still held"
+    )
+
+
+async def test_a_write_refused_at_the_fence_renews_nobody(
+    durable: Durable,  # noqa: F811 - the fixture imported above, taken by name
+    workflow: str,
+) -> None:
+    # A superseded pass's stray write, landing after the pass that superseded it has gone
+    # quiet. The write is refused, and it has to renew *nothing* on the way out: a store
+    # that renewed whoever holds the claim would keep a dead holder's claim alive for as
+    # long as the corpse of the pass before it kept writing, and delay the takeover that
+    # the holder's silence should have brought on.
+    checkpointer = durable.checkpointer
+    stalled = await claimed(checkpointer, workflow, AMPLE, BRIEF)
+    await checkpointer.release(stalled)
+    await claimed(checkpointer, workflow, AMPLE, BRIEF)
+    await asyncio.sleep(BRIEF.total_seconds() * 2)  # the holder goes quiet for longer than its window
+
+    with pytest.raises(Fenced):
+        await checkpointer.record(stalled, "stray", "s-1")
 
     assert await checkpointer.claim(workflow, AMPLE, BRIEF) is not None, (
-        "but the budget has run out, so the renewal bought nothing and the workflow is free"
+        "the holder's silence freed the workflow, and the refused write did not un-free it"
     )
 
 

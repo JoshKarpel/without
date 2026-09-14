@@ -41,6 +41,7 @@ import logging
 from collections.abc import AsyncGenerator
 from collections.abc import Awaitable
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import datetime
 from datetime import timedelta
 from typing import assert_never
@@ -139,8 +140,9 @@ def passes(
     async def advance(taken: Delivery) -> None:
         # Rebound rather than reassigned, because `extend` renames a delivery on every store
         # whose receipt is the visibility it was taken under. Everything below answers for
-        # the *current* name, and `keep_alive` is cancelled before any of it runs, so
-        # nothing here can read one the renewal is halfway through replacing.
+        # the *current* name, and `keep_alive` waits out a renewal in flight before it
+        # ends, so by the time anything here runs the name it reads is the one the store
+        # holds rather than one a renewal was halfway through replacing.
         delivery = taken
         holder = await durable.checkpointer.claim(delivery.workflow, budget, lease)
         if holder is None:
@@ -161,7 +163,7 @@ def passes(
         )
         # Set by `keep_alive` and read by the handler below, because a cancelled `await`
         # cannot say who cancelled it and the two callers mean opposite things.
-        taken_over = False
+        lost_claim = False
 
         async def keep_alive() -> None:
             """
@@ -177,20 +179,51 @@ def passes(
             mistake, and it is the *only* thing keeping the delivery alive across one: a
             single slow step makes no writes, so nothing else here would speak for minutes
             at a time.
+
+            A tick that fails is logged and the next one tried, rather than ending the
+            ticker: the tick *is* the retry, and `RENEWALS` per window is the margin that
+            absorbs a missed one. Letting the error out would leave the pass running with
+            nothing renewing it, to be taken over a window later, and would then surface
+            the store's error at the end of a pass that was otherwise fine.
+
+            The renewal of the delivery is shielded, and a cancellation that lands while
+            it is in flight waits for it and takes its answer. On every store whose
+            receipt is the visibility, the store has renamed the delivery the moment the
+            statement commits, whether or not this task was still around to be told; a
+            pass finishing at that moment would otherwise answer `done` under the old
+            name, be silently declined, and be redelivered for nothing.
             """
-            nonlocal taken_over, delivery
+            nonlocal lost_claim, delivery
             while True:
                 await asyncio.sleep((lease / RENEWALS).total_seconds())
-                if not await durable.checkpointer.renew(holder, lease):
-                    # Ending the pass here rather than leaving it to find out at its next
-                    # write is the whole value of having asked: a step with an hour left
-                    # would otherwise spend it on work that is already refused. The
-                    # delivery is deliberately not renewed on the way out, since whoever
-                    # fenced this pass is who should be handed it.
-                    taken_over = True
-                    running.cancel()
-                    return
-                delivery = await durable.scheduler.extend(delivery, lease)
+                try:
+                    if not await durable.checkpointer.renew(holder, lease):
+                        # Ending the pass here rather than leaving it to find out at its
+                        # next write is the whole value of having asked: a step with an
+                        # hour left would otherwise spend it on work that is already
+                        # refused, and a step that will never return would otherwise
+                        # never be ended at all. The delivery is deliberately not renewed
+                        # on the way out, since whoever takes the workflow next is who
+                        # should be handed it.
+                        lost_claim = True
+                        running.cancel()
+                        return
+                    renaming = asyncio.ensure_future(durable.scheduler.extend(delivery, lease))
+                    try:
+                        delivery = await asyncio.shield(renaming)
+                    except asyncio.CancelledError:
+                        while not renaming.done():
+                            with suppress(asyncio.CancelledError):
+                                await asyncio.wait([renaming])
+                        if renaming.exception() is None:
+                            delivery = renaming.result()
+                        else:
+                            logger.warning(
+                                f"{delivery.workflow} could not renew its delivery: {renaming.exception()!r}"
+                            )
+                        raise
+                except Exception as error:  # noqa: BLE001 - a missed tick is retried by the next one, not fatal
+                    logger.warning(f"{delivery.workflow} could not be renewed: {error!r}; trying again next tick")
 
         try:
             async with background_task(keep_alive()):
@@ -198,11 +231,12 @@ def passes(
         except asyncio.CancelledError:
             # This worker's or the world's, and only the flag tells them apart. One nobody
             # here asked for is a shutdown and belongs to whoever sent it; one `keep_alive`
-            # sent is this worker discovering it no longer holds the workflow, which is the
+            # sent is this worker discovering it no longer holds the workflow, whether
+            # because somebody took it or because its budget ran out, which is the
             # `Fenced` case arriving early and gets the same answer.
-            if not taken_over:
+            if not lost_claim:
                 raise
-            await look_again(delivery, "was taken over mid-pass")
+            await look_again(delivery, "lost its claim mid-pass (superseded, or past its budget)")
             return
         except (Fenced, Contended) as lost:
             # The claim lapsed mid-pass and someone else took the workflow, which is the

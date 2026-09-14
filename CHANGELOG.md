@@ -8,10 +8,15 @@
   pass is no longer fenced for being slow. `Checkpointer.claim` takes a `budget` and an
   `alive` window and lapses at whichever comes first: one `alive` past its holder's last
   sign of life, or its budget running out. The worker renews on a tick
-  (`Checkpointer.renew` alongside `Scheduler.extend`, both on the scheduler's `lease`), so
-  a pass that is still running keeps its workflow however short that window is, and
-  `work(..., budget=...)` caps how long any one pass may hold a workflow however alive it
-  looks.
+  (`Checkpointer.renew` alongside the new `Scheduler.extend`, both on the scheduler's
+  `lease`), so a pass that is still running keeps its workflow however short that window
+  is, and `work(..., budget=...)` caps how long any one pass may hold a workflow however
+  alive it looks. `Scheduler.extend` returns the delivery to use from then on: three of
+  the four schedulers make the visibility a delivery was taken under *be* its receipt, so
+  renewing renames it, and a worker still holding the old name would find its own `done`
+  silently declined. The stream scheduler's checks that the entry is still this
+  consumer's before resetting its idle clock, so a delivery another worker has already
+  reclaimed is left with that worker rather than taken back.
 
   One number was answering two questions that pull opposite ways. A single lease had to
   exceed the longest a pass could honestly take, or a healthy-but-slow pass was fenced
@@ -34,21 +39,31 @@
   A write counts as a sign of life, folded into the statement or script that already
   fences it, so a workflow of ordinary short steps renews itself with no extra round trip
   and the tick is left with the case it is really for: one step long enough that no write
-  falls inside a whole window. Every renewal is capped at the budget, which is what stops a
-  hung pass from holding a workflow for ever and what stops a write still in flight after a
-  `release` from taking the workflow back.
+  falls inside a whole window. Only the winning write renews, so a superseded pass's stray
+  writes cannot keep a dead holder's claim alive. Every renewal is capped at the budget,
+  and once the budget is spent `renew` reports the claim gone, which is what ends a hung
+  pass: the worker cancels it and hands the workflow back rather than renewing a claim
+  anybody may take. A window shorter than what is left never shortens the budget. A
+  missed tick (the store briefly unreachable) is logged and the next tick tried, and a
+  renewal in flight when the pass ends is waited out, so the delivery is answered for
+  under the name the store gave it.
+
+  A caller driving `resume` without a worker has no tick, so the window a step buys there
+  counts as a sign of life for the whole of that step, and the default `Extend` assumes
+  nothing about what the claim was taken for: the first window a pass names is always
+  bought.
 
 ### Changed
 
-- **`without-durability`**: `Scheduler.extend` returns the delivery to use from then on
-  rather than nothing. Three of the four schedulers make the visibility a delivery was
-  taken under *be* its receipt, so renewing renames it, and a worker still holding the old
-  name would find its own `done` silently declined and the workflow redelivered for
-  nothing.
 - **`without-durability`**: `Run` takes an `extend`, and `Checkpointer.claim` takes two
   durations where it took one. A store or a hand-built `Run` from 0.0.8 needs updating;
   the SQL claim tables gain two columns and a Redis pass hash two fields, so an existing
   database has to be recreated.
+- **`without-durability-postgres`**: `transact` no longer holds the claim row lock across
+  the effect. The fence is read plainly before the effect and re-read under the lock
+  after it, so a renewal or a `claim` from another connection lands during a long effect
+  rather than queueing behind it, and a pass superseded mid-effect is still refused with
+  its effect rolled back.
 
 ## 0.0.8
 

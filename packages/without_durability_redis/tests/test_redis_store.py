@@ -748,6 +748,53 @@ async def test_a_delivery_a_dead_worker_never_answered_for_is_taken_over(
     assert await surviving.reclaim(timedelta(minutes=1)) is None, "and nothing else is outstanding for long"
 
 
+async def test_renewing_a_delivery_another_worker_has_taken_over_does_not_take_it_back(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # `XCLAIM` resets an entry's idle clock for whoever asks, and a worker whose delivery
+    # was reclaimed a moment ago has no way to know that. Left unchecked, its next tick
+    # would claim the entry straight back from the worker that took it over, and the two
+    # would hand one wakeup back and forth for the rest of the pass.
+    dying = RedisStreamScheduler(redis=redis, namespace=workflow)
+    await dying.prepare()
+    await dying.make_ready("wf-slow")
+    taken = await dying.next_ready(timedelta(seconds=1))
+    assert taken is not None
+    surviving = RedisStreamScheduler(redis=redis, namespace=workflow)
+    taken_over = await surviving.reclaim(timedelta())
+    assert taken_over is not None
+
+    assert await dying.extend(taken, timedelta(seconds=30)) == taken, "silent, as about any delivery not its own"
+
+    still_survivors = await redis.xpending_range(
+        dying.ready_key, dying.group, min="-", max="+", count=1, consumername=surviving.consumer
+    )
+    assert [pending["message_id"] for pending in still_survivors] == [taken.receipt], (
+        "the entry stayed with the worker that took it over"
+    )
+
+
+async def test_renewing_a_delivery_this_worker_holds_resets_its_idle_clock(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # The other half, which the ownership check must not break: a worker's own delivery is
+    # renewed, so a `reclaim` measuring against the lease finds it freshly held.
+    idle = timedelta(milliseconds=100)
+    holding = RedisStreamScheduler(redis=redis, namespace=workflow)
+    await holding.prepare()
+    await holding.make_ready("wf-slow")
+    taken = await holding.next_ready(timedelta(seconds=1))
+    assert taken is not None
+    await asyncio.sleep(idle.total_seconds() * 2)
+
+    assert await holding.extend(taken, timedelta(seconds=30)) == taken
+
+    rescuer = RedisStreamScheduler(redis=redis, namespace=workflow)
+    assert await rescuer.reclaim(idle) is None, "just renewed, so not idle enough to be abandoned"
+
+
 async def test_the_two_queue_keys_share_a_slot_so_the_timers_script_may_touch_both(workflow: str) -> None:
     # `wake_due` is a script over both of these, because taking a workflow off the
     # sleepers and appending it to the stream are durable only together. Redis Cluster

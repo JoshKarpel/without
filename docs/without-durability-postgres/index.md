@@ -49,7 +49,7 @@ came from*, and here it came with the database:
 | | Redis | Postgres |
 |---|---|---|
 | Claim the workflow | the `CLAIM` script: read the lease, compare, write, expire | one upsert whose `DO UPDATE` carries a `WHERE` |
-| Record under the fence | the `RECORD` script: read the token, refuse or `HSETNX`, read back | one statement: a `FOR UPDATE` CTE feeding an upsert |
+| Record under the fence | the `RECORD` script: read the token, refuse or `HSETNX`, read back | one statement: an `UPDATE ... RETURNING` CTE on the claim row feeding an upsert |
 | Supply from outside a pass | the `SUPPLY` script: `HSETNX`, read back | the same upsert without the CTE |
 | Append under a key the store names | the `APPEND` script: `HLEN`, then `HSET` under it | one insert naming its key from `nextval` |
 | Step and checkpoint together | the `TRANSACT` script, a wrapper the effect is spliced into | `BEGIN` ... `COMMIT`, with the effect's own SQL in the middle |
@@ -122,10 +122,23 @@ which costs nothing and buys the renewal: a write is the plainest sign of life a
 pass gives, and the statement was already locking the claim row, so a workflow of
 ordinary short steps renews itself for free and the worker's tick is left with the
 case it is really for, a single step long enough that no write falls inside a whole
-lease. A data-modifying CTE gives the same re-read behaviour the `FOR UPDATE` did,
-re-evaluating against the committed row version and returning what it re-read; that
-was confirmed against a real server rather than assumed, since the whole fence rests
-on it.
+lease. A data-modifying CTE gives the same re-read behaviour a `FOR UPDATE` would,
+re-evaluating its `WHERE` against the committed row version and returning what it
+re-read; that was confirmed against a real server rather than assumed, since the
+whole fence rests on it. The token is in that `WHERE`, so a refused write renews
+nobody: a superseded pass's stray writes would otherwise keep the winner's claim
+alive after the winner had died.
+
+`transact` reads the fence twice, and the split is where the lock goes. A plain
+read before the effect stops a superseded pass from performing anything, and takes
+no lock, so the claim row stays free while the effect runs; the locked re-read comes
+after the effect, in the statement that renews, so a pass superseded meanwhile is
+refused there and its effect rolls back with the transaction. Holding the lock across
+the effect would queue the worker's own renewal (on another connection) behind it
+for the whole effect, and a long effect would then be taken over on commit for having
+gone quiet. That renewal is stamped with `clock_timestamp()`, the one claim
+statement that needs it: `now()` is the transaction's start, which for a slow effect
+is already in the past by the time it commits.
 
 ### What the move takes away
 

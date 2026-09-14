@@ -547,6 +547,36 @@ async def test_a_window_the_outstanding_budget_already_covers_costs_no_round_tri
     assert checkpointer.claims[ORDER].held_until > granted, "and the store moved the deadline out"
 
 
+async def test_the_default_extend_buys_the_first_window_rather_than_assuming_the_claim_covers_it() -> None:
+    # `resume` builds this one, for a caller that did not say what it claimed for. A `Pass`
+    # carries no budget, so any figure assumed here is a guess, and a guess that overstates
+    # the claim is the quiet failure: the step's extension is skipped as already covered,
+    # the short claim lapses under the effect, and the write after it is fenced.
+    checkpointer = MemoryCheckpointer()
+    holder = await claimed(checkpointer, ORDER, budget=timedelta(seconds=10))
+    granted = checkpointer.claims[ORDER].held_until
+    extend = extending(checkpointer)
+
+    assert await extend(holder, timedelta(minutes=2))
+
+    assert checkpointer.claims[ORDER].held_until > granted, "bought from the store, whatever the claim was for"
+
+
+async def test_a_window_bought_without_a_tick_is_alive_for_the_whole_window() -> None:
+    # A caller driving `resume` itself has nothing renewing its claim between writes, and
+    # every store holds the liveness deadline at or below the budget. A window bought under
+    # a liveness tick it does not have would therefore lapse one tick in, however long the
+    # budget said, and the two-hour step it was bought for would be fenced anyway. With no
+    # tick, the window *is* the sign of life, and it is good for as long as the step.
+    checkpointer = MemoryCheckpointer()
+    holder = await claimed(checkpointer, ORDER)
+
+    assert await extending(checkpointer)(holder, timedelta(hours=2))
+
+    claim = checkpointer.claims[ORDER]
+    assert claim.alive_until == claim.held_until, "alive for as long as it is held, since nothing will speak sooner"
+
+
 async def test_a_transacted_step_cannot_be_run_without_being_recorded() -> None:
     # Exactly-once, because there is no in-between for a crash to land in: the effect and
     # its record are one commit, so a record that is missing means the effect did not

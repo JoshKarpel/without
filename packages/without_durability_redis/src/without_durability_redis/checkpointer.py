@@ -152,7 +152,9 @@ return token
 
 # A fresh budget and a sign of life with it: what a step that declared a `within` spends
 # before running its effect. Conditional on the token rather than on the deadline, since a
-# claim that has lapsed without being taken is still this pass's to stretch.
+# claim that has lapsed without being taken is still this pass's to stretch. The `math.max`
+# against the budget already standing is what keeps a short window from taking time away
+# from the unannotated steps behind it: a budget can only ever be too generous from here.
 #
 #   KEYS[1]  the workflow's pass hash
 #   ARGV[1]  the asking pass's fencing token
@@ -165,7 +167,7 @@ EXTEND = (
     + """
 if tonumber(ARGV[1]) < tonumber(redis.call('HGET', KEYS[1], 'token') or '0') then return 0 end
 local now_ms = now_ms()
-local held_until = now_ms + tonumber(ARGV[2])
+local held_until = math.max(tonumber(redis.call('HGET', KEYS[1], 'until') or '0'), now_ms + tonumber(ARGV[2]))
 redis.call('HSET', KEYS[1], 'until', held_until, 'for', ARGV[3],
   'alive', math.min(now_ms + tonumber(ARGV[3]), held_until))
 redis.call('EXPIRE', KEYS[1], ARGV[4])
@@ -174,17 +176,22 @@ return 1
 )
 
 # A sign of life and nothing else: the worker's tick, which says this pass is still running
-# without saying it may run any longer than it was already granted.
+# without saying it may run any longer than it was already granted. Refused once the budget
+# has run out as well as below the fence, because the answer is what the worker acts on: a
+# renewal that reported success on a lapsed claim would keep a hung pass running for as
+# long as nothing else happened to take its workflow.
 #
 #   KEYS[1]  the workflow's pass hash
 #   ARGV[1]  the asking pass's fencing token
 #   ARGV[2]  liveness window, in milliseconds
 #   ARGV[3]  expiry for the pass hash, in seconds
-#   returns  1 if this pass still holds the workflow, 0 if it has been superseded
+#   returns  1 if this pass still holds the workflow, 0 if it has been superseded or its
+#            budget has run out
 RENEW = (
     LIVENESS
     + """
 if tonumber(ARGV[1]) < tonumber(redis.call('HGET', KEYS[1], 'token') or '0') then return 0 end
+if tonumber(redis.call('HGET', KEYS[1], 'until') or '0') <= now_ms() then return 0 end
 redis.call('HSET', KEYS[1], 'for', ARGV[2], 'alive', heard_from(KEYS[1], tonumber(ARGV[2])))
 redis.call('EXPIRE', KEYS[1], ARGV[3])
 return 1

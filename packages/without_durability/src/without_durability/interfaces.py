@@ -251,20 +251,30 @@ class Checkpointer[Effect = Never](Protocol):
       *earlier* of one `alive` past its holder's last sign of life and its `budget`
       running out, so a holder that stops renewing frees the workflow within `alive`, and
       one that renews forever frees it at the budget regardless.
-    - `extend` MUST grant a fresh `budget` and count as a sign of life, and `renew` MUST
-      count as one without touching the budget. Both MUST refuse a holder below the fence,
-      exactly as `record` does, and both MUST report whether it still holds the workflow
-      rather than raising `Fenced`: the caller is deciding what to do about having lost it,
-      where `Fenced` is the answer to a write it will not get to make.
+    - `extend` MUST grant `budget` from now and count as a sign of life, and MUST NOT
+      bring a budget already granted forward: what it sets is the later of the two, so a
+      step asking for less than what is left costs nothing and takes nothing away. A
+      claim that has lapsed without being taken is still its holder's to stretch, since
+      nobody else has raised the fence.
+    - `renew` MUST count as a sign of life without touching the budget, and MUST report
+      `False` once the budget has run out whatever the token says: a pass past its budget
+      holds nothing however alive it looks, and that report is what ends a hung pass
+      rather than leaving it to renew a claim anybody may take.
+    - Both MUST refuse a holder below the fence, exactly as `record` does, and both MUST
+      report whether it still holds the workflow rather than raising `Fenced`: the caller
+      is deciding what to do about having lost it, where `Fenced` is the answer to a
+      write it will not get to make.
     - A sign of life MUST NOT carry a claim past its budget or past a `release`. Holding
       the liveness deadline at or below the budget is the direct way to get both, since
       `release` brings the budget down to now and a write still in flight then renews
       nothing rather than taking the workflow back.
-    - `record` and `transact` MUST renew the liveness deadline of the pass that wins,
-      since a write is the plainest sign of life there is. That makes a workflow of
-      ordinary short steps renew itself for free, and leaves the worker's own renewal with
-      the case it is actually needed for, a single step long enough that no write falls
-      inside one `LEASE`.
+    - `record` and `transact` MUST renew the liveness deadline of the pass that wins, and
+      of no other pass: a write refused at the fence MUST leave the holder's deadline
+      where it was, or a superseded pass's stray writes would keep a dead holder's claim
+      alive past the silence that should have freed it. A write is the plainest sign of
+      life there is, so this makes a workflow of ordinary short steps renew itself for
+      free, and leaves the worker's own renewal with the case it is actually needed for,
+      a single step long enough that no write falls inside one `LEASE`.
     - `record` MUST refuse a write whose token is below the highest claimed for that
       workflow, raising `Fenced`, and MUST NOT overwrite a key that is already recorded.
       It returns a `Recorded`: the value stored *after* the call, so two passes that both
@@ -368,7 +378,8 @@ class Checkpointer[Effect = Never](Protocol):
     this pass may hold the workflow at all, so it measures the work and is what a step
     declares when it knows better than the default. Renewal cannot lift `budget`, which is
     what keeps a pass that is hung rather than slow from holding a workflow forever: it
-    goes on renewing happily, and the cap is what eventually frees the workflow anyway.
+    goes on renewing happily until the budget runs out, at which point `renew` says so
+    and the worker ends the pass, and the workflow is free either way.
     """
 
     async def load(self, workflow: str) -> dict[str, object]: ...

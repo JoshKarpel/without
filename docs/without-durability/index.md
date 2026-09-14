@@ -339,9 +339,11 @@ they come from one place.
 `budget` is how long a single pass may hold a workflow however alive it looks, and it is
 a `work` argument rather than the scheduler's because the queue has no opinion about it.
 It is the deadline renewal cannot lift, which is what stops a pass wedged on a step that
-will never return from holding its workflow for ever: a hung pass goes on answering the
-renewal perfectly well, since its loop is free and it is simply not going to finish. The
-default has to cover the steps nobody annotated, and a step that knows better says so:
+will never return from holding its workflow for ever: a hung pass goes on asking for the
+renewal perfectly well, since its loop is free and it is simply not going to finish, and
+once the budget is spent the store refuses it, which is what ends the pass and hands its
+workflow back to the queue. The default has to cover the steps nobody annotated, and a
+step that knows better says so:
 
 ```python
 await run.step("transcode", lambda: transcode(source), as_path, within=timedelta(hours=2))
@@ -350,7 +352,15 @@ await run.step("transcode", lambda: transcode(source), as_path, within=timedelta
 That claim is stretched before the effect runs, so a two-hour step is never fenced, and a
 worker that dies inside one still loses the workflow within a `lease`. Annotating cheap
 steps costs nothing: the extension is skipped whenever the outstanding budget already
-covers what the step asked for, so the store is only asked when the answer changes.
+covers what the step asked for, so the store is only asked when the answer changes, and
+a window shorter than what is left never shortens the budget, so the steps behind it keep
+what the pass was claimed for.
+
+A caller driving `resume` itself, with no worker and so no tick, is covered the same way
+by a different route: the window it buys counts as its sign of life for the whole of the
+step, since nothing will speak for that pass again before the write that ends it. What
+that caller does not get is a renewal for the steps it did *not* annotate, which lapse
+one `lease` after the last write as they would under a dead worker.
 
 There are eight durations across the stores, the worker, and a step, and the natural worry is that
 they form a hierarchy nobody has written down. They mostly do not, and where one
@@ -430,9 +440,10 @@ features, expected in something this size:
   `lease`.
 - **A hung step holds its workflow for its whole budget.** Renewal cannot tell a step
   that is slow from one that will never return, so the budget is the only thing that ends
-  it, and nothing here times an effect out or interrupts one. A `within` sized for the
-  worst case is therefore also how long a wedged pass sits on a workflow before anything
-  else may touch it.
+  it: the tick after it is spent is refused, the worker cancels the pass, and the
+  workflow is handed back to be looked at again. Nothing here times an effect out on its
+  own, so a `within` sized for the worst case is also how long a wedged pass sits on a
+  workflow before anything else may touch it.
 - **No retries, backoff, or timeouts.** A step that raises is logged and acknowledged,
   and the workflow stops until something else wakes it. There is no dead-letter, and
   nothing bounds how long an effect may run: the worker's heartbeat says a pass is still

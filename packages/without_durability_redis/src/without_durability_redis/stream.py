@@ -121,6 +121,27 @@ redis.call('ZADD', KEYS[2], tonumber(ARGV[4]), ARGV[2])
 return 1
 """
 
+# Reset a delivery's idle clock, but only if it is still this consumer's to reset.
+#
+# `XCLAIM` is how an entry's idle time is set back to zero, and on its own it would do that
+# for an entry *any* consumer holds: `min_idle_time` of zero says "whatever its idle time",
+# and nothing about the command asks who holds it. A worker whose delivery had already
+# been taken over by another's `reclaim` would then take it straight back, and the two
+# would hand one entry back and forth for the rest of the pass. So the ownership is checked
+# first, with `XPENDING` filtered to this consumer, and the two are one script because the
+# check is only worth anything if nothing can reclaim the entry between it and the claim.
+#
+#   KEYS[1]  the ready stream
+#   ARGV[1]  the group
+#   ARGV[2]  this consumer
+#   ARGV[3]  the receipt, which is the stream entry this worker took
+#   returns  1 if the clock was reset, 0 if the entry is no longer this consumer's
+HOLD = """
+if #redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[3], ARGV[3], 1, ARGV[2]) == 0 then return 0 end
+redis.call('XCLAIM', KEYS[1], ARGV[1], ARGV[2], 0, ARGV[3], 'JUSTID')
+return 1
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class RedisStreamScheduler:
@@ -169,6 +190,7 @@ class RedisStreamScheduler:
     # seen it.
     move: AsyncScript = field(init=False, repr=False, compare=False)
     suspend: AsyncScript = field(init=False, repr=False, compare=False)
+    hold: AsyncScript = field(init=False, repr=False, compare=False)
     # Where this worker's sweep of the pending list got to, as a one-element list because
     # the rest of this is a value and a cursor is not: it is the one thing here that
     # carries from one call to the next. See `reclaim` for why the sweep is resumed rather
@@ -179,6 +201,7 @@ class RedisStreamScheduler:
         check_duration("a lease", self.lease)
         object.__setattr__(self, "move", self.redis.register_script(WAKE_DUE))
         object.__setattr__(self, "suspend", self.redis.register_script(SUSPEND))
+        object.__setattr__(self, "hold", self.redis.register_script(HOLD))
 
     # The braces are Redis Cluster's hash tag, exactly as they are on `RedisCheckpointer`'s
     # pair, and for a reason that is stronger here: `wake_due` is a script over *both* of
@@ -326,22 +349,16 @@ class RedisStreamScheduler:
         `XCLAIM` with `JUSTID` is what says it, and the reset is the point rather than a
         side effect: idle time is what `reclaim` measures, so claiming an entry this
         consumer already holds sets it back to zero without moving the entry anywhere.
-        `min_idle_time=0` because this worker is asking about its own delivery rather than
-        hunting for an abandoned one, and `within` therefore has nothing to say here: the
-        clock is reset to now either way, and how long that buys is whatever `idle` the next
-        `reclaim` measures against.
+        `within` therefore has nothing to say here: the clock is reset to now either way,
+        and how long that buys is whatever `idle` the next `reclaim` measures against.
 
-        Silent about an entry the group no longer holds, since `XCLAIM` on an acknowledged
-        or deleted id returns nothing rather than failing.
+        Silent about an entry that is no longer this consumer's, whether acknowledged,
+        deleted, or taken over by another worker's `reclaim`, and the last of those is why
+        this is a script rather than the one command it reads as (see `HOLD`): claiming an
+        entry another consumer now holds would take it straight back, which is not renewing
+        a delivery but stealing one.
         """
-        await self.redis.xclaim(
-            self.ready_key,
-            self.group,
-            self.consumer,
-            min_idle_time=0,
-            message_ids=[delivery.receipt],
-            justid=True,
-        )
+        await self.hold(keys=[self.ready_key], args=[self.group, self.consumer, delivery.receipt])
         return delivery
 
     async def cancel(self, workflow: str) -> None:

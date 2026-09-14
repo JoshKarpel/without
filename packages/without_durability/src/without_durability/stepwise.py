@@ -44,9 +44,7 @@ from datetime import timedelta
 from itertools import islice
 from typing import Never
 
-from without_durability.interfaces import BUDGET
 from without_durability.interfaces import INBOX
-from without_durability.interfaces import LEASE
 from without_durability.interfaces import Checkpointer
 from without_durability.interfaces import Contended
 from without_durability.interfaces import Entry
@@ -197,8 +195,8 @@ def now_utc() -> datetime:
 
 def extending(
     checkpointer: Checkpointer,
-    granted: timedelta = BUDGET,
-    alive: timedelta = LEASE,
+    granted: timedelta | None = None,
+    alive: timedelta | None = None,
     now: Callable[[], datetime] = now_utc,
 ) -> Extend:
     """
@@ -208,29 +206,48 @@ def extending(
     granted and when. A step asking for less than what is left goes through untouched, so a
     body can annotate every step with a `within` and pay for none of the fast ones.
 
+    `granted` is what the claim was taken for, and it is what the first skip is measured
+    against. Left unset, nothing is assumed: the first window a pass names is always bought
+    from the store, and only what the store has granted since is ever skipped over. That is
+    the honest default for a caller that did not make the claim itself, since a `Pass`
+    carries no budget and a guess that overstates it is a step whose extension is skipped
+    as already covered and fenced after its effect ran.
+
+    `alive` is what one sign of life is worth, and it is the caller's to state because it
+    is the caller's *tick*: a worker renewing every `lease`/`RENEWALS` passes its `lease`.
+    Left unset, the caller has no tick, and each window it buys is its own sign of life,
+    good for the whole of the step it covers, because nothing will speak for the pass
+    again before the write that ends that step. Every store holds the liveness deadline at
+    or below the budget, so a window bought under a tick shorter than the step and never
+    renewed would lapse partway through it however long the budget said.
+
     The elapsed time is a *difference* between two reads of the same clock, which is what
     makes it safe to compare against a budget the store granted by its own. An offset
     between the two clocks cancels; only a difference in their *rate* survives, and that is
     small enough to ignore where an offset is not. Neither is trusted very far: the margin
-    is a whole `alive` window, so nothing is skipped unless it fits with a liveness window
-    to spare, and a clock wrong enough to defeat that costs a fenced pass rather than a
-    lost one.
+    is a whole liveness window, so nothing is skipped unless it fits with a window to
+    spare, and a clock wrong enough to defeat that costs a fenced pass rather than a lost
+    one.
 
     Skipping leaves a longer grant standing, so the cap a pass is running under is the
     largest budget it has asked for recently rather than the current step's exactly. That
     is the right way round: it can only ever be too generous, and being too tight is what
-    fences a pass that was doing nothing wrong.
+    fences a pass that was doing nothing wrong. The store keeps the same promise from its
+    side, since `extend` never brings a budget forward.
     """
-    check_duration("a budget", granted)
-    check_duration("a liveness window", alive)
+    if granted is not None:
+        check_duration("a budget", granted)
+    if alive is not None:
+        check_duration("a liveness window", alive)
     since = now()
-    covered = granted
+    covered = granted if granted is not None else timedelta()
 
     async def extend(holder: Pass, budget: timedelta) -> bool:
         nonlocal since, covered
-        if now() - since + budget + alive <= covered:
+        window = alive if alive is not None else budget
+        if now() - since + budget + window <= covered:
             return True
-        if not await checkpointer.extend(holder, budget, alive):
+        if not await checkpointer.extend(holder, budget, window):
             return False
         since, covered = now(), budget
         return True
@@ -849,11 +866,12 @@ async def resume[T, Effect](
 
     `extend` defaults to one over this checkpointer alone, which is the whole of what a
     caller driving its own workflow needs: there is no delivery to keep alive beside the
-    claim. A worker passes its own, because it holds both and a claim renewed without its
-    delivery is a pass another worker is about to be handed a wakeup for. What the default
-    cannot know is the budget this pass was claimed for, so it assumes the default one; a
-    caller that claimed for longer and wants the round trips skipped accordingly builds its
-    own with `extending`.
+    claim, and no tick renewing it, so every window a step names is bought outright and
+    counts as a sign of life for as long as the step. A worker passes its own, because it
+    holds both and a claim renewed without its delivery is a pass another worker is about
+    to be handed a wakeup for. What the default cannot know is the budget this pass was
+    claimed for, so it assumes nothing and buys the first window it is asked for; a caller
+    that wants that round trip skipped builds its own with `extending`.
     """
     run = Run(
         holder=holder,

@@ -8,9 +8,9 @@
 #
 #   - There is one writer at a time, by construction. `BEGIN IMMEDIATE` takes the write
 #     lock for the whole transaction, so the fence check and the write it guards cannot
-#     be interleaved with anything. Postgres needs `FOR UPDATE` on the claim row to get
-#     that, because there readers and writers run concurrently and a statement's snapshot
-#     can be stale; Redis needs a Lua script. Here the transaction *is* the exclusion.
+#     be interleaved with anything. Postgres needs a row lock on the claim to get that,
+#     because there readers and writers run concurrently and a statement's snapshot can
+#     be stale; Redis needs a Lua script. Here the transaction *is* the exclusion.
 #   - There is nothing to co-locate. `transact`, `arrive`, and `deliver` reach the whole datastore
 #     because the datastore is a file, so the question the other two stores have to keep
 #     asking (are these two writes in one local commit?) has one answer and it is yes.
@@ -191,37 +191,44 @@ RETURNING token
 
 # A fresh budget and a sign of life with it: what a step that declared a `within` spends
 # before running its effect. Conditional on the token rather than on the deadline, since a
-# claim that has lapsed without being taken is still this pass's to stretch.
+# claim that has lapsed without being taken is still this pass's to stretch. The `MAX`
+# against the budget already standing is what keeps a short window from taking time away
+# from the unannotated steps behind it: a budget can only ever be too generous from here.
 EXTEND = """
 UPDATE workflow_claim
-SET held_until = unixepoch('now', 'subsec') + :budget,
-    alive_until = unixepoch('now', 'subsec') + MIN(:alive, :budget),
+SET held_until = MAX(held_until, unixepoch('now', 'subsec') + :budget),
+    alive_until = MIN(unixepoch('now', 'subsec') + :alive, MAX(held_until, unixepoch('now', 'subsec') + :budget)),
     alive_for = :alive
 WHERE workflow = :workflow AND token <= :token
 """
 
 # A sign of life and nothing else: the worker's tick. The `MIN` against the budget is what
-# makes "this does not buy more time" true rather than merely intended.
+# makes "this does not buy more time" true rather than merely intended, and refusing once
+# the budget has run out is what makes the worker act on it: a renewal that reported
+# success on a lapsed claim would keep a hung pass running for as long as nothing else
+# happened to take its workflow.
 RENEW = """
 UPDATE workflow_claim
 SET alive_until = MIN(unixepoch('now', 'subsec') + :alive, held_until), alive_for = :alive
-WHERE workflow = :workflow AND token <= :token
+WHERE workflow = :workflow AND token <= :token AND held_until > unixepoch('now', 'subsec')
 """
 
 # A write is a sign of life, so `record` and `transact` note one in the same transaction
 # they write in. Postgres folds this into the fence CTE its `RECORD` already locks with;
 # SQLite admits one writer at a time, so a second statement inside the same transaction is
-# the same atomicity by a plainer route.
+# the same atomicity by a plainer route. Conditional on the token for the reason the
+# Postgres CTE is: a write refused at the fence must renew nobody, or a superseded pass's
+# stray writes would keep the winner's claim alive after the winner had died.
 WROTE = """
 UPDATE workflow_claim
 SET alive_until = MIN(unixepoch('now', 'subsec') + alive_for, held_until)
-WHERE workflow = :workflow
+WHERE workflow = :workflow AND token <= :token
 """
 
-# The fenced, conditional write, as one statement. The Postgres version wraps its fence
-# read in a `FOR UPDATE` CTE so a claim committing mid-statement cannot go unseen; here
-# the statement is its own transaction and SQLite admits one writer, so selecting the
-# claim row inline is already serialized against every other write.
+# The fenced, conditional write, as one statement. The Postgres version locks the claim row
+# in a data-modifying CTE so a claim committing mid-statement cannot go unseen; here the
+# statement runs under `BEGIN IMMEDIATE` beside `WROTE` and SQLite admits one writer, so
+# selecting the claim row inline is already serialized against every other write.
 #
 # `DO UPDATE SET value = the value already there` is a write that changes nothing and
 # therefore returns the row that was already stored, which is how a caller that lost the
@@ -632,7 +639,7 @@ class SqliteCheckpointer:
                 RECORD,
                 {"workflow": holder.workflow, "step": key, "value": encoded, "token": holder.token},
             ).fetchone()
-            cursor.execute(WROTE, {"workflow": holder.workflow})
+            cursor.execute(WROTE, {"workflow": holder.workflow, "token": holder.token})
             return stored
 
         stored = await self.database.run(lambda connection: transacted(connection, write))
@@ -657,6 +664,14 @@ class SqliteCheckpointer:
 
         The effect's result is written and read back through the codec rather than
         returned as it came, so it round-trips exactly as a later pass will see it.
+
+        What the write lock costs is stated rather than hidden: it is the connection's,
+        and there is one connection, so nothing else in this process reaches the store
+        until the effect returns, the worker's own renewal included. The claim is safe
+        regardless, since the sign of life at the end of the transaction lands before any
+        queued `claim` runs; what a long effect does lose is its delivery, which is not
+        renewed meanwhile and is redelivered after a `lease` to a pass that finds the
+        workflow held. Keep effects short, or accept that redelivery.
         """
 
         def one_commit(cursor: sqlite3.Cursor) -> object:
@@ -668,7 +683,7 @@ class SqliteCheckpointer:
                 return self.codec.decode(recorded[0])
             written = self.codec.encode(effect(cursor))
             cursor.execute(WRITE, (holder.workflow, key, written))
-            cursor.execute(WROTE, {"workflow": holder.workflow})
+            cursor.execute(WROTE, {"workflow": holder.workflow, "token": holder.token})
             return self.codec.decode(written)
 
         return await self.database.run(lambda connection: transacted(connection, one_commit))

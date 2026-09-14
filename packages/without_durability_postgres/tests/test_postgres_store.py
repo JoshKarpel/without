@@ -283,6 +283,96 @@ async def test_a_transacted_effect_is_refused_from_a_superseded_pass(
     assert await reserved(pool, workflow) is None, "the fence is checked before the effect runs, not after"
 
 
+async def test_a_renewal_lands_while_a_transacted_effect_is_still_running(
+    pool: AsyncConnectionPool,
+    workflow: str,
+    ledger: str,
+) -> None:
+    # The worker's tick, on its own connection, arriving mid-effect. The claim row must not
+    # be locked for the whole effect: a renewal queued behind it would land only when the
+    # effect committed, so a long effect would run with nothing renewing its delivery and
+    # be taken over on commit for having gone quiet, and every `claim` a rescuer made
+    # meanwhile would sit on a pinned connection waiting for the same lock.
+    checkpointer = PostgresCheckpointer(pool=pool)
+    holder = await claimed(checkpointer, workflow)
+    inside = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def slow(cursor: AsyncCursor[TupleRow]) -> object:
+        await reserving(workflow, 1)(cursor)
+        inside.set()
+        await finish.wait()
+        return 1
+
+    transacting = asyncio.create_task(
+        Run(holder=holder, checkpointer=checkpointer, recorded={}, extend=extending(checkpointer)).transact(
+            "reserved", slow, as_count
+        )
+    )
+    try:
+        async with asyncio.timeout(3):
+            await inside.wait()
+            assert await checkpointer.renew(holder, BRIEFLY), "the tick landed while the effect was still running"
+    finally:
+        finish.set()
+    assert await transacting == 1
+
+
+async def test_a_pass_superseded_while_its_effect_ran_is_refused_and_the_effect_rolled_back(
+    pool: AsyncConnectionPool,
+    workflow: str,
+    ledger: str,
+) -> None:
+    # The other half of not holding the lock across the effect: the fence is re-read under
+    # it *after* the effect, so a claim that landed meanwhile is seen there, and refusing at
+    # that point rolls the effect back with the transaction rather than committing work a
+    # superseded pass had no right to do.
+    checkpointer = PostgresCheckpointer(pool=pool)
+    holder = await claimed(checkpointer, workflow)
+
+    async def overtaken(cursor: AsyncCursor[TupleRow]) -> object:
+        await reserving(workflow, 1)(cursor)
+        # Another worker takes the workflow while the effect is still open, which the
+        # unlocked claim row now allows, exactly as a lapsed claim would.
+        await checkpointer.release(holder)
+        await claimed(checkpointer, workflow)
+        return 1
+
+    with pytest.raises(Fenced):
+        await Run(holder=holder, checkpointer=checkpointer, recorded={}, extend=extending(checkpointer)).transact(
+            "reserved", overtaken, as_count
+        )
+
+    assert await reserved(pool, workflow) is None, "the effect went with the transaction"
+    assert await checkpointer.load(workflow) == {}
+
+
+async def test_a_transacted_steps_sign_of_life_is_stamped_when_it_commits_not_when_it_began(
+    pool: AsyncConnectionPool,
+    workflow: str,
+    ledger: str,
+) -> None:
+    # `now()` is the transaction's *start*, and the effect runs inside the transaction. A
+    # sign of life stamped from before a slow effect began is already in the past by the
+    # time it commits, so a healthy pass that had just spoken read as one that had gone
+    # quiet, and the next `claim` took its workflow away.
+    checkpointer = PostgresCheckpointer(pool=pool)
+    holder = await claimed(checkpointer, workflow, alive=BRIEFLY)
+
+    async def slow(cursor: AsyncCursor[TupleRow]) -> object:
+        await reserving(workflow, 1)(cursor)
+        await asyncio.sleep(BRIEFLY.total_seconds() * 2)
+        return 1
+
+    await Run(holder=holder, checkpointer=checkpointer, recorded={}, extend=extending(checkpointer)).transact(
+        "reserved", slow, as_count
+    )
+
+    assert await checkpointer.claim(workflow, timedelta(seconds=30), BRIEFLY) is None, (
+        "the commit was a sign of life at the moment it landed, so the workflow is still held"
+    )
+
+
 async def test_an_effect_that_fails_leaves_neither_the_work_nor_the_record(
     pool: AsyncConnectionPool,
     workflow: str,
