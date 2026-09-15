@@ -138,13 +138,13 @@ end
 CLAIM = (
     LIVENESS
     + """
-local now_ms = now_ms()
-if tonumber(redis.call('HGET', KEYS[1], 'alive') or '0') > now_ms then return nil end
+local now = now_ms()
+if tonumber(redis.call('HGET', KEYS[1], 'alive') or '0') > now then return nil end
 local previous = tonumber(redis.call('HGET', KEYS[1], 'token') or '0')
-local token = math.max(now_ms, previous + 1)
-local held_until = now_ms + tonumber(ARGV[1])
+local token = math.max(now, previous + 1)
+local held_until = now + tonumber(ARGV[1])
 redis.call('HSET', KEYS[1], 'token', token, 'until', held_until, 'for', ARGV[2],
-  'alive', math.min(now_ms + tonumber(ARGV[2]), held_until))
+  'alive', math.min(now + tonumber(ARGV[2]), held_until))
 redis.call('EXPIRE', KEYS[1], ARGV[3])
 return token
 """
@@ -166,10 +166,10 @@ EXTEND = (
     LIVENESS
     + """
 if tonumber(ARGV[1]) < tonumber(redis.call('HGET', KEYS[1], 'token') or '0') then return 0 end
-local now_ms = now_ms()
-local held_until = math.max(tonumber(redis.call('HGET', KEYS[1], 'until') or '0'), now_ms + tonumber(ARGV[2]))
+local now = now_ms()
+local held_until = math.max(tonumber(redis.call('HGET', KEYS[1], 'until') or '0'), now + tonumber(ARGV[2]))
 redis.call('HSET', KEYS[1], 'until', held_until, 'for', ARGV[3],
-  'alive', math.min(now_ms + tonumber(ARGV[3]), held_until))
+  'alive', math.min(now + tonumber(ARGV[3]), held_until))
 redis.call('EXPIRE', KEYS[1], ARGV[4])
 return 1
 """

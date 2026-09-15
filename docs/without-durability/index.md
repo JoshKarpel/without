@@ -516,3 +516,24 @@ rather than one this page asserts.
 Everything here runs against dicts by default, because `Checkpointer` and `Scheduler`
 are injected and `memory.py` ships an implementation of both. That is also why the
 worker can be driven without a server at all.
+
+### Driving one method (`without_durability.testing`)
+
+`passing` builds a `Run` wired as `resume` wires one, for a test that drives a single
+method (a `transact`, a `record`) rather than a whole body. It takes the `Pass` and the
+`Checkpointer` under test, plus the records the run should start from, and fills in the
+rest of the wiring:
+
+```python
+from without_durability.testing import passing
+
+first = await passing(holder, checkpointer).transact("reserved", reserve, as_count)
+```
+
+The wiring lives here rather than in each store's suite so that a test says what it is
+about (this holder, this checkpointer, these records) instead of restating how a pass is
+assembled, and so that a store's own suite and this package's say it the same way.
+Anything testing the assembly itself builds its own `Run`.
+
+The module ships inside `without-durability` but is not re-exported from its top level,
+so it is imported explicitly and adds nothing to what a production import pulls in.

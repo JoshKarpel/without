@@ -79,8 +79,8 @@ POLL = timedelta(milliseconds=50)
 RECEIPTING = (
     CLOCK
     + """
-local function receipted(schedule, workflow, now_ms, lease_ms)
-  local held_until = now_ms + lease_ms + 0.5
+local function receipted(schedule, workflow, now, lease_ms)
+  local held_until = now + lease_ms + 0.5
   redis.call('ZADD', schedule, held_until, workflow)
   return string.format('%.1f', held_until)
 end
@@ -99,10 +99,10 @@ end
 TAKE = (
     RECEIPTING
     + """
-local now_ms = now_ms()
-local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now_ms, 'LIMIT', 0, 1)
+local now = now_ms()
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now, 'LIMIT', 0, 1)
 if #due == 0 then return nil end
-return {due[1], receipted(KEYS[1], due[1], now_ms, tonumber(ARGV[1]))}
+return {due[1], receipted(KEYS[1], due[1], now, tonumber(ARGV[1]))}
 """
 )
 
