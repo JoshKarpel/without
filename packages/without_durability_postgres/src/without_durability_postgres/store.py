@@ -258,10 +258,9 @@ WHERE workflow = %(workflow)s AND token <= %(token)s AND held_until > now()
 # read from the statement's snapshot, so a claim committing a microsecond after the
 # statement began would go unseen and a superseded pass's write would land. Taking the row
 # lock makes this statement queue behind any claim in flight and then re-read the row it
-# locked, so the token compared against is the newest one. An `UPDATE` gives that the same
-# way `SELECT ... FOR UPDATE` did, re-evaluating its `WHERE` against the committed row
-# version and returning what it re-read; confirmed against a real server rather than
-# assumed, since the whole fence rests on it.
+# locked, so the token compared against is the newest one. An `UPDATE` gives that as
+# `SELECT ... FOR UPDATE` would, re-evaluating its `WHERE` against the committed row
+# version and returning what it re-read.
 #
 # The token is in the CTE's `WHERE` rather than only in the insert's, so a refused write
 # renews nothing: a superseded pass's stray writes would otherwise keep the *winner's* claim
@@ -332,7 +331,7 @@ FROM minted
 RETURNING entry.step, entry.value::text
 """
 
-# The four statements `transact` runs between `BEGIN` and `COMMIT`, with the effect's own
+# The three statements `transact` runs between `BEGIN` and `COMMIT`, with the effect's own
 # work in the middle. They are separate strings rather than one because the effect is
 # arbitrary application SQL that this store cannot see, which is precisely what makes the
 # transaction worth having.
@@ -340,7 +339,7 @@ RETURNING entry.step, entry.value::text
 # The fence is read twice, and the split is where the row lock goes. `FENCE` is a plain
 # read before the effect, so a pass already superseded performs nothing; it takes no lock,
 # so the claim row stays free while the effect runs, and the worker's `RENEW` on another
-# connection lands instead of queueing behind the transaction for the whole effect. `WROTE`
+# connection lands instead of queueing behind the transaction for the whole effect. `WRITE`
 # is the locked re-read *after* the effect, in the statement that renews for the reason
 # `RECORD`'s does: it queues behind any claim in flight and re-evaluates against the
 # committed row, so a pass superseded while its effect ran is refused here and the effect
@@ -352,23 +351,30 @@ RETURNING entry.step, entry.value::text
 # effect began could already be in the past by the time it commits, which would say a
 # pass had gone quiet at the moment it was speaking.
 FENCE = "SELECT token FROM workflow_claim WHERE workflow = %s"
-WROTE = """
-UPDATE workflow_claim SET alive_until = LEAST(clock_timestamp() + alive_for, held_until)
-WHERE workflow = %s AND token <= %s
-RETURNING token
-"""
 ALREADY = "SELECT value::text FROM workflow_checkpoint WHERE workflow = %s AND step = %s"
-# `ON CONFLICT DO NOTHING` rather than a plain insert, because `supply` is deliberately not
-# gated on the claim and so is the one writer this transaction's fence does not exclude. An
-# approval landing between the `ALREADY` read and this write would otherwise turn a step
-# into a duplicate-key error, which `transact` MUST not answer with: the step is recorded,
-# so the contract is to hand back what is recorded. Returning no row says that happened,
-# and the caller rolls the effect back rather than committing work whose record belongs to
-# somebody else.
+# `ON CONFLICT DO NOTHING` rather than `RECORD`'s upsert, because `supply` is deliberately
+# not gated on the claim and so is the one writer this transaction's fence does not
+# exclude. An approval landing between the `ALREADY` read and this write would otherwise
+# turn a step into a duplicate-key error, which `transact` MUST not answer with: the step
+# is recorded, so the contract is to hand back what is recorded. So the statement reports
+# both halves rather than one row or none: whether the fence held, and what the insert
+# wrote. No fence is `Fenced`; a fence with nothing written says that happened, and the
+# caller rolls the effect back rather than committing work whose record belongs to somebody
+# else.
 WRITE = """
-INSERT INTO workflow_checkpoint (workflow, step, value) VALUES (%s, %s, %s::jsonb)
-ON CONFLICT (workflow, step) DO NOTHING
-RETURNING value::text
+WITH fence AS (
+    UPDATE workflow_claim
+    SET alive_until = LEAST(clock_timestamp() + alive_for, held_until)
+    WHERE workflow = %(workflow)s AND token <= %(token)s
+    RETURNING token
+),
+written AS (
+    INSERT INTO workflow_checkpoint (workflow, step, value)
+    SELECT %(workflow)s, %(step)s, %(value)s::jsonb FROM fence
+    ON CONFLICT (workflow, step) DO NOTHING
+    RETURNING value::text
+)
+SELECT EXISTS (SELECT FROM fence), (SELECT value FROM written)
 """
 
 LOAD = "SELECT step, value::text FROM workflow_checkpoint WHERE workflow = %s ORDER BY seq"
@@ -591,7 +597,7 @@ class PostgresCheckpointer:
 
         The claim row is *not* locked while the effect runs, and that is deliberate. The
         fence is read plainly before the effect, so a superseded pass performs nothing, and
-        re-read under the row lock after it (`WROTE`), so a pass superseded meanwhile is
+        re-read under the row lock after it (`WRITE`), so a pass superseded meanwhile is
         refused and the effect rolls back with the transaction. Holding the lock across the
         effect instead would queue the worker's own renewal behind it, so a long effect
         would run with nothing renewing the delivery and be taken over on commit for having
@@ -620,14 +626,16 @@ class PostgresCheckpointer:
                 if recorded is not None:
                     return self.codec.decode(cast(str, recorded[0]))
                 encoded = self.codec.encode(await effect(cursor))
-                await cursor.execute(WROTE, (holder.workflow, holder.token))
-                if await cursor.fetchone() is None:
+                await cursor.execute(
+                    WRITE,
+                    {"workflow": holder.workflow, "step": key, "value": encoded, "token": holder.token},
+                )
+                held, written = cast(tuple[bool, str | None], await cursor.fetchone())
+                if not held:
                     raise Fenced(f"{holder.workflow!r} moved on while this pass held it")
-                await cursor.execute(WRITE, (holder.workflow, key, encoded))
-                written = await cursor.fetchone()
                 if written is None:
                     raise Supplied
-                return self.codec.decode(cast(str, written[0]))
+                return self.codec.decode(written)
         except Supplied:
             pass
         async with self.pool.connection() as connection, connection.cursor() as cursor:

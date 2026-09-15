@@ -53,6 +53,13 @@
   nothing about what the claim was taken for: the first window a pass names is always
   bought.
 
+  `without_durability.testing.passing` builds a `Run` wired as `resume` wires one, for a
+  test driving a single method rather than a body.
+- **`without-async`**: `settled`, which awaits a future shielded and, when the caller is
+  cancelled, waits for the future to finish before the cancellation propagates. It is the
+  shape every durable write already had: the effect has happened by the time the record
+  is written, so cancelling the write would lose the record and not the effect.
+
 ### Changed
 
 - **`without-durability`**: `Run` takes an `extend`, and `Checkpointer.claim` takes two

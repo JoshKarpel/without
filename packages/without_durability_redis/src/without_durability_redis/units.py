@@ -41,3 +41,16 @@ def milliseconds(duration: timedelta) -> int:
 def seconds(duration: timedelta) -> int:
     """`duration` as whole seconds, never rounding a positive one down to zero."""
     return ceil(duration / SECOND)
+
+
+# The server's clock in the unit above, for a script. Every deadline a script writes is
+# measured against it rather than against a caller's clock, because a lease compared
+# against the caller's is only as good as the agreement between the two, which is exactly
+# what fails when a machine is unhealthy enough to stall mid-pass. Spliced into each script
+# that reads the clock, so the conversion is written once.
+CLOCK = """
+local function now_ms()
+  local now = redis.call('TIME')
+  return tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+end
+"""

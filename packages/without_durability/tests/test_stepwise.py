@@ -43,12 +43,12 @@ from without_durability import parse_deadline
 from without_durability import resume
 from without_durability.stepwise import stopped_at
 from without_durability.stepwise import unwound
+from without_durability.testing import passing
 
 from .helpers import STARTED_AT
 from .helpers import Clock
 from .helpers import ParkedWrites
 from .helpers import as_text
-from .helpers import passing
 
 ORDER = "ord-88"
 ITEMS = {"widget": 1200, "gizmo": 800}

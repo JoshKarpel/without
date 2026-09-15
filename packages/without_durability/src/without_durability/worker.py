@@ -41,13 +41,13 @@ import logging
 from collections.abc import AsyncGenerator
 from collections.abc import Awaitable
 from collections.abc import Callable
-from contextlib import suppress
 from datetime import datetime
 from datetime import timedelta
 from typing import assert_never
 
 from without_async import background_task
 from without_async import limit_concurrency
+from without_async import settled
 from without_streams import Sink
 from without_streams import Stream
 from without_streams import from_sink
@@ -55,7 +55,6 @@ from without_streams import ticks
 
 from without_durability.interfaces import BUDGET
 from without_durability.interfaces import LEASE
-from without_durability.interfaces import RENEWALS
 from without_durability.interfaces import Contended
 from without_durability.interfaces import Delivery
 from without_durability.interfaces import Durable
@@ -83,6 +82,10 @@ POOL = 20
 # pass holding it has a fair chance to finish (and to make this wakeup redundant), short
 # enough that a claim dropped immediately afterwards is not left sitting.
 CONTENDED = timedelta(seconds=1)
+# How many signs of life a pass gives inside one lease, and so how often the worker
+# renews. Three rather than two because the margin is what absorbs a slow store round trip:
+# at two, one delayed renewal is already the whole window.
+RENEWALS = 3
 
 
 def passes(
@@ -137,13 +140,12 @@ def passes(
         logger.info(f"{delivery.workflow} {why}; looking again in {contended}")
         await durable.scheduler.wake_at(delivery, now() + contended)
 
-    async def advance(taken: Delivery) -> None:
-        # Rebound rather than reassigned, because `extend` renames a delivery on every store
-        # whose receipt is the visibility it was taken under. Everything below answers for
-        # the *current* name, and `keep_alive` waits out a renewal in flight before it
-        # ends, so by the time anything here runs the name it reads is the one the store
-        # holds rather than one a renewal was halfway through replacing.
-        delivery = taken
+    async def advance(delivery: Delivery) -> None:
+        # Rebound by `keep_alive`, because `extend` renames a delivery on every store whose
+        # receipt is the visibility it was taken under. Everything below answers for the
+        # *current* name, and `keep_alive` waits out a renewal in flight before it ends, so
+        # by the time anything here runs the name it reads is the one the store holds
+        # rather than one a renewal was halfway through replacing.
         holder = await durable.checkpointer.claim(delivery.workflow, budget, lease)
         if holder is None:
             # Someone else is mid-pass. Whatever this wakeup carried is in the store
@@ -210,11 +212,8 @@ def passes(
                         return
                     renaming = asyncio.ensure_future(durable.scheduler.extend(delivery, lease))
                     try:
-                        delivery = await asyncio.shield(renaming)
+                        delivery = await settled(renaming)
                     except asyncio.CancelledError:
-                        while not renaming.done():
-                            with suppress(asyncio.CancelledError):
-                                await asyncio.wait([renaming])
                         if renaming.exception() is None:
                             delivery = renaming.result()
                         else:

@@ -6,7 +6,6 @@ from without_durability.interfaces import BUDGET
 from without_durability.interfaces import INBOX
 from without_durability.interfaces import INBOX_DIGITS
 from without_durability.interfaces import LEASE
-from without_durability.interfaces import RENEWALS
 from without_durability.interfaces import Checkpointer
 from without_durability.interfaces import Contended
 from without_durability.interfaces import Delivery
@@ -55,7 +54,6 @@ __all__ = [
     "INBOX_DIGITS",
     "JSON",
     "LEASE",
-    "RENEWALS",
     "Blocked",
     "CheckpointCodec",
     "Checkpointer",

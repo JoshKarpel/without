@@ -47,7 +47,10 @@ The async task helpers: `sleep_forever`; the `with`-scoped `background_task`
 `limit_concurrency`, a bounded-concurrency driver that pulls work from a source
 only while below the limit (so a lazy source is never advanced past it); and its
 building blocks `cancel_futures` (cancel a set, then await them all) and
-`as_async_iterator` (normalize a sync or async iterable into one async iterator).
+`as_async_iterator` (normalize a sync or async iterable into one async iterator);
+and `settled`, which awaits a future shielded and, when the caller is cancelled,
+waits for the future to finish before the cancellation propagates, for work that
+has already happened by the time it is awaited and would only lose its record.
 
 `background_task` is what the substrate's own behavior edge runs on:
 [`sample`](../without-streams/index.md#wiring-without_streamswiring) keeps its

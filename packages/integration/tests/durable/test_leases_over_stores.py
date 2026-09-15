@@ -38,9 +38,9 @@ async def test_a_renewing_pass_keeps_a_claim_past_its_liveness_window(
     workflow: str,
 ) -> None:
     # The property the whole split exists for: a pass that is still working holds its
-    # workflow however short the liveness window is, because it keeps saying so. Under one
-    # lease this was the case that fenced a slow-but-healthy pass and made it perform its
-    # current step twice.
+    # workflow however short the liveness window is, because it keeps saying so. A single
+    # lease sized for takeover latency would fence this slow-but-healthy pass and make it
+    # perform its current step twice.
     checkpointer = durable.checkpointer
     holder = await claimed(checkpointer, workflow, AMPLE, BRIEF)
 

@@ -19,10 +19,9 @@ from without_durability import INBOX_DIGITS
 from without_durability import Contended
 from without_durability import Fenced
 from without_durability import Recorded
-from without_durability import Run
 from without_durability import claimed
-from without_durability import extending
 from without_durability import now_utc
+from without_durability.testing import passing
 from without_durability_redis import LuaEffect
 from without_durability_redis import RedisCheckpointer
 from without_durability_redis import RedisSetScheduler
@@ -444,12 +443,8 @@ async def test_an_effect_in_this_redis_is_performed_and_recorded_in_one_commit(
         args=("piano", 1),
     )
 
-    first = await Run(holder=holder, checkpointer=checkpointer, recorded={}, extend=extending(checkpointer)).transact(
-        "reserved", reserve, as_count
-    )
-    again = await Run(holder=holder, checkpointer=checkpointer, recorded={}, extend=extending(checkpointer)).transact(
-        "reserved", reserve, as_count
-    )
+    first = await passing(holder, checkpointer).transact("reserved", reserve, as_count)
+    again = await passing(holder, checkpointer).transact("reserved", reserve, as_count)
 
     assert (first, again) == (1, 1), "the second pass read the record rather than reserving again"
     assert await redis.hget(ledger, "piano") == "1", "the stock moved once, however many passes reached the step"
@@ -465,7 +460,7 @@ async def test_a_transacted_effect_is_refused_from_a_superseded_pass(redis: Redi
     ledger = f"{checkpointer.hash_key(workflow)}:ledger"
 
     with pytest.raises(Fenced):
-        await Run(holder=stalled, checkpointer=checkpointer, recorded={}, extend=extending(checkpointer)).transact(
+        await passing(stalled, checkpointer).transact(
             "reserved",
             LuaEffect(
                 source="return cjson.encode(redis.call('HINCRBY', KEYS[1], ARGV[1], 1))",
@@ -487,7 +482,7 @@ async def test_a_transact_error_that_is_not_the_fence_is_not_swallowed(redis: Re
     await redis.set(checkpointer.hash_key(workflow), "not a hash at all")
 
     with pytest.raises(ResponseError, match="WRONGTYPE"):
-        await Run(holder=holder, checkpointer=checkpointer, recorded={}, extend=extending(checkpointer)).transact(
+        await passing(holder, checkpointer).transact(
             "reserved",
             LuaEffect(source="return cjson.encode(1)"),
             as_count,

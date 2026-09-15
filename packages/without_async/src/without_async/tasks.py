@@ -40,6 +40,33 @@ async def sleep_forever() -> None:
     await asyncio.get_running_loop().create_future()
 
 
+async def settled[T](future: asyncio.Future[T]) -> T:
+    """
+    Await `future`, and hold on through a cancellation of the caller until it is done.
+
+    For a future whose work has already happened by the time it is awaited (a store write
+    recording an effect that has been performed, a renewal a server has already applied),
+    where cancelling the await would not undo the work but would lose the record of it.
+    The future is shielded, so the caller's cancellation does not reach it, and when one
+    arrives the caller waits for the future to finish before the `CancelledError`
+    propagates. What the future came to is then there to read off it, on the cancellation
+    path as on the ordinary one.
+
+    It waits through *repeated* cancellation, which is the ordinary case rather than
+    stubbornness: a task torn down by a task group or a `gather` is commonly cancelled
+    twice, once by the combinator and once by its caller's own teardown. `wait` rather than
+    an `await` for that, so the future's own failure belongs to whoever reads it afterwards
+    and does not replace the cancellation.
+    """
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        while not future.done():
+            with suppress(asyncio.CancelledError):
+                await asyncio.wait([future])
+        raise
+
+
 async def cancel_futures[T](futures: Iterable[asyncio.Future[T] | None]) -> None:
     """
     Cancel every future, then await them all so their teardown completes.

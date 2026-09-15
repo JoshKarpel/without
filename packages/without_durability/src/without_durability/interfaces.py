@@ -42,16 +42,11 @@ LEASE = timedelta(minutes=1)
 # over. Temporal's pairing of a start-to-close timeout with a heartbeat timeout is the same
 # two numbers for the same reason.
 #
-# This is the guess `LEASE` used to be, and it is now the only one left: it has to exceed
-# the longest a step can honestly take. What changed is that a step which knows better says
-# so (`Run.step(..., within=...)`), so the default only has to cover the steps nobody
-# annotated rather than the slowest step in the deployment.
+# It is the one number here that is a guess: it has to exceed the longest a step can
+# honestly take. A step that knows better says so (`Run.step(..., within=...)`), so the
+# default only has to cover the steps nobody annotated rather than the slowest step in the
+# deployment.
 BUDGET = timedelta(minutes=5)
-
-# How many signs of life a pass gives inside one `LEASE`, and so how often the worker
-# renews. Three rather than two because the margin is what absorbs a slow store round trip:
-# at two, one delayed renewal is already the whole window.
-RENEWALS = 3
 
 # The key space `append` assigns out of, and the one piece of the inbox that every layer
 # has to agree on: the stores mint these keys, `Run.receive` picks them out of a

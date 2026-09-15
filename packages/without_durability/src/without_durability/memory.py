@@ -92,10 +92,9 @@ class Claim:
     alive_until: float
     alive: timedelta
 
-    def heard_from(self, at: float, alive: timedelta | None = None) -> Claim:
+    def heard_from(self, at: float) -> Claim:
         """A copy of the claim, with a sign of life noted at `at` and good for `alive` past it."""
-        for_ = self.alive if alive is None else alive
-        return replace(self, alive_until=min(at + for_.total_seconds(), self.held_until), alive=for_)
+        return replace(self, alive_until=min(at + self.alive.total_seconds(), self.held_until))
 
     def over(self) -> Claim:
         """A copy of the claim, handed back: the token stays, so the next claim still outranks it."""
@@ -152,36 +151,39 @@ class MemoryCheckpointer:
         }
 
     async def claim(self, workflow: str, budget: timedelta, alive: timedelta) -> Pass | None:
+        now = monotonic()
         held = self.claims.get(workflow)
-        if held is not None and held.alive_until > monotonic():
+        if held is not None and held.alive_until > now:
             return None
         taken = Claim(
             token=held.token + 1 if held is not None else 1,
-            held_until=monotonic() + budget.total_seconds(),
-            alive_until=0.0,
+            held_until=now + budget.total_seconds(),
+            alive_until=now + min(alive, budget).total_seconds(),
             alive=alive,
         )
-        self.claims[workflow] = taken.heard_from(monotonic())
+        self.claims[workflow] = taken
         return Pass(workflow=workflow, token=taken.token)
 
     async def extend(self, holder: Pass, budget: timedelta, alive: timedelta) -> bool:
+        now = monotonic()
         held = self.claims[holder.workflow]
         if holder.token < held.token:
             return False
         # The later of the two, so a step naming a window shorter than what is left takes
         # nothing away from the steps behind it.
-        granted = replace(held, held_until=max(held.held_until, monotonic() + budget.total_seconds()))
-        self.claims[holder.workflow] = granted.heard_from(monotonic(), alive)
+        granted = replace(held, held_until=max(held.held_until, now + budget.total_seconds()), alive=alive)
+        self.claims[holder.workflow] = granted.heard_from(now)
         return True
 
     async def renew(self, holder: Pass, alive: timedelta) -> bool:
+        now = monotonic()
         held = self.claims[holder.workflow]
         # Past the budget as well as below the fence, because the answer is what the worker
         # acts on: a renewal that reported success on a lapsed claim would keep a hung pass
         # running, and the workflow with it, for as long as nothing else happened to take it.
-        if holder.token < held.token or held.held_until <= monotonic():
+        if holder.token < held.token or held.held_until <= now:
             return False
-        self.claims[holder.workflow] = held.heard_from(monotonic(), alive)
+        self.claims[holder.workflow] = replace(held, alive=alive).heard_from(now)
         return True
 
     def wrote(self, holder: Pass) -> None:

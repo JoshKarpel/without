@@ -35,7 +35,6 @@ import asyncio
 from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Iterator
-from contextlib import suppress
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import UTC
@@ -43,6 +42,8 @@ from datetime import datetime
 from datetime import timedelta
 from itertools import islice
 from typing import Never
+
+from without_async import settled
 
 from without_durability.interfaces import INBOX
 from without_durability.interfaces import Checkpointer
@@ -214,7 +215,7 @@ def extending(
     as already covered and fenced after its effect ran.
 
     `alive` is what one sign of life is worth, and it is the caller's to state because it
-    is the caller's *tick*: a worker renewing every `lease`/`RENEWALS` passes its `lease`.
+    is the caller's *tick*: a worker renewing a few times per `lease` passes its `lease`.
     Left unset, the caller has no tick, and each window it buys is its own sign of life,
     good for the whole of the step it covers, because nothing will speak for the pass
     again before the write that ends that step. Every store holds the liveness deadline at
@@ -396,24 +397,11 @@ class Run[Effect = Never]:
         """
         if key in self.recorded:
             return parse(self.recorded[key])
-        if within is not None:
-            # Inside the branch, so the steps that name no window pay nothing for it. A
-            # zero here is the one value that would quietly do the opposite of what it
-            # says: a budget already spent lapses the claim on the spot, so the step that
-            # asked for more time gets none at all.
-            check_duration("a step's window", within)
-            if not await self.extend(self.holder, within):
-                raise Fenced(f"pass {self.holder.token} of {self.holder.workflow!r} was superseded")
+        await self.covered(within)
         recording = asyncio.ensure_future(self.checkpointer.record(self.holder, key, await effect()))
         try:
-            recorded = await asyncio.shield(recording)
+            recorded = await settled(recording)
         except asyncio.CancelledError:
-            # `wait` rather than an `await`, because this one is finishing somebody
-            # else's business: the write's own failure belongs to the pass being torn
-            # down, and raising it here would replace the cancellation with it.
-            while not recording.done():
-                with suppress(asyncio.CancelledError):
-                    await asyncio.wait([recording])
             # A write that landed is part of this pass whether or not the step that made
             # it survived to say so, and the mapping is what the rest of the pass reads:
             # `sleep` looks here for the deadline it was cancelled before it could raise.
@@ -422,6 +410,21 @@ class Run[Effect = Never]:
             raise
         self.recorded[key] = recorded.value
         return parse(recorded.value)
+
+    async def covered(self, within: timedelta | None) -> None:
+        """
+        Stretch the claim to cover a step that named a window, or lose the pass trying.
+
+        Nothing at all for a step that named none, so the steps that are over in
+        milliseconds pay nothing for the mechanism. A zero is the one value that would
+        quietly do the opposite of what it says: a budget already spent lapses the claim on
+        the spot, so the step that asked for more time gets none at all.
+        """
+        if within is None:
+            return
+        check_duration("a step's window", within)
+        if not await self.extend(self.holder, within):
+            raise Fenced(f"pass {self.holder.token} of {self.holder.workflow!r} was superseded")
 
     async def transact[T](
         self,
@@ -459,10 +462,7 @@ class Run[Effect = Never]:
         self.claim(key)
         if key in self.recorded:
             return parse(self.recorded[key])
-        if within is not None:
-            check_duration("a step's window", within)
-            if not await self.extend(self.holder, within):
-                raise Fenced(f"pass {self.holder.token} of {self.holder.workflow!r} was superseded")
+        await self.covered(within)
         stored = await self.checkpointer.transact(self.holder, key, effect)
         self.recorded[key] = stored
         return parse(stored)

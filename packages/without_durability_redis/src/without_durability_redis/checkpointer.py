@@ -54,6 +54,7 @@ from without_durability.interfaces import Recorded
 from without_durability.interfaces import Written
 from without_durability.interfaces import check_duration
 
+from without_durability_redis.units import CLOCK
 from without_durability_redis.units import milliseconds
 from without_durability_redis.units import seconds
 
@@ -71,14 +72,12 @@ from without_durability_redis.units import seconds
 #
 # Splitting on the first two colons is safe whatever the codec produces, because both
 # numbers are digits and both are in front.
-# The server's clock, and what a sign of life does to a claim. Spliced into every script
-# that touches either, so the `math.min` that holds the liveness deadline at or below the
-# budget is written once instead of in each of the five places a claim is renewed.
-LIVENESS = """
-local function now_ms()
-  local now = redis.call('TIME')
-  return tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
-end
+# What a sign of life does to a claim. Spliced into every script that gives one, so the
+# `math.min` that holds the liveness deadline at or below the budget is written once
+# instead of in each of the five places a claim is renewed.
+LIVENESS = (
+    CLOCK
+    + """
 local function heard_from(pass_key, window)
   return math.min(now_ms() + window, tonumber(redis.call('HGET', pass_key, 'until') or '0'))
 end
@@ -86,6 +85,7 @@ local function alive_for(pass_key)
   return tonumber(redis.call('HGET', pass_key, 'for') or '0')
 end
 """
+)
 
 PACKING = (
     LIVENESS
