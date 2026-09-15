@@ -45,12 +45,15 @@ from datetime import datetime
 from datetime import timedelta
 from typing import assert_never
 
+from without_async import background_task
 from without_async import limit_concurrency
+from without_async import settled
 from without_streams import Sink
 from without_streams import Stream
 from without_streams import from_sink
 from without_streams import ticks
 
+from without_durability.interfaces import BUDGET
 from without_durability.interfaces import LEASE
 from without_durability.interfaces import Contended
 from without_durability.interfaces import Delivery
@@ -63,6 +66,7 @@ from without_durability.stepwise import Completed
 from without_durability.stepwise import Outcome
 from without_durability.stepwise import Run
 from without_durability.stepwise import Sleeping
+from without_durability.stepwise import extending
 from without_durability.stepwise import now_utc
 from without_durability.stepwise import resume
 
@@ -78,6 +82,10 @@ POOL = 20
 # pass holding it has a fair chance to finish (and to make this wakeup redundant), short
 # enough that a claim dropped immediately afterwards is not left sitting.
 CONTENDED = timedelta(seconds=1)
+# How many signs of life a pass gives inside one lease, and so how often the worker
+# renews. Three rather than two because the margin is what absorbs a slow store round trip:
+# at two, one delayed renewal is already the whole window.
+RENEWALS = 3
 
 
 def passes(
@@ -86,6 +94,7 @@ def passes(
     limit: int = POOL,
     *,
     lease: timedelta = LEASE,
+    budget: timedelta = BUDGET,
     contended: timedelta = CONTENDED,
     now: Callable[[], datetime] = now_utc,
 ) -> Sink[Delivery]:
@@ -123,6 +132,7 @@ def passes(
     losing the claim means there was no pass to have an outcome.
     """
     check_duration("a lease", lease)
+    check_duration("a budget", budget)
     check_duration("a contended interval", contended)
 
     async def look_again(delivery: Delivery, why: str) -> None:
@@ -131,7 +141,12 @@ def passes(
         await durable.scheduler.wake_at(delivery, now() + contended)
 
     async def advance(delivery: Delivery) -> None:
-        holder = await durable.checkpointer.claim(delivery.workflow, lease)
+        # Rebound by `keep_alive`, because `extend` renames a delivery on every store whose
+        # receipt is the visibility it was taken under. Everything below answers for the
+        # *current* name, and `keep_alive` waits out a renewal in flight before it ends, so
+        # by the time anything here runs the name it reads is the one the store holds
+        # rather than one a renewal was halfway through replacing.
+        holder = await durable.checkpointer.claim(delivery.workflow, budget, lease)
         if holder is None:
             # Someone else is mid-pass. Whatever this wakeup carried is in the store
             # already, so the pass in flight may cover it; ask again shortly rather than
@@ -139,8 +154,89 @@ def passes(
             await look_again(delivery, "is held by another pass")
             return
         outcome: Outcome[object]
+        running = asyncio.ensure_future(
+            resume(
+                holder,
+                durable.checkpointer,
+                body,
+                extend=extending(durable.checkpointer, budget, lease, now=now),
+                now=now,
+            )
+        )
+        # Set by `keep_alive` and read by the handler below, because a cancelled `await`
+        # cannot say who cancelled it and the two callers mean opposite things.
+        lost_claim = False
+
+        async def keep_alive() -> None:
+            """
+            Say this worker is still here, to both stores, for as long as the pass runs.
+
+            Both halves on one tick because they answer the same question to two different
+            readers: the claim decides who may write, the delivery decides who owes this
+            wakeup, and a worker holding one without the other is either writing to a
+            workflow somebody else has been handed or sitting on a wakeup it may not act
+            on. Renewing them together is what keeps them lapsing together.
+
+            This is what makes a pass longer than one `lease` ordinary rather than a
+            mistake, and it is the *only* thing keeping the delivery alive across one: a
+            single slow step makes no writes, so nothing else here would speak for minutes
+            at a time.
+
+            A tick that fails is logged and the next one tried, rather than ending the
+            ticker: the tick *is* the retry, and `RENEWALS` per window is the margin that
+            absorbs a missed one. Letting the error out would leave the pass running with
+            nothing renewing it, to be taken over a window later, and would then surface
+            the store's error at the end of a pass that was otherwise fine.
+
+            The renewal of the delivery is shielded, and a cancellation that lands while
+            it is in flight waits for it and takes its answer. On every store whose
+            receipt is the visibility, the store has renamed the delivery the moment the
+            statement commits, whether or not this task was still around to be told; a
+            pass finishing at that moment would otherwise answer `done` under the old
+            name, be silently declined, and be redelivered for nothing.
+            """
+            nonlocal lost_claim, delivery
+            while True:
+                await asyncio.sleep((lease / RENEWALS).total_seconds())
+                try:
+                    if not await durable.checkpointer.renew(holder, lease):
+                        # Ending the pass here rather than leaving it to find out at its
+                        # next write is the whole value of having asked: a step with an
+                        # hour left would otherwise spend it on work that is already
+                        # refused, and a step that will never return would otherwise
+                        # never be ended at all. The delivery is deliberately not renewed
+                        # on the way out, since whoever takes the workflow next is who
+                        # should be handed it.
+                        lost_claim = True
+                        running.cancel()
+                        return
+                    renaming = asyncio.ensure_future(durable.scheduler.extend(delivery, lease))
+                    try:
+                        delivery = await settled(renaming)
+                    except asyncio.CancelledError:
+                        if renaming.exception() is None:
+                            delivery = renaming.result()
+                        else:
+                            logger.warning(
+                                f"{delivery.workflow} could not renew its delivery: {renaming.exception()!r}"
+                            )
+                        raise
+                except Exception as error:  # noqa: BLE001 - a missed tick is retried by the next one, not fatal
+                    logger.warning(f"{delivery.workflow} could not be renewed: {error!r}; trying again next tick")
+
         try:
-            outcome = await resume(holder, durable.checkpointer, body, now=now)
+            async with background_task(keep_alive()):
+                outcome = await running
+        except asyncio.CancelledError:
+            # This worker's or the world's, and only the flag tells them apart. One nobody
+            # here asked for is a shutdown and belongs to whoever sent it; one `keep_alive`
+            # sent is this worker discovering it no longer holds the workflow, whether
+            # because somebody took it or because its budget ran out, which is the
+            # `Fenced` case arriving early and gets the same answer.
+            if not lost_claim:
+                raise
+            await look_again(delivery, "lost its claim mid-pass (superseded, or past its budget)")
+            return
         except (Fenced, Contended) as lost:
             # The claim lapsed mid-pass and someone else took the workflow, which is the
             # same situation as losing it outright, discovered later. So it gets the same
@@ -262,6 +358,7 @@ async def work(
     *,
     tick: timedelta = TICK,
     within: timedelta = BLOCKING,
+    budget: timedelta = BUDGET,
     contended: timedelta = CONTENDED,
     limit: int = POOL,
     now: Callable[[], datetime] = now_utc,
@@ -281,19 +378,27 @@ async def work(
 
     The lease is the scheduler's rather than an argument here, and it is the one number
     that is *not* a knob on this call. It bounds two things that have to agree (how long
-    a delivery stays this worker's, and how long its claim on the workflow is good for),
-    and the queue is where the first one already lives: a visibility-scored store writes
-    it into the row it takes. Reading it back and claiming for exactly as long is what
-    keeps a store constructed with a ten-minute lease from being reclaimed after one.
-    Turning it means `PostgresScheduler(pool, lease=...)`, which is also where the
-    matching `poll` and the store's own timings are set, so the passes a deployment can
-    honestly run are described in one place.
+    a delivery stays this worker's, and how long its claim on the workflow outlives the
+    last word from it), and the queue is where the first one already lives: a
+    visibility-scored store writes it into the row it takes. Reading it back and renewing
+    both on that window is what keeps a store constructed with a ten-minute lease from
+    being reclaimed after one. Turning it means `PostgresScheduler(pool, lease=...)`, which
+    is also where the matching `poll` and the store's own timings are set, so the passes a
+    deployment can honestly run are described in one place.
+
+    `budget` is the other number and is deliberately *not* the scheduler's, because the
+    queue has no opinion about it. It caps how long one pass may hold a workflow however
+    alive it looks, so what it has to exceed is the longest a step can honestly take, where
+    the lease has to exceed nothing at all and is sized for how fast a dead worker should
+    be noticed. A step that knows better than this default says so with
+    `Run.step(..., within=...)`, so this only has to cover the ones nobody annotated.
     """
     # Up front, rather than leaving each to the function that spends it, so a bad timing
     # is a `ValueError` from this call instead of an `ExceptionGroup` out of the task
     # group below. The lease is checked where the scheduler was built.
     check_duration("a tick", tick)
     check_duration("a blocking read", within)
+    check_duration("a budget", budget)
     check_duration("a contended interval", contended)
     await durable.scheduler.prepare()
     lease = durable.scheduler.lease
@@ -302,7 +407,7 @@ async def work(
         await waking(durable.scheduler)(ticks(tick, now=now))
 
     async def advance_ready() -> None:
-        await passes(durable, body, limit, lease=lease, contended=contended, now=now)(
+        await passes(durable, body, limit, lease=lease, budget=budget, contended=contended, now=now)(
             ready(durable.scheduler, within=within, idle=lease)
         )
 

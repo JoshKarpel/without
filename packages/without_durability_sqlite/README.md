@@ -21,8 +21,8 @@ a cluster, a database server, or a dependency.
 Two questions the other stores have to answer carefully settle themselves here.
 There is one writer at a time by construction, so `BEGIN IMMEDIATE` takes the
 write lock for the whole transaction and the fence check and the write it guards
-cannot be interleaved: Postgres needs `FOR UPDATE` on the claim row to get that
-and Redis needs a Lua script, while here the transaction *is* the exclusion. And
+cannot be interleaved: Postgres needs a row lock on the claim to get that and
+Redis needs a Lua script, while here the transaction *is* the exclusion. And
 there is nothing to co-locate, because the datastore is a file, so `transact`,
 `arrive`, and `deliver` reach every table an application keeps in it. That last one is the same
 guarantee DBOS gets from Postgres, for an application that never needed Postgres.

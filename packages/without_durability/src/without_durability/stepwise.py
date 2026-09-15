@@ -35,7 +35,6 @@ import asyncio
 from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Iterator
-from contextlib import suppress
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import UTC
@@ -44,6 +43,8 @@ from datetime import timedelta
 from itertools import islice
 from typing import Never
 
+from without_async import settled
+
 from without_durability.interfaces import INBOX
 from without_durability.interfaces import Checkpointer
 from without_durability.interfaces import Contended
@@ -51,8 +52,19 @@ from without_durability.interfaces import Entry
 from without_durability.interfaces import Fenced
 from without_durability.interfaces import Interruption
 from without_durability.interfaces import Pass
+from without_durability.interfaces import check_duration
 
 type StepKey = str
+# How a step buys itself more time than the claim it inherited was granted, reporting
+# whether the pass still holds the workflow at all.
+#
+# A callback rather than a call to `Checkpointer.extend`, which `Run` could perfectly well
+# make for itself, because the interesting part is the round trip it *skips*. Deciding that
+# means remembering what the store last granted and how long ago, which is a place, and a
+# frozen `Run` rebuilt from the checkpoint on every pass is the wrong thing to hang it on.
+# Injecting it keeps that bookkeeping with whoever owns the claim, which is the worker, and
+# leaves a test free to pass a function that records what it was asked for.
+type Extend = Callable[[Pass, timedelta], Awaitable[bool]]
 # How a recorded value re-enters the workflow as the type the workflow declared.
 #
 # It takes `object` because that is honestly what a checkpoint holds: the store's codec
@@ -182,6 +194,68 @@ def now_utc() -> datetime:
     return datetime.now(UTC)
 
 
+def extending(
+    checkpointer: Checkpointer,
+    granted: timedelta | None = None,
+    alive: timedelta | None = None,
+    now: Callable[[], datetime] = now_utc,
+) -> Extend:
+    """
+    An `Extend` over one claim, skipping the round trip when that claim already covers it.
+
+    Built per pass, because what it remembers is that pass's claim: how long the store last
+    granted and when. A step asking for less than what is left goes through untouched, so a
+    body can annotate every step with a `within` and pay for none of the fast ones.
+
+    `granted` is what the claim was taken for, and it is what the first skip is measured
+    against. Left unset, nothing is assumed: the first window a pass names is always bought
+    from the store, and only what the store has granted since is ever skipped over. That is
+    the honest default for a caller that did not make the claim itself, since a `Pass`
+    carries no budget and a guess that overstates it is a step whose extension is skipped
+    as already covered and fenced after its effect ran.
+
+    `alive` is what one sign of life is worth, and it is the caller's to state because it
+    is the caller's *tick*: a worker renewing a few times per `lease` passes its `lease`.
+    Left unset, the caller has no tick, and each window it buys is its own sign of life,
+    good for the whole of the step it covers, because nothing will speak for the pass
+    again before the write that ends that step. Every store holds the liveness deadline at
+    or below the budget, so a window bought under a tick shorter than the step and never
+    renewed would lapse partway through it however long the budget said.
+
+    The elapsed time is a *difference* between two reads of the same clock, which is what
+    makes it safe to compare against a budget the store granted by its own. An offset
+    between the two clocks cancels; only a difference in their *rate* survives, and that is
+    small enough to ignore where an offset is not. Neither is trusted very far: the margin
+    is a whole liveness window, so nothing is skipped unless it fits with a window to
+    spare, and a clock wrong enough to defeat that costs a fenced pass rather than a lost
+    one.
+
+    Skipping leaves a longer grant standing, so the cap a pass is running under is the
+    largest budget it has asked for recently rather than the current step's exactly. That
+    is the right way round: it can only ever be too generous, and being too tight is what
+    fences a pass that was doing nothing wrong. The store keeps the same promise from its
+    side, since `extend` never brings a budget forward.
+    """
+    if granted is not None:
+        check_duration("a budget", granted)
+    if alive is not None:
+        check_duration("a liveness window", alive)
+    since = now()
+    covered = granted if granted is not None else timedelta()
+
+    async def extend(holder: Pass, budget: timedelta) -> bool:
+        nonlocal since, covered
+        window = alive if alive is not None else budget
+        if now() - since + budget + window <= covered:
+            return True
+        if not await checkpointer.extend(holder, budget, window):
+            return False
+        since, covered = now(), budget
+        return True
+
+    return extend
+
+
 @dataclass(frozen=True, slots=True)
 class Run[Effect = Never]:
     """
@@ -193,11 +267,17 @@ class Run[Effect = Never]:
     the pass and kept current as the pass adds to it, so a step reads memory rather
     than the store. `holder` is this pass's claim, and carrying it is what lets a step
     write at all: there is no way to record without one.
+
+    `extend` is how a step buys more time than that claim was granted, and it has no
+    default because a silent one would be worse than none: a body annotating its slow steps
+    with `within` and getting no extension would read as working and behave exactly as it
+    did before, one fenced pass per slow step. `resume` builds the ordinary one.
     """
 
     holder: Pass
     checkpointer: Checkpointer[Effect]
     recorded: dict[StepKey, object]
+    extend: Extend
     now: Callable[[], datetime] = now_utc
     claimed: set[StepKey] = field(default_factory=set)
     # Every suspension this pass reached, noted where it was raised rather than gathered
@@ -220,7 +300,14 @@ class Run[Effect = Never]:
     def workflow(self) -> str:
         return self.holder.workflow
 
-    async def step[T](self, key: StepKey, effect: Callable[[], Awaitable[object]], parse: Parse[T]) -> T:
+    async def step[T](
+        self,
+        key: StepKey,
+        effect: Callable[[], Awaitable[object]],
+        parse: Parse[T],
+        *,
+        within: timedelta | None = None,
+    ) -> T:
         """
         Run `effect` once across every pass of this workflow, recording what it returns.
 
@@ -271,11 +358,31 @@ class Run[Effect = Never]:
         the rest a second time. Honouring the second one is dropping a write whose
         gateway call has already happened, which is the charge this whole shape exists
         to keep. The wait is still bounded by the store, not by the workflow.
+
+        `within` is how long this step says it may honestly take, and giving it turns the
+        one number a deployment had to guess for every workflow at once into a statement by
+        the code that knows. Without it the step spends whatever the pass was claimed for,
+        which is the deployment's default and is the right answer for the steps that are
+        over in milliseconds. With it the claim is stretched to cover the step *before* the
+        effect runs, so a gateway that takes four minutes is not a pass fenced at one and a
+        charge made twice.
+
+        It is a bound and not a timeout: nothing here stops an effect that outruns it. What
+        it buys is the right to still be holding the workflow when the effect returns, and
+        what it costs is that a step which hangs holds the workflow for this long before
+        anything else may take it.
         """
         self.claim(key)
-        return await self.perform(key, effect, parse)
+        return await self.perform(key, effect, parse, within=within)
 
-    async def perform[T](self, key: StepKey, effect: Callable[[], Awaitable[object]], parse: Parse[T]) -> T:
+    async def perform[T](
+        self,
+        key: StepKey,
+        effect: Callable[[], Awaitable[object]],
+        parse: Parse[T],
+        *,
+        within: timedelta | None = None,
+    ) -> T:
         """
         `step` once the name has been claimed: the lookup, the effect, and the write.
 
@@ -283,19 +390,18 @@ class Run[Effect = Never]:
         will run an effect at all, since a pass that suspends on an empty inbox should
         still have reported a duplicate step name. Claiming inside here instead would
         make that either a double claim or no claim.
+
+        The recorded check comes first, so a pass replaying fifty finished steps to reach
+        an unfinished one pays for none of their budgets: a step that is not going to run
+        needs no time to run in.
         """
         if key in self.recorded:
             return parse(self.recorded[key])
+        await self.covered(within)
         recording = asyncio.ensure_future(self.checkpointer.record(self.holder, key, await effect()))
         try:
-            recorded = await asyncio.shield(recording)
+            recorded = await settled(recording)
         except asyncio.CancelledError:
-            # `wait` rather than an `await`, because this one is finishing somebody
-            # else's business: the write's own failure belongs to the pass being torn
-            # down, and raising it here would replace the cancellation with it.
-            while not recording.done():
-                with suppress(asyncio.CancelledError):
-                    await asyncio.wait([recording])
             # A write that landed is part of this pass whether or not the step that made
             # it survived to say so, and the mapping is what the rest of the pass reads:
             # `sleep` looks here for the deadline it was cancelled before it could raise.
@@ -305,7 +411,29 @@ class Run[Effect = Never]:
         self.recorded[key] = recorded.value
         return parse(recorded.value)
 
-    async def transact[T](self, key: StepKey, effect: Effect, parse: Parse[T]) -> T:
+    async def covered(self, within: timedelta | None) -> None:
+        """
+        Stretch the claim to cover a step that named a window, or lose the pass trying.
+
+        Nothing at all for a step that named none, so the steps that are over in
+        milliseconds pay nothing for the mechanism. A zero is the one value that would
+        quietly do the opposite of what it says: a budget already spent lapses the claim on
+        the spot, so the step that asked for more time gets none at all.
+        """
+        if within is None:
+            return
+        check_duration("a step's window", within)
+        if not await self.extend(self.holder, within):
+            raise Fenced(f"pass {self.holder.token} of {self.holder.workflow!r} was superseded")
+
+    async def transact[T](
+        self,
+        key: StepKey,
+        effect: Effect,
+        parse: Parse[T],
+        *,
+        within: timedelta | None = None,
+    ) -> T:
         """
         Perform `effect` and record it in one commit, so the step is *exactly* once.
 
@@ -327,10 +455,14 @@ class Run[Effect = Never]:
         `parse` is required for the reason it is on `step`, and more plainly: what the
         effect returns is produced by the *store* (a Lua script's reply, a cursor's
         row), so there is no Python type to infer even before the codec touches it.
+
+        `within` is `step`'s, and means the same thing: the store is running this work, so
+        the claim has to outlive it exactly as it would an effect of the caller's own.
         """
         self.claim(key)
         if key in self.recorded:
             return parse(self.recorded[key])
+        await self.covered(within)
         stored = await self.checkpointer.transact(self.holder, key, effect)
         self.recorded[key] = stored
         return parse(stored)
@@ -651,6 +783,7 @@ async def resume[T, Effect](
     checkpointer: Checkpointer[Effect],
     body: Callable[[Run[Effect]], Awaitable[T]],
     *,
+    extend: Extend | None = None,
     now: Callable[[], datetime] = now_utc,
 ) -> Outcome[T]:
     """
@@ -730,8 +863,23 @@ async def resume[T, Effect](
     waiting on the world, so it is refused as the workflow's own error (`Swallowed`). That
     is a deliberate narrowing of what a workflow may do with a `Suspended`: they may be
     named, and they may not be handled.
+
+    `extend` defaults to one over this checkpointer alone, which is the whole of what a
+    caller driving its own workflow needs: there is no delivery to keep alive beside the
+    claim, and no tick renewing it, so every window a step names is bought outright and
+    counts as a sign of life for as long as the step. A worker passes its own, because it
+    holds both and a claim renewed without its delivery is a pass another worker is about
+    to be handed a wakeup for. What the default cannot know is the budget this pass was
+    claimed for, so it assumes nothing and buys the first window it is asked for; a caller
+    that wants that round trip skipped builds its own with `extending`.
     """
-    run = Run(holder=holder, checkpointer=checkpointer, recorded=await checkpointer.load(holder.workflow), now=now)
+    run = Run(
+        holder=holder,
+        checkpointer=checkpointer,
+        recorded=await checkpointer.load(holder.workflow),
+        extend=extend if extend is not None else extending(checkpointer, now=now),
+        now=now,
+    )
     try:
         finished = Completed(await body(run))
     except Fenced, Contended:

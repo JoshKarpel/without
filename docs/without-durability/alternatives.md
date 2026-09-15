@@ -6,7 +6,7 @@ step across a replay, and who guarantees one writer.
 
 | | Closest piece here | What it has that this does not |
 |---|---|---|
-| **Temporal** | `stepwise` | An event history replayed in order, a versioning API for changing in-flight code, retries and timeouts and heartbeats, visibility and search, a determinism sandbox |
+| **Temporal** | `stepwise` | An event history replayed in order, a versioning API for changing in-flight code, retries and timeouts, visibility and search, a determinism sandbox |
 | **DBOS** | `stepwise` over `PostgresCheckpointer`, almost exactly: a library plus a database, no server of its own | Recovery of pending workflows at startup, queues with concurrency and rate limits, workflow and step status tables, decorators that make all of it invisible, a real migration story |
 | **LangGraph** | `stepwise` | Per-superstep state snapshots over a statically declared graph that may be traversed cyclically, plus time travel and a platform for scheduling |
 | **Restate** | the API-plus-worker pair | Also a single binary rather than a cluster, with exclusion structural in keyed virtual objects rather than leased |
@@ -24,7 +24,12 @@ check over a structure known before the run.
 Restate is the one that most tests the premise, because it accepts the same starting
 position (a durable workflow should not need a cluster) and still concludes it needs a
 log and a leader per key. What it gets for that is exclusion that does not expire: a
-lease has to be guessed at, and a partition leader does not.
+budget has to be guessed at, and a partition leader does not. Splitting the claim's
+liveness window off from that budget narrows the guess without closing it, since the
+window is renewed rather than guessed and the budget is still a claim about how long a
+step can honestly take. Temporal draws the same line, pairing a start-to-close timeout
+with a heartbeat timeout, which is evidence the shape is right rather than that the
+guess went away.
 
 ## Credit, and how this sits next to DBOS
 

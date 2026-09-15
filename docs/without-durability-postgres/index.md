@@ -25,7 +25,7 @@ can read.
 workflow_checkpoint   one row per (workflow, step), the value as jsonb,
                       a `seq` column for the order they were recorded in,
                       a `written_at` column for when each one landed
-workflow_claim        one row per workflow: whose pass it is, and until when
+workflow_claim        one row per workflow: whose pass it is, and until when it lapses
 workflow_queue        one row per (namespace, workflow), scored by when it is visible
 workflow_seq          the sequence behind `seq`, which `append` also names its keys from
 ```
@@ -49,7 +49,7 @@ came from*, and here it came with the database:
 | | Redis | Postgres |
 |---|---|---|
 | Claim the workflow | the `CLAIM` script: read the lease, compare, write, expire | one upsert whose `DO UPDATE` carries a `WHERE` |
-| Record under the fence | the `RECORD` script: read the token, refuse or `HSETNX`, read back | one statement: a `FOR UPDATE` CTE feeding an upsert |
+| Record under the fence | the `RECORD` script: read the token, refuse or `HSETNX`, read back | one statement: an `UPDATE ... RETURNING` CTE on the claim row feeding an upsert |
 | Supply from outside a pass | the `SUPPLY` script: `HSETNX`, read back | the same upsert without the CTE |
 | Append under a key the store names | the `APPEND` script: `HLEN`, then `HSET` under it | one insert naming its key from `nextval` |
 | Step and checkpoint together | the `TRANSACT` script, a wrapper the effect is spliced into | `BEGIN` ... `COMMIT`, with the effect's own SQL in the middle |
@@ -78,17 +78,32 @@ The claim is the one to look at, because every clause of the script it replaces
 survives as a clause of the statement:
 
 ```sql
-INSERT INTO workflow_claim AS held (workflow, token, held_until)
-VALUES (%(workflow)s, 1, now() + %(lease)s)
+INSERT INTO workflow_claim AS held (workflow, token, held_until, alive_until, alive_for)
+VALUES (
+    %(workflow)s, 1,
+    now() + %(budget)s, LEAST(now() + %(alive)s, now() + %(budget)s), %(alive)s
+)
 ON CONFLICT (workflow) DO UPDATE
-    SET token = held.token + 1, held_until = now() + %(lease)s
-    WHERE held.held_until <= now()
+    SET token = held.token + 1,
+        held_until = now() + %(budget)s,
+        alive_until = LEAST(now() + %(alive)s, now() + %(budget)s),
+        alive_for = %(alive)s
+    WHERE held.alive_until <= now()
 RETURNING token
 ```
 
 The `WHERE` on `DO UPDATE` is the "is it free" check: a conflicting row whose
-lease has not elapsed fails it, the update does not happen, and `RETURNING` yields
-no row, which is how a lost race is reported. The insert arm covers a workflow
+liveness deadline has not elapsed fails it, the update does not happen, and
+`RETURNING` yields no row, which is how a lost race is reported.
+
+Three columns rather than one, because a claim lapses at the earlier of two things.
+`held_until` is the budget and `alive_until` is when silence ends the claim, and the
+`LEAST` is what holds the second at or below the first everywhere it is written, so
+a renewal can neither carry a pass past its budget nor take a workflow back after a
+`RELEASE` has brought that budget down to now. `alive_for` rides along because
+`RECORD` is itself a sign of life and has only the workflow to go on: keeping it on
+the row rather than in a store-wide setting is what stops a workflow claimed with a
+short window from quietly renewing on a long one. The insert arm covers a workflow
 nobody has ever claimed, and Postgres serializes two of those against each other
 on the primary key, so the loser waits and then takes the `DO UPDATE` path rather
 than both winning. The clock is the server's, for the reason the Lua script's is:
@@ -96,11 +111,34 @@ a lease compared against the claimant's own clock is only as good as the agreeme
 between the two, which is exactly what fails when a machine is unhealthy enough to
 stall mid-pass.
 
-`FOR UPDATE` in `record` is the one piece that is easy to leave out and wrong to.
+The row lock in `record` is the one piece that is easy to leave out and wrong to.
 Without it the fence is read from the statement's snapshot, so a claim committing
 a microsecond after the statement began goes unseen and a superseded pass's write
 lands. Taking the row lock makes the write queue behind any claim in flight and
 then re-read the row it locked, so the token it compares against is the newest one.
+
+That fence is an `UPDATE ... RETURNING token` rather than a `SELECT ... FOR UPDATE`,
+which costs nothing and buys the renewal: a write is the plainest sign of life a
+pass gives, and the statement was already locking the claim row, so a workflow of
+ordinary short steps renews itself for free and the worker's tick is left with the
+case it is really for, a single step long enough that no write falls inside a whole
+lease. A data-modifying CTE gives the same re-read behaviour a `FOR UPDATE` would,
+re-evaluating its `WHERE` against the committed row version and returning what it
+re-read; that was confirmed against a real server rather than assumed, since the
+whole fence rests on it. The token is in that `WHERE`, so a refused write renews
+nobody: a superseded pass's stray writes would otherwise keep the winner's claim
+alive after the winner had died.
+
+`transact` reads the fence twice, and the split is where the lock goes. A plain
+read before the effect stops a superseded pass from performing anything, and takes
+no lock, so the claim row stays free while the effect runs; the locked re-read comes
+after the effect, in the statement that renews, so a pass superseded meanwhile is
+refused there and its effect rolls back with the transaction. Holding the lock across
+the effect would queue the worker's own renewal (on another connection) behind it
+for the whole effect, and a long effect would then be taken over on commit for having
+gone quiet. That renewal is stamped with `clock_timestamp()`, the one claim
+statement that needs it: `now()` is the transaction's start, which for a slow effect
+is already in the past by the time it commits.
 
 ### What the move takes away
 

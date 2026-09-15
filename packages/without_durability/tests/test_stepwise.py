@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable
+from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import UTC
@@ -13,6 +15,8 @@ from integration.durable import parse_held
 from integration.durable import parse_items
 from integration.durable import parse_reference
 from integration.durable import pay_out
+from without_durability import BUDGET
+from without_durability import LEASE
 from without_durability import Blocked
 from without_durability import Completed
 from without_durability import Contended
@@ -23,6 +27,7 @@ from without_durability import MemoryCheckpointer
 from without_durability import MemoryEffect
 from without_durability import MessageNeeded
 from without_durability import Outcome
+from without_durability import Pass
 from without_durability import Recorded
 from without_durability import Run
 from without_durability import ScheduledWakeup
@@ -30,6 +35,7 @@ from without_durability import Sleeping
 from without_durability import Suspended
 from without_durability import Swallowed
 from without_durability import claimed
+from without_durability import extending
 from without_durability import inbox_key
 from without_durability import now_utc
 from without_durability import parse_bound
@@ -37,6 +43,7 @@ from without_durability import parse_deadline
 from without_durability import resume
 from without_durability.stepwise import stopped_at
 from without_durability.stepwise import unwound
+from without_durability.testing import passing
 
 from .helpers import STARTED_AT
 from .helpers import Clock
@@ -291,13 +298,15 @@ async def test_a_workflow_already_being_passed_over_cannot_be_claimed_again() ->
 
     holder = await claimed(checkpointer, ORDER)
 
-    assert await checkpointer.claim(ORDER, timedelta(minutes=1)) is None
+    assert await checkpointer.claim(ORDER, timedelta(minutes=5), timedelta(minutes=1)) is None
     with pytest.raises(Contended, match=f"another pass holds {ORDER!r}"):
         await claimed(checkpointer, ORDER)
 
     await checkpointer.release(holder)
 
-    assert await checkpointer.claim(ORDER, timedelta(minutes=1)) is not None, "released, so the next pass may run"
+    assert await checkpointer.claim(ORDER, timedelta(minutes=5), timedelta(minutes=1)) is not None, (
+        "released, so the next pass may run"
+    )
 
 
 async def test_a_claim_outranks_every_claim_before_it() -> None:
@@ -310,18 +319,21 @@ async def test_a_claim_outranks_every_claim_before_it() -> None:
     assert second.token > first.token, "releasing hands the workflow back, it does not rewind the fence"
 
 
-@pytest.mark.parametrize("lease", [timedelta(), timedelta(seconds=-1)])
-async def test_claiming_refuses_a_lease_that_is_not_a_positive_duration(lease: timedelta) -> None:
-    # Checked before the store is asked, and named, because a lease is one of several
+@pytest.mark.parametrize("bad", [timedelta(), timedelta(seconds=-1)])
+@pytest.mark.parametrize("named", ["a budget", "a liveness window"])
+async def test_claiming_refuses_a_duration_that_is_not_positive(bad: timedelta, named: str) -> None:
+    # Checked before the store is asked, and named, because these are two of several
     # durations a deployment sets from configuration and they all fail the same way: a zero
     # arrives from an unset setting, and "must be a positive duration" without saying which
-    # one sends the operator through every timing they have.
+    # one sends the operator through every timing they have. Naming matters more now that a
+    # claim takes two of them, since "the lease" no longer identifies which.
     checkpointer = MemoryCheckpointer()
+    budget, alive = (bad, LEASE) if named == "a budget" else (BUDGET, bad)
 
-    with pytest.raises(ValueError, match=r"^a lease must be a positive duration"):
-        await claimed(checkpointer, ORDER, lease)
+    with pytest.raises(ValueError, match=rf"^{named} must be a positive duration"):
+        await claimed(checkpointer, ORDER, budget, alive)
 
-    assert checkpointer.tokens == {}, "and nothing was claimed on the way to finding out"
+    assert checkpointer.claims == {}, "and nothing was claimed on the way to finding out"
 
 
 async def test_a_write_from_a_superseded_pass_is_refused_rather_than_applied() -> None:
@@ -340,7 +352,7 @@ async def test_a_write_from_a_superseded_pass_is_refused_rather_than_applied() -
 
     await checkpointer.release(stalled)
 
-    assert await checkpointer.claim(ORDER, timedelta(minutes=1)) is None, (
+    assert await checkpointer.claim(ORDER, timedelta(minutes=5), timedelta(minutes=1)) is None, (
         "and a superseded pass cannot hand back a workflow that is no longer its to give"
     )
 
@@ -396,7 +408,7 @@ async def test_a_step_returns_what_the_store_holds_rather_than_what_its_effect_p
     checkpointer = MemoryCheckpointer()
     await checkpointer.supply(ORDER, "charged", "ch-recorded-earlier")
     holder = await claimed(checkpointer, ORDER)
-    run = Run(holder=holder, checkpointer=checkpointer, recorded={})
+    run = passing(holder, checkpointer)
 
     assert await run.step("charged", lambda: answering("ch-just-now"), as_text) == "ch-recorded-earlier"
 
@@ -419,7 +431,7 @@ async def test_a_step_whose_record_never_lands_runs_its_effect_again() -> None:
     # between leaves the effect done and unrecorded, so the next pass repeats it.
     checkpointer = MemoryCheckpointer()
     holder = await claimed(checkpointer, ORDER)
-    run = Run(holder=holder, checkpointer=checkpointer, recorded={})
+    run = passing(holder, checkpointer)
     effect = tallying("charges")
 
     async def charge() -> object:
@@ -427,9 +439,142 @@ async def test_a_step_whose_record_never_lands_runs_its_effect_again() -> None:
 
     await run.step("charged", charge, as_count)
     checkpointer.hashes[ORDER].clear()  # the record that a crash lost
-    await Run(holder=holder, checkpointer=checkpointer, recorded={}).step("charged", charge, as_count)
+    await passing(holder, checkpointer).step("charged", charge, as_count)
 
     assert checkpointer.data["charges"] == 2, "the card was charged twice, which is what an idempotency key is for"
+
+
+async def test_a_step_that_names_a_window_buys_the_claim_that_much_longer() -> None:
+    # The number moving from the deployment to the code that knows it. A worker's default
+    # budget has to cover every workflow it runs, so a gateway that takes minutes either
+    # forces that default up for everything or fences the pass that calls it; saying so at
+    # the step is what lets both be right at once.
+    checkpointer = MemoryCheckpointer()
+    holder = await claimed(checkpointer, ORDER, timedelta(milliseconds=1), timedelta(milliseconds=1))
+    run = passing(holder, checkpointer)
+
+    async def slow() -> object:
+        await asyncio.sleep(0.05)
+        return "ch-1"
+
+    assert await run.step("charged", slow, as_text, within=timedelta(minutes=5)) == "ch-1", (
+        "the effect outran the budget the claim was taken under, and the write still landed"
+    )
+    assert await checkpointer.claim(ORDER, BUDGET, LEASE) is None, "because the claim was stretched to cover it"
+
+
+async def test_a_step_whose_window_the_store_refuses_stops_before_its_effect_runs() -> None:
+    # Asking is also the earliest this pass can find out it has lost the workflow, which is
+    # worth having: the alternative is performing the effect and discovering at the write
+    # that nobody wanted it, which is the duplicate charge the fence exists to make safe
+    # rather than to prevent.
+    checkpointer = MemoryCheckpointer()
+    stalled = await claimed(checkpointer, ORDER)
+    await checkpointer.release(stalled)
+    await claimed(checkpointer, ORDER)
+    ran: list[str] = []
+
+    async def charge() -> object:  # pragma: no cover - never reached, which is what this test asserts
+        ran.append("charged")
+        return "ch-1"
+
+    with pytest.raises(Fenced, match=f"pass {stalled.token} of {ORDER!r} was superseded"):
+        await passing(stalled, checkpointer).step("charged", charge, as_text, within=timedelta(minutes=5))
+
+    assert ran == [], "refused before the effect ran, not after"
+
+
+# The two ways a step names a window, as calls rather than as a name to branch on, so the
+# `raises` block below holds the one statement under test.
+def stepping(run: Run[MemoryEffect], within: timedelta) -> Awaitable[str]:
+    return run.step("charged", lambda: answering("ch-1"), as_text, within=within)
+
+
+def transacting(run: Run[MemoryEffect], within: timedelta) -> Awaitable[int]:
+    return run.transact("charged", tallying("charges"), as_count, within=within)
+
+
+@pytest.mark.parametrize("bad", [timedelta(), timedelta(seconds=-1)])
+@pytest.mark.parametrize("reach", [stepping, transacting], ids=["step", "transact"])
+async def test_a_step_refuses_a_window_that_is_not_a_positive_duration(
+    bad: timedelta,
+    reach: Callable[[Run[MemoryEffect], timedelta], Awaitable[object]],
+) -> None:
+    # The same boundary every other duration here crosses, and this one is the easiest to
+    # let through because it arrives per call rather than from a settings object. A zero is
+    # the value that does the opposite of what it says: a budget already spent lapses the
+    # claim on the spot, so the step that asked for more time would get none at all.
+    checkpointer = MemoryCheckpointer()
+    run = passing(await claimed(checkpointer, ORDER), checkpointer)
+
+    with pytest.raises(ValueError, match=r"^a step's window must be a positive duration"):
+        await reach(run, bad)
+
+    assert await checkpointer.load(ORDER) == {}, "and nothing ran on the way to finding out"
+
+
+async def test_a_recorded_step_pays_nothing_for_the_window_it_names() -> None:
+    # A pass replaying fifty finished steps to reach an unfinished one should not spend fifty
+    # round trips buying time for effects that are not going to run. The recorded check comes
+    # first, so annotating every step costs a replay nothing.
+    checkpointer = MemoryCheckpointer()
+    holder = await claimed(checkpointer, ORDER)
+    asked: list[timedelta] = []
+
+    async def noting(_holder: Pass, budget: timedelta) -> bool:  # pragma: no cover - never called, as asserted below
+        asked.append(budget)
+        return True
+
+    run = Run(holder=holder, checkpointer=checkpointer, recorded={"charged": "ch-1"}, extend=noting)
+
+    assert await run.step("charged", lambda: answering("ch-2"), as_text, within=timedelta(minutes=5)) == "ch-1"
+    assert asked == [], "the step was already recorded, so nothing had to be bought for it"
+
+
+async def test_a_window_the_outstanding_budget_already_covers_costs_no_round_trip() -> None:
+    # Which is what makes a `within` on every step affordable. The claim a worker takes is
+    # good for minutes and most steps are over in milliseconds, so the common case is a
+    # comparison rather than a write, and the store is only asked when the answer changes.
+    checkpointer = MemoryCheckpointer()
+    holder = await claimed(checkpointer, ORDER)
+    extend = extending(checkpointer, timedelta(minutes=10), LEASE)
+    granted = checkpointer.claims[ORDER].held_until
+
+    assert await extend(holder, timedelta(seconds=1)), "comfortably inside what the claim already holds"
+    assert checkpointer.claims[ORDER].held_until == granted, "so the store was never asked"
+
+    assert await extend(holder, timedelta(minutes=30)), "past it, so this one has to be asked for"
+    assert checkpointer.claims[ORDER].held_until > granted, "and the store moved the deadline out"
+
+
+async def test_the_default_extend_buys_the_first_window_rather_than_assuming_the_claim_covers_it() -> None:
+    # `resume` builds this one, for a caller that did not say what it claimed for. A `Pass`
+    # carries no budget, so any figure assumed here is a guess, and a guess that overstates
+    # the claim is the quiet failure: the step's extension is skipped as already covered,
+    # the short claim lapses under the effect, and the write after it is fenced.
+    checkpointer = MemoryCheckpointer()
+    holder = await claimed(checkpointer, ORDER, budget=timedelta(seconds=10))
+    granted = checkpointer.claims[ORDER].held_until
+    extend = extending(checkpointer)
+
+    assert await extend(holder, timedelta(minutes=2))
+
+    assert checkpointer.claims[ORDER].held_until > granted, "bought from the store, whatever the claim was for"
+
+
+async def test_a_window_bought_without_a_tick_is_alive_for_the_whole_window() -> None:
+    # A caller driving `resume` itself has nothing renewing its claim between writes, and
+    # every store holds the liveness deadline at or below the budget. A window bought under
+    # a liveness tick it does not have would therefore lapse one tick in, however long the
+    # budget said, and the two-hour step it was bought for would be fenced anyway. With no
+    # tick, the window *is* the sign of life, and it is good for as long as the step.
+    checkpointer = MemoryCheckpointer()
+    holder = await claimed(checkpointer, ORDER)
+
+    assert await extending(checkpointer)(holder, timedelta(hours=2))
+
+    claim = checkpointer.claims[ORDER]
+    assert claim.alive_until == claim.held_until, "alive for as long as it is held, since nothing will speak sooner"
 
 
 async def test_a_transacted_step_cannot_be_run_without_being_recorded() -> None:
@@ -441,21 +586,46 @@ async def test_a_transacted_step_cannot_be_run_without_being_recorded() -> None:
     checkpointer = MemoryCheckpointer()
     holder = await claimed(checkpointer, ORDER)
 
-    first = await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact(
+    first = await passing(holder, checkpointer).transact("charged", tallying("charges"), as_count)
+    again = await passing(holder, checkpointer, await checkpointer.load(ORDER)).transact(
         "charged", tallying("charges"), as_count
     )
-    again = await Run(
-        holder=holder,
-        checkpointer=checkpointer,
-        recorded=await checkpointer.load(ORDER),
-    ).transact("charged", tallying("charges"), as_count)
-    fresh = await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact(
-        "charged", tallying("charges"), as_count
-    )
+    fresh = await passing(holder, checkpointer).transact("charged", tallying("charges"), as_count)
 
     assert (first, again, fresh) == (1, 1, 1), "one effect, however many passes reach it"
     assert checkpointer.data["charges"] == 1
     assert await checkpointer.load(ORDER) == {"charged": 1}
+
+
+async def test_a_transacted_step_that_names_a_window_is_granted_it_too() -> None:
+    # The store is the one running the effect here, so the claim has to outlive it exactly
+    # as it would an effect of the caller's own: a co-committed step that takes minutes is
+    # no more allowed to lose its workflow mid-commit than a gateway call is.
+    checkpointer = MemoryCheckpointer()
+    holder = await claimed(checkpointer, ORDER, timedelta(milliseconds=1), timedelta(milliseconds=1))
+    run = passing(holder, checkpointer)
+
+    charged = await run.transact("charged", tallying("charges"), as_count, within=timedelta(minutes=5))
+
+    assert charged == 1, "the effect ran and committed under the budget it asked for"
+    assert await checkpointer.claim(ORDER, BUDGET, LEASE) is None, "because the claim was stretched to cover it"
+
+
+async def test_a_transacted_step_that_names_a_window_is_refused_the_same_way() -> None:
+    # `transact` asks for the same reason `step` does: the store is running the work, so the
+    # claim has to outlive it exactly as it would an effect of the caller's own, and a pass
+    # that has lost the workflow must not set one going.
+    checkpointer = MemoryCheckpointer()
+    stalled = await claimed(checkpointer, ORDER)
+    await checkpointer.release(stalled)
+    await claimed(checkpointer, ORDER)
+
+    with pytest.raises(Fenced, match=f"pass {stalled.token} of {ORDER!r} was superseded"):
+        await passing(stalled, checkpointer).transact(
+            "charged", tallying("charges"), as_count, within=timedelta(minutes=5)
+        )
+
+    assert checkpointer.data == {}, "refused before the effect ran, not after"
 
 
 async def test_a_transacted_step_is_refused_from_a_superseded_pass() -> None:
@@ -467,9 +637,7 @@ async def test_a_transacted_step_is_refused_from_a_superseded_pass() -> None:
     await claimed(checkpointer, ORDER)
 
     with pytest.raises(Fenced):
-        await Run(holder=stalled, checkpointer=checkpointer, recorded={}).transact(
-            "charged", tallying("charges"), as_count
-        )
+        await passing(stalled, checkpointer).transact("charged", tallying("charges"), as_count)
 
     assert checkpointer.data == {}, "refused before the effect ran, not after"
 
@@ -559,9 +727,7 @@ async def test_a_step_cancelled_while_writing_still_records_the_effect_it_perfor
     # an exotic one.
     checkpointer = ParkedWrites()
     holder = await claimed(checkpointer, ORDER)
-    charging = asyncio.ensure_future(
-        Run(holder=holder, checkpointer=checkpointer, recorded={}).step("charged", lambda: answering("ch-1"), as_text)
-    )
+    charging = asyncio.ensure_future(passing(holder, checkpointer).step("charged", lambda: answering("ch-1"), as_text))
     await checkpointer.writing.wait()
 
     charging.cancel()
@@ -855,11 +1021,7 @@ async def test_a_read_names_the_step_whose_cursor_the_store_holds_wrongly() -> N
     # `receive` rather than by calling the parser, since the closure is where the key could
     # go missing.
     checkpointer = MemoryCheckpointer()
-    run = Run(
-        holder=await claimed(checkpointer, ORDER),
-        checkpointer=checkpointer,
-        recorded={inbox_key(0): "a message", "heard": 7},
-    )
+    run = passing(await claimed(checkpointer, ORDER), checkpointer, {inbox_key(0): "a message", "heard": 7})
 
     with pytest.raises(TypeError, match=r"^'heard' holds 7,"):
         await run.receive("heard")
@@ -870,7 +1032,7 @@ async def test_a_sleep_names_the_step_whose_deadline_the_store_holds_wrongly() -
     # deadlines, so which one the checkpoint holds something else under is what an operator
     # needs before anything can be done about it.
     checkpointer = MemoryCheckpointer()
-    run = Run(holder=await claimed(checkpointer, ORDER), checkpointer=checkpointer, recorded={"settling": 17})
+    run = passing(await claimed(checkpointer, ORDER), checkpointer, {"settling": 17})
 
     with pytest.raises(TypeError, match=r"^'settling' holds 17,"):
         await run.sleep("settling", SETTLING)
@@ -892,7 +1054,7 @@ async def test_a_transacted_effect_that_fails_leaves_the_stores_data_alone() -> 
         raise RuntimeError("the ledger refused the debit")
 
     with pytest.raises(RuntimeError, match="refused the debit"):
-        await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("debited", debit, as_count)
+        await passing(holder, checkpointer).transact("debited", debit, as_count)
 
     assert checkpointer.data == {"balance": 100}, "the effect went back with the record that never landed"
     assert await checkpointer.load(ORDER) == {}
@@ -1001,9 +1163,7 @@ async def test_a_step_cancelled_twice_still_records_the_effect_it_performed() ->
     # charge the first one was held for.
     checkpointer = ParkedWrites()
     holder = await claimed(checkpointer, ORDER)
-    charging = asyncio.ensure_future(
-        Run(holder=holder, checkpointer=checkpointer, recorded={}).step("charged", lambda: answering("ch-1"), as_text)
-    )
+    charging = asyncio.ensure_future(passing(holder, checkpointer).step("charged", lambda: answering("ch-1"), as_text))
     await checkpointer.writing.wait()
 
     charging.cancel()
@@ -1024,7 +1184,7 @@ async def test_a_step_cancelled_over_a_write_that_failed_records_nothing() -> No
     # the at-least-once bound `step` already documents.
     checkpointer = ParkedWrites(refuse=True)
     holder = await claimed(checkpointer, ORDER)
-    run = Run(holder=holder, checkpointer=checkpointer, recorded={})
+    run = passing(holder, checkpointer)
     charging = asyncio.ensure_future(run.step("charged", lambda: answering("ch-1"), as_text))
     await checkpointer.writing.wait()
 

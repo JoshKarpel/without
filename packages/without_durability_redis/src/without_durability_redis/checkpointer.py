@@ -54,6 +54,7 @@ from without_durability.interfaces import Recorded
 from without_durability.interfaces import Written
 from without_durability.interfaces import check_duration
 
+from without_durability_redis.units import CLOCK
 from without_durability_redis.units import milliseconds
 from without_durability_redis.units import seconds
 
@@ -71,17 +72,31 @@ from without_durability_redis.units import seconds
 #
 # Splitting on the first two colons is safe whatever the codec produces, because both
 # numbers are digits and both are in front.
-PACKING = """
-local function now_ms()
-  local now = redis.call('TIME')
-  return tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+# What a sign of life does to a claim. Spliced into every script that gives one, so the
+# `math.min` that holds the liveness deadline at or below the budget is written once
+# instead of in each of the five places a claim is renewed.
+LIVENESS = (
+    CLOCK
+    + """
+local function heard_from(pass_key, window)
+  return math.min(now_ms() + window, tonumber(redis.call('HGET', pass_key, 'until') or '0'))
 end
+local function alive_for(pass_key)
+  return tonumber(redis.call('HGET', pass_key, 'for') or '0')
+end
+"""
+)
+
+PACKING = (
+    LIVENESS
+    + """
 local function pack_value(position, at, encoded) return position .. ':' .. at .. ':' .. encoded end
 local function bare_value(packed)
   local past_position = string.find(packed, ':', 1, true) + 1
   return string.sub(packed, string.find(packed, ':', past_position, true) + 1)
 end
 """
+)
 
 # Take the workflow if nobody holds it, and stamp the taking with a number that only
 # ever goes up. It is the store, not the claimant, that decides the ordering, so two
@@ -104,21 +119,84 @@ end
 # makes that unreachable is the `ttl` rather than the arithmetic, since an expiry cannot
 # happen in under a day. The guarantee rests on that margin, not on the token alone.
 #
+# The pass hash carries three numbers rather than one, and they are three because one was
+# being asked two questions. `until` is the budget, the latest this claim can lapse at
+# whatever its holder does; `alive` is when it lapses if nothing more is heard, which is
+# what this script tests; `for` is what one sign of life is worth, kept on the hash because
+# `RECORD` is one and has only the keys to go on.
+#
+# Every write of `alive` is a `math.min` against `until`, which is what makes a renewal
+# unable to carry a pass past its budget or take a workflow back after a `RELEASE`. The
+# three live in the hash already holding the token, so nothing new expires and nothing new
+# has to expire in step.
+#
 #   KEYS[1]  the workflow's pass hash
-#   ARGV[1]  lease, in milliseconds
-#   ARGV[2]  expiry for the pass hash, in seconds
+#   ARGV[1]  budget, in milliseconds
+#   ARGV[2]  liveness window, in milliseconds
+#   ARGV[3]  expiry for the pass hash, in seconds
 #   returns  the fencing token, or nil if another pass holds the workflow
-CLAIM = """
-local now = redis.call('TIME')
-local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
-local held_until = tonumber(redis.call('HGET', KEYS[1], 'until') or '0')
-if held_until > now_ms then return nil end
+CLAIM = (
+    LIVENESS
+    + """
+local now = now_ms()
+if tonumber(redis.call('HGET', KEYS[1], 'alive') or '0') > now then return nil end
 local previous = tonumber(redis.call('HGET', KEYS[1], 'token') or '0')
-local token = math.max(now_ms, previous + 1)
-redis.call('HSET', KEYS[1], 'token', token, 'until', now_ms + tonumber(ARGV[1]))
-redis.call('EXPIRE', KEYS[1], ARGV[2])
+local token = math.max(now, previous + 1)
+local held_until = now + tonumber(ARGV[1])
+redis.call('HSET', KEYS[1], 'token', token, 'until', held_until, 'for', ARGV[2],
+  'alive', math.min(now + tonumber(ARGV[2]), held_until))
+redis.call('EXPIRE', KEYS[1], ARGV[3])
 return token
 """
+)
+
+# A fresh budget and a sign of life with it: what a step that declared a `within` spends
+# before running its effect. Conditional on the token rather than on the deadline, since a
+# claim that has lapsed without being taken is still this pass's to stretch. The `math.max`
+# against the budget already standing is what keeps a short window from taking time away
+# from the unannotated steps behind it: a budget can only ever be too generous from here.
+#
+#   KEYS[1]  the workflow's pass hash
+#   ARGV[1]  the asking pass's fencing token
+#   ARGV[2]  budget, in milliseconds
+#   ARGV[3]  liveness window, in milliseconds
+#   ARGV[4]  expiry for the pass hash, in seconds
+#   returns  1 if this pass still holds the workflow, 0 if it has been superseded
+EXTEND = (
+    LIVENESS
+    + """
+if tonumber(ARGV[1]) < tonumber(redis.call('HGET', KEYS[1], 'token') or '0') then return 0 end
+local now = now_ms()
+local held_until = math.max(tonumber(redis.call('HGET', KEYS[1], 'until') or '0'), now + tonumber(ARGV[2]))
+redis.call('HSET', KEYS[1], 'until', held_until, 'for', ARGV[3],
+  'alive', math.min(now + tonumber(ARGV[3]), held_until))
+redis.call('EXPIRE', KEYS[1], ARGV[4])
+return 1
+"""
+)
+
+# A sign of life and nothing else: the worker's tick, which says this pass is still running
+# without saying it may run any longer than it was already granted. Refused once the budget
+# has run out as well as below the fence, because the answer is what the worker acts on: a
+# renewal that reported success on a lapsed claim would keep a hung pass running for as
+# long as nothing else happened to take its workflow.
+#
+#   KEYS[1]  the workflow's pass hash
+#   ARGV[1]  the asking pass's fencing token
+#   ARGV[2]  liveness window, in milliseconds
+#   ARGV[3]  expiry for the pass hash, in seconds
+#   returns  1 if this pass still holds the workflow, 0 if it has been superseded or its
+#            budget has run out
+RENEW = (
+    LIVENESS
+    + """
+if tonumber(ARGV[1]) < tonumber(redis.call('HGET', KEYS[1], 'token') or '0') then return 0 end
+if tonumber(redis.call('HGET', KEYS[1], 'until') or '0') <= now_ms() then return 0 end
+redis.call('HSET', KEYS[1], 'for', ARGV[2], 'alive', heard_from(KEYS[1], tonumber(ARGV[2])))
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+return 1
+"""
+)
 
 # The fenced, conditional write. Refuse anything from a superseded pass, never overwrite
 # a step that is already recorded, and hand back whatever is stored once the dust
@@ -150,6 +228,11 @@ if tonumber(ARGV[3]) < fence then
   return redis.error_reply('FENCED pass ' .. ARGV[3] .. ' superseded by ' .. fence)
 end
 redis.call('HSETNX', KEYS[1], ARGV[1], pack_value(redis.call('HLEN', KEYS[1]), now_ms(), ARGV[2]))
+-- A write is the plainest sign of life a pass gives, so it counts as one here rather than
+-- costing a round trip of its own. The `math.min` inside `heard_from` is what keeps that
+-- safe after a `RELEASE`, which brings the budget down to now: a write still in flight
+-- then renews to now and takes nothing back from whoever has claimed the workflow since.
+redis.call('HSET', KEYS[2], 'alive', heard_from(KEYS[2], alive_for(KEYS[2])))
 redis.call('EXPIRE', KEYS[1], ARGV[4])
 redis.call('EXPIRE', KEYS[2], ARGV[4])
 local stored = bare_value(redis.call('HGET', KEYS[1], ARGV[1]))
@@ -233,23 +316,28 @@ local removed = redis.call('HLEN', KEYS[1])
 redis.call('DEL', KEYS[1])
 local previous = tonumber(redis.call('HGET', KEYS[2], 'token') or '0')
 if previous > 0 then
-  redis.call('HSET', KEYS[2], 'token', math.max(now_ms(), previous + 1), 'until', 0)
+  redis.call('HSET', KEYS[2], 'token', math.max(now_ms(), previous + 1), 'until', 0, 'alive', 0)
   redis.call('EXPIRE', KEYS[2], ARGV[1])
 end
 return removed
 """
 )
 
-# Give the workflow back early, but keep the token. Zeroing the deadline rather than
+# Give the workflow back early, but keep the token. Zeroing the deadlines rather than
 # deleting the key is what preserves the fence across a clean handover: the next claim
 # gets the next number up, so a pass that comes back from the dead still loses.
+#
+# Both of them, and the budget is the load-bearing one: a write this pass had already
+# started is entitled to land, since releasing keeps the token, and zeroing `until` is what
+# stops that write's own renewal from taking the workflow back, since every renewal is a
+# `math.min` against it.
 #
 #   KEYS[1]  the workflow's pass hash
 #   ARGV[1]  the releasing pass's fencing token
 #   returns  0 always; a release by a superseded pass is a no-op, not an error
 RELEASE = """
 if tonumber(redis.call('HGET', KEYS[1], 'token') or '0') == tonumber(ARGV[1]) then
-  redis.call('HSET', KEYS[1], 'until', 0)
+  redis.call('HSET', KEYS[1], 'until', 0, 'alive', 0)
 end
 return 0
 """
@@ -379,6 +467,9 @@ end)()
 -- prefix added on the way in and taken off on the way out, so an effect never sees one and
 -- never writes one.
 redis.call('HSET', KEYS[1], ARGV[1], pack_value(redis.call('HLEN', KEYS[1]), now_ms(), result))
+-- A co-committed step is a write like any other, so it counts as a sign of life for the
+-- same reason `RECORD`'s does.
+redis.call('HSET', KEYS[2], 'alive', heard_from(KEYS[2], alive_for(KEYS[2])))
 redis.call('EXPIRE', KEYS[1], ARGV[3])
 redis.call('EXPIRE', KEYS[2], ARGV[3])
 return result
@@ -457,6 +548,8 @@ class RedisCheckpointer:
     # not seen it. One field per script rather than a tuple read by index, so the name a
     # call site uses is checked against the script it was registered with.
     take: AsyncScript = field(init=False, repr=False, compare=False)
+    stretch: AsyncScript = field(init=False, repr=False, compare=False)
+    still_here: AsyncScript = field(init=False, repr=False, compare=False)
     write: AsyncScript = field(init=False, repr=False, compare=False)
     offer: AsyncScript = field(init=False, repr=False, compare=False)
     file_away: AsyncScript = field(init=False, repr=False, compare=False)
@@ -475,6 +568,8 @@ class RedisCheckpointer:
     def __post_init__(self) -> None:
         check_duration("a ttl", self.ttl)
         object.__setattr__(self, "take", self.redis.register_script(CLAIM))
+        object.__setattr__(self, "stretch", self.redis.register_script(EXTEND))
+        object.__setattr__(self, "still_here", self.redis.register_script(RENEW))
         object.__setattr__(self, "write", self.redis.register_script(RECORD))
         object.__setattr__(self, "offer", self.redis.register_script(SUPPLY))
         object.__setattr__(self, "file_away", self.redis.register_script(APPEND))
@@ -504,14 +599,28 @@ class RedisCheckpointer:
             key: Written(value=self.codec.decode(encoded), at=moment(at)) for key, at, encoded in unpacked(recorded)
         }
 
-    async def claim(self, workflow: str, lease: timedelta) -> Pass | None:
+    async def claim(self, workflow: str, budget: timedelta, alive: timedelta) -> Pass | None:
         token = await self.take(
             keys=[self.pass_key(workflow)],
-            args=[milliseconds(lease), self.ttl_seconds],
+            args=[milliseconds(budget), milliseconds(alive), self.ttl_seconds],
         )
         if token is None:
             return None
         return Pass(workflow=workflow, token=int(cast(int, token)))
+
+    async def extend(self, holder: Pass, budget: timedelta, alive: timedelta) -> bool:
+        held = await self.stretch(
+            keys=[self.pass_key(holder.workflow)],
+            args=[holder.token, milliseconds(budget), milliseconds(alive), self.ttl_seconds],
+        )
+        return bool(cast(int, held))
+
+    async def renew(self, holder: Pass, alive: timedelta) -> bool:
+        held = await self.still_here(
+            keys=[self.pass_key(holder.workflow)],
+            args=[holder.token, milliseconds(alive), self.ttl_seconds],
+        )
+        return bool(cast(int, held))
 
     async def record(self, holder: Pass, key: str, value: object) -> Recorded:
         try:

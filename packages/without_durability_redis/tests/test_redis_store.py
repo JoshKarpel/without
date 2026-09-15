@@ -19,9 +19,9 @@ from without_durability import INBOX_DIGITS
 from without_durability import Contended
 from without_durability import Fenced
 from without_durability import Recorded
-from without_durability import Run
 from without_durability import claimed
 from without_durability import now_utc
+from without_durability.testing import passing
 from without_durability_redis import LuaEffect
 from without_durability_redis import RedisCheckpointer
 from without_durability_redis import RedisSetScheduler
@@ -87,7 +87,9 @@ async def test_only_one_of_many_processes_racing_for_a_workflow_gets_to_pass_ove
     # that sees all of them, which is why the check and the take have to happen there.
     racing = [RedisCheckpointer(redis=redis) for _ in range(8)]
 
-    claims = await asyncio.gather(*(store.claim(workflow, timedelta(minutes=1)) for store in racing))
+    claims = await asyncio.gather(
+        *(store.claim(workflow, timedelta(minutes=5), timedelta(minutes=1)) for store in racing)
+    )
     won = [holder for holder in claims if holder is not None]
 
     assert len(won) == 1, "a claim is exclusive no matter how many clients ask at once"
@@ -441,8 +443,8 @@ async def test_an_effect_in_this_redis_is_performed_and_recorded_in_one_commit(
         args=("piano", 1),
     )
 
-    first = await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("reserved", reserve, as_count)
-    again = await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact("reserved", reserve, as_count)
+    first = await passing(holder, checkpointer).transact("reserved", reserve, as_count)
+    again = await passing(holder, checkpointer).transact("reserved", reserve, as_count)
 
     assert (first, again) == (1, 1), "the second pass read the record rather than reserving again"
     assert await redis.hget(ledger, "piano") == "1", "the stock moved once, however many passes reached the step"
@@ -458,7 +460,7 @@ async def test_a_transacted_effect_is_refused_from_a_superseded_pass(redis: Redi
     ledger = f"{checkpointer.hash_key(workflow)}:ledger"
 
     with pytest.raises(Fenced):
-        await Run(holder=stalled, checkpointer=checkpointer, recorded={}).transact(
+        await passing(stalled, checkpointer).transact(
             "reserved",
             LuaEffect(
                 source="return cjson.encode(redis.call('HINCRBY', KEYS[1], ARGV[1], 1))",
@@ -480,7 +482,7 @@ async def test_a_transact_error_that_is_not_the_fence_is_not_swallowed(redis: Re
     await redis.set(checkpointer.hash_key(workflow), "not a hash at all")
 
     with pytest.raises(ResponseError, match="WRONGTYPE"):
-        await Run(holder=holder, checkpointer=checkpointer, recorded={}).transact(
+        await passing(holder, checkpointer).transact(
             "reserved",
             LuaEffect(source="return cjson.encode(1)"),
             as_count,
@@ -739,6 +741,53 @@ async def test_a_delivery_a_dead_worker_never_answered_for_is_taken_over(
     assert taken_over is not None
     assert taken_over.receipt == abandoned.receipt, "the same delivery, taken over rather than duplicated"
     assert await surviving.reclaim(timedelta(minutes=1)) is None, "and nothing else is outstanding for long"
+
+
+async def test_renewing_a_delivery_another_worker_has_taken_over_does_not_take_it_back(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # `XCLAIM` resets an entry's idle clock for whoever asks, and a worker whose delivery
+    # was reclaimed a moment ago has no way to know that. Left unchecked, its next tick
+    # would claim the entry straight back from the worker that took it over, and the two
+    # would hand one wakeup back and forth for the rest of the pass.
+    dying = RedisStreamScheduler(redis=redis, namespace=workflow)
+    await dying.prepare()
+    await dying.make_ready("wf-slow")
+    taken = await dying.next_ready(timedelta(seconds=1))
+    assert taken is not None
+    surviving = RedisStreamScheduler(redis=redis, namespace=workflow)
+    taken_over = await surviving.reclaim(timedelta())
+    assert taken_over is not None
+
+    assert await dying.extend(taken, timedelta(seconds=30)) == taken, "silent, as about any delivery not its own"
+
+    still_survivors = await redis.xpending_range(
+        dying.ready_key, dying.group, min="-", max="+", count=1, consumername=surviving.consumer
+    )
+    assert [pending["message_id"] for pending in still_survivors] == [taken.receipt], (
+        "the entry stayed with the worker that took it over"
+    )
+
+
+async def test_renewing_a_delivery_this_worker_holds_resets_its_idle_clock(
+    redis: Redis,
+    workflow: str,
+) -> None:
+    # The other half, which the ownership check must not break: a worker's own delivery is
+    # renewed, so a `reclaim` measuring against the lease finds it freshly held.
+    idle = timedelta(milliseconds=100)
+    holding = RedisStreamScheduler(redis=redis, namespace=workflow)
+    await holding.prepare()
+    await holding.make_ready("wf-slow")
+    taken = await holding.next_ready(timedelta(seconds=1))
+    assert taken is not None
+    await asyncio.sleep(idle.total_seconds() * 2)
+
+    assert await holding.extend(taken, timedelta(seconds=30)) == taken
+
+    rescuer = RedisStreamScheduler(redis=redis, namespace=workflow)
+    assert await rescuer.reclaim(idle) is None, "just renewed, so not idle enough to be abandoned"
 
 
 async def test_the_two_queue_keys_share_a_slot_so_the_timers_script_may_touch_both(workflow: str) -> None:

@@ -4,6 +4,7 @@ from without_async.tasks import as_async_iterator
 from without_async.tasks import background_task
 from without_async.tasks import cancel_futures
 from without_async.tasks import limit_concurrency
+from without_async.tasks import settled
 from without_async.tasks import sleep_forever
 from without_async.tasks import timeout
 
@@ -14,6 +15,7 @@ __all__ = [
     "background_task",
     "cancel_futures",
     "limit_concurrency",
+    "settled",
     "sleep_forever",
     "timeout",
 ]

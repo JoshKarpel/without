@@ -28,9 +28,9 @@ from collections.abc import Mapping
 from collections.abc import Sequence
 from collections.abc import Set as AbstractSet
 from contextlib import aclosing
-from contextlib import suppress
 from typing import cast
 
+from without_async import settled
 from without_dag import CompiledGraph
 from without_dag import NodeKey
 
@@ -139,16 +139,7 @@ async def written(checkpointer: Checkpointer, holder: Pass, key: NodeKey, value:
     whatever the run was doing, and the claim is still held while it lands, since a
     release keeps the token.
     """
-    recording = asyncio.ensure_future(checkpointer.record(holder, key, value))
-    try:
-        return await asyncio.shield(recording)
-    except asyncio.CancelledError:
-        # `wait` rather than an `await`: the write's own failure belongs to the run being
-        # torn down, and raising it here would replace the cancellation with it.
-        while not recording.done():
-            with suppress(asyncio.CancelledError):
-                await asyncio.wait([recording])
-        raise
+    return await settled(asyncio.ensure_future(checkpointer.record(holder, key, value)))
 
 
 async def run_durably[*Ins, Out](

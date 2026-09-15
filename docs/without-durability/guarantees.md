@@ -115,6 +115,16 @@ None of these is obvious from the protocol alone.
   the token it was claimed with and the store refuses anything below the highest it
   has issued (`Fenced`). This is why `Pass` carries a number rather than a name, and
   why the number is minted by the store rather than by the claimant.
+- **One deadline was answering two questions.** A single lease has to exceed the longest
+  a pass can honestly take, or a slow-but-healthy pass is fenced and repeats the step it
+  was in the middle of; and it has to be short, or a dead worker's workflow waits that
+  long before anyone may touch it. Those pull opposite ways, so a claim carries two
+  deadlines instead: a liveness window the holder renews for as long as it runs, and a
+  budget renewal cannot lift. The first measures how fast a death is noticed and the
+  second how long the work may take, and each is answerable on its own where the single
+  number was not. Temporal pairs a start-to-close timeout with a heartbeat timeout for
+  exactly this reason; DBOS takes the other road, tying ownership to an executor's
+  identity and pushing liveness out to a control plane of its own.
 - **Each script is a script because it is only correct as one step.** Checking
   whether a workflow is free and taking it; checking a token and applying the write it
   guards; testing whether a key is recorded and reading back the winner. Split any of

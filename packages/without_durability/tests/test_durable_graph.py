@@ -307,8 +307,14 @@ class Preempted:
     async def load(self, workflow: str) -> dict[str, object]:
         return {}
 
-    async def claim(self, workflow: str, lease: timedelta) -> Pass | None:
+    async def claim(self, workflow: str, budget: timedelta, alive: timedelta) -> Pass | None:
         return Pass(workflow=workflow, token=1)
+
+    async def extend(self, holder: Pass, budget: timedelta, alive: timedelta) -> bool:  # pragma: no cover - unused
+        return True
+
+    async def renew(self, holder: Pass, alive: timedelta) -> bool:  # pragma: no cover - unused
+        return True
 
     async def record(self, holder: Pass, key: str, value: object) -> Recorded:
         stored = self.already.setdefault(key, value)
@@ -537,6 +543,9 @@ class UnreachableQueue:
 
     async def reclaim(self, idle: timedelta) -> Delivery | None:  # pragma: no cover - unused here
         return None
+
+    async def extend(self, delivery: Delivery, within: timedelta) -> Delivery:  # pragma: no cover - unused here
+        return delivery
 
     async def cancel(self, workflow: str) -> None:  # pragma: no cover - unused here
         return None

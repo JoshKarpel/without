@@ -268,8 +268,14 @@ class BrokenCheckpointer:
     async def history(self, workflow: str) -> dict[str, Written]:  # pragma: no cover - same
         return {}
 
-    async def claim(self, workflow: str, lease: timedelta) -> Pass | None:  # pragma: no cover - same
+    async def claim(self, workflow: str, budget: timedelta, alive: timedelta) -> Pass | None:  # pragma: no cover - same
         return Pass(workflow=workflow, token=1)
+
+    async def extend(self, holder: Pass, budget: timedelta, alive: timedelta) -> bool:  # pragma: no cover - same
+        return True
+
+    async def renew(self, holder: Pass, alive: timedelta) -> bool:  # pragma: no cover - same
+        return True
 
     async def record(self, holder: Pass, key: str, value: object) -> Recorded:  # pragma: no cover - same
         raise RuntimeError("the store is down")

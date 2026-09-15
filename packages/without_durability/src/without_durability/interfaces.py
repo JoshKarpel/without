@@ -19,16 +19,34 @@ from datetime import timedelta
 from typing import Never
 from typing import Protocol
 
-# How long a claim is good for, and how long a delivery stays its taker's. It has to
-# exceed the longest a pass can honestly take, since a pass that outlives its claim finds
-# its writes `Fenced` and has to start over.
+# How long one sign of life is good for: how long a delivery stays its taker's, and how far
+# past a pass's last word the store goes on honouring its claim. A pass renews inside this
+# window for as long as it runs, so what it bounds is how long a *dead* worker's workflow
+# waits before somebody else may take it, rather than how long a live pass may take. That
+# is the number a deployment can actually answer, which is the whole point of splitting it
+# from `BUDGET`.
 #
 # One number for both, defined once here and read by every store and the worker, because
 # the two are not independent: a delivery that becomes reclaimable before its holder's
-# claim expires is handed to a worker that cannot yet write, which spends a pass to
-# discover it. A store that wants a different window sets `Scheduler.lease`, and `work`
-# follows it.
+# claim does is handed to a worker that cannot yet write, which spends a pass to discover
+# it. A store that wants a different window sets `Scheduler.lease`, and `work` follows it.
 LEASE = timedelta(minutes=1)
+
+# How long a pass may hold a workflow however alive it looks, and what a step spends when
+# it names no `within` of its own.
+#
+# The cap renewal cannot lift, and the reason it has to exist: a pass wedged on a step that
+# will never return goes on answering the renewal perfectly well, since its loop is free
+# and it is simply never going to finish. Without a second deadline that renewal cannot
+# touch, the claim it holds would never lapse and nothing would ever take the workflow
+# over. Temporal's pairing of a start-to-close timeout with a heartbeat timeout is the same
+# two numbers for the same reason.
+#
+# It is the one number here that is a guess: it has to exceed the longest a step can
+# honestly take. A step that knows better says so (`Run.step(..., within=...)`), so the
+# default only has to cover the steps nobody annotated rather than the slowest step in the
+# deployment.
+BUDGET = timedelta(minutes=5)
 
 # The key space `append` assigns out of, and the one piece of the inbox that every layer
 # has to agree on: the stores mint these keys, `Run.receive` picks them out of a
@@ -85,9 +103,10 @@ def check_duration(name: str, duration: timedelta) -> None:
     anything outstanding, however recently it was delivered) and SQLite's `busy_timeout`
     (do not wait for the write lock at all).
 
-    What no check reaches is the bound that decides correctness, that a lease exceed the
-    longest a pass can honestly take. Only the deployment knows that, so this rules out
-    the values that are nonsense rather than certifying the ones that are not.
+    What no check reaches is the bound that decides correctness, that a budget exceed the
+    longest a step can honestly take. Only the deployment knows that, and only for the
+    steps that named no `within` of their own, so this rules out the values that are
+    nonsense rather than certifying the ones that are not.
     """
     if duration <= timedelta():
         raise ValueError(f"{name} must be a positive duration, but got {duration}")
@@ -223,7 +242,34 @@ class Checkpointer[Effect = Never](Protocol):
       can see.
     - `claim` MUST grant at most one live `Pass` per workflow, and MUST issue tokens that
       strictly increase per workflow, so that a later claim always outranks an earlier
-      one. It returns `None` when someone else holds the workflow.
+      one. It returns `None` when someone else holds the workflow. A claim lapses at the
+      *earlier* of one `alive` past its holder's last sign of life and its `budget`
+      running out, so a holder that stops renewing frees the workflow within `alive`, and
+      one that renews forever frees it at the budget regardless.
+    - `extend` MUST grant `budget` from now and count as a sign of life, and MUST NOT
+      bring a budget already granted forward: what it sets is the later of the two, so a
+      step asking for less than what is left costs nothing and takes nothing away. A
+      claim that has lapsed without being taken is still its holder's to stretch, since
+      nobody else has raised the fence.
+    - `renew` MUST count as a sign of life without touching the budget, and MUST report
+      `False` once the budget has run out whatever the token says: a pass past its budget
+      holds nothing however alive it looks, and that report is what ends a hung pass
+      rather than leaving it to renew a claim anybody may take.
+    - Both MUST refuse a holder below the fence, exactly as `record` does, and both MUST
+      report whether it still holds the workflow rather than raising `Fenced`: the caller
+      is deciding what to do about having lost it, where `Fenced` is the answer to a
+      write it will not get to make.
+    - A sign of life MUST NOT carry a claim past its budget or past a `release`. Holding
+      the liveness deadline at or below the budget is the direct way to get both, since
+      `release` brings the budget down to now and a write still in flight then renews
+      nothing rather than taking the workflow back.
+    - `record` and `transact` MUST renew the liveness deadline of the pass that wins, and
+      of no other pass: a write refused at the fence MUST leave the holder's deadline
+      where it was, or a superseded pass's stray writes would keep a dead holder's claim
+      alive past the silence that should have freed it. A write is the plainest sign of
+      life there is, so this makes a workflow of ordinary short steps renew itself for
+      free, and leaves the worker's own renewal with the case it is actually needed for,
+      a single step long enough that no write falls inside one `LEASE`.
     - `record` MUST refuse a write whose token is below the highest claimed for that
       workflow, raising `Fenced`, and MUST NOT overwrite a key that is already recorded.
       It returns a `Recorded`: the value stored *after* the call, so two passes that both
@@ -313,13 +359,33 @@ class Checkpointer[Effect = Never](Protocol):
     `ttl` and expires on its own, and a SQL claim row stays until something sweeps it,
     which is the same homework those stores already have (see
     docs/without-durability/index.md).
+
+    A claim carries *two* deadlines because one number was being asked two questions it
+    cannot answer at once. A single lease has to exceed the longest a pass can honestly
+    take, or a slow-but-healthy pass is fenced mid-flight and the step it was in the middle
+    of runs twice; and it has to be short, or a dead worker's workflow waits that long
+    before anyone else may touch it. Those pull in opposite directions, and a deployment
+    that sizes for the first gets a takeover latency it never chose.
+
+    Splitting them lets each be answerable. `alive` is how long a sign of life is good for,
+    so it measures how fast a death is noticed and has nothing to do with how long the work
+    takes; the pass renews inside it for as long as it is running. `budget` is how long
+    this pass may hold the workflow at all, so it measures the work and is what a step
+    declares when it knows better than the default. Renewal cannot lift `budget`, which is
+    what keeps a pass that is hung rather than slow from holding a workflow forever: it
+    goes on renewing happily until the budget runs out, at which point `renew` says so
+    and the worker ends the pass, and the workflow is free either way.
     """
 
     async def load(self, workflow: str) -> dict[str, object]: ...
 
     async def history(self, workflow: str) -> dict[str, Written]: ...
 
-    async def claim(self, workflow: str, lease: timedelta) -> Pass | None: ...
+    async def claim(self, workflow: str, budget: timedelta, alive: timedelta) -> Pass | None: ...
+
+    async def extend(self, holder: Pass, budget: timedelta, alive: timedelta) -> bool: ...
+
+    async def renew(self, holder: Pass, alive: timedelta) -> bool: ...
 
     async def record(self, holder: Pass, key: str, value: object) -> Recorded: ...
 
@@ -376,7 +442,11 @@ class Scheduler(Protocol):
       cancelled reaches a later `next_ready` or `reclaim` until something makes the
       workflow ready again;
     - `wake_at` MUST NOT reinstate a workflow whose wakeups have been cancelled since its
-      delivery was taken.
+      delivery was taken;
+    - `extend` keeps a delivery its taker's for another `within` from now, and returns the
+      delivery to use from then on. It MUST be silent about one the store no longer holds,
+      returning it unchanged, since a delivery taken over or cancelled underneath a worker
+      is not that worker's to renew and not an error to have tried.
 
     The last two are one requirement seen from both ends, and the second half is what
     makes the first half worth anything. A worker holding a delivery answers for it
@@ -407,9 +477,25 @@ class Scheduler(Protocol):
     claim. The implementations reach it by different routes (an idle threshold `reclaim`
     measures against, or the invisibility a visibility-scored queue writes when it takes
     one) and it is the answer to the same question either way, so `work` reads it here
-    and claims the workflow for exactly as long. Taking the two from different places
-    fails quietly: a delivery reclaimed while its holder can still write is a pass spent
-    finding out that somebody else owns the workflow.
+    and gives the workflow's claim exactly as long to live. Taking the two from different
+    places fails quietly: a delivery reclaimed while its holder can still write is a pass
+    spent finding out that somebody else owns the workflow.
+
+    It is the *liveness* window that has to match, not the pass's budget, and the pairing
+    is what `extend` exists for. Both answer the one question a second worker asks, whether
+    the holder is still there, so the worker renewing its claim renews its delivery on the
+    same tick and the two lapse together. A budget is the other question, how long this
+    pass may run, which only the checkpoint store is asked: a two-hour step that keeps
+    renewing holds its delivery two hours by renewing it, not by having said two hours up
+    front, so a worker that dies inside one still loses both within a `lease`.
+
+    That `extend` hands back a delivery rather than nothing is a fact about these queues
+    rather than ceremony. Three of the four here make the visibility a delivery is taken
+    under *be* its receipt, which is what lets `wake_at` tell its own delivery from a wakeup
+    that arrived since; moving the visibility therefore renames the delivery, and a worker
+    still holding the old name would find its `done` silently declined and the workflow
+    redelivered for nothing. So the store says what the delivery is called now, the same
+    way `record` says who won: it is the party that knows.
 
     A `wake_at` deadline is the *caller's* clock, where a lease is measured by the
     store's, because a workflow chooses its own deadline (`Run.sleep` records one) and
@@ -433,6 +519,8 @@ class Scheduler(Protocol):
     async def next_ready(self, within: timedelta) -> Delivery | None: ...
 
     async def reclaim(self, idle: timedelta) -> Delivery | None: ...
+
+    async def extend(self, delivery: Delivery, within: timedelta) -> Delivery: ...
 
     async def cancel(self, workflow: str) -> None: ...
 
@@ -557,7 +645,12 @@ class SplitDurable[Effect = Never]:
         return await self.checkpointer.discard(workflow)
 
 
-async def claimed(checkpointer: Checkpointer, workflow: str, lease: timedelta = LEASE) -> Pass:
+async def claimed(
+    checkpointer: Checkpointer,
+    workflow: str,
+    budget: timedelta = BUDGET,
+    alive: timedelta = LEASE,
+) -> Pass:
     """
     Claim `workflow`, or raise because someone else has it.
 
@@ -566,8 +659,9 @@ async def claimed(checkpointer: Checkpointer, workflow: str, lease: timedelta = 
     losing the race is ordinary there and the answer is to come back later rather than to
     fail.
     """
-    check_duration("a lease", lease)
-    holder = await checkpointer.claim(workflow, lease)
+    check_duration("a budget", budget)
+    check_duration("a liveness window", alive)
+    holder = await checkpointer.claim(workflow, budget, alive)
     if holder is None:
         raise Contended(f"another pass holds {workflow!r}")
     return holder

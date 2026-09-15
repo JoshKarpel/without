@@ -1,5 +1,77 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`without-durability`**: a claim now carries two deadlines instead of one, so a slow
+  pass is no longer fenced for being slow. `Checkpointer.claim` takes a `budget` and an
+  `alive` window and lapses at whichever comes first: one `alive` past its holder's last
+  sign of life, or its budget running out. The worker renews on a tick
+  (`Checkpointer.renew` alongside the new `Scheduler.extend`, both on the scheduler's
+  `lease`), so a pass that is still running keeps its workflow however short that window
+  is, and `work(..., budget=...)` caps how long any one pass may hold a workflow however
+  alive it looks. `Scheduler.extend` returns the delivery to use from then on: three of
+  the four schedulers make the visibility a delivery was taken under *be* its receipt, so
+  renewing renames it, and a worker still holding the old name would find its own `done`
+  silently declined. The stream scheduler's checks that the entry is still this
+  consumer's before resetting its idle clock, so a delivery another worker has already
+  reclaimed is left with that worker rather than taken back.
+
+  One number was answering two questions that pull opposite ways. A single lease had to
+  exceed the longest a pass could honestly take, or a healthy-but-slow pass was fenced
+  mid-flight; and it had to be short, or a crashed worker's workflow waited that long
+  before anyone could touch it. Being fenced was not merely a re-run, either: the step in
+  flight had already performed its effect, so the pass that took over performed it again,
+  on a system where nothing had gone wrong. Splitting the deadlines makes each one
+  answerable, since the liveness window measures how fast a death is noticed and has
+  nothing to do with how long the work takes.
+
+  `Run.step`, `Run.transact`, and `Run.perform` take a `within`, which is the budget that
+  step says it needs, granted before its effect runs. That moves the guess from one number
+  covering every workflow a worker runs to a statement by the code that knows, and leaves
+  the deployment-wide default covering only the steps nobody annotated. Annotating a cheap
+  step costs nothing: the extension is skipped whenever the outstanding budget already
+  covers the request, and a step that is already recorded never reaches it at all. How a
+  pass buys that time is an injected `Extend` (`extending` builds the ordinary one), so a
+  test hands in a function rather than a store.
+
+  A write counts as a sign of life, folded into the statement or script that already
+  fences it, so a workflow of ordinary short steps renews itself with no extra round trip
+  and the tick is left with the case it is really for: one step long enough that no write
+  falls inside a whole window. Only the winning write renews, so a superseded pass's stray
+  writes cannot keep a dead holder's claim alive. Every renewal is capped at the budget,
+  and once the budget is spent `renew` reports the claim gone, which is what ends a hung
+  pass: the worker cancels it and hands the workflow back rather than renewing a claim
+  anybody may take. A window shorter than what is left never shortens the budget. A
+  missed tick (the store briefly unreachable) is logged and the next tick tried, and a
+  renewal in flight when the pass ends is waited out, so the delivery is answered for
+  under the name the store gave it.
+
+  A caller driving `resume` without a worker has no tick, so the window a step buys there
+  counts as a sign of life for the whole of that step, and the default `Extend` assumes
+  nothing about what the claim was taken for: the first window a pass names is always
+  bought.
+
+  `without_durability.testing.passing` builds a `Run` wired as `resume` wires one, for a
+  test driving a single method rather than a body.
+- **`without-async`**: `settled`, which awaits a future shielded and, when the caller is
+  cancelled, waits for the future to finish before the cancellation propagates. It is the
+  shape every durable write already had: the effect has happened by the time the record
+  is written, so cancelling the write would lose the record and not the effect.
+
+### Changed
+
+- **`without-durability`**: `Run` takes an `extend`, and `Checkpointer.claim` takes two
+  durations where it took one. A store or a hand-built `Run` from 0.0.8 needs updating;
+  the SQL claim tables gain two columns and a Redis pass hash two fields, so an existing
+  database has to be recreated.
+- **`without-durability-postgres`**: `transact` no longer holds the claim row lock across
+  the effect. The fence is read plainly before the effect and re-read under the lock
+  after it, so a renewal or a `claim` from another connection lands during a long effect
+  rather than queueing behind it, and a pass superseded mid-effect is still refused with
+  its effect rolled back.
+
 ## 0.0.8
 
 ### Added

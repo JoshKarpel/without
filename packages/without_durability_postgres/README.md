@@ -19,8 +19,9 @@ write the Redis store needs a Lua script for is one statement here, or one
 transaction, and neither is something this package supplies. Redis needs scripts
 because it has no way to say "check this, then write that, and let nobody in
 between"; SQL says it by default. The claim is an upsert whose `DO UPDATE` carries
-a `WHERE` on the lease; the fenced record is one statement whose `FOR UPDATE` CTE
-serializes it against a claim in flight; the queue takes with
+a `WHERE` on the liveness deadline; the fenced record is one statement whose
+updating CTE serializes it against a claim in flight and notes the write as a sign
+of life in the same breath; the queue takes with
 `FOR UPDATE SKIP LOCKED`, so several workers polling one table fan out instead of
 queueing on its head.
 

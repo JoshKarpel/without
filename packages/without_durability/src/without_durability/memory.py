@@ -6,6 +6,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
 from datetime import datetime
 from datetime import timedelta
 from itertools import count
@@ -64,6 +65,43 @@ class Stored:
 
 
 @dataclass(frozen=True, slots=True)
+class Claim:
+    """
+    Who holds a workflow, until when, and what a word from them is worth.
+
+    One record rather than a mapping per field, for the reason `Stored` is one: four
+    mappings kept in step are three states that can disagree, and this cannot. It is the
+    claim row the SQL stores keep, with the column names spelled out.
+
+    `alive_until` is when the claim lapses if nothing more is heard and is what `claim`
+    tests; `held_until` is the budget it can never pass. Holding the first at or below the
+    second is what makes a renewal unable to do the two things a renewal must not: carry a
+    pass beyond its budget, or take a workflow back after its holder released it.
+
+    `alive` travels with the claim because a write is a sign of life and `record` is not
+    told how long one should count for. Taking it from the claim rather than from a
+    store-wide setting is what keeps a workflow claimed with a short liveness window from
+    quietly renewing itself on a long one.
+
+    Both moments are `monotonic`, as every lease here is, so a clock that steps cannot
+    hand a workflow to two writers.
+    """
+
+    token: int
+    held_until: float
+    alive_until: float
+    alive: timedelta
+
+    def heard_from(self, at: float) -> Claim:
+        """A copy of the claim, with a sign of life noted at `at` and good for `alive` past it."""
+        return replace(self, alive_until=min(at + self.alive.total_seconds(), self.held_until))
+
+    def over(self) -> Claim:
+        """A copy of the claim, handed back: the token stays, so the next claim still outranks it."""
+        return replace(self, held_until=0.0, alive_until=0.0)
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryCheckpointer:
     """
     A `Checkpointer` keeping one dict per workflow, and one claim beside it.
@@ -86,8 +124,7 @@ class MemoryCheckpointer:
     # you may not. What the default lookup bought was two characters at each read, and
     # what it cost was that every read of an unknown workflow silently grew the mapping.
     hashes: dict[str, dict[str, Stored]] = field(default_factory=dict)
-    tokens: dict[str, int] = field(default_factory=dict)
-    held_until: dict[str, float] = field(default_factory=dict)
+    claims: dict[str, Claim] = field(default_factory=dict)
     codec: CheckpointCodec[str] = JSON
     # The clock every record is stamped with. The other two stores read their server's,
     # which here would be `datetime.now(UTC)`; taking it as an argument is what lets a test
@@ -113,20 +150,53 @@ class MemoryCheckpointer:
             for key, held in self.hashes.get(workflow, {}).items()
         }
 
-    async def claim(self, workflow: str, lease: timedelta) -> Pass | None:
-        if self.held_until.get(workflow, 0.0) > monotonic():
+    async def claim(self, workflow: str, budget: timedelta, alive: timedelta) -> Pass | None:
+        now = monotonic()
+        held = self.claims.get(workflow)
+        if held is not None and held.alive_until > now:
             return None
-        token = self.tokens.get(workflow, 0) + 1
-        self.tokens[workflow] = token
-        self.held_until[workflow] = monotonic() + lease.total_seconds()
-        return Pass(workflow=workflow, token=token)
+        taken = Claim(
+            token=held.token + 1 if held is not None else 1,
+            held_until=now + budget.total_seconds(),
+            alive_until=now + min(alive, budget).total_seconds(),
+            alive=alive,
+        )
+        self.claims[workflow] = taken
+        return Pass(workflow=workflow, token=taken.token)
+
+    async def extend(self, holder: Pass, budget: timedelta, alive: timedelta) -> bool:
+        now = monotonic()
+        held = self.claims[holder.workflow]
+        if holder.token < held.token:
+            return False
+        # The later of the two, so a step naming a window shorter than what is left takes
+        # nothing away from the steps behind it.
+        granted = replace(held, held_until=max(held.held_until, now + budget.total_seconds()), alive=alive)
+        self.claims[holder.workflow] = granted.heard_from(now)
+        return True
+
+    async def renew(self, holder: Pass, alive: timedelta) -> bool:
+        now = monotonic()
+        held = self.claims[holder.workflow]
+        # Past the budget as well as below the fence, because the answer is what the worker
+        # acts on: a renewal that reported success on a lapsed claim would keep a hung pass
+        # running, and the workflow with it, for as long as nothing else happened to take it.
+        if holder.token < held.token or held.held_until <= now:
+            return False
+        self.claims[holder.workflow] = replace(held, alive=alive).heard_from(now)
+        return True
+
+    def wrote(self, holder: Pass) -> None:
+        """Note that this pass wrote, which is the plainest sign of life a claim can get."""
+        self.claims[holder.workflow] = self.claims[holder.workflow].heard_from(monotonic())
 
     async def record(self, holder: Pass, key: str, value: object) -> Recorded:
         # Indexed rather than defaulted, here and in `transact` and `release`: a `Pass`
         # exists only because `claim` wrote a token for that workflow, so a miss is a
         # broken invariant and worth a `KeyError` rather than a `0` that fences nobody.
-        if holder.token < self.tokens[holder.workflow]:
+        if holder.token < self.claims[holder.workflow].token:
             raise Fenced(f"pass {holder.token} of {holder.workflow!r} was superseded")
+        self.wrote(holder)
         encoded = self.codec.encode(value)
         # `setdefault` is the whole of first-writer-wins, and it reports the winner by
         # handing back what is now stored: ours when we won, and the earlier writer's
@@ -163,8 +233,9 @@ class MemoryCheckpointer:
         the way a real one is (replace the entry, do not edit it in place) stays inside
         it.
         """
-        if holder.token < self.tokens[holder.workflow]:
+        if holder.token < self.claims[holder.workflow].token:
             raise Fenced(f"pass {holder.token} of {holder.workflow!r} was superseded")
+        self.wrote(holder)
         recorded = self.hashes.setdefault(holder.workflow, {})
         if key not in recorded:
             before = dict(self.data)
@@ -224,17 +295,17 @@ class MemoryCheckpointer:
         a workflow that never ran.
         """
         removed = self.hashes.pop(workflow, {})
-        superseded = self.tokens.get(workflow)
+        superseded = self.claims.get(workflow)
         if superseded is not None:
-            self.tokens[workflow] = superseded + 1
-            self.held_until[workflow] = 0.0
+            self.claims[workflow] = replace(superseded, token=superseded.token + 1).over()
         return len(removed)
 
     async def release(self, holder: Pass) -> None:
         # The token stays, so the next claim outranks this one: releasing hands the
         # workflow back, it does not rewind the fence.
-        if holder.token == self.tokens[holder.workflow]:
-            self.held_until[holder.workflow] = 0.0
+        held = self.claims[holder.workflow]
+        if holder.token == held.token:
+            self.claims[holder.workflow] = held.over()
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,6 +387,36 @@ class MemoryScheduler:
             # this worker is now holding is not immediately reclaimable again.
             self.outstanding[taken.receipt] = (taken, monotonic())
         return taken
+
+    async def extend(self, delivery: Delivery, within: timedelta) -> Delivery:
+        """
+        Keep this delivery its taker's for another `within`, by restarting its idle clock.
+
+        Silent about a delivery the store no longer holds, which is the requirement and not
+        merely tolerance: a worker renewing on a tick has no way to know it was reclaimed or
+        cancelled a moment ago, and putting it back would be this store handing out a
+        delivery nobody is waiting on.
+
+        What this store keeps is the moment a delivery was taken, and `reclaim` measures
+        `idle` back from now against it, so keeping one for another `within` means putting
+        that moment where one `lease` past it lands `within` from now. For the `within` the
+        worker actually passes, its own `lease`, that is exactly "freshly taken"; spelling
+        out the arithmetic is what makes a test that passes something else get what it
+        asked for rather than the window this store happens to run on.
+
+        The receipt does not change here, which is the one place this double is weaker than
+        what it stands in for rather than equal to it: a receipt is a counter, where three
+        of the four real schedulers make the visibility the receipt and so *rename* a
+        delivery whenever they move it. A worker that wrongly held on to the old name would
+        pass against this store and fail against those, which is what the cross-store suite
+        is for.
+        """
+        taken = self.outstanding.get(delivery.receipt)
+        if taken is None:
+            return delivery
+        stretched = monotonic() + (within - self.lease).total_seconds()
+        self.outstanding[delivery.receipt] = (taken[0], stretched)
+        return delivery
 
     async def cancel(self, workflow: str) -> None:
         """
