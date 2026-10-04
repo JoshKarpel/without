@@ -701,6 +701,12 @@ codings are decoded inbound and produced outbound.
 `brotli_compress` keeps the bindings' own quality of 11 while the server table
 defaults lower: a client compressing an upload it holds whole is the case that
 ratio is worth paying for, and a response encoded per request is not.
+Each helper takes its factory's arguments, which are the codec's own (see
+[the server guide](../without-asgi/index.md#how-far-back-a-stream-can-reach)), and
+builds one compressor up front, so an argument the codec or HTTP refuses fails when
+the middleware is built rather than on the first request. A request is also where
+`zstd_compress`'s `zstd_dict` fits: the `zstd` coding cannot say which dictionary it
+used, so only an upstream known to hold the same one can decode it.
 
 State a middleware carries lives in a value you own, not in the transport. A `CookieJar`
 is the canonical case: you construct the jar and hand it to `cookies(jar)`, so cookie

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import random
 import zlib
 from collections.abc import AsyncIterator
 from collections.abc import Callable
@@ -11,6 +12,7 @@ from compression import zstd
 from dataclasses import dataclass
 from dataclasses import field
 from dataclasses import replace
+from functools import cache
 from typing import cast
 
 import brotli
@@ -32,16 +34,20 @@ from without_asgi import ZeroCopySend
 from without_asgi.compression import DEFAULT_COMPRESSORS
 from without_asgi.compression import GZIP_CONTAINER
 from without_asgi.compression import MAX_RANDOM_BYTES
+from without_asgi.compression import MAX_ZSTD_WINDOW_LOG
 from without_asgi.compression import PADDED_COMPRESSORS
 from without_asgi.compression import Compressor
 from without_asgi.compression import OffloadedBodyAfterEncoding
 from without_asgi.compression import StreamingCompressor
 from without_asgi.compression import _PaddedGzipCompressor
+from without_asgi.compression import brotli_compressor
 from without_asgi.compression import compress
+from without_asgi.compression import gzip_compressor
 from without_asgi.compression import is_compressible
 from without_asgi.compression import negotiate_coding
 from without_asgi.compression import padded_gzip_compressor
 from without_asgi.compression import padded_zstd_compressor
+from without_asgi.compression import zstd_compressor
 from without_asgi.routing import HttpMiddleware
 from without_streams import Stream
 from without_streams import stream_from_iterable
@@ -1107,6 +1113,232 @@ class TestPaddedCompressors:
         pieces = (BODY[start : start + 7] for start in range(0, len(BODY), 7))
         encoded = b"".join(padded.compress(piece) + padded.flush_block() for piece in pieces)
         assert gzip.decompress(encoded + padded.flush()) == BODY
+
+
+def _zstd_window_log(frame: bytes) -> int:
+    """
+    The window a zstd frame asks its decoder for, read from the header's
+    `Window_Descriptor` (RFC 8878 §3.1.1.1.2) as a base-2 logarithm. Every window the
+    factories can request is a power of two, so the mantissa is checked rather than
+    carried.
+    """
+    assert not frame[4] & 0b0010_0000, "a single-segment frame states no window"
+    descriptor = frame[5]
+    assert descriptor & 0b111 == 0
+    return 10 + (descriptor >> 3)
+
+
+def _brotli_window_log(stream: bytes) -> int:
+    """The `WBITS` a brotli stream opens with (RFC 7932 §9.1), read least significant bit first."""
+    bits = int.from_bytes(stream[:2], "little")
+    if not bits & 1:
+        return 16
+    if wide := (bits >> 1) & 0b111:
+        return 17 + wide
+    narrow = (bits >> 4) & 0b111
+    return 8 + narrow if narrow else 17
+
+
+WINDOW_LOG_READERS: dict[bytes, Callable[[bytes], int]] = {b"zstd": _zstd_window_log, b"br": _brotli_window_log}
+WINDOWED_FACTORIES: dict[bytes, Callable[[int], StreamingCompressor]] = {
+    b"zstd": lambda window_log: zstd_compressor(options={zstd.CompressionParameter.window_log: window_log}),
+    b"br": lambda window_log: brotli_compressor(lgwin=window_log),
+}
+# The windows the no-argument factories write: zstd's choice at its default level,
+# and the bindings' default `lgwin`.
+DEFAULT_WINDOW_LOGS = {b"zstd": 21, b"br": 22}
+# Each coding's widest window: HTTP's ceiling for zstd, the format's for brotli.
+WIDEST_WINDOW_LOGS = {b"zstd": MAX_ZSTD_WINDOW_LOG, b"br": 24}
+
+
+@cache
+def _page(size: int) -> bytes:
+    """
+    `size` bytes of HTML-shaped rows, compressible within themselves but with no
+    long-range repeats, so the only way a second copy gets cheap is a window wide
+    enough to reach the first.
+
+    Not random bytes, because brotli stores an incompressible block without looking
+    for matches at all, and not hex either, whose short spurious matches crowd a
+    match finder's tables until neither codec finds the distant copy.
+    """
+    rng = random.Random(size)
+    rows: list[str] = []
+    written = 0
+    while written < size:
+        row = f'<tr id="row-{len(rows)}"><td>{rng.getrandbits(64):x}</td><td>{rng.random():.6f}</td></tr>\n'
+        rows.append(row)
+        written += len(row)
+    return "".join(rows).encode()[:size]
+
+
+def _repeated(compressor: StreamingCompressor, chunk: bytes) -> tuple[int, int]:
+    """What `chunk` costs sent twice through one compressor, the way `compress` streams it."""
+    first = compressor.compress(chunk) + compressor.flush_block()
+    second = compressor.compress(chunk) + compressor.flush_block()
+    return len(first), len(second)
+
+
+# Wider than both default windows (2 MiB and 4 MiB) and narrower than both widest ones.
+REPEATED_PAGE_SIZE = 5 * 1024 * 1024
+
+
+class TestCompressorWindows:
+    """
+    The window is how far back a match may reach, so it decides whether a stream
+    that repeats something large can encode the repeat as a reference. It is never
+    negotiated: the encoder writes it into the stream header and the decoder
+    allocates what the header says.
+    """
+
+    @pytest.mark.parametrize("coding", [b"zstd", b"br"])
+    # One of each way brotli spells `WBITS`: 16, 17, below 16, and above 17.
+    @pytest.mark.parametrize("window_log", [10, 16, 17, 18])
+    def test_the_stream_header_names_the_requested_window(self, coding: bytes, window_log: int) -> None:
+        encoded = _encoded(lambda: WINDOWED_FACTORIES[coding](window_log), BODY)
+        assert WINDOW_LOG_READERS[coding](encoded) == window_log
+
+    @pytest.mark.parametrize("coding", [b"zstd", b"br"])
+    def test_the_widest_window_is_named_and_decodes(self, coding: bytes) -> None:
+        encoded = _encoded(lambda: WINDOWED_FACTORIES[coding](WIDEST_WINDOW_LOGS[coding]), BODY)
+        assert WINDOW_LOG_READERS[coding](encoded) == WIDEST_WINDOW_LOGS[coding]
+        assert INCREMENTAL_DECODERS[coding]()(encoded) == BODY
+
+    @pytest.mark.parametrize("coding", [b"zstd", b"br"])
+    def test_the_default_factories_keep_their_windows(self, coding: bytes) -> None:
+        encoded = _encoded(DEFAULT_COMPRESSORS[coding], BODY)
+        assert WINDOW_LOG_READERS[coding](encoded) == DEFAULT_WINDOW_LOGS[coding]
+
+    @pytest.mark.parametrize("coding", [b"zstd", b"br"])
+    def test_a_repeat_inside_the_window_costs_almost_nothing(self, coding: bytes) -> None:
+        first, second = _repeated(WINDOWED_FACTORIES[coding](WIDEST_WINDOW_LOGS[coding]), _page(REPEATED_PAGE_SIZE))
+        assert second < first // 20
+
+    @pytest.mark.parametrize("coding", [b"zstd", b"br"])
+    def test_a_repeat_beyond_the_default_window_costs_full_price(self, coding: bytes) -> None:
+        first, second = _repeated(cast(StreamingCompressor, DEFAULT_COMPRESSORS[coding]()), _page(REPEATED_PAGE_SIZE))
+        assert second > first * 9 // 10
+
+    @pytest.mark.parametrize(
+        "make",
+        [
+            lambda: zstd_compressor(options={zstd.CompressionParameter.window_log: MAX_ZSTD_WINDOW_LOG + 1}),
+            lambda: zstd_compressor(20),
+            lambda: zstd_compressor(options={zstd.CompressionParameter.enable_long_distance_matching: 1}),
+        ],
+        ids=["explicit-window", "level-20", "long-distance-matching"],
+    )
+    def test_zstd_refuses_a_window_http_forbids(self, make: Callable[[], Compressor]) -> None:
+        """
+        RFC 9659 caps an HTTP zstd window at 8 MiB, though the stdlib's own decoder
+        would take a wider one. Levels 20 and up, and long distance matching, pick a
+        wider window without naming one, so the refusal reads the window zstd resolved
+        rather than the arguments.
+        """
+        with pytest.raises(ValueError, match="RFC 9659"):
+            make()
+
+    def test_zstd_accepts_long_distance_matching_under_a_capped_window(self) -> None:
+        capped: dict[int, int] = {
+            zstd.CompressionParameter.enable_long_distance_matching: 1,
+            zstd.CompressionParameter.window_log: MAX_ZSTD_WINDOW_LOG,
+        }
+        encoded = _encoded(lambda: zstd_compressor(options=capped), BODY)
+        assert _zstd_window_log(encoded) == MAX_ZSTD_WINDOW_LOG
+        assert zstd.decompress(encoded) == BODY
+
+    @pytest.mark.parametrize(
+        "make",
+        [lambda: brotli_compressor(lgwin=25), lambda: brotli_compressor(lgblock=15), lambda: brotli_compressor(mode=9)],
+        ids=["lgwin", "lgblock", "mode"],
+    )
+    def test_brotli_refuses_what_its_bindings_refuse(self, make: Callable[[], Compressor]) -> None:
+        with pytest.raises(brotli.error):
+            make()
+
+
+# A raw-content zstd dictionary: any bytes serve, and sharing the page's vocabulary
+# makes it change what the encoder emits.
+ZSTD_DICT = zstd.ZstdDict(b'<tr id="row-"><td></td><td>0.</td></tr>\n' * 64, is_raw=True)
+
+
+class TestCompressorOptions:
+    """
+    Each factory takes its codec's own constructor arguments, so every one of them
+    has to reach the codec, and the few a coding cannot allow have to be refused.
+    """
+
+    @pytest.mark.parametrize(
+        ("coding", "make"),
+        [
+            (b"gzip", lambda: gzip_compressor(wbits=GZIP_CONTAINER - 6)),
+            (b"gzip", lambda: gzip_compressor(mem_level=1)),
+            (b"gzip", lambda: gzip_compressor(strategy=zlib.Z_HUFFMAN_ONLY)),
+            (b"zstd", lambda: zstd_compressor(options={zstd.CompressionParameter.checksum_flag: 1})),
+            # `MODE_TEXT` and `lgblock=16` encode identically to the defaults at quality
+            # 5, so these are values the encoder visibly acts on there.
+            (b"br", lambda: brotli_compressor(mode=brotli.MODE_FONT)),
+            (b"br", lambda: brotli_compressor(lgblock=18)),
+        ],
+        ids=["gzip-wbits", "gzip-mem_level", "gzip-strategy", "zstd-options", "br-mode", "br-lgblock"],
+    )
+    def test_each_option_reaches_the_codec_and_still_decodes(
+        self, coding: bytes, make: Callable[[], Compressor]
+    ) -> None:
+        page = _page(256 * 1024)
+        encoded = _encoded(make, page)
+        assert encoded != _encoded(DEFAULT_COMPRESSORS[coding], page)
+        assert INCREMENTAL_DECODERS[coding]()(encoded) == page
+
+    def test_a_zstd_dictionary_reaches_the_codec(self) -> None:
+        page = _page(256 * 1024)
+        encoded = _encoded(lambda: zstd_compressor(zstd_dict=ZSTD_DICT), page)
+        assert encoded != _encoded(zstd_compressor, page)
+        assert zstd.ZstdDecompressor(zstd_dict=ZSTD_DICT).decompress(encoded) == page
+
+    def test_zstd_keeps_the_stdlib_rule_that_level_and_options_exclude_each_other(self) -> None:
+        with pytest.raises(TypeError):
+            zstd_compressor(1, options={zstd.CompressionParameter.checksum_flag: 1})
+
+    @pytest.mark.parametrize(
+        "wbits", [zlib.MAX_WBITS, -zlib.MAX_WBITS, GZIP_CONTAINER - 7, GZIP_CONTAINER + 1], ids=str
+    )
+    def test_gzip_refuses_a_wbits_outside_the_gzip_container(self, wbits: int) -> None:
+        """Zlib would accept the first two and label a zlib or raw DEFLATE stream `gzip`."""
+        with pytest.raises(ValueError, match="gzip wbits"):
+            gzip_compressor(wbits=wbits)
+
+    @pytest.mark.parametrize(
+        ("coding", "plain", "padded"),
+        [
+            (b"gzip", lambda: gzip_compressor(1), lambda: padded_gzip_compressor(0, level=1)),
+            (b"gzip", lambda: gzip_compressor(wbits=25), lambda: padded_gzip_compressor(0, wbits=25)),
+            (b"gzip", lambda: gzip_compressor(mem_level=1), lambda: padded_gzip_compressor(0, mem_level=1)),
+            (
+                b"gzip",
+                lambda: gzip_compressor(strategy=zlib.Z_HUFFMAN_ONLY),
+                lambda: padded_gzip_compressor(0, strategy=zlib.Z_HUFFMAN_ONLY),
+            ),
+            (b"zstd", lambda: zstd_compressor(1), lambda: padded_zstd_compressor(0, level=1)),
+            (
+                b"zstd",
+                lambda: zstd_compressor(options={zstd.CompressionParameter.checksum_flag: 1}),
+                lambda: padded_zstd_compressor(0, options={zstd.CompressionParameter.checksum_flag: 1}),
+            ),
+            (
+                b"zstd",
+                lambda: zstd_compressor(zstd_dict=ZSTD_DICT),
+                lambda: padded_zstd_compressor(0, zstd_dict=ZSTD_DICT),
+            ),
+        ],
+        ids=["gzip-level", "gzip-wbits", "gzip-mem_level", "gzip-strategy", "zstd-level", "zstd-options", "zstd-dict"],
+    )
+    def test_a_padded_compressor_passes_its_options_to_the_codec(
+        self, coding: bytes, plain: Callable[[], Compressor], padded: Callable[[], Compressor]
+    ) -> None:
+        """An empty padding budget leaves only the container field, so any other difference is a dropped option."""
+        page = _page(256 * 1024)
+        assert len(_encoded(padded, page)) - len(_encoded(plain, page)) == EMPTY_PADDING_OVERHEAD[coding]
 
 
 # Every coding the shipped tables can produce, with the decoder that reads it back. A

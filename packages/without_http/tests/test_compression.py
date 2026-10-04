@@ -19,6 +19,7 @@ from without_asgi import Send
 from without_asgi import parse_http_scope
 from without_http import DEFAULT_DECOMPRESSORS
 from without_http import GZIP_CONTAINER
+from without_http import ClientMiddleware
 from without_http import ClientRequest
 from without_http import ClientResponse
 from without_http import Compressor
@@ -127,6 +128,124 @@ async def test_zstd_compress_encodes_the_request_body_seen_server_side() -> None
         async with request(client, "POST", url, body=b"zstandard squeeze") as (head, body):
             assert head.status == 200
             assert await body.read() == b"encoding=zstd length=absent accept=absent type=absent body=zstandard squeeze"
+
+
+@pytest.mark.parametrize(
+    ("middleware", "coding"),
+    [
+        (zstd_compress(options={zstd.CompressionParameter.window_log: 23}), b"zstd"),
+        (brotli_compress(lgwin=24), b"br"),
+    ],
+    ids=["zstd", "br"],
+)
+async def test_a_widened_window_still_decodes_server_side(middleware: ClientMiddleware, coding: bytes) -> None:
+    async with serving(report_app) as server, ConnectionPool() as pool:
+        client = middleware(pool)
+        url = f"http://{server.host}:{server.port}/upload"
+        async with request(client, "POST", url, body=b"wide squeeze") as (_head, body):
+            assert (
+                await body.read() == b"encoding=%s length=absent accept=absent type=absent body=wide squeeze" % coding
+            )
+
+
+@pytest.mark.parametrize(
+    ("assemble", "refusal"),
+    [
+        (lambda: gzip_compress(wbits=zlib.MAX_WBITS), ValueError),
+        (lambda: zstd_compress(options={zstd.CompressionParameter.window_log: 24}), ValueError),
+        (lambda: zstd_compress(20), ValueError),
+        (lambda: brotli_compress(lgwin=25), brotli.error),
+    ],
+    ids=["gzip-zlib-container", "zstd-window", "zstd-level", "br-window"],
+)
+def test_a_refused_option_fails_at_assembly(assemble: Callable[[], ClientMiddleware], refusal: type[Exception]) -> None:
+    """Each helper builds one compressor up front, so a bad option fails here rather than on the first request."""
+    with pytest.raises(refusal):
+        assemble()
+
+
+# Rows rather than a repeated phrase, so the options under test have structure to act on.
+UPLOAD = b"".join(b'<tr id="row-%d"><td>%x</td></tr>\n' % (index, index * 2654435761 % 2**32) for index in range(2000))
+ZSTD_DICT = zstd.ZstdDict(b'<tr id="row-"><td></td></tr>\n' * 64, is_raw=True)
+
+
+async def _sent(middleware: ClientMiddleware, body: bytes) -> bytes:
+    """The request body `middleware` puts on the wire for `body`, sent as one chunk."""
+    sent: list[bytes] = []
+
+    async def answer(outgoing: ClientRequest) -> ClientResponse:
+        sent.extend([piece async for piece in outgoing.body])
+
+        async def empty() -> AsyncGenerator[bytes | ResponseTrailers]:
+            return
+            yield
+
+        return ClientResponse(ResponseHead(200, ()), ResponseBody(empty()))
+
+    async with request(middleware(mock_client(answer)), "POST", "http://mock.test/upload", body=body) as (_head, got):
+        await got.read()
+    return b"".join(sent)
+
+
+def _whole(make: Callable[[], Compressor], body: bytes) -> bytes:
+    compressor = make()
+    return compressor.compress(body) + compressor.flush()
+
+
+def _client_brotli_default() -> Compressor:
+    """The compressor `brotli_compress()` builds: the bindings' quality of 11, every other default kept."""
+    return brotli_compressor(11)
+
+
+@pytest.mark.parametrize(
+    ("middleware", "make", "default"),
+    [
+        (gzip_compress(1), lambda: gzip_compressor(1), gzip_compressor),
+        (gzip_compress(wbits=25), lambda: gzip_compressor(wbits=25), gzip_compressor),
+        (gzip_compress(mem_level=1), lambda: gzip_compressor(mem_level=1), gzip_compressor),
+        (
+            gzip_compress(strategy=zlib.Z_HUFFMAN_ONLY),
+            lambda: gzip_compressor(strategy=zlib.Z_HUFFMAN_ONLY),
+            gzip_compressor,
+        ),
+        (zstd_compress(1), lambda: zstd_compressor(1), zstd_compressor),
+        (
+            zstd_compress(options={zstd.CompressionParameter.checksum_flag: 1}),
+            lambda: zstd_compressor(options={zstd.CompressionParameter.checksum_flag: 1}),
+            zstd_compressor,
+        ),
+        (zstd_compress(zstd_dict=ZSTD_DICT), lambda: zstd_compressor(zstd_dict=ZSTD_DICT), zstd_compressor),
+        (brotli_compress(5), lambda: brotli_compressor(5), _client_brotli_default),
+        (
+            brotli_compress(mode=brotli.MODE_FONT),
+            lambda: brotli_compressor(11, mode=brotli.MODE_FONT),
+            _client_brotli_default,
+        ),
+        (brotli_compress(lgwin=18), lambda: brotli_compressor(11, lgwin=18), _client_brotli_default),
+        # At quality 11 on this body, 16 is the block size the encoder visibly acts on.
+        (brotli_compress(lgblock=16), lambda: brotli_compressor(11, lgblock=16), _client_brotli_default),
+    ],
+    ids=[
+        "gzip-level",
+        "gzip-wbits",
+        "gzip-mem_level",
+        "gzip-strategy",
+        "zstd-level",
+        "zstd-options",
+        "zstd-dict",
+        "br-quality",
+        "br-mode",
+        "br-lgwin",
+        "br-lgblock",
+    ],
+)
+async def test_each_option_reaches_the_codec(
+    middleware: ClientMiddleware, make: Callable[[], Compressor], default: Callable[[], Compressor]
+) -> None:
+    """The body on the wire is the factory's own output for that option, which the defaults do not produce."""
+    expected = _whole(make, UPLOAD)
+    assert expected != _whole(default, UPLOAD)
+    assert await _sent(middleware, UPLOAD) == expected
 
 
 async def test_gzip_compress_skips_a_bodyless_request() -> None:

@@ -916,6 +916,73 @@ final body event, so one can arrive while the floor is still being weighed. It w
 with the held head rather than going out ahead of it, and is released in the order the
 app sent it, whichever way the floor resolves.
 
+### How far back a stream can reach
+
+A committed stream runs every chunk through one compressor, so a chunk can be encoded
+as references to the ones before it, but only as far back as the codec's **window**.
+The shipped factories leave it where the codecs put it: 2 MiB for zstd at its default
+level, 4 MiB for brotli. For most responses that is far more than the body. It stops
+being enough for a held-open stream whose messages repeat something larger, such as an
+event stream that re-sends a whole re-rendered page: each message falls outside the
+window of the last and is compressed from scratch.
+
+Each factory takes its codec's own constructor arguments, under the codec's own names,
+so the codec's documentation is the reference for every one of them:
+`gzip_compressor` takes `zlib.compressobj`'s (`memLevel` spelled `mem_level`),
+`zstd_compressor` takes `zstd.ZstdCompressor`'s `level`, `options`, and `zstd_dict`, and
+`brotli_compressor` takes `brotli.Compressor`'s `mode`, `lgwin`, and `lgblock`. The
+padded factories and `without-http`'s request-side helpers pass the same arguments
+through. The window is zstd's `CompressionParameter.window_log` and brotli's `lgwin`,
+each a base-2 logarithm. Measured on a 5.9 MB page sent twice through one compressor,
+the second copy cost 704 KB at zstd's default window and 0.6 KB at a `window_log` of
+23, and 540 KB at brotli's default against 0.1 KB at an `lgwin` of 24:
+
+```python
+from compression import zstd
+
+from without_asgi.compression import (
+    DEFAULT_COMPRESSORS,
+    MAX_ZSTD_WINDOW_LOG,
+    brotli_compressor,
+    compress,
+    zstd_compressor,
+)
+
+# Annotated because the stdlib types `options` as `Mapping[int, int]`, whose keys are
+# invariant; a literal written inline at the call needs no annotation.
+zstd_window: dict[int, int] = {zstd.CompressionParameter.window_log: MAX_ZSTD_WINDOW_LOG}
+compress(
+    DEFAULT_COMPRESSORS
+    | {
+        b"br": lambda: brotli_compressor(lgwin=24),
+        b"zstd": lambda: zstd_compressor(options=zstd_window),
+    }
+)
+```
+
+The window is never negotiated. The encoder writes it into the stream header and the
+decoder allocates whatever the header says, so a client cannot ask for less, only
+refuse a stream over its ceiling. For zstd,
+[RFC 9659](https://www.rfc-editor.org/rfc/rfc9659) sets that ceiling at 8 MiB, and
+`zstd_compressor` refuses any configuration whose window is wider when it is called:
+the stdlib's decoder accepts a wider window, so the mistake would otherwise pass every
+test and fail in a browser. The refusal reads the window zstd actually resolved rather
+than the arguments, because most ways past the ceiling never name a window: levels 20
+to 22 pick 32 to 128 MiB, and long distance matching picks 128 MiB unless
+`window_log` caps it. Brotli's ceiling is its format's own, an `lgwin` of 24, and the
+bindings enforce it. gzip's `wbits` can only narrow its window, since DEFLATE tops out
+at 32 KiB, so a client that negotiates only gzip gets none of this.
+
+The cost is memory on both sides for as long as the compressor lives. For a response
+that arrives whole, that is one encode. For a held-open stream it is the whole
+connection, multiplied by every open connection, and each browser tab holds a decoder
+about the window's size. Measured after three 5.9 MB renders, a held compressor came to
+about 3 MiB for zstd at its default window and 9 MiB at 8 MiB, and about 17 MiB for
+brotli at its default and 23 MiB at 16 MiB. That is why the defaults stay where they
+are. An event stream also needs a `compressible` that accepts `text/event-stream`,
+which `is_compressible` declines; read [Compression and
+secrets](#compression-and-secrets) before passing one.
+
 ### Compression and secrets
 
 Compressing a response that mixes a secret (a CSRF token, a session identifier)
