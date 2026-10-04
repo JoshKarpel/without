@@ -22,6 +22,7 @@ from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
 from email.utils import parsedate_to_datetime
+from functools import partial
 from importlib import metadata
 from types import MappingProxyType
 from typing import NamedTuple
@@ -1695,7 +1696,13 @@ def compressing(coding: bytes, make_compressor: Callable[[], Compressor]) -> Cli
     return wrap(request=apply)
 
 
-def gzip_compress(level: int = zlib.Z_DEFAULT_COMPRESSION) -> ClientMiddleware:
+def gzip_compress(
+    level: int = zlib.Z_DEFAULT_COMPRESSION,
+    *,
+    wbits: int = GZIP_CONTAINER,
+    mem_level: int = zlib.DEF_MEM_LEVEL,
+    strategy: int = zlib.Z_DEFAULT_STRATEGY,
+) -> ClientMiddleware:
     """
     Client middleware that gzips every request body sent through it.
 
@@ -1708,15 +1715,26 @@ def gzip_compress(level: int = zlib.Z_DEFAULT_COMPRESSION) -> ClientMiddleware:
 
     The body streams through an incremental compressor and the framing follows the
     rewrite (see `compressing` for both, and for which requests pass through
-    untouched). `level` is zlib's compression level, defaulting to zlib's own
-    default. `zstd_compress` and `brotli_compress` are the same middleware over their
-    codings, and `compressing` is the shared mechanism for any coding beyond those;
-    the response-side counterpart to all of them is `decompress`.
+    untouched). The arguments are `without_asgi.compression.gzip_compressor`'s, which
+    are zlib's own. `zstd_compress` and `brotli_compress` are the same middleware over
+    their codings, and `compressing` is the shared mechanism for any coding beyond
+    those; the response-side counterpart to all of them is `decompress`.
+
+    Each of the three builds one compressor when called and discards it, so an
+    argument the codec refuses raises here, at assembly, rather than on the first
+    request that would have sent a body.
     """
-    return compressing(b"gzip", lambda: gzip_compressor(level))
+    make_compressor = partial(gzip_compressor, level, wbits=wbits, mem_level=mem_level, strategy=strategy)
+    make_compressor()
+    return compressing(b"gzip", make_compressor)
 
 
-def zstd_compress(level: int | None = None) -> ClientMiddleware:
+def zstd_compress(
+    level: int | None = None,
+    *,
+    options: Mapping[int, int] | None = None,
+    zstd_dict: zstd.ZstdDict | tuple[zstd.ZstdDict, int] | None = None,
+) -> ClientMiddleware:
     """
     Client middleware that zstd-compresses every request body sent through it.
 
@@ -1725,12 +1743,23 @@ def zstd_compress(level: int | None = None) -> ClientMiddleware:
     differs. gzip is the coding everything decodes; reach for zstd where the upstream
     is known to decode it.
 
-    `level` is zstd's compression level, defaulting to the library's own default.
+    The arguments are `without_asgi.compression.zstd_compressor`'s, which are the
+    stdlib's `zstd.ZstdCompressor`'s own; a configuration whose window HTTP forbids
+    raises `ValueError` here. A request is where `zstd_dict` fits, for an upstream
+    known to hold the same dictionary.
     """
-    return compressing(b"zstd", lambda: zstd_compressor(level))
+    make_compressor = partial(zstd_compressor, level, options=options, zstd_dict=zstd_dict)
+    make_compressor()
+    return compressing(b"zstd", make_compressor)
 
 
-def brotli_compress(quality: int = 11) -> ClientMiddleware:
+def brotli_compress(
+    quality: int = 11,
+    *,
+    mode: int = brotli.MODE_GENERIC,
+    lgwin: int = 22,
+    lgblock: int = 0,
+) -> ClientMiddleware:
     """
     Client middleware that brotli-compresses every request body sent through it.
 
@@ -1740,9 +1769,12 @@ def brotli_compress(quality: int = 11) -> ClientMiddleware:
     defaulting to the bindings' own default of 11, the maximum, because a client
     compressing an upload it holds whole is the case that ratio is worth paying for.
     The server-side `compress` table defaults lower, since it encodes per response;
-    see `without_asgi.compression.brotli_compressor`, the shared codec behind both.
+    see `without_asgi.compression.brotli_compressor`, the shared codec behind both,
+    whose other arguments are the bindings' own.
     """
-    return compressing(b"br", lambda: brotli_compressor(quality))
+    make_compressor = partial(brotli_compressor, quality, mode=mode, lgwin=lgwin, lgblock=lgblock)
+    make_compressor()
+    return compressing(b"br", make_compressor)
 
 
 class Decompressor(Protocol):

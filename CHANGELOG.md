@@ -59,8 +59,37 @@
   cancelled, waits for the future to finish before the cancellation propagates. It is the
   shape every durable write already had: the effect has happened by the time the record
   is written, so cancelling the write would lose the record and not the effect.
+- **`without-asgi`**: the compressor factories take their codec's own constructor
+  arguments, under the codec's own names: `gzip_compressor` takes `zlib.compressobj`'s
+  `wbits`, `mem_level`, and `strategy`, `zstd_compressor` takes `zstd.ZstdCompressor`'s
+  `options` and `zstd_dict`, and `brotli_compressor` takes `brotli.Compressor`'s `mode`,
+  `lgwin`, and `lgblock`. `padded_gzip_compressor`, `padded_zstd_compressor`, and
+  `without-http`'s `gzip_compress`, `zstd_compress`, and `brotli_compress` pass the same
+  arguments through. Every default is unchanged, so existing tables encode the same
+  bytes.
+
+  The window is the one that prompted it. A held-open stream whose messages repeat
+  something larger than the default window (2 MiB for zstd, 4 MiB for brotli), such as an
+  event stream re-sending a whole page, compresses every message from scratch. With the
+  window widened the repeat costs almost nothing: on a 5.9 MB page, zstd's second copy fell
+  from 704 KB to 0.6 KB and brotli's from 540 KB to 0.1 KB. The window is memory on both
+  ends for the life of the connection, which is why the defaults stay small.
+
+  Two arguments a coding cannot allow are refused. A gzip `wbits` outside the gzip range
+  raises `ValueError`, since zlib would otherwise write a zlib or raw DEFLATE stream
+  labelled `gzip`, and `zdict` is absent because zlib refuses it in the gzip container.
+  `MAX_ZSTD_WINDOW_LOG` names the 8 MiB ceiling RFC 9659 sets for a zstd window in HTTP.
 
 ### Changed
+
+- **`without-asgi`**: `zstd_compressor` raises `ValueError` for any configuration whose
+  window exceeds the 8 MiB RFC 9659 allows, including `zstd_compressor(20)` and up,
+  which used to write 32 to 128 MiB windows that the stdlib decodes and a conforming
+  browser may refuse. Long distance matching without a `window_log` to cap it is refused
+  for the same reason. The check reads the window zstd resolved, once per configuration.
+- **`without-http`**: `gzip_compress`, `zstd_compress`, and `brotli_compress` build one
+  compressor when called, so an argument the codec refuses raises when the middleware is
+  built rather than on the first request with a body.
 
 - **`without-durability`**: `Run` takes an `extend`, and `Checkpointer.claim` takes two
   durations where it took one. A store or a hand-built `Run` from 0.0.8 needs updating;

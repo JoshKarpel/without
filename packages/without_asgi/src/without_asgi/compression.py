@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from compression import zstd
 from dataclasses import dataclass
 from dataclasses import replace
+from functools import cache
 from types import MappingProxyType
 from typing import Protocol
 from typing import runtime_checkable
@@ -34,6 +35,7 @@ __all__ = [
     "DYNAMIC_BROTLI_QUALITY",
     "GZIP_CONTAINER",
     "MAX_RANDOM_BYTES",
+    "MAX_ZSTD_WINDOW_LOG",
     "PADDED_COMPRESSORS",
     "Compressor",
     "OffloadedBodyAfterEncoding",
@@ -131,12 +133,32 @@ class _FlushingCompressor:
         return self._flush()
 
 
-def gzip_compressor(level: int = zlib.Z_DEFAULT_COMPRESSION) -> StreamingCompressor:
+# The narrowest `wbits` that still selects the gzip container: a 2**9-byte window.
+_NARROWEST_GZIP_CONTAINER = 9 | 16
+
+
+def gzip_compressor(
+    level: int = zlib.Z_DEFAULT_COMPRESSION,
+    *,
+    wbits: int = GZIP_CONTAINER,
+    mem_level: int = zlib.DEF_MEM_LEVEL,
+    strategy: int = zlib.Z_DEFAULT_STRATEGY,
+) -> StreamingCompressor:
     """
     A fresh gzip `StreamingCompressor`, the codec behind `DEFAULT_COMPRESSORS`' `gzip` entry.
 
-    `level` is zlib's compression level, defaulting to zlib's own default. Called with
+    The arguments are `zlib.compressobj`'s own, with zlib's own defaults (`mem_level`
+    is its `memLevel`), so zlib's documentation is the reference for each. Called with
     no argument it is already the zero-argument factory a table wants.
+
+    Two of `compressobj`'s arguments are absent because the coding fixes them: `method`
+    has one legal value, and `zdict` is refused by zlib in the gzip container, which
+    has no field to name a dictionary in. `wbits` is narrowed the same way: zlib reads
+    9 to 15 as a zlib container and -9 to -15 as raw DEFLATE, either of which would
+    label non-gzip bytes `gzip`, so only the gzip range (25 to `GZIP_CONTAINER`, a
+    2**9 to 2**15-byte window) is accepted, and anything else raises `ValueError`.
+    DEFLATE's window tops out at 32 KiB, so unlike zstd and brotli no setting lets
+    gzip reach back across a large repeated message.
 
     Public because `zlib.compressobj` is not a substitute for it: the raw object is a
     `Compressor` and *not* a `StreamingCompressor`, since ending a block is a mode
@@ -144,19 +166,109 @@ def gzip_compressor(level: int = zlib.Z_DEFAULT_COMPRESSION) -> StreamingCompres
     from it directly would silently take the buffered path for every streaming
     response. `without-http`'s request-side `gzip_compress` drives this same factory.
     """
-    raw = zlib.compressobj(level, zlib.DEFLATED, GZIP_CONTAINER)
+    if not _NARROWEST_GZIP_CONTAINER <= wbits <= GZIP_CONTAINER:
+        raise ValueError(
+            f"a gzip wbits runs from {_NARROWEST_GZIP_CONTAINER} to {GZIP_CONTAINER}, not {wbits}: "
+            "anything else selects a zlib or raw DEFLATE stream"
+        )
+    raw = zlib.compressobj(level, zlib.DEFLATED, wbits, mem_level, strategy)
     return _FlushingCompressor(raw.compress, lambda: raw.flush(zlib.Z_SYNC_FLUSH), raw.flush)
 
 
-def zstd_compressor(level: int | None = None) -> StreamingCompressor:
+# The widest zstd window an HTTP content coding may use: 2**23 bytes, 8 MiB. RFC 9659
+# §3 has encoders "MUST NOT generate frames requiring a Window_Size larger than 8 MB"
+# and lets decoders reject them, so this is HTTP's ceiling rather than zstd's (the
+# format goes to 2**31). Enforced here rather than left to the decoder because the
+# window is never negotiated: the stdlib's decoder accepts a wider one, so a test
+# suite passes and a browser refuses the response.
+MAX_ZSTD_WINDOW_LOG = 23
+
+
+def _window_size(frame: bytes) -> int:
+    """
+    The `Window_Size` a zstd frame header asks its decoder for (RFC 8878 §3.1.1.1.2).
+
+    Reads the `Window_Descriptor` straight after the frame header descriptor, which is
+    only there in a frame that is not single-segment, so the frame has to come from a
+    compressor never told its input size.
+    """
+    descriptor = frame[5]
+    base = 1 << (10 + (descriptor >> 3))
+    return base + base // 8 * (descriptor & 0b111)
+
+
+@cache
+def _resolved_window_size(
+    level: int | None,
+    options: frozenset[tuple[int, int]] | None,
+    zstd_dict: zstd.ZstdDict | tuple[zstd.ZstdDict, int] | None,
+) -> int:
+    """
+    The window zstd writes for this configuration, read off the header a throwaway
+    compressor emits.
+
+    Asked of zstd rather than worked out from the arguments because most of what sets
+    the window is implicit: levels 20 to 22 pick 32 to 128 MiB, and enabling long
+    distance matching picks 128 MiB, none of them naming a `window_log`, and the stdlib
+    exposes no way to read back the parameters it resolved. Cached, so each
+    configuration is asked once per process rather than once per response.
+    """
+    probe = zstd.ZstdCompressor(level, None if options is None else dict(options), zstd_dict)
+    return _window_size(probe.compress(b"\0") + probe.flush(probe.FLUSH_BLOCK))
+
+
+def zstd_compressor(
+    level: int | None = None,
+    *,
+    options: Mapping[int, int] | None = None,
+    zstd_dict: zstd.ZstdDict | tuple[zstd.ZstdDict, int] | None = None,
+) -> StreamingCompressor:
     """
     A fresh zstd `StreamingCompressor`, the codec behind `DEFAULT_COMPRESSORS`' `zstd` entry.
 
-    `level` is zstd's compression level, defaulting to the library's own. Everything in
-    `gzip_compressor` about why the raw `zstd.ZstdCompressor` is not a substitute
-    applies here: it spells a block flush as a mode argument too.
+    The arguments are `zstd.ZstdCompressor`'s own, passed through unchanged, so the
+    stdlib's documentation is the reference for each and its rules hold: `level` and
+    `options` are exclusive, so a level set beside other parameters goes in `options`
+    as `CompressionParameter.compression_level`. Everything in `gzip_compressor` about
+    why the raw `zstd.ZstdCompressor` is not a substitute applies here: it spells a
+    block flush as a mode argument too.
+
+    The parameter that matters most for a streamed response is
+    `CompressionParameter.window_log`, how far back in the stream a match may reach
+    (2 MiB at the default level). Within one response the window is what lets later
+    bytes be encoded as references to earlier ones, so a stream whose messages repeat a
+    body larger than the window (an event stream re-sending a whole page) is
+    compressed from scratch every message until the window spans one:
+
+    ```python
+    window: dict[int, int] = {zstd.CompressionParameter.window_log: MAX_ZSTD_WINDOW_LOG}
+    compress(DEFAULT_COMPRESSORS | {b"zstd": lambda: zstd_compressor(options=window)})
+    ```
+
+    The annotation is the stdlib's doing: its stubs type `options` as
+    `Mapping[int, int]`, whose keys are invariant, so a type checker rejects the
+    `dict[CompressionParameter, int]` it infers for a bare literal held in a variable,
+    though it accepts the same literal written inline at the call.
+
+    The cost is memory on both ends for as long as the compressor lives: one
+    `compress` call for a response that arrives whole, the whole connection for one
+    held open, and on the client a decoder of about the window's size for as long as
+    it reads. Measured after three 5.9 MB renders, a held compressor came to about
+    3 MiB at the default window and 9 MiB at 8 MiB.
+
+    Raises `ValueError` for any configuration whose window exceeds
+    `2**MAX_ZSTD_WINDOW_LOG` bytes, which HTTP forbids, however it got there: an
+    explicit `window_log`, a level of 20 or more, or long distance matching without a
+    `window_log` to cap it.
+
+    `zstd_dict` writes frames only a decoder holding the same dictionary can read, and
+    the `zstd` coding has no way to say which one, so it suits a request to a server
+    known to hold it and not a negotiated response.
     """
-    raw = zstd.ZstdCompressor(level)
+    raw = zstd.ZstdCompressor(level, options, zstd_dict)
+    window = _resolved_window_size(level, None if options is None else frozenset(options.items()), zstd_dict)
+    if window > 1 << MAX_ZSTD_WINDOW_LOG:
+        raise ValueError(f"an HTTP zstd window is at most {1 << MAX_ZSTD_WINDOW_LOG} bytes (RFC 9659), not {window}")
     return _FlushingCompressor(raw.compress, lambda: raw.flush(raw.FLUSH_BLOCK), raw.flush)
 
 
@@ -199,23 +311,38 @@ class _BrotliCompressor:
 DYNAMIC_BROTLI_QUALITY = 5
 
 
-def brotli_compressor(quality: int = DYNAMIC_BROTLI_QUALITY) -> StreamingCompressor:
+def brotli_compressor(
+    quality: int = DYNAMIC_BROTLI_QUALITY,
+    *,
+    mode: int = brotli.MODE_GENERIC,
+    lgwin: int = 22,
+    lgblock: int = 0,
+) -> StreamingCompressor:
     """
     A fresh brotli `Compressor`, the codec behind `DEFAULT_COMPRESSORS`' `br` entry.
 
-    `quality` is brotli's compression quality (0-11), defaulting to
-    `DYNAMIC_BROTLI_QUALITY` rather than the bindings' own 11: a table entry encodes
-    a response per request, where 11 costs much more CPU without a ratio to show for
-    it at response sizes. Raise it for a table serving bodies large enough for the
-    wider window to pay, or content compressed once
+    The arguments are `brotli.Compressor`'s own, so the bindings' documentation is
+    the reference for each, and the bindings raise `brotli.error` for a value outside
+    its range. Every default but `quality` is the bindings' own.
+
+    `quality` defaults to `DYNAMIC_BROTLI_QUALITY` rather than the bindings' 11: a
+    table entry encodes a response per request, where 11 costs much more CPU without
+    a ratio to show for it at response sizes. Raise it for a table serving bodies
+    large enough for the wider search to pay, or content compressed once
     (`compress(DEFAULT_COMPRESSORS | {b"br": lambda: brotli_compressor(11)})`).
+
+    `lgwin` is the base-2 logarithm of the window, 4 MiB at the default 22.
+    Everything in `zstd_compressor` about what the window buys a held-open stream,
+    and what it costs, holds here; measured the same way, a held brotli compressor
+    came to about 17 MiB at the default window and 23 MiB at 16 MiB. The format's
+    ceiling of 24 is the only one HTTP sets for brotli.
 
     Called with no argument it is already the zero-argument factory a table wants.
     `without-http`'s request-side `brotli_compress` drives the same adapter, keeping
     its own default at 11, since a client compressing one upload is the static case
     again.
     """
-    return _BrotliCompressor(brotli.Compressor(quality=quality))
+    return _BrotliCompressor(brotli.Compressor(mode=mode, quality=quality, lgwin=lgwin, lgblock=lgblock))
 
 
 # The codings encoded out of the box. `compress`'s default table, and *ordered*:
@@ -327,16 +454,39 @@ class _PaddedZstdCompressor:
         return self._inner.flush() + self._trailer
 
 
-def padded_gzip_compressor(max_random_bytes: int = MAX_RANDOM_BYTES) -> StreamingCompressor:
-    """A gzip `Compressor` whose output length carries up to `max_random_bytes` of noise."""
-    return _PaddedGzipCompressor(gzip_compressor(), _random_run(max_random_bytes))
+def padded_gzip_compressor(
+    max_random_bytes: int = MAX_RANDOM_BYTES,
+    *,
+    level: int = zlib.Z_DEFAULT_COMPRESSION,
+    wbits: int = GZIP_CONTAINER,
+    mem_level: int = zlib.DEF_MEM_LEVEL,
+    strategy: int = zlib.Z_DEFAULT_STRATEGY,
+) -> StreamingCompressor:
+    """
+    A gzip `Compressor` whose output length carries up to `max_random_bytes` of noise.
+
+    The keyword arguments are `gzip_compressor`'s, passed to the codec underneath.
+    """
+    inner = gzip_compressor(level, wbits=wbits, mem_level=mem_level, strategy=strategy)
+    return _PaddedGzipCompressor(inner, _random_run(max_random_bytes))
 
 
-def padded_zstd_compressor(max_random_bytes: int = MAX_RANDOM_BYTES) -> StreamingCompressor:
-    """A zstd `Compressor` whose output length carries up to `max_random_bytes` of noise."""
+def padded_zstd_compressor(
+    max_random_bytes: int = MAX_RANDOM_BYTES,
+    *,
+    level: int | None = None,
+    options: Mapping[int, int] | None = None,
+    zstd_dict: zstd.ZstdDict | tuple[zstd.ZstdDict, int] | None = None,
+) -> StreamingCompressor:
+    """
+    A zstd `Compressor` whose output length carries up to `max_random_bytes` of noise.
+
+    The keyword arguments are `zstd_compressor`'s, passed to the codec underneath.
+    """
+    inner = zstd_compressor(level, options=options, zstd_dict=zstd_dict)
     payload = _random_run(max_random_bytes)
     trailer = struct.pack("<II", _ZSTD_SKIPPABLE_FRAME, len(payload)) + payload
-    return _PaddedZstdCompressor(zstd_compressor(), trailer)
+    return _PaddedZstdCompressor(inner, trailer)
 
 
 # `compress`'s table for a router whose responses mix a secret with text an attacker
