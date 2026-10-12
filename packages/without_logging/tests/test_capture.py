@@ -55,6 +55,7 @@ async def test_capture_fans_out_to_several_sinks_sharing_a_prefix() -> None:
         tee(
             sink_into(everything),
             compose(from_selector(at_least(Level.WARNING)), sink_into(warnings)),
+            buffer=4,
         ),
     )
 
@@ -69,6 +70,26 @@ async def test_capture_fans_out_to_several_sinks_sharing_a_prefix() -> None:
     # the shared prefix ran once, so both branches see the enriched records
     assert all(r.fields["service"] == "api" for r in everything)
     assert all(r.fields["service"] == "api" for r in warnings)
+
+
+async def test_capture_keeps_up_with_bursts_through_a_tee_as_deep_as_the_burst() -> None:
+    logger = logging.getLogger("test.capture.tee_burst")
+    left: list[Record] = []
+    right: list[Record] = []
+    burst, frames = 12, 50
+
+    # a tee shallower than the burst lets only part of each burst through per yield, so
+    # the backlog fills capture's queue and records drop; one as deep keeps up
+    async with capture(
+        tee(sink_into(left), sink_into(right), buffer=burst), logger=logger, level=logging.INFO, capacity=32
+    ) as handler:
+        for _ in range(frames):
+            for _ in range(burst):
+                logger.info("frame")
+            await asyncio.sleep(0)
+
+    assert handler.dropped == 0
+    assert len(left) == len(right) == burst * frames
 
 
 async def test_capture_restores_the_logger_level_and_detaches_on_exit() -> None:

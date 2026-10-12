@@ -489,7 +489,7 @@ enabled** here, for two reasons.
 
 It removes none of the suppression machinery. Every `# pragma: no mutate` in this codebase guards
 a mutation that is *type-valid but behavior-equivalent*: truthiness (`bool(msg.get(k, False))` →
-`None`), a value that equals a field default, a timing-only buffer depth, `zip(strict=True)` where
+`None`), a value that equals a field default, `zip(strict=True)` where
 lengths are always equal. mypy sees no error in
 any of these, so the pragmas stay. The filter only catches *type-invalid* mutations (assigning
 `None` into a non-optional slot, `cast(T, x)` → `cast(None, x)`), a set almost disjoint from what

@@ -504,7 +504,7 @@ exception is captured as structure and not flattened to a string at the edge.
 A real logging setup wants more than one sink: console *and* a file, or a file
 *and* the network. That is fan-out, one record stream split into several
 independent sinks, and it is [`tee`](../without-streams/reference.md) from
-`without-streams`. `tee(*sinks)` returns a single `Sink` that feeds every event to every
+`without-streams`. `tee(*sinks, buffer=...)` returns a single `Sink` that feeds every event to every
 branch, consuming the input exactly once, so there is one `capture` and one pass
 through the shared middleware.
 
@@ -516,7 +516,7 @@ carrying its own filtering, rendering, and terminal:
 import logging
 import sys
 
-from without_streams import compose, from_selector, tee
+from without_streams import compose, from_selector, offload, tee
 from without_logging import (
     Level,
     add_fields,
@@ -527,6 +527,8 @@ from without_logging import (
     to_rotating_file,
     to_stream,
 )
+
+depth = 1024  # capture's queue and each tee branch: the tee absorbs any burst the queue holds
 
 async with (
     offload(to_stream(sys.stderr)) as console,
@@ -540,9 +542,11 @@ async with (
                     from_selector(at_least(Level.WARNING)),
                     compose(render_json(), file),
                 ),
+                buffer=depth,
             ),
         ),
         level=logging.DEBUG,
+        capacity=depth,
     ),
 ):
     ...
@@ -581,6 +585,18 @@ thread through its `offload`, so a slow disk never blocks the console. A branch
 MAY itself be another `tee`, so "one input, several sink groups" nests. With one
 `capture` at `DEBUG`, the per-branch `from_selector` does the level filtering, so
 each sink keeps exactly what it wants without a second pass over the records.
+
+`buffer` is how many records each branch may queue ahead of its sink, and it has
+no default because the right depth depends on how the program logs. The `tee`'s
+pump suspends whenever a branch's queue is full, and resuming it costs event loop
+iterations, so a buffer shallower than a burst lets only part of each burst through
+per iteration. A program that logs a dozen records and then yields once (a UI frame
+loop, say) then falls behind on every frame, the backlog piles up in `capture`'s
+queue, and once that queue is full `capture` drops records, counting them in
+`handler.dropped`. Matching `buffer` to `capture`'s `capacity`, as above, means
+the `tee` can absorb anything the queue in front of it holds; a smaller value that
+still covers the largest burst between yields also keeps up, at less memory
+(`buffer` records per branch at most).
 
 The *fan-in* half is still ahead. `tee` covers splitting one stream; merging
 several back (app records, stdlib-captured records, and per-request sub-streams
