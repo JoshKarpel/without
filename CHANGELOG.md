@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Every package supports Python 3.15, and CI tests it alongside 3.14 on Linux, macOS,
+  and Windows.
+
 ## 0.0.10
 
 ### Added
