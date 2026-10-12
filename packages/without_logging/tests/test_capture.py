@@ -55,6 +55,7 @@ async def test_capture_fans_out_to_several_sinks_sharing_a_prefix() -> None:
         tee(
             sink_into(everything),
             compose(from_selector(at_least(Level.WARNING)), sink_into(warnings)),
+            buffer=4,
         ),
     )
 

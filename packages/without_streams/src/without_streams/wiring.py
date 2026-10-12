@@ -408,7 +408,7 @@ def compose[A, B, C](first: Processor[A, B], second: Processor[B, C] | Sink[B]) 
     return cast("Processor[A, C] | Sink[A]", composed)  # pragma: no mutate - cast is a runtime no-op
 
 
-def tee[T](*sinks: Sink[T], buffer: int = 1) -> Sink[T]:  # pragma: no mutate - default depth; effect is timing-only
+def tee[T](*sinks: Sink[T], buffer: int) -> Sink[T]:
     """
     Fan one stream out to every `sink`: the terminal counterpart to `compose`.
 
@@ -431,10 +431,19 @@ def tee[T](*sinks: Sink[T], buffer: int = 1) -> Sink[T]:  # pragma: no mutate - 
     silently starving the rest.
 
     `buffer` is how far a branch may run ahead: the queues are bounded to it, so the
-    slowest branch gates the pump (and thus backpressure onto the source), while a
-    larger value trades memory for slack so a fast branch need not wait on a slow
-    one. The default `1` keeps memory `O(sinks)`. At least one sink is REQUIRED, and
-    `buffer` MUST be at least 1 (an unbounded branch could grow memory without limit).
+    slowest branch gates the pump (and thus backpressure onto the source), and the
+    `tee` holds at most `buffer * len(sinks)` values. It is REQUIRED because no one
+    depth suits every source. The pump suspends whenever a branch's queue is full, and
+    resuming it costs event loop iterations, so a buffer smaller than the bursts the
+    source delivers caps throughput by how often the program yields rather than by
+    CPU, and the backlog lands upstream, where a bounded queue drops it. Size it to
+    the largest burst the source delivers between yields to the loop: a program that
+    logs a dozen records per frame wants at least 12, and matching the capacity of a
+    bounded queue upstream (such as the one `without_logging.capture` reads from)
+    ensures the `tee` is never the narrower bound. `buffer=1` runs the branches in
+    lockstep, which suits only a source that yields once per value anyway. At least
+    one sink is REQUIRED, and `buffer` MUST be at least 1 (an unbounded branch could
+    grow memory without limit).
     """
     if not sinks:
         raise ValueError("tee requires at least one sink")
