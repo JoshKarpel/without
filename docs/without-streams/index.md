@@ -54,9 +54,12 @@ fan-in family (`broadcast`, `merge`) is reserved in issue #13.
 the only connector that needs nothing running. When its second argument is a
 `Sink` rather than a `Processor`, the result is a `Sink` too, which is how a
 middleware chain (a filter, an enrichment) is prefixed onto a terminal consumer.
-`tee` is its terminal fan-out counterpart: `tee(*sinks)` returns one `Sink` that
-splits a stream across several branches, each with its own tail, so a shared
-prefix composed ahead of it runs once and every branch consumes its own copy.
+`tee` is its terminal fan-out counterpart: `tee(*sinks, buffer=...)` returns one
+`Sink` that splits a stream across several branches, each with its own tail, so a
+shared prefix composed ahead of it runs once and every branch consumes its own copy.
+`buffer` bounds how far each branch may run ahead and has no default: a buffer
+shallower than the bursts the source delivers between yields to the event loop
+caps throughput by how often the program yields, so size it to the largest burst.
 `sample` is the behavior edge: it
 exposes a stream's latest value as a `Context` (latest-wins, no backpressure),
 driven by a `background_task` for the life of its `with` block. The source and

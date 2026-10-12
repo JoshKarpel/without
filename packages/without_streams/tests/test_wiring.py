@@ -71,7 +71,7 @@ async def test_tee_delivers_every_value_to_every_sink_in_order() -> None:
     async def push_right(value: int) -> None:
         right.append(value)
 
-    await tee(from_sink(push_left), from_sink(push_right))(stream_from_iterable([5, 6, 7]))
+    await tee(from_sink(push_left), from_sink(push_right), buffer=1)(stream_from_iterable([5, 6, 7]))
 
     assert left == [5, 6, 7]
     assert right == [5, 6, 7]
@@ -96,7 +96,7 @@ async def test_tee_delivers_every_value_to_a_slower_branch() -> None:
 
 async def test_tee_requires_at_least_one_sink() -> None:
     with pytest.raises(ValueError, match=r"^tee requires at least one sink$"):
-        tee()
+        tee(buffer=1)
 
 
 async def test_tee_rejects_a_nonpositive_buffer() -> None:
@@ -119,7 +119,7 @@ async def test_tee_surfaces_a_sink_failure() -> None:
         raise SinkFailed("branch broke")
 
     with pytest.raises(ExceptionGroup) as excinfo:
-        await tee(from_sink(record), from_sink(fail))(stream_from_iterable([1, 2, 3]))
+        await tee(from_sink(record), from_sink(fail), buffer=1)(stream_from_iterable([1, 2, 3]))
 
     assert any(isinstance(error, SinkFailed) for error in excinfo.value.exceptions)
 

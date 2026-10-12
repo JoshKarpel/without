@@ -7,6 +7,16 @@
 - Every package supports Python 3.15, and CI tests it alongside 3.14 on Linux, macOS,
   and Windows.
 
+### Changed
+
+- **`without-streams`**: `tee` requires `buffer`, which defaulted to `1`. A buffer
+  shallower than the bursts a source delivers between yields to the event loop caps
+  the `tee`'s throughput by how often the program yields, so a program logging a
+  dozen records per frame through `tee` into `without-logging`'s `capture` fell behind
+  on every frame and `capture` dropped most of its records. The docstring says how to
+  size it: cover the largest burst, or match the bounded queue upstream. Pass
+  `buffer=1` to keep the old behavior.
+
 ## 0.0.10
 
 ### Added
