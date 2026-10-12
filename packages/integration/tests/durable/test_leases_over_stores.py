@@ -41,14 +41,20 @@ async def test_a_renewing_pass_keeps_a_claim_past_its_liveness_window(
     # workflow however short the liveness window is, because it keeps saying so. A single
     # lease sized for takeover latency would fence this slow-but-healthy pass and make it
     # perform its current step twice.
+    #
+    # Widened like `test_a_write_is_a_sign_of_life`, and for the same reason: a renewal is a
+    # SQLite write, whose deadline is stamped when the statement runs and so is spent by its
+    # own fsync. On a loaded Windows runner one commit has taken the whole of a `BRIEF`. Four
+    # renewals a third of a window apart still span past it, so the assertion is as strong.
+    window = BRIEF * 4
     checkpointer = durable.checkpointer
-    holder = await claimed(checkpointer, workflow, AMPLE, BRIEF)
+    holder = await claimed(checkpointer, workflow, AMPLE, window)
 
     for _ in range(4):
-        await asyncio.sleep(BRIEF.total_seconds() / 3)
-        assert await checkpointer.renew(holder, BRIEF), "the pass still holds it, so renewing succeeds"
+        await asyncio.sleep(window.total_seconds() / 3)
+        assert await checkpointer.renew(holder, window), "the pass still holds it, so renewing succeeds"
 
-    assert await checkpointer.claim(workflow, AMPLE, BRIEF) is None, (
+    assert await checkpointer.claim(workflow, AMPLE, window) is None, (
         "and nobody else may take a workflow whose holder has been heard from"
     )
 
@@ -175,8 +181,8 @@ async def test_a_write_is_a_sign_of_life(
     # leaves the worker's own tick with the case it is really for: one step long enough that
     # no write falls inside a whole window.
     #
-    # A wider window than the rest of this file uses, because this is the one test whose
-    # margin is a *write* rather than a sleep: SQLite commits under `synchronous=FULL`, so a
+    # A wider window than a `BRIEF`, because the margin here is a *write* rather than a
+    # sleep: SQLite commits under `synchronous=FULL`, so a
     # single fsync on a loaded machine can be most of a `BRIEF`, and a claim that lapsed
     # would say the store failed to renew when all that happened was a slow disk. Six writes
     # spanning well past the window keep the assertion exactly as strong.

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Added
+
+- Every package supports Python 3.15, and CI tests it alongside 3.14 on Linux, macOS,
+  and Windows.
+
 ### Changed
 
 - **`without-streams`**: `tee` requires `buffer`, which defaulted to `1`. A buffer

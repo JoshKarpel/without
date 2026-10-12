@@ -39,6 +39,13 @@ SMALL = {"widget": 1200, "gizmo": 800}
 LARGE = {"piano": 90_000}
 WORKFLOW = "wf-payout-1"
 BRIEF = timedelta(milliseconds=10)
+# For a test whose claim has to survive on renewals alone. A renewal comes every third of
+# the lease, so one landing more than a tick late lets the claim lapse, and a test that
+# makes the store refuse a tick has only that one tick of slack left. At `BRIEF * 3` the
+# tick is 10 ms, which a loaded macOS runner's event loop has overrun, failing the test on
+# the runner's timing rather than the worker's. Paid for in wall clock: those tests sleep
+# through two leases.
+RENEWED_LEASE = BRIEF * 30
 # Short enough that the assembled worker test waits it out for real. Every test that
 # asserts on the suspension itself drives an injected `Clock` instead, because on the
 # wall clock this window doubles as a budget for the pass: one slower than it reaches
@@ -489,7 +496,7 @@ async def test_the_worker_keeps_a_long_pass_alive_rather_than_letting_it_be_fenc
     # mistake: the window is sized for how fast a *dead* worker should be noticed, and a step
     # that takes a gateway four minutes is neither dead nor doing anything wrong. Without the
     # tick, the claim lapses underneath it and the step it was in the middle of runs twice.
-    lease = BRIEF * 3
+    lease = RENEWED_LEASE
     checkpointer = MemoryCheckpointer()
     scheduler = MemoryScheduler(lease=lease)
     holding = asyncio.Event()
@@ -609,7 +616,7 @@ async def test_a_tick_the_store_refuses_is_retried_rather_than_ending_the_renewa
     # renewing it, to be taken over a window later for having gone quiet, and then surface
     # the store's error at the end of a pass that finished fine, so the delivery went
     # unanswered and the finished workflow was redelivered.
-    lease = BRIEF * 3
+    lease = RENEWED_LEASE
     checkpointer = FlakyRenewals()
     scheduler = MemoryScheduler(lease=lease)
     holding = asyncio.Event()
