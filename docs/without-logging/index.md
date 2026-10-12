@@ -528,6 +528,8 @@ from without_logging import (
     to_stream,
 )
 
+depth = 1024  # capture's queue and each tee branch: the tee absorbs any burst the queue holds
+
 async with (
     offload(to_stream(sys.stderr)) as console,
     offload(to_rotating_file(name, max_bytes=64 * 1024 * 1024)) as file,
@@ -540,11 +542,11 @@ async with (
                     from_selector(at_least(Level.WARNING)),
                     compose(render_json(), file),
                 ),
-                buffer=1024,  # as deep as capture's queue, so the tee keeps up with any burst it holds
+                buffer=depth,
             ),
         ),
         level=logging.DEBUG,
-        capacity=1024,
+        capacity=depth,
     ),
 ):
     ...
