@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
+import signal
 import subprocess
 import sys
 import time
@@ -18,11 +20,10 @@ from benchmarks.todos.servers import FRAMEWORKS
 from benchmarks.todos.servers import SERVERS
 
 # The async supervisor: for each rate it boots a fresh server process (optionally
-# under the austin sampler, so each rate gets its own profile), drives a vegeta run
+# under the Tachyon sampler, so each rate gets its own profile), drives a vegeta run
 # against it, and writes that run's raw results and text report into `results/`.
-# Load generation and sampling both happen in separate processes (vegeta, austin),
-# never in this
-# interpreter, so nothing here competes with the code under test for CPU. vegeta
+# Load generation and sampling both happen in separate processes (vegeta, Tachyon),
+# never in this interpreter, so nothing here competes with the code under test for CPU. vegeta
 # drives a constant arrival rate (open loop), so its latency distribution is
 # corrected for coordinated omission. This is pure orchestration, run by hand, so
 # it is out of the unit-test path.
@@ -39,6 +40,9 @@ _ENDPOINTS: dict[str, tuple[str, str, bool]] = {
 # Both stacks serve this identically and return 200, so it doubles as the
 # readiness probe without adding an asymmetric route to either hot path.
 _READINESS_PATH = "/todos"
+
+# Tachyon, the stdlib sampling profiler (Python 3.15+), run as this interpreter's module.
+_TACHYON = (sys.executable, "-m", "profiling.sampling")
 
 
 async def _run(command: list[str], *, stdin: str | None = None) -> None:
@@ -89,8 +93,6 @@ async def _server(
     framework: str, server_kind: str, host: str, port: int, *, profile: tuple[Path, int] | None = None
 ) -> AsyncIterator[asyncio.subprocess.Process]:
     server = [
-        sys.executable,
-        "-m",
         "benchmarks.todos.servers",
         framework,
         "--server",
@@ -100,28 +102,32 @@ async def _server(
         "--port",
         str(port),
     ]
-    # austin's launch mode runs the server as austin's own child, so sampling works
-    # under Yama `ptrace_scope=1` (which forbids tracing a non-descendant) with no
-    # sudo, and it brackets the whole run. Attach mode (`-p PID`) would need ptrace
-    # relaxation. `-c` is CPU mode: sample only on-CPU stacks, so the profile shows
-    # where the core actually goes rather than counting idle waits. When not
-    # profiling, the server is launched directly.
-    austin = ["austin", "-c", "-i", str(profile[1]), "-o", str(profile[0])] if profile is not None else []
-    command = [*austin, *server]
+    # Tachyon's `run` launches the server as its own child, so sampling works under
+    # Yama `ptrace_scope=1` (which forbids tracing a non-descendant) with no sudo, and
+    # it brackets the whole run. `--mode gil` samples only while a thread holds the
+    # GIL, so the event loop parked in `epoll_wait` doesn't count, and `--blocking`
+    # freezes the threads for each read: without it about a sixth of samples fail,
+    # and not uniformly across frames. Not `--mode cpu`: a frozen thread is never on
+    # CPU, so with `--blocking` it records no samples at all. When not profiling, the
+    # server is launched directly.
+    sampler = [*_TACHYON, "run", "--blocking", "--mode", "gil", "--all-threads"]
+    command = (
+        [*sampler, "--sampling-rate", str(profile[1]), "--binary", "-o", str(profile[0]), "-m", *server]
+        if profile is not None
+        else [sys.executable, "-m", *server]
+    )
     proc = await asyncio.create_subprocess_exec(*command)
     try:
         await _await_ready(f"http://{host}:{port}{_READINESS_PATH}")
         yield proc
     finally:
-        proc.terminate()
+        # Tachyon writes its profile and stops the server on SIGINT; a SIGTERM kills
+        # it with an empty profile and leaves the server running as an orphan.
+        proc.send_signal(signal.SIGINT if profile is not None else signal.SIGTERM)
         await proc.wait()
         if profile is not None:
-            # austin 4.0 writes the MOJO binary format; convert it to austin's text
-            # format and then to speedscope, both via `austin-python`'s converters.
-            mojo = profile[0]
-            text = mojo.with_suffix(".austin")
-            await _run(["mojo2austin", str(mojo), str(text)])
-            await _run(["austin2speedscope", str(text), str(mojo.with_suffix(".speedscope.json"))])
+            flamegraph = profile[0].with_suffix(".flamegraph.html")
+            await _run([*_TACHYON, "replay", "--flamegraph", "-o", str(flamegraph), str(profile[0])])
 
 
 async def _attack(base: str, endpoint: str, rate: int, duration: int, connections: int, out: Path, *, h2c: bool) -> str:
@@ -156,7 +162,7 @@ async def _attack(base: str, endpoint: str, rate: int, duration: int, connection
 
 
 def _server_process(proc: asyncio.subprocess.Process, profiling: bool) -> psutil.Process:
-    # When profiling, `proc` is austin and the server it launched is austin's child;
+    # When profiling, `proc` is Tachyon and the server it launched is Tachyon's child;
     # measure that, not the sampler. Otherwise `proc` is the server itself.
     parent = psutil.Process(proc.pid)
     children = parent.children()
@@ -167,7 +173,7 @@ async def _record(base: str, args: argparse.Namespace, rate: int, label: str, st
     # A fresh server per rate, so each rate gets its own profile (the hot path can
     # look different under light load versus past the knee) instead of one sample
     # stream smeared across every rate.
-    profile = (stem.with_suffix(".mojo"), args.interval) if args.profile else None
+    profile = (stem.with_suffix(".tachyon"), args.sampling_rate) if args.profile else None
     async with _server(args.framework, args.server, args.host, args.port, profile=profile) as proc:
         server = _server_process(proc, profile is not None)
         before = server.cpu_times()
@@ -190,7 +196,7 @@ async def _record(base: str, args: argparse.Namespace, rate: int, label: str, st
 
 async def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Drive a vegeta rate sweep against one todo stack, optionally profiling the server with austin.",
+        description="Drive a vegeta rate sweep against one todo stack, optionally profiling the server with Tachyon.",
     )
     parser.add_argument("framework", choices=tuple(FRAMEWORKS))
     parser.add_argument(
@@ -225,11 +231,15 @@ async def main() -> None:
         help="drive HTTP/2 cleartext instead of HTTP/1.1 (only without-http negotiates it; uvicorn will refuse)",
     )
     parser.add_argument(
-        "--profile", action="store_true", help="run each rate's server under austin for a per-rate profile"
+        "--profile",
+        action="store_true",
+        help="run each rate's server under Tachyon (Python 3.15+) for a per-rate profile",
     )
-    parser.add_argument("--interval", type=int, default=100, help="austin sampling interval in microseconds")
+    parser.add_argument("--sampling-rate", type=int, default=10_000, help="Tachyon samples per second")
     parser.add_argument("--results", type=Path, default=Path(__file__).parent.parent.parent / "results")
     args = parser.parse_args()
+    if args.profile and importlib.util.find_spec("profiling.sampling") is None:
+        parser.error("--profile needs Tachyon, Python 3.15's sampling profiler: rerun with UV_PYTHON=3.15")
 
     args.server = args.server or DEFAULT_SERVER[args.framework]
     rates = args.rates or [1000, 2000, 5000, 10000]

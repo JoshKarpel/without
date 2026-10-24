@@ -14,7 +14,7 @@ from matplotlib.lines import Line2D
 # achieved throughput falls below the target arrival rate and the tail latency
 # blows up) is visible at a glance. Like the harness, this shells out to vegeta and
 # is run by hand, so it stays out of the unit-test path. Plot *unprofiled* runs:
-# austin sampling inflates latency, so a profiled `.bin` would misrepresent it.
+# Tachyon's blocking sampling inflates latency, so a profiled `.bin` would misrepresent it.
 
 # Matches a clean run's stem, e.g. `without+without-http-list-r1500-d8s`. Profiled
 # runs end in `-prof`, so the trailing `$` after the duration excludes them (and the

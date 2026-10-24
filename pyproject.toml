@@ -29,6 +29,9 @@ dependencies = [
 [tool.uv]
 package = false
 exclude-newer = "7 days"
+# Security fixes taken inside the cooldown, each cut off just after its fix release so
+# nothing newer rides in. Drop each entry once the cooldown passes that date (2026-10-30).
+exclude-newer-package = { brotli = "2026-10-23T00:00:00Z", certifi = "2026-10-21T00:00:00Z", filelock = "2026-10-18T00:00:00Z", virtualenv = "2026-10-23T00:00:00Z" }
 
 [tool.uv.workspace]
 members = ["packages/*"]
@@ -166,7 +169,7 @@ branch = true
 omit = [
     # Imperative benchmark shells, exercised by actually running a benchmark rather
     # than unit-tested, per functional-core/imperative-shell: the process-launch and
-    # orchestration modules (they spawn the server, vegeta, and austin as
+    # orchestration modules (they spawn the server, vegeta, and Tachyon as
     # subprocesses), the run-by-hand result-analysis CLIs (plot, hotspots), which
     # read `results/` and render/print, and the render benchmark, which times in
     # process and prints its own tables. Their pure cores (hotspots' frame

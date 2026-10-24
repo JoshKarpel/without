@@ -57,31 +57,35 @@ core:
   deliberately over-capacity step; read it as a *throughput ceiling*, not as a
   latency figure.
 - **Sampling profiler on the server, per rate.** With `--profile`, each rate's
-  server is launched *under* the
-  [`austin`](https://github.com/P403n1x87/austin) statistical sampler (no
-  instrumentation of the hot path). Launch mode, rather than attaching to a PID,
-  means austin is the server's parent, so it works under the common Yama
+  server is launched *under* Tachyon, CPython 3.15's stdlib sampling profiler
+  ([`profiling.sampling`](https://docs.python.org/3.15/library/profiling.sampling.html)),
+  so nothing instruments the hot path. Launch mode, rather than attaching to a PID,
+  makes Tachyon the server's parent, so it works under the common Yama
   `ptrace_scope=1` with no sudo. Each rate gets its *own* profile, since the hot
-  path can look different under light load versus past the knee. austin 4.0 emits
-  the MOJO binary format, which the harness converts to a speedscope flamegraph
-  via `austin-python`'s `mojo2austin` then `austin2speedscope`. This is the
-  stand-in for CPython 3.15's stdlib `profiling.sampling`, which the project can
-  adopt once it moves off 3.14.
+  path can look different under light load versus past the knee. It samples in GIL
+  mode (only while a thread runs Python, so the loop idling in `epoll_wait` doesn't
+  count) with `--blocking`, which freezes the server for each read: without it,
+  about a sixth of samples fail, and unevenly across frames. Freezing slows the
+  server, which is one more reason a profiled run's latency isn't comparable.
 
 ## Prerequisites
 
-The Python side comes from `uv` (including `austin2speedscope`, via the
-`austin-python` dependency). The two *binaries* are managed by
+The Python side comes from `uv`. The vegeta *binary* is managed by
 [`mise`](https://mise.jdx.dev/) from the repo-root `mise.toml`:
 
 ```bash
-mise install        # austin (sampler) + vegeta (load generator)
+mise install        # vegeta (load generator)
 ```
 
-Because the harness launches the server *under* austin (rather than attaching to
-a running PID), `--profile` needs no `ptrace` relaxation. austin is pinned to 4.0
-for Python 3.14 support; the run leaves a `.mojo` (raw samples), an intermediate
-`.austin`, and the `.speedscope.json` flamegraph per rate.
+`--profile` needs Python 3.15, where Tachyon lives; profiling on older Pythons
+isn't supported. Run the profiled sweep, and `just hotspots` on its results, with
+`UV_PYTHON=3.15`. Because the harness launches the server *under* Tachyon (rather
+than attaching to a running PID), `--profile` needs no `ptrace` relaxation. Each
+profiled rate leaves a `.tachyon` (Tachyon's binary profile) and a
+`.flamegraph.html` replayed from it. Any of Tachyon's other formats replays from
+the same file, e.g.
+`python -m profiling.sampling replay --gecko -o out.json results/<run>.tachyon`
+for the Firefox Profiler.
 
 ## Running
 
@@ -93,8 +97,8 @@ uv run python -m benchmarks.harness without --endpoint list
 uv run python -m benchmarks.harness without --endpoint list --server uvicorn
 
 # The FastAPI peer, the write path, custom rates, and a saturation ceiling,
-# with a flamegraph of the server.
-uv run python -m benchmarks.harness fastapi --endpoint create \
+# with a flamegraph of the server (profiling needs Python 3.15).
+UV_PYTHON=3.15 uv run python -m benchmarks.harness fastapi --endpoint create \
     --rate 2000 --rate 8000 --saturate 40000 --profile
 
 # The same list endpoint over HTTP/2 cleartext instead of HTTP/1.1.
@@ -113,8 +117,8 @@ Results land in a git-ignored `results/`, named
 joins the cell, `-` separates fields), so every combination (a profiled run
 beside a clean one, an h2c run beside an h1 one, or two durations) at the same
 rate coexists rather than overwrites. Each run leaves a `.bin` (raw vegeta) and
-`.txt` (report); `--profile` adds the `-prof` tag and a `.speedscope.json`
-flamegraph. Endpoints: `list` (`GET /todos`), `show` (`GET /todos/2`), `create`
+`.txt` (report); `--profile` adds the `-prof` tag, a `.tachyon` profile, and a
+`.flamegraph.html`. Endpoints: `list` (`GET /todos`), `show` (`GET /todos/2`), `create`
 (`POST /todos`).
 
 ## Rendering: a different shape of benchmark
