@@ -201,7 +201,7 @@ docs-build *args:
 bootstrap-pypi +names:
     uv run --script scripts/bootstrap_pypi.py {{ names }}
 
-[doc('Benchmark one framework (without|fastapi) with vegeta+austin on PATH; add --server to pick the server; extra args pass to the harness')]
+[doc('Benchmark one framework (without|fastapi) with vegeta on PATH; add --server to pick the server; --profile needs UV_PYTHON=3.15; extra args pass to the harness')]
 bench framework *args:
     mise exec -- uv run python -m benchmarks.harness {{ framework }} {{ args }}
 
@@ -215,7 +215,7 @@ bench-render *args:
 plot *args:
     mise exec -- uv run python -m benchmarks.plot {{ args }}
 
-[doc('Summarize per-package + per-frame self-time from the austin profiles in results/')]
+[doc('Summarize per-package + per-frame self-time from the Tachyon profiles in results/ (needs UV_PYTHON=3.15)')]
 hotspots *args:
     uv run python -m benchmarks.hotspots {{ args }}
 

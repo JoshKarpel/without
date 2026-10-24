@@ -16,6 +16,10 @@
   on every frame and `capture` dropped most of its records. The docstring says how to
   size it: cover the largest burst, or match the bounded queue upstream. Pass
   `buffer=1` to keep the old behavior.
+- **`without-http`**, **`without-asgi`**: both require `brotli>=1.2.1`, up from
+  `>=1.1`. Brotli 1.2.1 fixes an out-of-bounds write in the decoder
+  ([PYSEC-2026-4322](https://nvd.nist.gov/vuln/detail/CVE-2026-111497)), which
+  `without-http`'s client runs on every brotli-encoded response body it reads.
 
 ## 0.0.10
 
